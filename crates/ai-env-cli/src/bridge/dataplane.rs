@@ -27,6 +27,7 @@ use crate::wire::workspace::{
     known_refusal, refusal, CodeoutManifest, CodeoutRequest, SeedQuery, SeedReply, SeedState, SettingsCapture, TranscriptStat, WsRefusal,
 };
 use crate::wire::workspace::{StatQuery, TranscriptPull, TranscriptPullReply, TranscriptPush, TranscriptPushReply, TranscriptTail, ViewQuery};
+use crate::wire::workspace::{ClaudeRelay, ClaudeRelayReply, ClaudeStage, ClaudeStageQuery, ClaudeStageReply};
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
@@ -184,6 +185,26 @@ pub trait DataPlane: Send + Sync {
         let _ = (target, token, req);
         async { Err(unserved("POST /transcript/tail")) }
     }
+
+    // S11 (A.3): the VM's claude cache, each `cap` claude_stage_v1. The defaults fail closed as S9's do.
+
+    /// S11: `POST /claude/stage` (8080), `cap` claude_stage_v1: 200, 201 and 202 carry the reply.
+    fn claude_stage(&self, target: &AgentTarget, token: &AuthToken, req: &ClaudeStage) -> impl Future<Output = Result<DpReply<ClaudeStageReply>, BridgeError>> + Send {
+        let _ = (target, token, req);
+        async { Err(unserved("POST /claude/stage")) }
+    }
+
+    /// S11: `GET /claude/stage?sha256=` (8080): 200 carries the state.
+    fn claude_stage_state(&self, target: &AgentTarget, token: &AuthToken, q: &ClaudeStageQuery) -> impl Future<Output = Result<DpReply<ClaudeStageReply>, BridgeError>> + Send {
+        let _ = (target, token, q);
+        async { Err(unserved("GET /claude/stage")) }
+    }
+
+    /// S11: `POST /claude/relay` (8080): 200 carries S3's answer.
+    fn claude_relay(&self, target: &AgentTarget, token: &AuthToken, req: &ClaudeRelay) -> impl Future<Output = Result<DpReply<ClaudeRelayReply>, BridgeError>> + Send {
+        let _ = (target, token, req);
+        async { Err(unserved("POST /claude/relay")) }
+    }
 }
 
 /// What a data plane answers for a route it does not serve (S9's defaults).
@@ -194,7 +215,7 @@ fn unserved(route: &str) -> BridgeError {
 /// What the caller does with one answer (plan §10).
 #[derive(Debug)]
 pub enum Verdict {
-    /// 200, 201 or 204: the answer stands.
+    /// 200, 201 or 204 (S11: and 202, a claude stage still fetching): the answer stands.
     Done,
     /// 401 or 403: [`TokenSource::forget`] the port's token and send once
     /// more with a new one; a second refusal is `error` (exit 7).
@@ -251,7 +272,10 @@ pub fn verdict<T>(route: &str, port: u16, reply: &DpReply<T>) -> Verdict {
 }
 
 /// [`verdict`]'s table with a 404 naming `cap` (S9): the capability the
-/// route's VM lacks, `NoCapability` (exit 7, `make deploy`).
+/// route's VM lacks, `NoCapability` (exit 7, `make deploy`). S11 (A.3): 202
+/// is done (its body the reply); a 404 whose refusal is `not_staged` is
+/// `WorkspaceFailed { not_staged }` (exit 1), never a missing capability;
+/// 507 is `WorkspaceFailed { disk_full }` (exit 1).
 #[must_use]
 pub fn verdict_cap<T>(route: &str, port: u16, cap: &'static str, reply: &DpReply<T>) -> Verdict {
     let status = reply.status;
@@ -259,9 +283,10 @@ pub fn verdict_cap<T>(route: &str, port: u16, cap: &'static str, reply: &DpReply
     let refused = |fallback: &'static str| BridgeError::WorkspaceRefused { code: if code == "unknown" { fallback } else { code }, message: message.clone() };
     let failed = |fallback: &'static str| BridgeError::WorkspaceFailed { code: if code == "unknown" { fallback } else { code }, message: message.clone() };
     match status {
-        200 | 201 | 204 => Verdict::Done,
+        200 | 201 | 202 | 204 => Verdict::Done,
         400 | 411 => Verdict::Fail(refused(refusal::BAD_REQUEST)),
         401 | 403 => Verdict::Remint { error: BridgeError::TokenRejected { port, status, proxy_error: reply.proxy_error.clone() } },
+        404 if code == refusal::NOT_STAGED => Verdict::Fail(failed(refusal::NOT_STAGED)),
         404 => Verdict::Fail(BridgeError::NoCapability { cap, message: format!("{route} answered 404") }),
         409 => match code {
             refusal::DIRTY => Verdict::Kept { reason: KeptReason::Dirty, state: reply.refusal.as_ref().and_then(|r| r.state.clone()) },
@@ -274,6 +299,7 @@ pub fn verdict_cap<T>(route: &str, port: u16, cap: &'static str, reply: &DpReply
         422 => Verdict::Fail(failed(refusal::BAD_PACK)),
         500 => Verdict::Fail(failed(refusal::GIT_FAILED)),
         504 => Verdict::Fail(failed(refusal::TIMEOUT)),
+        507 => Verdict::Fail(failed(refusal::DISK_FULL)),
         429 => Verdict::Throttled { retry_after_s: reply.retry_after_s, error: BridgeError::EndpointThrottled { retry_after_s: reply.retry_after_s } },
         502 | 503 => Verdict::CheckVm { error: BridgeError::Http { status, body: message } },
         _ => Verdict::Fail(BridgeError::Http { status, body: message }),
@@ -893,6 +919,44 @@ impl DataPlane for HttpsEndpoint {
         }
         refusal_of(resp, "POST", &shown).await
     }
+
+    // S11 (A.3): the claude cache's routes, on S9's pattern: the request checked first, its URL only in the JSON
+    // body, `reply_of`.
+
+    async fn claude_stage(&self, target: &AgentTarget, token: &AuthToken, req: &ClaudeStage) -> Result<DpReply<ClaudeStageReply>, BridgeError> {
+        req.check().map_err(|e| BridgeError::Config(format!("POST /claude/stage: the request {e}")))?;
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, crate::wire::workspace::CLAUDE_STAGE_ROUTE, &none)?;
+        let json = serde_json::to_vec(req).map_err(|e| BridgeError::Config(format!("POST /claude/stage: {e}")))?;
+        if json.len() > crate::wire::workspace::TRANSFER_REQUEST_MAX {
+            return Err(BridgeError::Config(format!("POST /claude/stage: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
+        }
+        let shown = url.as_str().to_string();
+        let timeout = REQUEST_BASE + Duration::from_secs(u64::from(req.wait_s));
+        let resp = self.send(reqwest::Method::POST, target, token, url, timeout, Payload::Json(json)).await?;
+        reply_of(resp, &[200, 201, 202], "POST", &shown).await
+    }
+
+    async fn claude_stage_state(&self, target: &AgentTarget, token: &AuthToken, q: &ClaudeStageQuery) -> Result<DpReply<ClaudeStageReply>, BridgeError> {
+        q.check().map_err(|e| BridgeError::Config(format!("GET /claude/stage: the query {e}")))?;
+        let url = self.url(target, crate::wire::workspace::CLAUDE_STAGE_ROUTE, &q.pairs())?;
+        let shown = url.as_str().to_string();
+        let resp = self.send(reqwest::Method::GET, target, token, url, request_timeout(0, crate::wire::workspace::budget::TRANSCRIPT_VIEW), Payload::None).await?;
+        reply_of(resp, &[200], "GET", &shown).await
+    }
+
+    async fn claude_relay(&self, target: &AgentTarget, token: &AuthToken, req: &ClaudeRelay) -> Result<DpReply<ClaudeRelayReply>, BridgeError> {
+        req.check().map_err(|e| BridgeError::Config(format!("POST /claude/relay: the request {e}")))?;
+        let none: [(&str, &str); 0] = [];
+        let url = self.url(target, crate::wire::workspace::CLAUDE_RELAY_ROUTE, &none)?;
+        let json = serde_json::to_vec(req).map_err(|e| BridgeError::Config(format!("POST /claude/relay: {e}")))?;
+        if json.len() > crate::wire::workspace::TRANSFER_REQUEST_MAX {
+            return Err(BridgeError::Config(format!("POST /claude/relay: a {}-byte request (at most {})", json.len(), crate::wire::workspace::TRANSFER_REQUEST_MAX)));
+        }
+        let shown = url.as_str().to_string();
+        let resp = self.send(reqwest::Method::POST, target, token, url, request_timeout(req.size, crate::wire::workspace::budget::CLAUDE_RELAY), Payload::Json(json)).await?;
+        reply_of(resp, &[200], "POST", &shown).await
+    }
 }
 
 /// Git smart-HTTP v2 on the code port (S9 §2.1): through `send_with`, with
@@ -1239,7 +1303,7 @@ mod tests {
         };
         let pull = |lens: &[u64], share: u32| TranscriptPull {
             rel: "-w/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/subagents/a.jsonl".into(),
-            parts: lens.iter().map(|len| PullPart { url: url(), len: *len, sha256: None }).collect(),
+            parts: lens.iter().map(|len| PullPart { url: url(), len: *len, sha256: None, encoding: None }).collect(),
             sha256: None,
             owner: "123456789012".into(),
             proxy: None,
@@ -1379,10 +1443,69 @@ mod tests {
         }
         let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: crate::wire::redact::Secret::new("t".into()), vpc: true, shell: false };
         let token = AuthToken { headers: std::collections::BTreeMap::new(), port: 8080, expires_at_unix: 0 };
-        let q = ViewQuery { rel: "s/u.jsonl".into(), n: 10 };
+        let q = ViewQuery { rel: "s/u.jsonl".into(), n: 10, parent: false };
         let e = Unreached.transcript_view(&target, &token, &q).await.unwrap_err();
         assert!(matches!(&e, BridgeError::Config(m) if m == "GET /transcript/view: this data plane does not serve it (S9)"), "{e:?}");
         assert_eq!(exit(e), 1);
         assert_eq!(MAX_JSON, crate::wire::workspace::JSON_PAYLOAD_MAX, "the helper's payload fits the client's read");
+    }
+
+    /// S11 (A.3): a claude stage's 202 (still fetching) is done, its body the reply, as 200 and 201 are; 507 is
+    /// `WorkspaceFailed { disk_full }` (exit 1); the claude routes of a data plane that does not serve them fail
+    /// closed.
+    #[tokio::test]
+    async fn a_202_is_done_and_507_is_disk_full() {
+        use crate::wire::frame::CAP_CLAUDE_STAGE_V1;
+        use crate::wire::workspace::{ClaudeStageState, ClaudeStageReply};
+        let fetching = ClaudeStageReply { state: ClaudeStageState::Fetching, src: None, why: None, got_len: Some(10), got_sha256: None, ms: Some(5) };
+        for s in [200, 201, 202] {
+            let reply = DpReply::ok(s, fetching.clone());
+            assert!(matches!(verdict_cap("POST /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &reply), Verdict::Done), "{s}");
+            assert_eq!(reply.body.as_ref(), Some(&fetching));
+        }
+        for reply in [DpReply::<ClaudeStageReply>::refused(WsRefusal::new(refusal::DISK_FULL, "no room for 290 MB")), DpReply::<ClaudeStageReply>::status(507)] {
+            let reply = DpReply { status: 507, ..reply };
+            match verdict_cap("POST /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &reply) {
+                Verdict::Fail(e @ BridgeError::WorkspaceFailed { code: refusal::DISK_FULL, .. }) => assert_eq!(exit(e), 1),
+                other => panic!("{other:?}"),
+            }
+        }
+        // 409 `not_fresh` stays the existing conflict arm (exit 9); 422 keeps its known code (exit 1).
+        let not_fresh = DpReply::<ClaudeStageReply>::refused(WsRefusal::new(refusal::NOT_FRESH, "this VM ran a spawn"));
+        let (code, text) = fail_code(verdict_cap("POST /claude/relay", 8080, CAP_CLAUDE_STAGE_V1, &DpReply { status: 409, ..not_fresh }));
+        assert_eq!(code, 9, "{text}");
+        let mismatch = DpReply::<ClaudeStageReply>::refused(WsRefusal::new(refusal::CHECKSUM_MISMATCH, "290 bytes came"));
+        match verdict_cap("POST /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &DpReply { status: 422, ..mismatch }) {
+            Verdict::Fail(e @ BridgeError::WorkspaceFailed { code: refusal::CHECKSUM_MISMATCH, .. }) => assert_eq!(exit(e), 1),
+            other => panic!("{other:?}"),
+        }
+        let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: crate::wire::redact::Secret::new("t".into()), vpc: true, shell: false };
+        let token = AuthToken { headers: std::collections::BTreeMap::new(), port: 8080, expires_at_unix: 0 };
+        let q = ClaudeStageQuery { sha256: "a".repeat(64) };
+        let e = Unreached.claude_stage_state(&target, &token, &q).await.unwrap_err();
+        assert!(matches!(&e, BridgeError::Config(m) if m == "GET /claude/stage: this data plane does not serve it (S9)"), "{e:?}");
+        assert_eq!(exit(e), 1);
+    }
+
+    /// S11 (A.3): a 404 whose refusal is `not_staged` is `WorkspaceFailed { not_staged }` (exit 1), never the generic
+    /// 404's missing capability, which a bare 404 still is.
+    #[test]
+    fn a_404_not_staged_is_no_missing_cap() {
+        use crate::wire::frame::CAP_CLAUDE_STAGE_V1;
+        let not_staged = DpReply::<SeedReply>::refused(WsRefusal::new(refusal::NOT_STAGED, "S3 answered 404"));
+        match verdict_cap("POST /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &DpReply { status: 404, ..not_staged }) {
+            Verdict::Fail(e @ BridgeError::WorkspaceFailed { code: refusal::NOT_STAGED, .. }) => assert_eq!(exit(e), 1),
+            other => panic!("{other:?}"),
+        }
+        match verdict_cap("POST /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &DpReply::<SeedReply>::status(404)) {
+            Verdict::Fail(e @ BridgeError::NoCapability { .. }) => {
+                assert!(e.to_string().contains(CAP_CLAUDE_STAGE_V1), "{e}");
+                assert_eq!(exit(e), 7);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Another 404 refusal is still the missing capability.
+        let other = DpReply::<SeedReply>::refused(WsRefusal::new(refusal::BUSY, "x"));
+        assert!(matches!(verdict_cap("GET /claude/stage", 8080, CAP_CLAUDE_STAGE_V1, &DpReply { status: 404, ..other }), Verdict::Fail(BridgeError::NoCapability { .. })));
     }
 }

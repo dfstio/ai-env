@@ -166,12 +166,25 @@ pub struct SpawnSpec {
     /// detach); a fresh uuid v7 when `None`. A uuid v7 ([`SpawnId::new_v7`]):
     /// the shim refuses any other.
     pub id: Option<SpawnId>,
+    /// S11 (A.4, L2): the staged claudes the spawn may run, in preference
+    /// order (at most `wire::workspace::CLAUDE_REFS_MAX`); sent as
+    /// `spawn.claude` only to a shim whose `hello_ok.caps` name
+    /// `claude_stage_v1`. Empty: the image's claude.
+    pub claude: Vec<crate::wire::workspace::ClaudeRef>,
 }
 
 impl std::fmt::Debug for SpawnSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let argv0 = self.argv.first().map_or("", |a| a.rsplit('/').next().unwrap_or(a));
-        write!(f, "SpawnSpec(argv0={argv0}, argc={}, env={}, cwd={}, detach_grace_s={:?})", self.argv.len(), self.env.len(), if self.cwd.is_some() { "set" } else { "default" }, self.detach_grace_s)
+        write!(
+            f,
+            "SpawnSpec(argv0={argv0}, argc={}, env={}, cwd={}, detach_grace_s={:?}, claude={})",
+            self.argv.len(),
+            self.env.len(),
+            if self.cwd.is_some() { "set" } else { "default" },
+            self.detach_grace_s,
+            self.claude.len()
+        )
     }
 }
 
@@ -493,7 +506,8 @@ impl RemoteExit {
 #[derive(Clone, PartialEq, Eq)]
 pub enum SpawnEvent {
     /// The spawn runs (after `spawned`, or after a reattach's `hello_ok`).
-    Started { spawn_id: SpawnId, pid: u32, pgid: u32, claude_version: Option<String> },
+    /// S11: `claude_sha256` is the cached claude that ran (`Spawned.claude_sha256`), `None` for the image's.
+    Started { spawn_id: SpawnId, pid: u32, pgid: u32, claude_version: Option<String>, claude_sha256: Option<String> },
     Stdout { seq: u64, bytes: Vec<u8> },
     /// `dropped`: the cumulative count of stderr bytes dropped, by the shim
     /// (drop-oldest) and by the session while `STDERR_BUFFER_BYTES` of stderr
@@ -531,7 +545,7 @@ pub enum ParkReport {
 impl std::fmt::Debug for SpawnEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnEvent::Started { spawn_id, pid, pgid, claude_version } => write!(f, "Started({spawn_id}, pid={pid}, pgid={pgid}, claude_version={claude_version:?})"),
+            SpawnEvent::Started { spawn_id, pid, pgid, claude_version, claude_sha256 } => write!(f, "Started({spawn_id}, pid={pid}, pgid={pgid}, claude_version={claude_version:?}, claude_sha256={claude_sha256:?})"),
             SpawnEvent::Stdout { seq, bytes } => write!(f, "Stdout(seq={seq}, {} bytes)", bytes.len()),
             SpawnEvent::Stderr { seq, bytes, dropped } => write!(f, "Stderr(seq={seq}, {} bytes, dropped={dropped})", bytes.len()),
             SpawnEvent::Note(text) => write!(f, "Note({text:?})"),
@@ -826,6 +840,7 @@ mod tests {
             env: BTreeMap::from([("LANG".to_string(), "private-env-value".to_string())]),
             detach_grace_s: Some(30),
             id: None,
+            claude: vec![crate::wire::workspace::ClaudeRef { version: "2.1.308".into(), sha256: "a".repeat(64) }],
         };
         let shown = [
             format!("{spec:?}"),
@@ -838,7 +853,8 @@ mod tests {
         for leak in ["--print", "the private prompt", "private-env-value", "/home/agent/work", "private stdin", "private stdout", "private stderr"] {
             assert!(!shown.contains(leak), "{leak}: {shown}");
         }
-        for kept in ["argv0=claude", "argc=3", "env=1", "Stdin(13 bytes)", "Stdout(seq=3, 14 bytes)", "Stderr(seq=4, 14 bytes, dropped=9)"] {
+        assert!(!shown.contains(&"a".repeat(64)), "a claude ref's sha256 is never shown: {shown}");
+        for kept in ["argv0=claude", "argc=3", "env=1", "claude=1", "Stdin(13 bytes)", "Stdout(seq=3, 14 bytes)", "Stderr(seq=4, 14 bytes, dropped=9)"] {
             assert!(shown.contains(kept), "{kept}: {shown}");
         }
     }

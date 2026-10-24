@@ -77,6 +77,18 @@ pub struct ManifestPart {
     pub from: u64,
     pub len: u64,
     pub sha256: String,
+    /// S11 (L5): how the object is stored (`gzip`); `None`: its bytes are
+    /// `len` and `sha256` (identity). `len` and `sha256` always mean the
+    /// transcript's own (decoded) bytes, so `committed`, `fp`, the byte
+    /// ranges and the cut-stage rules do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<crate::wire::workspace::PartEncoding>,
+    /// S11: with `encoding` only: the stored bytes' length (S3's size) and
+    /// sha256 (the `v1/<sid>/mac/<sha256>` key's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_sha256: Option<String>,
 }
 
 /// One file of the session's subtree in S3 (`v1/<sid>/vm/f/<sha256>`).
@@ -90,6 +102,18 @@ pub struct ManifestFile {
     pub version_id: Option<String>,
     pub len: u64,
     pub sha256: String,
+    /// S11 (L5): how the object is stored (`gzip`); `None`: its bytes are
+    /// `len` and `sha256` (identity). `len` and `sha256` always mean the
+    /// transcript's own (decoded) bytes, so `committed`, `fp`, the byte
+    /// ranges and the cut-stage rules do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<crate::wire::workspace::PartEncoding>,
+    /// S11: with `encoding` only: the stored bytes' length (S3's size) and
+    /// sha256 (the `v1/<sid>/mac/<sha256>` key's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_sha256: Option<String>,
 }
 
 /// Where a chat began, the one predicate P0, P3, `session stage`,
@@ -119,6 +143,26 @@ pub fn origin_of(paths: &Paths, sid: &str) -> Option<&'static str> {
     (row.mode == "remote").then_some(ORIGIN_S8_MIRROR)
 }
 
+/// S11 (L5, C.3.6): the capabilities a VM must name to restore `sid`'s chat:
+/// `[CAP_TRANSCRIPT_GZIP_V1]` when its manifest is [`Manifest::encoded`];
+/// none without one, for an identity manifest, or a session id that is no
+/// uuid. A manifest that cannot be read gives none (logged): the restore
+/// then reports it.
+#[must_use]
+pub fn caps_required(paths: &Paths, sid: &str) -> Vec<&'static str> {
+    if !crate::bridge::registry::is_uuid(sid) {
+        return Vec::new();
+    }
+    match read(paths, sid) {
+        Ok(Some(m)) if m.encoded() => vec![crate::wire::frame::CAP_TRANSCRIPT_GZIP_V1],
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(session = sid, "the transcript manifest cannot be read ({e}): no capability required of the VM for it; its restore reports it");
+            Vec::new()
+        }
+    }
+}
+
 // ---- the manifest on disk (G4) -----------------------------------------------------------------
 
 /// A chat begun on a VM.
@@ -134,7 +178,10 @@ pub const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(120)
 
 /// The manifest of `sid` (a uuid `registry::is_uuid` took): `Ok(None)` when
 /// it does not exist; a symlink, a non-regular file, TOML that does not
-/// parse, another version or another session is an error naming the file.
+/// parse (S11: an encoding this build does not know among it), another
+/// version or another session is an error naming the file; so is (S11, L5)
+/// a part or file that holds some of `encoding`, `stored_len` and
+/// `stored_sha256` but not all three.
 pub fn read(paths: &Paths, sid: &str) -> Result<Option<Manifest>, BridgeError> {
     let path = paths.transcript_manifest(sid);
     let Some(text) = crate::bridge::registry::read_regular_file(&path)? else {
@@ -143,6 +190,12 @@ pub fn read(paths: &Paths, sid: &str) -> Result<Option<Manifest>, BridgeError> {
     let m: Manifest = toml::from_str(&text).map_err(|e| BridgeError::Config(format!("{}: {}", path.display(), e.message())))?;
     if m.v != MANIFEST_V || m.session != sid {
         return Err(BridgeError::Config(format!("{}: manifest v{} of session {} (this ai-env reads v{MANIFEST_V} of {sid})", path.display(), m.v, m.session)));
+    }
+    let partial = |encoding: bool, len: bool, sha: bool| (encoding || len || sha) && !(encoding && len && sha);
+    let bad = m.parts.iter().find(|p| partial(p.encoding.is_some(), p.stored_len.is_some(), p.stored_sha256.is_some())).map(|p| format!("the part {}", p.key));
+    let bad = bad.or_else(|| m.files.iter().find(|f| partial(f.encoding.is_some(), f.stored_len.is_some(), f.stored_sha256.is_some())).map(|f| format!("the file {}", f.rel)));
+    if let Some(what) = bad {
+        return Err(BridgeError::Config(format!("{}: {what} names an encoding without its stored length and sha256", path.display())));
     }
     Ok(Some(m))
 }
@@ -259,6 +312,22 @@ impl Manifest {
     #[must_use]
     pub fn file_version(&self, key: &str) -> Option<String> {
         self.files.iter().find(|f| f.key == key).and_then(|f| f.version_id.clone())
+    }
+
+    /// S11 (L5): any part or file is stored encoded (`encoding` set): only a
+    /// VM naming `transcript_gzip_v1` restores it ([`caps_required`]).
+    #[must_use]
+    pub fn encoded(&self) -> bool {
+        self.parts.iter().any(|p| p.encoding.is_some()) || self.files.iter().any(|f| f.encoding.is_some())
+    }
+
+    /// S11 (C.3.7): every part's and file's stored bytes, summed (an
+    /// identity entry's are its `len`): what S3 holds of the chat.
+    #[must_use]
+    pub fn stored_bytes(&self) -> u64 {
+        let parts = self.parts.iter().map(|p| p.stored_len.unwrap_or(p.len));
+        let files = self.files.iter().map(|f| f.stored_len.unwrap_or(f.len));
+        parts.chain(files).fold(0u64, u64::saturating_add)
     }
 }
 
@@ -429,6 +498,135 @@ sha256 = "d569b20cbdd570395fd77fa48b21cf76be5842248a2b7571ea17204e6b907e59"
         assert!(!written.contains("ino") && !written.contains("vm ="), "{written}");
         assert_eq!(origin_of(&Paths::from_root_and_env("/nonexistent/bridge".into(), None), "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"), None, "phase 0's stub");
     }
+
+    /// S11 (C.3.3): an unencoded manifest writes as S10's, byte for byte (the three fields left out); one whose
+    /// part and file hold the three round-trips, each field last; an unknown encoding word is refused.
+    #[test]
+    fn the_encoding_fields_are_additive() {
+        let s10 = "v = 1\nsession = \"0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\"\nbucket = \"b\"\nowner = \"o\"\norigin = \"mac\"\nrel = \"-w/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl\"\ngen = 0\ncommitted = 5\nfp = \"f\"\nat = \"t\"\nsuperseded = []\n\n[[parts]]\nkey = \"k\"\nversion_id = \"fv1\"\nfrom = 0\nlen = 5\nsha256 = \"s\"\n\n[[files]]\nrel = \"r\"\nkey = \"fk\"\nlen = 3\nsha256 = \"fs\"\n";
+        let m: Manifest = toml::from_str(s10).unwrap();
+        assert_eq!((m.parts[0].encoding, m.parts[0].stored_len, m.files[0].stored_sha256.as_deref()), (None, None, None));
+        let plain = toml::to_string(&m).unwrap();
+        assert!(!plain.contains("encoding") && !plain.contains("stored_"), "an S10 manifest writes as S10's: {plain}");
+        assert_eq!(toml::from_str::<Manifest>(&plain).unwrap(), m);
+        let mut gz = m.clone();
+        gz.parts[0].encoding = Some(crate::wire::workspace::PartEncoding::Gzip);
+        gz.parts[0].stored_len = Some(2);
+        gz.parts[0].stored_sha256 = Some("ss".into());
+        gz.files[0].encoding = Some(crate::wire::workspace::PartEncoding::Gzip);
+        gz.files[0].stored_len = Some(1);
+        gz.files[0].stored_sha256 = Some("fss".into());
+        let written = toml::to_string(&gz).unwrap();
+        assert!(written.contains("sha256 = \"s\"\nencoding = \"gzip\"\nstored_len = 2\nstored_sha256 = \"ss\"\n"), "{written}");
+        assert!(written.contains("sha256 = \"fs\"\nencoding = \"gzip\"\nstored_len = 1\nstored_sha256 = \"fss\"\n"), "{written}");
+        assert_eq!(toml::from_str::<Manifest>(&written).unwrap(), gz);
+        assert!(toml::from_str::<Manifest>(&written.replace("\"gzip\"", "\"zstd\"")).is_err(), "an unknown encoding fails closed");
+        assert!(caps_required(&Paths::from_root_and_env("/nonexistent/bridge".into(), None), "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").is_empty(), "no manifest: none");
+    }
+}
+
+#[cfg(test)]
+mod c4_tests {
+    use super::*;
+    use crate::bridge::s3::{S3Endpoint, S3Target, LAB_BUCKET, LAB_OWNER};
+    use crate::wire::frame::CAP_TRANSCRIPT_GZIP_V1;
+    use crate::wire::s3::S3Key;
+    use crate::wire::workspace::PartEncoding;
+
+    const S: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+    /// A Mac-begun chat's manifest: its object and one subtree file, identity.
+    fn mac_manifest() -> Manifest {
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Aws };
+        let mut m = Manifest::new(S, &target, ORIGIN_MAC, &format!("-w/{S}.jsonl"), "2026-10-23T10:00:00.000Z");
+        m.parts.push(ManifestPart { key: S3Key::Mac { session: S.into(), sha256: "b".repeat(64) }.render(), version_id: "fv1".into(), from: 0, len: 500, sha256: "b".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
+        m.files.push(ManifestFile { rel: format!("-w/{S}/subagents/a.jsonl"), key: S3Key::Mac { session: S.into(), sha256: "c".repeat(64) }.render(), version_id: Some("fv2".into()), len: 300, sha256: "c".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
+        m.committed = 500;
+        m
+    }
+
+    /// The manifest of `m` gzip-encoded: the part's and the file's stored bytes.
+    fn gzipped(mut m: Manifest) -> Manifest {
+        let p = &mut m.parts[0];
+        (p.encoding, p.stored_len, p.stored_sha256) = (Some(PartEncoding::Gzip), Some(120), Some("d".repeat(64)));
+        p.key = S3Key::Mac { session: S.into(), sha256: "d".repeat(64) }.render();
+        let f = &mut m.files[0];
+        (f.encoding, f.stored_len, f.stored_sha256) = (Some(PartEncoding::Gzip), Some(80), Some("e".repeat(64)));
+        f.key = S3Key::Mac { session: S.into(), sha256: "e".repeat(64) }.render();
+        m
+    }
+
+    /// S11 (C.3.3): `read` refuses a part or a file that holds one or two of
+    /// `encoding`, `stored_len` and `stored_sha256`, naming the manifest and
+    /// the entry; all three, or none, read. `encoded` says whether any entry
+    /// is stored encoded, and `stored_bytes` sums what S3 holds.
+    #[test]
+    fn an_encoding_without_its_stored_fields_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let plain = mac_manifest();
+        write(&paths, &plain).unwrap();
+        let back = read(&paths, S).unwrap().unwrap();
+        assert!(!back.encoded() && back.stored_bytes() == 800, "{back:?}");
+        let gz = gzipped(plain);
+        write(&paths, &gz).unwrap();
+        let back = read(&paths, S).unwrap().unwrap();
+        assert_eq!(back, gz);
+        assert!(back.encoded() && back.stored_bytes() == 200, "{back:?}");
+        let path = paths.transcript_manifest(S).display().to_string();
+        // One or two of the three kept, on the part, then on the file: refused (an older or a hand-made writer's).
+        for keep in [[true, false, false], [false, true, false], [false, false, true], [true, true, false], [true, false, true], [false, true, true]] {
+            for entry in 0..2 {
+                let mut m = gz.clone();
+                let what = if entry == 0 { format!("the part {}", gz.parts[0].key) } else { format!("the file {}", gz.files[0].rel) };
+                let (encoding, len, sha) = if entry == 0 {
+                    let p = &mut m.parts[0];
+                    (&mut p.encoding, &mut p.stored_len, &mut p.stored_sha256)
+                } else {
+                    let f = &mut m.files[0];
+                    (&mut f.encoding, &mut f.stored_len, &mut f.stored_sha256)
+                };
+                if !keep[0] {
+                    *encoding = None;
+                }
+                if !keep[1] {
+                    *len = None;
+                }
+                if !keep[2] {
+                    *sha = None;
+                }
+                write(&paths, &m).unwrap();
+                let e = read(&paths, S).expect_err(&format!("{keep:?} of entry {entry}"));
+                assert_eq!(e.to_string(), format!("config: {path}: {what} names an encoding without its stored length and sha256"), "{keep:?} of entry {entry}");
+                assert_eq!(crate::errors::CliError::from(e).exit_code(), 1);
+                assert!(caps_required(&paths, S).is_empty(), "a manifest that cannot be read requires none");
+            }
+        }
+        write(&paths, &gz).unwrap();
+        assert_eq!(read(&paths, S).unwrap().unwrap(), gz, "whole again, it reads");
+    }
+
+    /// S11 (C.3.6): `caps_required` names `transcript_gzip_v1` for a session
+    /// whose manifest is encoded (one encoded file alone is enough), none for
+    /// an identity manifest, no manifest, one that cannot be read, or a
+    /// session id that is no uuid.
+    #[test]
+    fn caps_required_names_gzip_for_an_encoded_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        assert!(caps_required(&paths, S).is_empty(), "no manifest");
+        write(&paths, &mac_manifest()).unwrap();
+        assert!(caps_required(&paths, S).is_empty(), "an identity manifest");
+        write(&paths, &gzipped(mac_manifest())).unwrap();
+        assert_eq!(caps_required(&paths, S), [CAP_TRANSCRIPT_GZIP_V1]);
+        let mut file_only = gzipped(mac_manifest());
+        file_only.parts[0] = mac_manifest().parts[0].clone();
+        write(&paths, &file_only).unwrap();
+        assert_eq!(caps_required(&paths, S), [CAP_TRANSCRIPT_GZIP_V1], "an encoded subtree file alone");
+        std::fs::write(paths.transcript_manifest(S), "v = 1\nnot a manifest").unwrap();
+        assert!(caps_required(&paths, S).is_empty(), "unreadable: none (the restore reports it)");
+        assert!(caps_required(&paths, "../x").is_empty() && caps_required(&paths, "not-a-uuid").is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -451,7 +649,7 @@ mod g4_tests {
     }
 
     fn part(key: S3Key, from: u64, len: u64) -> ManifestPart {
-        ManifestPart { key: key.render(), version_id: format!("fv{from}"), from, len, sha256: "a".repeat(64) }
+        ManifestPart { key: key.render(), version_id: format!("fv{from}"), from, len, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None }
     }
 
     /// The first push is generation 1's base; every later turn's bytes are a
@@ -599,7 +797,7 @@ mod c2_tests {
     }
 
     fn part(key: S3Key, from: u64, len: u64) -> ManifestPart {
-        ManifestPart { key: key.render(), version_id: format!("fv{from}"), from, len, sha256: "a".repeat(64) }
+        ManifestPart { key: key.render(), version_id: format!("fv{from}"), from, len, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None }
     }
 
     /// S10 (R1, §1.4): a tail handed again is recorded once, its `at` the

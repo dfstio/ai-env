@@ -337,6 +337,7 @@ fn check_frame(plan: &ExecPlan) -> Result<()> {
         deliver_secret: Deliver::Fd,
         detach_grace_s: plan.detach_grace_s,
         credential: None,
+        claude: Vec::new(),
     };
     let size = frame.to_json().len();
     if size > CONTROL_FRAME_MAX {
@@ -425,7 +426,7 @@ pub async fn run_exec<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
         let ready = async {
             let vm = live_vm(api, &plan.id).await?;
             let env = agent_env(ctx, api, ep, &plan.row, Some(&vm))?;
-            let spec = SpawnSpec { argv: plan.argv.clone(), cwd: plan.cwd.clone(), env: spawn_env(ctx, &plan.row, &plan.env), detach_grace_s: plan.detach_grace_s, id: None };
+            let spec = SpawnSpec { argv: plan.argv.clone(), cwd: plan.cwd.clone(), env: spawn_env(ctx, &plan.row, &plan.env), detach_grace_s: plan.detach_grace_s, id: None, claude: Vec::new() };
             let delivery = match (&plan.credential, supply) {
                 (Some(cp), Some(supply)) => Some(super::credential::prepare(ctx, api, ep, &plan.row, &vm, cp, supply).await?.delivery),
                 (Some(_), None) => return Err(CliError::Msg("internal: a credentialed exec without its keystore".into())),
@@ -455,7 +456,7 @@ pub async fn run_exec<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: 
     if let (Some(r), Some(cred)) = (rejected, &plan.credential) {
         super::credential::record_rejection(&ctx.paths, &plan.id, &cred.tag, r.how);
     }
-    audit_run(ctx, "vm_exec", &plan.id, &name, spawn.as_ref(), &result, started);
+    audit_run(ctx, crate::bridge::audit::event::VM_EXEC, &plan.id, &name, spawn.as_ref(), &result, started);
     result
 }
 
@@ -474,7 +475,7 @@ pub async fn run_attach<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
         pump(&env, Start::Attach { spawn_id: plan.spawn_id.clone(), from_seq: plan.from_seq, err_from_seq: None }, stdin, None, None).await
     };
     let (result, spawn) = finish(run.await);
-    audit_run(ctx, "vm_attach", &plan.id, "-", spawn.as_ref().or(Some(&plan.spawn_id)), &result, started);
+    audit_run(ctx, crate::bridge::audit::event::VM_ATTACH, &plan.id, "-", spawn.as_ref().or(Some(&plan.spawn_id)), &result, started);
     result
 }
 
@@ -1486,7 +1487,7 @@ pub async fn smoke_exec<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
             }
             (Ok(env), None) => env,
         };
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None, claude: Vec::new() };
         let t = Instant::now();
         match capture(env, spec, None).await {
             Ok(cap) => steps.push(judged(field, &shown, &want, &cap, t.elapsed().as_millis())),
@@ -1559,7 +1560,7 @@ pub async fn smoke_credential<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
         let plan = super::credential::check(&ctx.cfg, &ctx.paths, row, &argv, &flags)?.ok_or_else(|| CliError::Msg("internal: no credential plan".into()))?;
         let prepared = super::credential::prepare(ctx, api, ep, row, vm, &plan, supply).await?;
         let env = agent_env(ctx, api, ep, row, Some(vm))?;
-        let spec = SpawnSpec { argv: argv.clone(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None };
+        let spec = SpawnSpec { argv: argv.clone(), cwd: None, env: spawn_env(ctx, row, &[]), detach_grace_s: None, id: None, claude: Vec::new() };
         // What the session did with the token, read once it ran: the source the line names (S9).
         let report = prepared.delivery.report();
         let cap = capture(&env, spec, Some(prepared.delivery)).await?;
@@ -1989,6 +1990,7 @@ mod tests {
             listeners_omitted: 0,
             credential: Default::default(),
             workspace: None,
+            claude_cache: None,
         };
         let lines = detail_lines(&d, None);
         let text = lines.join("\n");

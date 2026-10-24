@@ -199,6 +199,112 @@ pub fn takes_value(flag: &str) -> bool {
     VALUE_FLAGS.contains(&flag)
 }
 
+/// S11 (A.5, L1): flags an unknown-option respawn never drops: the session's wire and identity, and any whose
+/// removal could widen what the CLI may do (LD-4). A start refused for one of them fails as before.
+pub const NEVER_DROP: [&str; 19] = [
+    "--output-format",
+    "--input-format",
+    "--resume",
+    "-r",
+    "--session-id",
+    "--resume-session-at",
+    "--continue",
+    "-c",
+    "--fork-session",
+    "--permission-prompt-tool",
+    "--permission-mode",
+    "--mcp-config",
+    "--replay-user-messages",
+    "--verbose",
+    "--disallowedTools",
+    "--tools",
+    "--setting-sources",
+    "--settings",
+    "--managed-settings",
+];
+
+/// `argv` (P0's VM argv: `claude` first) without every form of `flag` before a bare `--`: `--x`, `--x=v`, and
+/// `--x v` when [`takes_value`] or the next token does not start with `-` (the extension's argv has no positional
+/// argument). argv[0] is never touched. `None` when `flag` is in [`NEVER_DROP`], is no long option
+/// (`--[A-Za-z0-9][A-Za-z0-9-]{0,63}`), or occurs nowhere before the `--`. A bare `--` is never taken as a value.
+#[must_use]
+pub fn drop_option(argv: &[String], flag: &str) -> Option<Vec<String>> {
+    if NEVER_DROP.contains(&flag) || !is_long_option(flag) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    let mut dropped = false;
+    let mut rest = argv.iter().enumerate().skip(1);
+    out.extend(argv.first().cloned());
+    while let Some((i, a)) = rest.next() {
+        if a == "--" {
+            out.extend(argv[i..].iter().cloned());
+            break;
+        }
+        if a == flag {
+            dropped = true;
+            // Its value: never a bare `--`, nor a flag this function keeps whatever happens.
+            let next = argv.get(i + 1).filter(|n| n.as_str() != "--" && !NEVER_DROP.contains(&n.as_str()));
+            if next.is_some_and(|n| takes_value(flag) || !n.starts_with('-')) {
+                rest.next();
+            }
+            continue;
+        }
+        if a.strip_prefix(flag).is_some_and(|tail| tail.starts_with('=')) {
+            dropped = true;
+            continue;
+        }
+        out.push(a.clone());
+    }
+    dropped.then_some(out)
+}
+
+/// `--[A-Za-z0-9][A-Za-z0-9-]{0,63}`: a long option's name, without `=value`.
+fn is_long_option(flag: &str) -> bool {
+    let Some(name) = flag.strip_prefix("--") else { return false };
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric()) && name.len() <= 64 && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// How the router knows a `--flag` (S11, C.4: doctor's drift row), the
+/// first that holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagClass {
+    /// In `VALUE_FLAGS`: it takes the next token, or `=value`.
+    Value,
+    /// One `classify`, `sanitise` or the pipeline's `move_argv` acts on that
+    /// takes no value ([`STRIPPED_FLAGS`]).
+    Stripped,
+    /// A reviewed boolean flag the extension passes ([`BOOL_FLAGS`]).
+    Bool,
+    /// None of these: doctor names it.
+    Unknown,
+}
+
+/// The value-less flags the router itself acts on: `classify`'s,
+/// `sanitise`'s and `move_argv`'s (`bridge::remote::pipeline`). Short flags
+/// (`-c`, `-r`, `-v`) are never judged.
+pub const STRIPPED_FLAGS: [&str; 10] = ["--version", "--claude-in-chrome-mcp", "--bare", "--continue", "--debug", "--debug-to-stderr", "--no-session-persistence", "--session-mirror", "--fork-session", "--reply-on-resume"];
+
+/// The boolean flags a session's argv carries, reviewed: seeded from the
+/// argv fixtures of a session's shape (`route` `remote`) at `3abcf80`. A
+/// new one comes here once reviewed; doctor names it until then.
+pub const BOOL_FLAGS: [&str; 5] = ["--verbose", "--include-partial-messages", "--enable-auth-status", "--no-chrome", "--replay-user-messages"];
+
+/// `flag`'s class: `--name` alone (split a `--name=value` first).
+#[must_use]
+pub fn flag_class(flag: &str) -> FlagClass {
+    if VALUE_FLAGS.contains(&flag) {
+        FlagClass::Value
+    } else if STRIPPED_FLAGS.contains(&flag) {
+        FlagClass::Stripped
+    } else if BOOL_FLAGS.contains(&flag) {
+        FlagClass::Bool
+    } else {
+        FlagClass::Unknown
+    }
+}
+
 /// Value of `--flag v` or `--flag=v`; flag handling stops at a bare `--`.
 #[must_use]
 pub fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -745,6 +851,35 @@ mod tests {
 mod n_tests {
     use super::*;
 
+    /// S11 (C.4): every `VALUE_FLAGS`, `STRIPPED_FLAGS` and `BOOL_FLAGS`
+    /// entry has its class; the three lists are disjoint long options; an
+    /// unknown flag, a `--name=value` unsplit and a short flag are `Unknown`.
+    /// `NEVER_DROP` (A.5) holds the session's wire and identity.
+    #[test]
+    fn flag_class_sorts_value_stripped_bool_and_unknown() {
+        for f in VALUE_FLAGS {
+            assert_eq!(flag_class(f), FlagClass::Value, "{f}");
+        }
+        for f in STRIPPED_FLAGS {
+            assert_eq!(flag_class(f), FlagClass::Stripped, "{f}");
+        }
+        for f in BOOL_FLAGS {
+            assert_eq!(flag_class(f), FlagClass::Bool, "{f}");
+        }
+        let all: Vec<&str> = VALUE_FLAGS.iter().chain(STRIPPED_FLAGS.iter()).chain(BOOL_FLAGS.iter()).copied().collect();
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "the three lists are disjoint");
+        assert!(all.iter().all(|f| f.starts_with("--") && f.len() > 2), "long options only");
+        for f in ["--from-the-future", "--model=opus", "-c", "-r", "-v", "--", ""] {
+            assert_eq!(flag_class(f), FlagClass::Unknown, "{f}");
+        }
+        let never: std::collections::BTreeSet<&str> = NEVER_DROP.iter().copied().collect();
+        assert_eq!(never.len(), 19, "unique");
+        for f in ["--output-format", "--input-format", "--resume", "--session-id", "--resume-session-at", "--permission-mode", "--settings", "--managed-settings"] {
+            assert!(never.contains(f), "{f}");
+        }
+    }
+
     /// The `argv` array of a fixture's text.
     fn argv_of(text: &str) -> Vec<String> {
         let j: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -766,5 +901,96 @@ mod n_tests {
         let chrome = argv_of(include_str!("../../tests/fixtures/argv/session_chrome_mcp.json"));
         assert!(matches!(classify(&chrome), Route::Remote(s) if s.has_mcp_config), "{chrome:?}");
         assert!(value_of(&chrome, "--mcp-config").is_some_and(|c| c.contains("claude-in-chrome")), "{chrome:?}");
+    }
+}
+
+#[cfg(test)]
+mod a3_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// S11 (A.5, L1): the refused flag goes in every form before a bare `--` (`--x`, `--x=v`, `--x v` for a
+    /// value flag or a next token that is no option), and nothing else; a session flag, a short flag, a name
+    /// that is no long option, or a flag that is not there is `None`.
+    #[test]
+    fn drop_option_takes_the_flag_and_its_value_never_a_session_flag() {
+        let base = v(&["claude", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json"]);
+        let with = |extra: &[&str]| base.iter().cloned().chain(v(extra)).collect::<Vec<_>>();
+        // A boolean flag, alone and twice.
+        assert_eq!(drop_option(&with(&["--from-the-future"]), "--from-the-future"), Some(base.clone()));
+        assert_eq!(drop_option(&with(&["--from-the-future", "--include-partial-messages", "--from-the-future"]), "--from-the-future"), Some(with(&["--include-partial-messages"])));
+        // `--x=v`, and `--x v` when the next token is no option.
+        assert_eq!(drop_option(&with(&["--thinking=disabled", "--include-partial-messages"]), "--thinking"), Some(with(&["--include-partial-messages"])));
+        assert_eq!(drop_option(&with(&["--thinking", "disabled", "--include-partial-messages"]), "--thinking"), Some(with(&["--include-partial-messages"])));
+        // A value flag takes its next token whatever it looks like; a boolean one never takes an option.
+        assert_eq!(drop_option(&with(&["--model", "-weird", "--include-partial-messages"]), "--model"), Some(with(&["--include-partial-messages"])));
+        assert_eq!(drop_option(&with(&["--new-bool", "--include-partial-messages"]), "--new-bool"), Some(with(&["--include-partial-messages"])));
+        // A prefix of another flag is not that flag.
+        assert_eq!(drop_option(&with(&["--thinking-budget=3"]), "--thinking"), None);
+        // Never a session flag, a short one, or no long option.
+        for flag in NEVER_DROP {
+            assert_eq!(drop_option(&with(&[flag, "x"]), flag), None, "{flag}");
+        }
+        for flag in ["-x", "--", "---x", "--a_b", "--=x", "", "x", &format!("--{}", "a".repeat(65))] {
+            assert_eq!(drop_option(&with(&[flag]), flag), None, "{flag:?}");
+        }
+        assert!(drop_option(&with(&[&format!("--{}", "a".repeat(64))]), &format!("--{}", "a".repeat(64))).is_some(), "64 characters is a name");
+        assert_eq!(drop_option(&base, "--from-the-future"), None, "nowhere in the argv");
+    }
+
+    /// argv[0] stays whatever it is, and what follows a bare `--` is never touched (nor taken as a value).
+    #[test]
+    fn drop_option_keeps_argv0_and_what_follows_a_bare_dashdash() {
+        assert_eq!(drop_option(&v(&["--x", "--x"]), "--x"), Some(v(&["--x"])), "argv[0] is never dropped");
+        assert_eq!(drop_option(&v(&["claude", "--x", "--", "--x", "--x=1"]), "--x"), Some(v(&["claude", "--", "--x", "--x=1"])));
+        assert_eq!(drop_option(&v(&["claude", "--", "--x"]), "--x"), None, "only after the `--`");
+        assert_eq!(drop_option(&v(&["claude", "--model", "--", "x"]), "--model"), Some(v(&["claude", "--", "x"])), "a bare `--` is no value");
+        assert_eq!(drop_option(&[], "--x"), None);
+    }
+
+    fn token() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(NEVER_DROP.to_vec()).prop_map(str::to_string),
+            prop::sample::select(VALUE_FLAGS.to_vec()).prop_map(str::to_string),
+            Just("--".to_string()),
+            "--[a-z][a-z0-9-]{0,8}",
+            "--[a-z]{2,6}=[a-z0-9]{1,4}",
+            "[a-z0-9]{1,6}",
+            "-[a-z]",
+        ]
+    }
+
+    proptest! {
+        /// Whatever the argv and the flag, a `NEVER_DROP` flag is never dropped (`None`), argv[0] stays first, the
+        /// result is a subsequence of the argv that no longer names the flag before its `--`, and dropping again
+        /// finds nothing.
+        #[test]
+        fn drop_option_never_drops_a_never_drop_flag_or_argv0(argv in prop::collection::vec(token(), 1..16), flag in token()) {
+            let got = drop_option(&argv, &flag);
+            if NEVER_DROP.contains(&flag.as_str()) {
+                prop_assert_eq!(got, None);
+                return Ok(());
+            }
+            let Some(out) = got else { return Ok(()) };
+            prop_assert_eq!(out.first(), argv.first());
+            let mut j = 0;
+            for a in &argv {
+                if j < out.len() && &out[j] == a {
+                    j += 1;
+                }
+            }
+            prop_assert_eq!(j, out.len(), "a subsequence");
+            let before: Vec<&String> = out.iter().skip(1).take_while(|a| a.as_str() != "--").collect();
+            prop_assert!(!before.iter().any(|a| **a == flag || a.starts_with(&format!("{flag}="))), "{:?}", out);
+            prop_assert_eq!(drop_option(&out, &flag), None);
+            for never in NEVER_DROP {
+                let count = |v: &[String]| v.iter().skip(1).filter(|a| a.as_str() == never).count();
+                prop_assert_eq!(count(&out), count(&argv), "{} kept", never);
+            }
+        }
     }
 }

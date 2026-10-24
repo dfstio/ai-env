@@ -11,7 +11,9 @@
 //!   411 `bad_request`), at most `SEED_BODY_MAX` (else 413), streamed to the
 //!   helper, never buffered; a `SeedReply` (201, or 200 when up to date);
 //! * `POST /codeout`: a `CodeoutRequest` (at most `CODEOUT_REQUEST_MAX`);
-//!   a `CodeoutManifest` line, then the pack (200), or 204 when nothing is new.
+//!   a `CodeoutManifest` line, then the pack (200), or 204 when nothing is
+//!   new (S11: the line alone, 200, when the request sets
+//!   `manifest_when_empty`, as `codeout_manifest_v1` is named).
 //!
 //! One workspace per VM: seed, code-out and snapshot hold the shim's
 //! workspace lock (`budget::BUSY_WAIT`, then 409 `busy`), and the shim keeps
@@ -39,6 +41,12 @@ use serde::de::DeserializeOwned;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// S11 (C.1, `codeout_manifest_v1`): whether this build answers a code-out
+/// that sets `manifest_when_empty` with its manifest line alone (200) when
+/// nothing is new, and names the cap (`ShimState::caps`). While false the
+/// flag is ignored and the answer stays a bare 204, as a 12.0 shim's.
+pub const MANIFEST_SERVED: bool = true;
 
 /// The code-port router. Serve it with `into_make_service_with_connect_info::<peer::Peer>()`.
 pub fn router(state: Arc<ShimState>) -> Router {
@@ -233,7 +241,8 @@ async fn put_seed(State(state): State<Arc<ShimState>>, req: Request) -> Response
 
 /// `POST /codeout`: the helper's snapshot (with `wip`) and pack; its
 /// manifest line, then the pack streamed from it, the workspace held until
-/// the run ended; 204 when nothing is new. Up to its head the run is a task
+/// the run ended; 204 when nothing is new (S11: the manifest line alone,
+/// 200, when the request sets `manifest_when_empty`). Up to its head the run is a task
 /// of its own (`asagent::detached`): a client gone meanwhile never ends it
 /// mid-snapshot; past the head, a body dropped ends it (its pack already
 /// left the inbox). A head announcing more than `max_bytes` is 413: the
@@ -289,6 +298,9 @@ async fn post_codeout(State(state): State<Arc<ShimState>>, req: Request) -> Resp
                     state.workspace.wip_made(w);
                 }
                 let Some(len) = len else {
+                    if creq.manifest_when_empty && MANIFEST_SERVED {
+                        return manifest_only(proc, &manifest, held, started).await;
+                    }
                     if let Err(e) = proc.finish().await {
                         return asagent::refuse(op, started, &e.refusal(op));
                     }
@@ -326,4 +338,29 @@ async fn post_codeout(State(state): State<Arc<ShimState>>, req: Request) -> Resp
         }
     })
     .await
+}
+
+/// S11 (C.1.2): the answer to a code-out that set `manifest_when_empty`
+/// when the helper made no pack: 200 whose body is exactly the manifest's
+/// framed line (`Content-Length` its length, no pack byte), so the Mac's
+/// record follows the VM's HEAD and branch. The run is finished off the
+/// body's path and `held` (the workspace lock) goes once it ended
+/// (`AgentProc::into_body` with nothing after the line). A line that does
+/// not frame is 500 `git_failed`, as a pack's.
+async fn manifest_only(proc: AgentProc, manifest: &CodeoutManifest, held: asagent::SlotGuard, started: Instant) -> Response {
+    let op = "codeout";
+    let line = match asagent::framed_head(manifest) {
+        Ok(l) => l,
+        Err(e) => {
+            proc.stop().await;
+            drop(held);
+            return asagent::refuse(op, started, &WsRefusal::new(refusal::GIT_FAILED, &format!("the code-out manifest does not frame: {e}")));
+        }
+    };
+    let total = line.len() as u64;
+    asagent::log(op, 200, None, started);
+    let mut res = Response::new(proc.into_body(line, 0, Some(held)));
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    res.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(total));
+    res
 }

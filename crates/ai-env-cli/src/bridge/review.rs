@@ -60,7 +60,8 @@ pub enum HookState {
 /// and what is there.
 #[must_use]
 pub fn hook_state(repo_root: &Path) -> HookState {
-    if let Err(e) = crate::gitrun::GitRun::mac(repo_root).output(["rev-parse", "--git-dir"]) {
+    // B3's review (D16): under `ai-env as ops -- ai-env doctor` this git inherits no credential.
+    if let Err(e) = crate::gitrun::GitRun::mac(repo_root).without_credentials().output(["rev-parse", "--git-dir"]) {
         return HookState::Unknown(format!("{} is not a git repository ({e})", repo_root.display()));
     }
     let path = crate::git::hook_path(repo_root, "pre-push");

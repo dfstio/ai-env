@@ -20,9 +20,17 @@
 //! the library, as no command prints them without asking AWS. Each chain is
 //! a pure reader with an offline test.
 //!
+//! S11 (part B, in a `target/s8` fixture window): `t11_3` (B6 (b)) chains
+//! the panel's rows (`vm_suspend`, `vm_resume` and
+//! `session_migrate_request`, `actor` panel) to the wrapper's
+//! `session_move_end` whose `request` is the panel's nonce, and holds the
+//! CLI's twins to the panel's keys; `t11_fresh` (B3 (c), B7 (a)) reads a
+//! chat's census end row: `claude_src:cached`, its `claude:` the window's
+//! extension (the row's `ext`). Each is a pure reader with an offline test.
+//!
 //! Each test is `#[ignore]`d and skips, saying why, unless
 //! `AI_ENV_CURSOR_TESTS=1` and `AI_ENV_CURSOR_STEP` names its step (`t8_3`
-//! to `t8_7`, `t9_s3`, `t10_2` to `t10_5`, `t10_p`):
+//! to `t8_7`, `t9_s3`, `t10_2` to `t10_5`, `t10_p`, `t11_3`, `t11_fresh`):
 //! `make test-cursor STEP=t8_3 SINCE=…` runs
 //! `AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=t8_3 AI_ENV_CURSOR_SINCE=…
 //! cargo test -p ai-env-cli --features bridge --test cursor_live --
@@ -42,8 +50,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The steps, as `AI_ENV_CURSOR_STEP` names them (S9: `t9_s3`, the S3 store's chats; S10: `t10_2` to `t10_5` and
-/// `t10_p`, the continuity steps and the placeholder's picker reopen).
-const STEPS: [&str; 11] = ["t8_3", "t8_4", "t8_5", "t8_6", "t8_7", "t9_s3", "t10_2", "t10_3", "t10_4", "t10_5", "t10_p"];
+/// `t10_p`, the continuity steps and the placeholder's picker reopen; S11: `t11_3`, the panel's actions, and
+/// `t11_fresh`, a chat on the window's claude from the VM's cache).
+const STEPS: [&str; 13] = ["t8_3", "t8_4", "t8_5", "t8_6", "t8_7", "t9_s3", "t10_2", "t10_3", "t10_4", "t10_5", "t10_p", "t11_3", "t11_fresh"];
 
 /// The remote sessions' mode notes (`remote::MODE_NOTES`).
 const REMOTE_MODES: [&str; 2] = ["mode:remote", "mode:remote(config)"];
@@ -1029,6 +1038,147 @@ fn t10_p_evidence() {
     assert_closed_well(&reopen);
 }
 
+/// T11.3's chain (S11, part B's B6 (b)), pure: since `since` (Unix ms), a
+/// live migrate the panel asked (`session_migrate_request`, `actor` panel,
+/// `how` live) of a chat of `ws` (its registry row's `cwd` there or below,
+/// among `sessions`); the wrapper's `session_move_end` whose `request` is
+/// that request's `nonce` (the same chat, `actor` wrapper, `kind` migrate,
+/// `outcome` done); and, in the order the audit's rows were written, the
+/// panel's `vm_suspend` of the VM that move left (`from_vm`), then its
+/// `vm_resume` of that VM. Where the CLI's twins ran since `since` (`actor`
+/// cli), the newest row of each of the three events (a migrate's of the
+/// same `how`) holds the panel's row's keys, `actor` aside (CLI parity). `Ok`: the evidence in one line;
+/// `Err`: what the newest request of the panel lacks, or that there is none.
+fn panel_evidence(audit: &[Value], sessions: &[Value], ws: &Path, since: u64) -> Result<String, String> {
+    use ai_env_cli::bridge::audit::event::{VM_RESUME, VM_SUSPEND};
+    use ai_env_cli::bridge::audit::Actor;
+    use audit_event::{SESSION_MIGRATE_REQUEST, SESSION_MOVE_END};
+    let (panel, cli, wrapper, migrate) = (Actor::Panel.word(), Actor::Cli.word(), Actor::Wrapper.word(), MoveKind::Migrate.word());
+    let rows: Vec<&Value> = audit.iter().filter(|r| at_ms(r).is_some_and(|t| t >= since)).collect();
+    let by = |r: &Value, event: &str, actor: &str| r["event"] == event && detail(r, "actor") == Some(actor);
+    let asked = rows.iter().rev().filter(|r| by(r, SESSION_MIGRATE_REQUEST, panel));
+    let none = || "no session_migrate_request audit row with actor panel since AI_ENV_CURSOR_SINCE: Migrate the chat from the panel's Sessions page (T11.3)".to_string();
+    first_passing(asked, none, |&req| {
+        let (sid, nonce, how) = (detail(req, "session").unwrap_or("-"), detail(req, "nonce").unwrap_or("-"), detail(req, "how").unwrap_or("-"));
+        if how != "live" {
+            return Err(format!("the panel's migrate of {sid} at {} was {how}, not live: Migrate the chat while its tab is open (T11.3)", req["ts"]));
+        }
+        let row = sessions.iter().find(|s| s["session_id"] == sid).ok_or_else(|| format!("the panel migrated {sid} at {}, which has no registry row (ai-env session list --json)", req["ts"]))?;
+        if !row["cwd"].as_str().is_some_and(|c| Path::new(c).starts_with(ws)) {
+            return Err(format!("the chat the panel migrated at {} ({sid}) ran in {}, not in {} (AI_ENV_CURSOR_WORKSPACE)", req["ts"], row["cwd"], ws.display()));
+        }
+        let end = rows
+            .iter()
+            .find(|r| r["event"] == SESSION_MOVE_END && detail(r, "request") == Some(nonce))
+            .ok_or_else(|| format!("no session_move_end audit row whose request is the panel's nonce {nonce} (its migrate of {sid} at {}): the chat's wrapper never moved it (its dialog, M1, answered? Migrate's action page says why)", req["ts"]))?;
+        let facts = [detail(end, "session"), detail(end, "actor"), detail(end, "kind"), detail(end, "outcome")];
+        if facts != [Some(sid), Some(wrapper), Some(migrate), Some("done")] {
+            let [s, a, k, o] = facts.map(|f| f.unwrap_or("-"));
+            return Err(format!("the session_move_end of the panel's nonce {nonce} at {} says session {s}, actor {a}, kind {k}, outcome {o}: not the wrapper's migrate of {sid}, done", end["ts"]));
+        }
+        let (from, to) = (detail(end, "from_vm").unwrap_or("-"), detail(end, "to_vm").unwrap_or("-"));
+        let on = |r: &Value, event: &str| by(r, event, panel) && detail(r, "id") == Some(from);
+        let toggled = rows.iter().enumerate().filter(|(_, r)| on(r, VM_SUSPEND)).find_map(|(i, &s)| rows[i + 1..].iter().find(|r| on(r, VM_RESUME)).map(|&r| (s, r)));
+        let Some((suspended, resumed)) = toggled else {
+            return Err(format!("no vm_suspend audit row with actor panel of {from}, the VM the panel's migrate of {sid} left, then a vm_resume of it with actor panel, since AI_ENV_CURSOR_SINCE: Suspend, then Resume, on its row of the panel's VMs page before Migrate (T11.3)"));
+        };
+        let keys = |r: &Value| r["detail"].as_object().map(|d| d.keys().filter(|k| k.as_str() != "actor").cloned().collect::<BTreeSet<String>>()).unwrap_or_default();
+        let mut twins = Vec::new();
+        for (event, ours) in [(VM_SUSPEND, suspended), (VM_RESUME, resumed), (SESSION_MIGRATE_REQUEST, req)] {
+            if let Some(twin) = rows.iter().rev().find(|r| by(r, event, cli) && detail(r, "how") == detail(ours, "how")) {
+                if keys(twin) != keys(ours) {
+                    return Err(format!("CLI parity: the CLI's {event} at {} holds the keys {:?}, the panel's at {} {:?}", twin["ts"], keys(twin), ours["ts"], keys(ours)));
+                }
+                twins.push(event);
+            }
+        }
+        let parity = if twins.is_empty() { "no CLI twin since AI_ENV_CURSOR_SINCE (parity not compared)".to_string() } else { format!("the CLI's {} hold the panel's keys", twins.join(", ")) };
+        Ok(format!(
+            "session {sid}: the panel (actor=panel) suspended {from} at {} and resumed it at {}, then asked a live migrate at {} (nonce {nonce}, wrapper pid {}); the wrapper moved the chat off {from} to {to} at {} (outcome done, touchid {}, {} ms), its request the panel's nonce; {parity}",
+            suspended["ts"],
+            resumed["ts"],
+            req["ts"],
+            detail(req, "wrapper_pid").unwrap_or("-"),
+            end["ts"],
+            detail(end, "touchid").unwrap_or("-"),
+            detail(end, "ms").unwrap_or("-")
+        ))
+    })
+}
+
+/// S11's claude always fresh in a Cursor window (D3; part B's B3 (c) and
+/// B7 (a)), pure: since `since` (Unix ms), in `ws`, a chat's end row (a run
+/// [`served`] names: a config probe's names no chat) whose `claude_src` is
+/// `cached` (the window's version ran from the VM's cache,
+/// `claude::claude_src_of`) and whose `claude:` is the window's extension
+/// (the row's `ext`, from argv[1]'s bundle path). `Ok`: that end row and
+/// the evidence in one line, with every chat's claude words since the step,
+/// oldest first (part B records them: B3's tab B `image(not_cached)`
+/// before the fetch); `Err`: what the newest chat lacks, or that there is
+/// none.
+fn fresh_evidence(census: &[Value], audit: &[Value], ws: &Path, since: u64) -> Result<(Value, String), String> {
+    use census_part::{AUTH_TIMERS, CLAUDE, CLAUDE_SRC, VM, VM_HOW};
+    let ends = remote_ends(census, ws, since);
+    let chats: Vec<(&Value, String)> = ends.iter().filter_map(|r| served(r, audit).map(|id| (r, id))).collect();
+    let none = || format!("no chat of {} ended since AI_ENV_CURSOR_SINCE (a remote end row whose --resume, or whose wrapper's session_remote_end audit row, names the chat): open a tab in the window, send a line, close the tab, then check", ws.display());
+    let (end, id) = first_passing(chats.iter().rev(), none, |(r, id)| {
+        let (pid, vm, claude, src) = (r["pid"].as_u64().unwrap_or(0), shown(r, VM), shown(r, CLAUDE), shown(r, CLAUDE_SRC));
+        let ext = r["ext"].as_str().filter(|e| !e.is_empty()).ok_or_else(|| format!("chat {id} (wrapper pid {pid}) on {vm} names no extension (no ext: its argv[1] is no Cursor bundle's claude): open the chat in a Cursor window"))?;
+        if src != "cached" {
+            return Err(format!("chat {id} (wrapper pid {pid}) on {vm} ran claude {claude} with claude_src:{src}, not the window's {ext} from the VM's cache (claude_src:cached): once claude_fetch says fetched on {vm}, open another tab, send a line, close it, then check"));
+        }
+        if claude != ext {
+            return Err(format!("chat {id} (wrapper pid {pid}) on {vm} ran claude {claude} from the VM's cache, not the window's extension {ext}"));
+        }
+        Ok(((*r).clone(), id.clone()))
+    })?;
+    let words = chats.iter().map(|(r, id)| format!("{id} claude:{} claude_src:{} ext:{}", shown(r, CLAUDE), shown(r, CLAUDE_SRC), r["ext"].as_str().unwrap_or("-"))).collect::<Vec<_>>().join(", ");
+    let evidence = format!(
+        "chat {id} (wrapper pid {}) on {} (vm_how:{}) ran claude {} from the VM's cache (claude_src:cached), the window's extension; auth_timers:{}, end:{}, exit {}; the chats since the step, oldest first: {words}",
+        end["pid"],
+        shown(&end, VM),
+        shown(&end, VM_HOW),
+        shown(&end, CLAUDE),
+        shown(&end, AUTH_TIMERS),
+        shown(&end, "end"),
+        end["exit"]
+    );
+    Ok((end, evidence))
+}
+
+/// T11.3 (S11, part B's B6 (b), in a `target/s8` fixture window, after the
+/// CLI's twins): the panel suspended, resumed and migrated the window's
+/// chat (`actor=panel` on `vm_suspend`, `vm_resume` and
+/// `session_migrate_request`), and the wrapper's `session_move_end` has the
+/// panel's nonce as its `request`; the CLI's twins, where run since the
+/// step, wrote the same keys: [`panel_evidence`]. The pages, the Touch IDs
+/// and the action lines are seen by hand.
+#[test]
+#[ignore = "live evidence after T11.3 in Cursor and the panel: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t11_3 SINCE=… WORKSPACE=…"]
+fn t11_3_evidence() {
+    if !chosen("t11_3") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let evidence = panel_evidence(&audit_since(since), &sessions(), &ws, since).unwrap_or_else(|why| panic!("T11.3: {why}"));
+    eprintln!("t11_3: {evidence}");
+}
+
+/// S11's claude always fresh in Cursor (part B's B3 (c) and B7 (a), in a
+/// `target/s8` fixture window): a chat ran the window's own claude from the
+/// VM's cache (`claude_src:cached`, its `claude:` the row's `ext`):
+/// [`fresh_evidence`]. Its answer is seen in Cursor.
+#[test]
+#[ignore = "live evidence after a chat on the window's claude in Cursor: AI_ENV_CURSOR_TESTS=1 make test-cursor STEP=t11_fresh SINCE=… WORKSPACE=…"]
+fn t11_fresh_evidence() {
+    if !chosen("t11_fresh") {
+        return;
+    }
+    let (ws, since) = (workspace(), since_of());
+    let (_, evidence) = fresh_evidence(&census(), &audit_since(since), &ws, since).unwrap_or_else(|why| panic!("claude always fresh: {why}"));
+    eprintln!("t11_fresh: {evidence}");
+}
+
 /// Offline (no gate, nothing live): the readers the checks rest on take the
 /// census's and the view's shapes: note parts by name (`vm` is not
 /// `vm_how`), remote end rows of the workspace since a time, a `--resume`
@@ -1413,4 +1563,136 @@ fn placeholder_evidence_chains_the_unsynced_close_to_the_kept_reopen() {
     let none = format!("no chat of {FIXTURE_WS} reopened from the picker with its transcript kept on its VM since AI_ENV_CURSOR_SINCE");
     assert!(err(&[first("microvm-a"), reopen("restored", "")], &audit).starts_with(&none), "restored into a new VM");
     assert!(err(&[first("microvm-a"), reopen("kept", "carried:migrate; ")], &audit).starts_with(&none), "carried off a VM near its wall");
+}
+
+/// S11 (T11.3): the panel's chain, offline. The panel's live migrate of
+/// the window's chat, the wrapper's move whose request is its nonce, the
+/// panel's suspend then resume of the VM that move left, and the CLI's
+/// twins with the same keys; the platform's own suspend first (Resume,
+/// then Suspend and Resume) passes too. Each broken link is named: the
+/// CLI's request alone, a request before the step, an offline migrate, no
+/// registry row, another workspace, no move with the nonce, a move not
+/// done, a suspend of another VM, by the CLI, or only before its resume,
+/// and a CLI twin with other keys.
+#[test]
+fn panel_evidence_chains_the_panels_actions_to_the_move() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-23T10:00:00Z"));
+    let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let (n1, n2) = ("019a1111-2222-7333-8444-555566667777", "019a8888-9999-7aaa-8bbb-ccccddddeeee");
+    let row = |ts: &str, event: &str, pid: u32, actor: &str, pairs: &[(&str, &str)]| {
+        let mut detail: serde_json::Map<String, Value> = pairs.iter().map(|(k, v)| ((*k).to_string(), Value::from(*v))).collect();
+        detail.insert("actor".into(), Value::from(actor));
+        serde_json::json!({"v": 2, "ts": ts, "event": event, "session_id": null, "pid": pid, "detail": detail})
+    };
+    let toggle = |ts: &str, event: &str, actor: &str, vm: &str| row(ts, event, 7391, actor, &[("id", vm)]);
+    let ask = |ts: &str, actor: &str, nonce: &str, how: &str| row(ts, "session_migrate_request", 7391, actor, &[("session", sid), ("nonce", nonce), ("how", how), ("wrapper_pid", "4242")]);
+    let moved = |ts: &str, from: &str, to: &str, outcome: &str, nonce: &str| {
+        let pairs = [("session", sid), ("gen", "2"), ("kind", "migrate"), ("outcome", outcome), ("from_vm", from), ("to_vm", to), ("how", "started"), ("seed", "box"), ("transcript", "restored"), ("cut", "none"), ("touchid", "asked"), ("ms", "41000"), ("request", nonce)];
+        row(ts, "session_move_end", 4242, "wrapper", &pairs)
+    };
+    let panel = vec![
+        toggle("2026-10-23T10:10:00Z", "vm_suspend", "panel", "microvm-a"),
+        toggle("2026-10-23T10:11:00Z", "vm_resume", "panel", "microvm-a"),
+        ask("2026-10-23T10:20:00Z", "panel", n1, "live"),
+        moved("2026-10-23T10:21:00Z", "microvm-a", "microvm-b", "done", n1),
+    ];
+    let cli = vec![
+        toggle("2026-10-23T10:40:00Z", "vm_suspend", "cli", "microvm-b"),
+        toggle("2026-10-23T10:41:00Z", "vm_resume", "cli", "microvm-b"),
+        ask("2026-10-23T10:50:00Z", "cli", n2, "live"),
+        moved("2026-10-23T10:51:00Z", "microvm-b", "microvm-c", "done", n2),
+    ];
+    let sessions = vec![serde_json::json!({"session_id": sid, "cwd": FIXTURE_WS, "mode": "remote", "pid": 4242})];
+    let both: Vec<Value> = panel.iter().chain(&cli).cloned().collect();
+    assert_eq!(
+        panel_evidence(&both, &sessions, ws, since).unwrap(),
+        format!("session {sid}: the panel (actor=panel) suspended microvm-a at \"2026-10-23T10:10:00Z\" and resumed it at \"2026-10-23T10:11:00Z\", then asked a live migrate at \"2026-10-23T10:20:00Z\" (nonce {n1}, wrapper pid 4242); the wrapper moved the chat off microvm-a to microvm-b at \"2026-10-23T10:21:00Z\" (outcome done, touchid asked, 41000 ms), its request the panel's nonce; the CLI's vm_suspend, vm_resume, session_migrate_request hold the panel's keys")
+    );
+    assert!(panel_evidence(&panel, &sessions, ws, since).unwrap().ends_with("its request the panel's nonce; no CLI twin since AI_ENV_CURSOR_SINCE (parity not compared)"), "before the CLI's twins");
+    // The platform's own suspend first (the VMs page says SUSPENDED): Resume, then Suspend and Resume.
+    let idle: Vec<Value> = std::iter::once(toggle("2026-10-23T10:05:00Z", "vm_resume", "panel", "microvm-a")).chain(panel.iter().cloned()).collect();
+    assert!(panel_evidence(&idle, &sessions, ws, since).unwrap().contains("suspended microvm-a at \"2026-10-23T10:10:00Z\" and resumed it at \"2026-10-23T10:11:00Z\""));
+    // Each broken link, named.
+    let err = |audit: &[Value], sessions: &[Value], since: u64| panel_evidence(audit, sessions, ws, since).unwrap_err();
+    let with = |i: usize, r: Value| {
+        let mut audit = panel.clone();
+        audit[i] = r;
+        audit
+    };
+    let none = "no session_migrate_request audit row with actor panel since AI_ENV_CURSOR_SINCE";
+    assert!(err(&cli, &sessions, since).starts_with(none), "the CLI's request alone");
+    assert!(err(&both, &sessions, t("2026-10-23T10:30:00Z")).starts_with(none), "the panel's request before the step");
+    assert!(err(&with(2, ask("2026-10-23T10:20:00Z", "panel", n1, "offline")), &sessions, since).starts_with(&format!("the panel's migrate of {sid} at \"2026-10-23T10:20:00Z\" was offline, not live")));
+    assert!(err(&panel, &[], since).starts_with(&format!("the panel migrated {sid} at \"2026-10-23T10:20:00Z\", which has no registry row")));
+    let elsewhere = [serde_json::json!({"session_id": sid, "cwd": "/Users/mike/Documents/DeFi/ai-env"})];
+    assert!(err(&panel, &elsewhere, since).ends_with(&format!("ran in \"/Users/mike/Documents/DeFi/ai-env\", not in {FIXTURE_WS} (AI_ENV_CURSOR_WORKSPACE)")), "the development checkout's chat");
+    assert!(err(&with(3, moved("2026-10-23T10:21:00Z", "microvm-a", "microvm-b", "done", n2)), &sessions, since).starts_with(&format!("no session_move_end audit row whose request is the panel's nonce {n1}")), "another request's move");
+    assert!(err(&with(3, moved("2026-10-23T10:21:00Z", "microvm-a", "-", "failed", n1)), &sessions, since).ends_with(&format!("says session {sid}, actor wrapper, kind migrate, outcome failed: not the wrapper's migrate of {sid}, done")));
+    let no_toggle = format!("no vm_suspend audit row with actor panel of microvm-a, the VM the panel's migrate of {sid} left, then a vm_resume of it with actor panel");
+    assert!(err(&with(0, toggle("2026-10-23T10:10:00Z", "vm_suspend", "panel", "microvm-z")), &sessions, since).starts_with(&no_toggle), "another VM's suspend");
+    assert!(err(&with(0, toggle("2026-10-23T10:10:00Z", "vm_suspend", "cli", "microvm-a")), &sessions, since).starts_with(&no_toggle), "the CLI's suspend");
+    let swapped = [panel[1].clone(), panel[0].clone(), panel[2].clone(), panel[3].clone()];
+    assert!(err(&swapped, &sessions, since).starts_with(&no_toggle), "a resume before the suspend only");
+    let mut odd = both.clone();
+    odd[4] = row("2026-10-23T10:40:00Z", "vm_suspend", 7391, "cli", &[("id", "microvm-b"), ("by", "cli")]);
+    assert_eq!(err(&odd, &sessions, since), "CLI parity: the CLI's vm_suspend at \"2026-10-23T10:40:00Z\" holds the keys {\"by\", \"id\"}, the panel's at \"2026-10-23T10:10:00Z\" {\"id\"}");
+    // An offline migrate from the CLI (no wrapper, no wrapper_pid) is no twin of the panel's live one.
+    let offline = row("2026-10-23T10:50:00Z", "session_migrate_request", 7392, "cli", &[("session", sid), ("nonce", n2), ("how", "offline")]);
+    let mut twins = both.clone();
+    twins[6] = offline;
+    assert!(panel_evidence(&twins, &sessions, ws, since).unwrap().ends_with("its request the panel's nonce; the CLI's vm_suspend, vm_resume hold the panel's keys"));
+}
+
+/// S11 (claude always fresh): the chat's chain, offline. The newest chat of
+/// the window (its run named by its wrapper's `session_remote_end` row; a
+/// config probe's end row names none, so its words never count) ran the
+/// window's own claude from the VM's cache; every chat's words are listed
+/// for the record. Each broken link is named: the image's claude before
+/// the fetch, another version from the cache than the window's, no
+/// extension, and no chat at all (only probes, or before the step).
+#[test]
+fn fresh_evidence_takes_a_chat_on_the_windows_claude_from_the_cache() {
+    let t = |ts: &str| ai_env_cli::wire::time::parse_rfc3339_utc(ts).unwrap() * 1000;
+    let (ws, since) = (Path::new(FIXTURE_WS), t("2026-10-23T10:00:00Z"));
+    let ids = ["0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a51", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a52", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a53"];
+    let end_row = |pid: u32, start: &str, end: &str, ext: Option<&str>, claude: &str| {
+        let note = format!("mode:remote; end:eof; vm:microvm-a; vm_how:reused; spawn:sp-{pid}; claude:{claude}; init_ms:3000; close_ms:600; auth_timers:match; pid_rewrite:ok");
+        serde_json::json!({"pid": pid, "start": t(start), "end": t(end), "exit": 0, "ext": ext, "cwd": FIXTURE_WS, "argv": ["/x/ai-env-claude", "/x/claude"], "note": note})
+    };
+    let remote_end = |ts: &str, pid: u32, session: Option<&str>| {
+        serde_json::json!({"v": 2, "ts": ts, "event": "session_remote_end", "session_id": session, "pid": pid, "detail": {"vm": "microvm-a", "spawn": format!("sp-{pid}"), "gen": "1", "exit": "0", "end": "eof", "actor": "wrapper"}})
+    };
+    let v = Some("2.1.308");
+    let probe = end_row(700, "2026-10-23T10:01:00Z", "2026-10-23T10:01:02Z", v, "2.1.308; claude_src:cached");
+    let tab_a = end_row(701, "2026-10-23T10:01:00Z", "2026-10-23T10:03:00Z", v, "2.1.305; claude_src:image(seen)");
+    let tab_b = end_row(702, "2026-10-23T10:20:00Z", "2026-10-23T10:22:00Z", v, "2.1.305; claude_src:image(not_cached)");
+    let tab_c = |ext: Option<&str>| end_row(703, "2026-10-23T10:25:00Z", "2026-10-23T10:27:00Z", ext, "2.1.308; claude_src:cached");
+    let late_probe = end_row(704, "2026-10-23T10:28:00Z", "2026-10-23T10:28:02Z", v, "2.1.305; claude_src:image(not_cached)");
+    let audit = vec![
+        remote_end("2026-10-23T10:01:02Z", 700, None),
+        remote_end("2026-10-23T10:03:00Z", 701, Some(ids[0])),
+        remote_end("2026-10-23T10:22:00Z", 702, Some(ids[1])),
+        remote_end("2026-10-23T10:27:00Z", 703, Some(ids[2])),
+        remote_end("2026-10-23T10:28:02Z", 704, None),
+    ];
+    let census = vec![probe.clone(), tab_a.clone(), tab_b.clone(), tab_c(v), late_probe.clone()];
+    let (end, evidence) = fresh_evidence(&census, &audit, ws, since).unwrap();
+    assert_eq!(end, census[3], "tab C's chat, never the newer probe's end row");
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    assert_eq!(
+        evidence,
+        format!("chat {c} (wrapper pid 703) on microvm-a (vm_how:reused) ran claude 2.1.308 from the VM's cache (claude_src:cached), the window's extension; auth_timers:match, end:eof, exit 0; the chats since the step, oldest first: {a} claude:2.1.305 claude_src:image(seen) ext:2.1.308, {b} claude:2.1.305 claude_src:image(not_cached) ext:2.1.308, {c} claude:2.1.308 claude_src:cached ext:2.1.308")
+    );
+    // Each broken link, named.
+    let err = |census: &[Value], audit: &[Value], since: u64| fresh_evidence(census, audit, ws, since).unwrap_err();
+    let before_c = [probe.clone(), tab_a.clone(), tab_b.clone(), late_probe.clone()];
+    assert!(err(&before_c, &audit, since).starts_with(&format!("chat {b} (wrapper pid 702) on microvm-a ran claude 2.1.305 with claude_src:image(not_cached), not the window's 2.1.308 from the VM's cache (claude_src:cached)")), "tab B before the fetch: the probe's cached never counts");
+    assert!(err(&census, &audit[..3], since).starts_with(&format!("chat {b} (wrapper pid 702)")), "a run no session_remote_end row names is no chat");
+    let newer = [tab_a.clone(), tab_c(Some("2.1.309"))];
+    assert_eq!(err(&newer, &audit, since), format!("chat {c} (wrapper pid 703) on microvm-a ran claude 2.1.308 from the VM's cache, not the window's extension 2.1.309"));
+    assert!(err(&[tab_c(None)], &audit, since).starts_with(&format!("chat {c} (wrapper pid 703) on microvm-a names no extension")));
+    let none = format!("no chat of {FIXTURE_WS} ended since AI_ENV_CURSOR_SINCE");
+    assert!(err(&[probe, late_probe], &audit, since).starts_with(&none), "probes only");
+    assert!(err(&census, &audit, t("2026-10-23T10:30:00Z")).starts_with(&none), "before the step");
 }

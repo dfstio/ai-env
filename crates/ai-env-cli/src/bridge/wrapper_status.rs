@@ -803,7 +803,16 @@ pub fn rows() -> Vec<DoctorLine> {
             Ok(rows) => {
                 let (installed, restart) = (pick_bundle(&dirs).map(|(v, _)| v), Restart::of(mode, &wrapper));
                 lines.push(row_last_extension(&rows, installed.as_deref(), &census, wraps, changed, restart));
-                lines.extend(rows_live_windows(&running_extensions(&rows, &process_identity), installed.as_deref(), wraps, restart));
+                let running = running_extensions(&rows, &process_identity);
+                lines.extend(rows_live_windows(&running, installed.as_deref(), wraps, restart));
+                // S11 (A.7): each Claude Code version the bundle or a live window runs, the image's fallback (the
+                // deployed claude, as doctor reads it), and the newest remote chat's claude.
+                let image = crate::bridge::infra::read_infra_state(p).ok().flatten().and_then(|s| s.claude_version);
+                // T6: automatic admission is promised only when it can happen: `[claude].auto_admit` on (the
+                // default) and the effective mode remote.
+                let auto = wrapper.cfg.as_ref().is_none_or(|c| c.claude.auto_admit) && mode == Mode::Remote;
+                lines.extend(crate::bridge::claude::rows::rows_claude_auto(&crate::bridge::claude::load_all(p), image.as_deref(), installed.as_deref(), &running, auto));
+                lines.push(crate::bridge::claude::rows::row_last_claude(&rows));
                 lines.push(row_last_session(&rows, wraps, changed));
             }
             Err(e) => lines.push(DoctorLine::row(Tag::Warn, format!("census unreadable: {e}"))),

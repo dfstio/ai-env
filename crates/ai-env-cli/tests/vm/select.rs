@@ -546,6 +546,49 @@ async fn vm_row_modes_and_json_view_without_session_token() {
     assert_eq!(view["commit"], disk.commit.as_str());
 }
 
+/// S11 (L5): `RunPlan.caps_required` is empty from `from_cfg`; with a cap in
+/// it SELECT_VM passes over a reusable VM whose recorded caps lack it (a new
+/// VM is started), takes one whose caps are unknown or name it, and refuses
+/// a pinned VM lacking it (`NoCapability`, exit 7, naming the cap and the
+/// image version); without it the VM is reused as before.
+#[tokio::test]
+async fn caps_required_passes_over_a_vm_lacking_one_and_refuses_a_pinned_one() {
+    use ai_env_cli::bridge::vm::run::Choice;
+    use ai_env_cli::wire::frame::{CAP_CREDENTIAL_CACHE, CAP_TRANSCRIPT_GZIP_V1};
+    let env = Env::new();
+    let api = api();
+    let plan = env.plan(&env.flags());
+    assert!(plan.caps_required.is_empty(), "from_cfg requires no cap");
+    let old = started_id(&select_vm(&api, &env.paths, &plan, fast()).await.unwrap());
+    let mut row = env.row(&old);
+    row.caps = Some(vec![CAP_CREDENTIAL_CACHE.to_string()]);
+    registry::write_row(&env.paths, &row).unwrap();
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &plan, fast()).await.unwrap()), old, "no cap required: reused as before");
+    let needs = RunPlan { caps_required: vec![CAP_TRANSCRIPT_GZIP_V1], ..plan.clone() };
+    let new = started_id(&select_vm(&api, &env.paths, &needs, fast()).await.unwrap());
+    assert_ne!(new, old, "a VM whose caps lack transcript_gzip_v1 is passed over");
+    assert_eq!(env.row(&new).caps, None, "a new VM's caps are read later");
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &needs, fast()).await.unwrap()), new, "unknown caps pass");
+    let mut row = env.row(&new);
+    row.caps = Some(vec![CAP_CREDENTIAL_CACHE.to_string(), CAP_TRANSCRIPT_GZIP_V1.to_string()]);
+    registry::write_row(&env.paths, &row).unwrap();
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &needs, fast()).await.unwrap()), new, "caps naming it pass");
+    assert_eq!(api.run_specs().len(), 2);
+    let pinned = RunPlan { choice: Choice::Pin(old.clone()), ..needs.clone() };
+    match select_vm(&api, &env.paths, &pinned, fast()).await {
+        Err(e @ BridgeError::NoCapability { cap, .. }) => {
+            assert_eq!(cap, CAP_TRANSCRIPT_GZIP_V1);
+            let shown = e.to_string();
+            assert!(shown.contains(&old) && shown.contains(&format!("predates {CAP_TRANSCRIPT_GZIP_V1}")), "{shown}");
+            assert_eq!(exit(e), 7);
+        }
+        Err(other) => panic!("a pinned VM lacking the cap: {other}"),
+        Ok(s) => panic!("a pinned VM lacking the cap was taken: {}", s.row().id),
+    }
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &RunPlan { choice: Choice::Pin(new.clone()), ..needs }, fast()).await.unwrap()), new, "a pinned VM naming it is taken");
+    assert_eq!(api.run_specs().len(), 2, "a pin never places a VM");
+}
+
 #[tokio::test]
 async fn audit_rows_never_contain_the_session_token() {
     let env = Env::new();
@@ -583,7 +626,8 @@ async fn audit_rows_never_contain_the_session_token() {
     assert!(!text.contains("[redacted"), "nothing had to be scrubbed: the code never hands audit a token\n{text}");
     let keys = |names: &[&str]| names.iter().map(|k| (*k).to_string()).collect::<BTreeSet<String>>();
     let expected: BTreeMap<&str, BTreeSet<String>> = [
-        ("vm_run", keys(&["actor", "id", "purpose", "image_version", "egress", "shell", "client_token"])),
+        // S11 (B §B2.7): every vm_run row also carries the VM's limits and its memory, the cost's inputs.
+        ("vm_run", keys(&["actor", "id", "purpose", "image_version", "egress", "shell", "client_token", "max_duration_s", "max_idle_s", "suspended_s", "memory_mib"])),
         ("vm_egress_internet", keys(&["actor", "client_token", "purpose"])),
         ("vm_reuse", keys(&["actor", "id", "purpose", "resumed"])),
         ("vm_terminate", keys(&["actor", "id", "by"])),

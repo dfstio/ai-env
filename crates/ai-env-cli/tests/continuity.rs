@@ -20,6 +20,14 @@
 //! ends a claude a dead wrapper left parked (D5). The wall comes near by
 //! `bring_wall_near` (the fake's start and the Mac's row aged alike), the
 //! platform's own end of it by the fake's wall (`enforce_wall`).
+//!
+//! S11 wave 1 (C3): C-4, a move in the first turn after a `/compact`
+//! (`FAKE_COMPACT_BEFORE_TURN`), cut at the line's chain parent when the new
+//! VM names `view_parent_v1`, and S10's plain resume when it does not
+//! (plans/s11-contracts-C.md §C.2).
+//!
+//! S11 I2 (the lead): C-4's move on a gzip-staged chat, C.2 and C.3 at once
+//! (plans/s11-contracts-C.md §C.7.4).
 mod common;
 #[path = "continuity/rig.rs"]
 mod rig;
@@ -1359,7 +1367,7 @@ fn leave_parked(rig: &RemoteRig, vm: &str, owner: ParkOwner) -> SpawnId {
         let (sio, mut cio) = spawn_channels(8);
         let input = cio.input.clone();
         let told = Mutex::new((Vec::<u8>::new(), Vec::<String>::new()));
-        let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(id.clone()) };
+        let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(id.clone()), claude: Vec::new() };
         let consume = async {
             while let Some(ev) = cio.events.recv().await {
                 match ev {
@@ -1379,6 +1387,9 @@ fn leave_parked(rig: &RemoteRig, vm: &str, owner: ParkOwner) -> SpawnId {
             quiet.send_replace(QuietState { verdict: Verdict::Idle, since: tokio::time::Instant::now(), last_host: Some("user") });
             let shim = rig.shim_of(vm);
             until("parked on the shim under its owner", || shim.spawns.detail().iter().any(|d| d.status.spawn_id == id && d.parked == Some(owner))).await;
+            // And on the session's side (its `parked` read): a socket that ends while the session still asks is a
+            // loss, which reattaches, so the note below would never come.
+            until("the session's parked note", || told.lock().unwrap().1.iter().any(|n| n.starts_with("parked spawn "))).await;
             shim.agents.close_all(ai_env_cli::wire::frame::CLOSE_GOING_AWAY, "test").await;
             until("parked with no socket", || told.lock().unwrap().1.iter().any(|n| n.contains("stays parked until the next input"))).await;
             input.send(SpawnInput::StdinEof).await.expect("the EOF");
@@ -1425,6 +1436,232 @@ fn the_reaper_ends_a_parked_orphan_by_its_owner() {
     assert_eq!(h.out_json().iter().filter(|v| is_result_for(v, &u)).count(), 1);
     let left = h.rig().shim_of(&vm).spawns.detail();
     assert!(!left.iter().any(|d| d.status.spawn_id == orphan && d.status.alive), "the orphan is gone: {left:?}");
+    h.assert_vm_empty();
+}
+
+// ---- S11 wave 1 (C3): C-4, the cut after a compaction (plans/s11-contracts-C.md §C.2) ------------
+
+/// The entries of the chain that ends at the last entry of the transcript at
+/// `path` with a uuid, walked back by `parentUuid` to its root, root first:
+/// what a resume of that transcript continues.
+fn chain_at_leaf(path: &Path) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|e| e["uuid"].is_string()).collect();
+    let by_uuid: BTreeMap<&str, &Value> = entries.iter().filter_map(|e| Some((e["uuid"].as_str()?, e))).collect();
+    let mut chain = Vec::new();
+    let mut at = entries.last();
+    while let Some(e) = at {
+        assert!(chain.len() < entries.len(), "a cycle in {}", path.display());
+        chain.push(e.clone());
+        at = e["parentUuid"].as_str().and_then(|p| by_uuid.get(p).copied());
+    }
+    chain.reverse();
+    chain
+}
+
+/// The uuids of the prompts (user entries whose content is text: no
+/// tool_result) in `chain` after the entry `after`.
+fn prompts_after<'a>(chain: &'a [Value], after: &str) -> Vec<&'a str> {
+    let at = chain.iter().position(|e| e["uuid"] == after).unwrap_or_else(|| panic!("{after} in the chain: {chain:#?}"));
+    chain[at + 1..].iter().filter(|e| e["type"] == "user" && e["message"]["content"].is_string()).filter_map(|e| e["uuid"].as_str()).collect()
+}
+
+/// What [`moved_after_a_compaction`] leaves: the closed chat, its session,
+/// the line in flight (its uuid), the uuid it was sent again under, the new
+/// VM, and the chain the moved CLI's transcript holds there.
+struct Compacted {
+    h: Harness,
+    sid: String,
+    line: String,
+    resent: String,
+    vm2: String,
+    chain: Vec<Value>,
+}
+
+/// C-4's chat: turn 1 asks for its tool and is denied (`FAKE_ASK`, so
+/// FAKE_TURN_MS's wait runs in turn 2 alone); before turn 2 the fake
+/// compacts (`FAKE_COMPACT_BEFORE_TURN=2`: the boundary, a chain root, then
+/// its summary, which the turn's user entry chains to); the platform ends the
+/// VM once turn 2's long tool started (its mark, its tool_use forwarded,
+/// VM 1 holding the tail's key, so its `/terminate` pushes the compaction and
+/// the partial turn). The move sends the line again (a fresh uuid,
+/// `FAKE_DEDUP_RESUMED` in both generations) to generation 2 on a new VM,
+/// whose short tool answers it once. `cap`: the rig's `/health` caps keep
+/// `view_parent_v1` when the shim names it (`s3xfer::VIEW_PARENT_SERVED`),
+/// else they lose it (a 12.0 image).
+fn moved_after_a_compaction(cap: bool) -> Compacted {
+    let mut p = Harness::prepare();
+    if !cap {
+        p.rig().update_fake(|s| s.health_caps.retain(|c| c != ai_env_cli::wire::frame::CAP_VIEW_PARENT_V1));
+    }
+    moved_after_a_compaction_in(p, &[])
+}
+
+/// [`moved_after_a_compaction`]'s chat in `p` (its rig as the caller left
+/// it), the wrapper given `extra` (S11 I2: a reopen's `--resume`): turn 1's
+/// sync is the first view written after the start (a reopened chat's views
+/// before it are not counted).
+fn moved_after_a_compaction_in(p: common::Prepared, extra: &[&str]) -> Compacted {
+    let mark = p.root.join("turn.mark");
+    let mark_s = mark.display().to_string();
+    let gen1 = knobs(&[("FAKE_COMPACT_BEFORE_TURN", "2"), ("FAKE_ASK", "Bash"), ("FAKE_TURN_MS", "60000"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_DEDUP_RESUMED", "1")]);
+    let mut h = p.spawn_on(Link::Remote, "", extra, &gen1);
+    started(&mut h);
+    let views_before = h.audit_events("transcript_view");
+    let u1 = h.send_user("one");
+    let ask = h.expect_out(common::is_permission_request, T);
+    h.answer_permission(ask["request_id"].as_str().expect("the permission request's id"), false);
+    h.expect_out(|v| is_result_for(v, &u1), T);
+    let sid = session_of(&mut h);
+    let before = views_before.iter().filter(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["outcome"] == "written").count();
+    synced(&mut h, &sid, before + 1);
+    let line = h.send_user("two, the first line after the compaction");
+    wait_for_mark(&mark, 1, 2);
+    h.expect_out(|v| v["type"] == "assistant" && v["uuid"] == fake_tool_use_uuid(2, 1).as_str(), T);
+    let vm1 = vms_started(&h)[0].clone();
+    h.wait_until("VM 1 holds the tail's key", T, |h| h.rig().endpoint.attempts().iter().any(|a| a.vm.as_deref() == Some(vm1.as_str()) && a.path.starts_with("/transcript/tail") && (200..300).contains(&a.status)));
+    // Generation 2's tool is short; it asks nothing and compacts nothing.
+    let rig = h.rig();
+    rig.set_vm_knobs(&knobs(&[("FAKE_TURN_MS", "200"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_DEDUP_RESUMED", "1")]));
+    platform_ends(rig, &vm1);
+    h.expect_out(|v| is_result_for(v, &line), T);
+    let summary = common::fake_compact_summary_uuid(2, 1);
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 1 turn 2 compacted summary={summary}")), "{:?}", h.env_log());
+    let vm2 = vms_started(&h).get(1).cloned().expect("the new VM's spawn");
+    assert_ne!(vm2, vm1);
+    assert!(resent_as(h.stdin_of(2).last(), &line_sent(&h, &line)), "the line again, its uuid fresh, last: {:?}", h.stdin_of(2).last());
+    let resent = h.stdin_of(2).last().and_then(|l| serde_json::from_str::<Value>(l).ok()).and_then(|v| v["uuid"].as_str().map(str::to_string)).expect("the resent line's uuid");
+    let chain = chain_at_leaf(&h.rig().vm_projects_of(&vm2).join(h.slug()).join(format!("{sid}.jsonl")));
+    closed(&mut h);
+    let out = h.out_json();
+    assert_eq!((out.iter().filter(|v| is_echo_of(v, &line)).count(), out.iter().filter(|v| is_result_for(v, &line)).count()), (1, 1), "one echo and one result for the line");
+    assert!(note_has(&h.end_note(), "moves:readdress=1,respawn=0,migrate=0"), "{}", h.end_note());
+    Compacted { h, sid, line, resent, vm2, chain }
+}
+
+/// The host's line whose uuid is `uuid`, as sent.
+fn line_sent(h: &Harness, uuid: &str) -> String {
+    h.sent.iter().find(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| v["uuid"] == uuid)).cloned().unwrap_or_else(|| panic!("no line {uuid} sent"))
+}
+
+/// S11 (C-4, plans/s11-contracts-C.md §C.2.6): the VM ends in the first turn
+/// after a `/compact` ([`moved_after_a_compaction`]). The restored chain
+/// starts at the compact boundary, so the line opens the move's view with no
+/// leaf before it; the new VM names `view_parent_v1`, so the Mac asks for the
+/// view's first parent (`parent=true`) and cuts there, at the compaction's
+/// summary: generation 2 runs `--resume=<sid> --resume-session-at=<summary>`,
+/// which the fake finds (`gen 2 cut at=<summary> found`); the chain the
+/// resumed transcript continues holds the summary, then exactly one prompt,
+/// the line sent again, and neither the line's first entry nor generation
+/// 1's partial tool_use; `session_move_end` and the census say `cut` `at`.
+#[test]
+fn c4_a_move_in_the_first_turn_after_a_compaction_cuts_at_its_parent() {
+    let Compacted { h, sid, line, resent, vm2, chain } = moved_after_a_compaction(true);
+    let summary = common::fake_compact_summary_uuid(2, 1);
+    let views: Vec<String> = h.rig().endpoint.attempts().into_iter().filter(|a| a.vm.as_deref() == Some(vm2.as_str()) && a.path.starts_with("/transcript/view")).map(|a| a.path).collect();
+    // The move's view is VM 2's first (before generation 2's spawn); a later
+    // one is the per-turn sync's write_view, which never asks for a parent.
+    assert!(views.first().is_some_and(|p| p.contains("parent=true")), "the move's view asked for its first parent: {views:?}");
+    let argv = h.argv_log();
+    assert!(argv[1].contains(&format!("--resume={sid}")) && argv[1].contains(&format!("--resume-session-at={summary}")), "{:?}", argv[1]);
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 2 cut at={summary} found")), "{:?}", h.env_log());
+    assert_eq!(prompts_after(&chain, &summary), [resent.as_str()], "after the summary, the line sent again alone: {chain:#?}");
+    let first = fake_tool_use_uuid(2, 1);
+    assert!(!chain.iter().any(|e| e["uuid"] == line.as_str() || e["uuid"] == first.as_str()), "neither the line's first entry nor generation 1's partial tool_use: {chain:#?}");
+    let ends = h.audit_events("session_move_end");
+    assert_eq!(ends.len(), 1, "{ends:#?}");
+    assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["cut"].as_str()), (Some("done"), Some("at")), "{}", ends[0]);
+    assert_eq!(part_of(&h.end_note(), "cut").as_deref(), Some("at"), "{}", h.end_note());
+    h.assert_vm_empty();
+}
+
+/// S11 (C-4) on a VM without `view_parent_v1` (the rig's `/health` caps lack
+/// it, as a 12.0 image's do): the same move asks for no first parent, so the
+/// line opening the view cuts nothing: S10's plain `--resume=<sid>`, and the
+/// moved CLI continues the dead one's chain, so the line is in it twice (the
+/// line's first entry and generation 1's partial tool_use, then the line
+/// again): C-4 stays on such VMs. `session_move_end` and the census say `cut`
+/// `none`.
+#[test]
+fn c4_without_the_cap_the_move_resumes_plainly() {
+    let Compacted { h, sid, line, resent, vm2, chain } = moved_after_a_compaction(false);
+    let summary = common::fake_compact_summary_uuid(2, 1);
+    let views: Vec<String> = h.rig().endpoint.attempts().into_iter().filter(|a| a.vm.as_deref() == Some(vm2.as_str()) && a.path.starts_with("/transcript/view")).map(|a| a.path).collect();
+    assert!(!views.is_empty() && views.iter().all(|p| !p.contains("parent=")), "the move's view, no first parent asked: {views:?}");
+    let argv = h.argv_log();
+    assert!(argv[1].contains(&format!("--resume={sid}")) && !argv[1].iter().any(|a| a.starts_with("--resume-session-at")), "{:?}", argv[1]);
+    assert!(!h.env_log().iter().any(|l| l.starts_with("gen 2 cut at=")), "{:?}", h.env_log());
+    assert_eq!(prompts_after(&chain, &summary), [line.as_str(), resent.as_str()], "S10's resume: the line twice: {chain:#?}");
+    let first = fake_tool_use_uuid(2, 1);
+    assert!(chain.iter().any(|e| e["uuid"] == first.as_str()), "generation 1's partial tool_use in the chain: {chain:#?}");
+    let ends = h.audit_events("session_move_end");
+    assert_eq!(ends.len(), 1, "{ends:#?}");
+    assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["cut"].as_str()), (Some("done"), Some("none")), "{}", ends[0]);
+    assert_eq!(part_of(&h.end_note(), "cut").as_deref(), Some("none"), "{}", h.end_note());
+    h.assert_vm_empty();
+}
+
+/// S11 I2 (the lead; plans/s11-contracts-C.md §C.7.4, the plan's "a
+/// gzip-staged, compacted chat moved mid-turn"): C.2 and C.3 at once, the
+/// rig's VMs naming `view_parent_v1` and `transcript_gzip_v1`. A chat begun
+/// on this Mac is gzip-staged (`session stage`: its manifest encoded) and
+/// reopened (`--resume`): VM 1's restore pulls it decoded and the CLI resumes
+/// from it. Then C-4's move ([`moved_after_a_compaction_in`]): the fake
+/// compacts before turn 2 and the platform ends VM 1 in that turn's long
+/// tool. The move's restore on VM 2 pulls the staged base, decoded (the
+/// Mac's chat byte for byte at its head), with VM 1's tails after it (the
+/// compaction, the partial turn); the move's own view asks for its first
+/// parent and the cut is at the compaction's summary
+/// (`--resume-session-at=<summary>`, found), so the line is in the resumed
+/// chain once (sent again under a fresh uuid) and neither its first entry
+/// nor generation 1's partial tool_use is; `session_move_end` and the census
+/// say `cut` `at`; the manifest stays encoded.
+#[test]
+fn i2_a_gzip_staged_compacted_chat_moved_mid_turn_cuts_at_its_parent() {
+    use ai_env_cli::wire::frame::{CAP_TRANSCRIPT_GZIP_V1, CAP_VIEW_PARENT_V1};
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9301);
+    let cwd = p.work();
+    let lines: Vec<String> = (0..3).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0x9310 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("before the stage, {i}")}}).to_string()).collect();
+    let chat = p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let bytes = std::fs::read(&chat).expect("the chat");
+    {
+        let rig = p.rig();
+        let caps = rig.fake().health_caps;
+        assert!([CAP_VIEW_PARENT_V1, CAP_TRANSCRIPT_GZIP_V1].iter().all(|c| caps.iter().any(|x| x == c)), "the rig's VMs name both (C1's flags): {caps:?}");
+        let o = rig.run(&["session", "stage", &sid, "--json"], None);
+        assert!(o.status.success(), "session stage: {}", String::from_utf8_lossy(&o.stderr));
+        let m = ai_env_cli::bridge::s3::manifest::read(&paths_of(rig), &sid).unwrap().expect("the manifest");
+        assert!(m.encoded(), "gzip-staged: {m:?}");
+    }
+    let resume = format!("--resume={sid}");
+    let Compacted { h, sid: reopened, line, resent, vm2, chain } = moved_after_a_compaction_in(p, &[&resume]);
+    assert_eq!(reopened, sid, "the reopened chat goes on");
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 1 resumed lines={}", lines.len())), "VM 1's restore, decoded, before the CLI: {:?}", h.env_log());
+    let summary = common::fake_compact_summary_uuid(2, 1);
+    let views: Vec<String> = h.rig().endpoint.attempts().into_iter().filter(|a| a.vm.as_deref() == Some(vm2.as_str()) && a.path.starts_with("/transcript/view")).map(|a| a.path).collect();
+    assert!(views.first().is_some_and(|p| p.contains("parent=true")), "the move's view asked for its first parent: {views:?}");
+    let argv = h.argv_log();
+    assert!(argv[1].contains(&resume) && argv[1].contains(&format!("--resume-session-at={summary}")), "{:?}", argv[1]);
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 2 cut at={summary} found")), "{:?}", h.env_log());
+    assert_eq!(prompts_after(&chain, &summary), [resent.as_str()], "after the summary, the line sent again alone: {chain:#?}");
+    let first = fake_tool_use_uuid(2, 1);
+    assert!(!chain.iter().any(|e| e["uuid"] == line.as_str() || e["uuid"] == first.as_str()), "neither the line's first entry nor generation 1's partial tool_use: {chain:#?}");
+    let ends = h.audit_events("session_move_end");
+    assert_eq!(ends.len(), 1, "{ends:#?}");
+    assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["cut"].as_str()), (Some("done"), Some("at")), "{}", ends[0]);
+    assert_eq!(part_of(&h.end_note(), "cut").as_deref(), Some("at"), "{}", h.end_note());
+    // C.3: each restore pulled the staged base decoded (curl's `compressed`), VM 2's with VM 1's tails after it.
+    let vm1 = vms_started(&h)[0].clone();
+    let pulls = h.audit_events("transcript_pull");
+    for vm in [&vm1, &vm2] {
+        assert!(pulls.iter().any(|r| r["detail"]["vm"] == vm.as_str() && r["detail"]["outcome"] == "written"), "a pull into {vm}: {pulls:#?}");
+    }
+    let decoding = h.rig().vm_curl_calls().iter().filter(|c| c.config.lines().any(|l| l == "compressed")).count();
+    assert!(decoding >= 2, "both restores asked curl to decode the gzip part: {decoding}");
+    let held = std::fs::read(h.rig().vm_projects_of(&vm2).join(h.slug()).join(format!("{sid}.jsonl"))).expect("VM 2's copy");
+    assert!(held.starts_with(&bytes) && held.len() > bytes.len(), "VM 2 holds the Mac's chat, decoded, then what VM 1 added");
+    assert!(ai_env_cli::bridge::s3::manifest::read(&paths_of(h.rig()), &sid).unwrap().is_some_and(|m| m.encoded()), "the manifest keeps the staged base encoded");
     h.assert_vm_empty();
 }
 

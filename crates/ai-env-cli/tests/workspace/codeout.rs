@@ -14,11 +14,23 @@
 //! reaches no output, git argument, ref or record of the Mac's. S9: a
 //! manifest naming a tree or a blob promotes neither, only counts them; a
 //! ref `box_refs` skipped first is named, and a `wip_ref` naming a blob is
-//! not reported.
-use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_ok, git_out, target, FakeVm, Tokens, World};
+//! not reported. S11 (C.1): a VM whose caps name `codeout_manifest_v1`
+//! answers its manifest when nothing is new, and the VM's fetch record
+//! follows its HEAD and branch (a `checkout -b`, a fast-forward to a have)
+//! through an import without a pack, or stays as it is (nothing new) when
+//! nothing the Mac keeps changes; a 12.0 shim's 204 keeps S10's record.
+use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_ok, git_out, target, FakeVm, Repo, Tokens, World, VM};
+use ai_env_cli::bridge::agent::AgentTarget;
+use ai_env_cli::bridge::api::FakeMicrovmApi;
 use ai_env_cli::bridge::codeout::{fetch, import, CodeoutCtx, FetchOpts, Import, BOX_QUARANTINE_REFS, BOX_REFS, INCOMING_REFS};
-use ai_env_cli::bridge::workspace::{ensure_workspace, resolve, SeedProgress, SeedWant};
-use ai_env_cli::wire::workspace::{CodeoutManifest, ObjectFormat};
+use ai_env_cli::bridge::config::Paths;
+use ai_env_cli::bridge::errors::BridgeError;
+use ai_env_cli::bridge::vm::registry::{row_path, write_row, RowStatus, VmRow};
+use ai_env_cli::bridge::workspace::rows::{self, VmFetchRow};
+use ai_env_cli::bridge::workspace::{ensure_workspace, resolve, SeedProgress, SeedWant, WorkspaceRef};
+use ai_env_cli::errors::CliError;
+use ai_env_cli::wire::frame::{CAP_CODEOUT_MANIFEST_V1, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_PARK_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
+use ai_env_cli::wire::workspace::{refusal, CodeoutManifest, ObjectFormat};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -314,7 +326,7 @@ async fn a_fetch_brings_the_vms_commits_and_snapshot_into_box_refs() {
     assert_eq!((after.index, after.status, after.stash), (before.index, before.status, before.stash));
     assert_eq!(repo.git(&["rev-parse", "main"]), repo.head(), "HEAD and the branch did not move");
     let row = ai_env_cli::bridge::workspace::rows::row_of(&paths, &ws).unwrap().unwrap();
-    assert_eq!(row.last_fetch_vm.as_deref(), Some(super::fixture::VM));
+    assert_eq!(row.last_fetch_vm.as_deref(), Some(VM));
     assert_eq!(row.fetched.get(&format!("{BOX_REFS}main")), Some(&agent));
     let listed: BTreeMap<String, String> = repo
         .git(&["for-each-ref", "--format=%(refname) %(objectname)", BOX_REFS, BOX_QUARANTINE_REFS])
@@ -1028,4 +1040,492 @@ fn a_tree_routing_too_many_settings_paths_refuses_the_import() {
     }
     assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
     assert_eq!(mac.state().refs, before.refs, "no ref moved");
+}
+
+// ---- S11 (C.1): a code-out that answers its manifest ------------------------------------------------
+
+/// A 13.0 VM's caps: the workspace's and `codeout_manifest_v1`.
+const S11_CAPS: [&str; 2] = [CAP_WORKSPACE_V1, CAP_CODEOUT_MANIFEST_V1];
+
+/// The fake VM's `state/vms` row, its recorded caps `row_caps` (`None`: none recorded).
+fn vm_row(paths: &Paths, row_caps: Option<&[&str]>) {
+    vm_row_of(paths, VM, row_caps);
+}
+
+/// [`vm_row`] of the VM `id`.
+fn vm_row_of(paths: &Paths, id: &str, row_caps: Option<&[&str]>) {
+    let caps = row_caps.map(|c| c.iter().map(|s| (*s).to_string()).collect());
+    write_row(paths, &VmRow { id: id.into(), status: RowStatus::Running, caps, ..VmRow::default() }).unwrap();
+}
+
+/// A second VM on the workspace ([`Seeded::second`]).
+const VM2: &str = "microvm-00000000-0000-4000-8000-0000000000f2";
+
+/// A fake VM seeded from `app` (one commit, on `main`), and a code-out context on it.
+struct Seeded {
+    w: World,
+    repo: Repo,
+    paths: Paths,
+    ws: WorkspaceRef,
+    vm: Arc<FakeVm>,
+    ctx: CodeoutCtx<FakeMicrovmApi, FakeVm, Tokens>,
+}
+
+/// [`Seeded`], the VM's row written with `row_caps` when given.
+async fn seeded(row_caps: Option<&[&str]>) -> Seeded {
+    let w = World::new();
+    let repo = w.repo("app");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let vm = Arc::new(FakeVm::new(&w.root.join("vm"), &w.root.join("vm-projects")));
+    let (fake_api, t, c) = (api().await, target(), caps());
+    let progress = |_: SeedProgress| {};
+    ensure_workspace(&ensure_ctx(&fake_api, &vm, &paths, &cfg, &t, &c, &ws, &progress), None, SeedWant::Auto).await.unwrap();
+    if row_caps.is_some() {
+        vm_row(&paths, row_caps);
+    }
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: vm.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
+    Seeded { w, repo, paths, ws, vm, ctx }
+}
+
+impl Seeded {
+    /// A second fake VM, [`VM2`] (its row's caps `S11_CAPS`), seeded on the
+    /// same workspace, and a code-out context on it.
+    async fn second(&self) -> (Arc<FakeVm>, CodeoutCtx<FakeMicrovmApi, FakeVm, Tokens>) {
+        vm_row_of(&self.paths, VM2, Some(&S11_CAPS));
+        let vm = Arc::new(FakeVm::new(&self.w.root.join("vm2"), &self.w.root.join("vm2-projects")));
+        let (fake_api, t, c) = (api().await, AgentTarget { vm_id: VM2.into(), ..target() }, caps());
+        let progress = |_: SeedProgress| {};
+        ensure_workspace(&ensure_ctx(&fake_api, &vm, &self.paths, &self.ctx.cfg, &t, &c, &self.ws, &progress), None, SeedWant::Auto).await.unwrap();
+        let ctx = CodeoutCtx { api: Arc::new(api().await), dp: vm.clone(), tokens: Arc::new(Tokens), paths: self.paths.clone(), cfg: self.ctx.cfg.clone(), target: t, ws: self.ws.clone(), capture_settings: false, transcript: None };
+        (vm, ctx)
+    }
+
+    /// The `codeout_fetch` rows' outcomes so far, either VM's.
+    fn outcomes(&self) -> Vec<String> {
+        self.fetch_rows().into_iter().map(|(outcome, _)| outcome).collect()
+    }
+
+    /// The fake VM's fetch record in the workspace row.
+    fn record(&self) -> Option<VmFetchRow> {
+        rows::row_of(&self.paths, &self.ws).unwrap().and_then(|r| r.vm.get(VM).and_then(|e| e.fetched.clone()))
+    }
+
+    /// The record's HEAD, branch and snapshot.
+    fn holds(&self) -> Option<(String, Option<String>, Option<String>)> {
+        self.record().map(|f| (f.head, f.branch, f.wip))
+    }
+
+    /// `git <args>` in the VM's checkout: its stdout, trimmed.
+    fn at(&self, args: &[&str]) -> String {
+        git(&self.vm.dir, args)
+    }
+
+    /// A commit of `file` on the VM's current branch: its id.
+    fn commit(&self, file: &str) -> String {
+        std::fs::write(self.vm.dir.join(file), format!("{file}\n")).unwrap();
+        self.at(&["add", file]);
+        self.at(&["commit", "-q", "-m", file]);
+        self.at(&["rev-parse", "HEAD"])
+    }
+
+    /// The `codeout_fetch` audit rows so far: (outcome, bytes), `-` for a detail a row lacks.
+    fn fetch_rows(&self) -> Vec<(String, String)> {
+        let text = std::fs::read_to_string(self.paths.audit()).unwrap_or_default();
+        let rows = text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["event"] == "codeout_fetch");
+        rows.map(|r| {
+            let detail = |k: &str| r["detail"][k].as_str().unwrap_or("-").to_string();
+            (detail("outcome"), detail("bytes"))
+        })
+        .collect()
+    }
+}
+
+/// An audit row as [`Seeded::fetch_rows`] reads it.
+fn fetched_row(outcome: &str, bytes: &str) -> (String, String) {
+    (outcome.to_string(), bytes.to_string())
+}
+
+/// `(head, branch, no snapshot)` as [`Seeded::holds`] reads a record.
+fn holding_at(head: &str, branch: &str) -> Option<(String, Option<String>, Option<String>)> {
+    Some((head.to_string(), Some(branch.to_string()), None))
+}
+
+/// S11 (C.1.3): a branch the VM makes with no new object (`git checkout -b
+/// topic` on the seeded head) moves the VM's fetch record to `topic`. Asked
+/// for its manifest (its caps name `codeout_manifest_v1`), the VM answers
+/// it alone when nothing is new (200, no pack), and the Mac imports it
+/// without a pack, `box/topic` promoted at the commit it holds. The first
+/// fetch, nothing changed since the seed, records the VM's HEAD on `main`
+/// the same way (S10's 204 recorded nothing). The Mac's branch, index and
+/// worktree never move; each `codeout_fetch` row says `promoted`, 0 bytes.
+#[tokio::test]
+async fn a_branch_made_with_no_new_object_moves_the_fetch_record() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    let before = s.repo.state();
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    assert!(first.ok && first.bytes == 0 && first.wip_ref.is_none(), "{first:?}");
+    assert_eq!(first.promoted, BTreeMap::from([(format!("{BOX_REFS}main"), base.clone())]));
+    assert_eq!(s.holds(), holding_at(&base, "main"), "the seeded head on main, recorded");
+    s.at(&["checkout", "-q", "-b", "topic"]);
+    let report = fetch(&s.ctx, opts).await.unwrap();
+    assert!(report.ok && report.bytes == 0 && report.quarantined.is_empty(), "{report:?}");
+    assert_eq!(report.promoted.get(&format!("{BOX_REFS}topic")), Some(&base), "{report:?}");
+    assert_eq!(s.holds(), holding_at(&base, "topic"), "the record follows the VM's branch");
+    assert_eq!(s.repo.git(&["rev-parse", &format!("{BOX_REFS}topic")]), base);
+    assert_eq!(s.vm.flags(), [true, true], "each request asked for the manifest");
+    assert_eq!(s.fetch_rows(), [fetched_row("promoted", "0"), fetched_row("promoted", "0")]);
+    let after = s.repo.state();
+    assert_eq!((after.index, after.status, after.stash), (before.index, before.status, before.stash), "the index, the worktree and the stash untouched");
+    assert_eq!(s.repo.git(&["rev-parse", "main"]), base, "the Mac's branch did not move");
+    assert_eq!(s.repo.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+}
+
+/// S11 (C.1.3): the VM fast-forwards `main` to the commit the Mac already
+/// holds as `box/feature` (no new object): the manifest alone comes back,
+/// and the record follows `main` there, `box/main` moved by an import
+/// without a pack.
+#[tokio::test]
+async fn a_fast_forward_to_a_have_moves_the_fetch_record() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    s.at(&["checkout", "-q", "-b", "feature"]);
+    let feature = s.commit("feature.txt");
+    let opts = FetchOpts { wip: false, max_bytes: 1 << 20 };
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    assert!(first.bytes > 0 && first.promoted.get(&format!("{BOX_REFS}feature")) == Some(&feature), "{first:?}");
+    assert_eq!(s.holds(), holding_at(&feature, "feature"));
+    s.at(&["checkout", "-q", "main"]);
+    s.at(&["merge", "-q", "--ff-only", "feature"]);
+    let report = fetch(&s.ctx, opts).await.unwrap();
+    assert!(report.ok && report.bytes == 0, "{report:?}");
+    assert_eq!(report.promoted.get(&format!("{BOX_REFS}main")), Some(&feature), "{report:?}");
+    assert_eq!(s.holds(), holding_at(&feature, "main"), "the record follows main to the commit the Mac held");
+    assert_eq!(s.repo.git(&["rev-parse", &format!("{BOX_REFS}main")]), feature);
+    assert_eq!(s.repo.git(&["rev-parse", "main"]), base, "the Mac's branch did not move");
+    assert_eq!(s.fetch_rows().last(), Some(&fetched_row("promoted", "0")), "an import without a pack");
+}
+
+/// S11 (C.1.3), the cheap path: a manifest without a pack whose taken refs
+/// all sit at their commits among the row's box tips, the VM's record at
+/// its HEAD and branch, is nothing new: no import runs (the row's
+/// `last_fetch_at` is not this fetch's), only the record's `at` moves, and
+/// the `codeout_fetch` row says `nothing_new` where the first fetch's (the
+/// import without a pack) said `promoted`.
+#[tokio::test]
+async fn an_unchanged_manifest_refreshes_only_at() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    fetch(&s.ctx, opts).await.unwrap();
+    assert_eq!(s.holds(), holding_at(&base, "main"));
+    // Dated long ago, so what this fetch writes shows.
+    rows::update(&s.paths, &s.ws, |row| {
+        row.last_fetch_at = Some(1);
+        if let Some(f) = row.vm.get_mut(VM).and_then(|e| e.fetched.as_mut()) {
+            f.at = 1;
+        }
+    })
+    .unwrap();
+    let tips = rows::row_of(&s.paths, &s.ws).unwrap().unwrap().fetched;
+    let report = fetch(&s.ctx, opts).await.unwrap();
+    assert!(report.ok && report.promoted.is_empty() && report.bytes == 0 && report.note.is_none(), "{report:?}");
+    let row = rows::row_of(&s.paths, &s.ws).unwrap().unwrap();
+    let record = row.vm[VM].fetched.clone().expect("the record");
+    assert_eq!((record.head.as_str(), record.branch.as_deref(), record.wip.as_deref()), (base.as_str(), Some("main"), None));
+    assert!(record.at > 1, "the record's at refreshed: {}", record.at);
+    assert_eq!((row.last_fetch_at, &row.fetched), (Some(1), &tips), "no import wrote the row");
+    assert_eq!(s.vm.flags(), [true, true]);
+    assert_eq!(s.fetch_rows(), [fetched_row("promoted", "0"), fetched_row("nothing_new", "-")]);
+}
+
+/// S11 (C.1.3): a manifest without a pack that names a tip the Mac did not
+/// name (a broken or hostile shim) is a protocol error, exit 8, before any
+/// import: no box ref, no incoming ref, no record, no `codeout_fetch` row;
+/// the fetch's scratch directory and lock went with it, so the next fetch runs.
+#[tokio::test]
+async fn a_no_pack_answer_naming_an_unheld_tip_is_refused() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    s.at(&["checkout", "-q", "-b", "evil"]);
+    let unheld = s.commit("evil.txt");
+    s.at(&["checkout", "-q", "main"]);
+    let refs = BTreeMap::from([("refs/heads/main".to_string(), base.clone()), ("refs/heads/evil".to_string(), unheld.clone())]);
+    let forged = CodeoutManifest { v: 1, object_format: ObjectFormat::Sha1, refs, head: unheld.clone(), branch: Some("evil".into()), wip_ref: None, wip_skipped: None };
+    assert_eq!(forged.check(), Ok(()));
+    *s.vm.forge_next.lock().unwrap() = Some(forged);
+    let e = fetch(&s.ctx, FetchOpts::per_result(&s.ctx.cfg)).await.unwrap_err();
+    assert!(matches!(&e, BridgeError::Protocol(m) if m.contains("a code-out without a pack names a tip the Mac did not name")), "{e:?}");
+    assert_eq!(CliError::from(e).exit_code(), 8);
+    assert_eq!(s.repo.git(&["for-each-ref", "--format=%(refname)", "refs/remotes/", INCOMING_REFS]), "", "no box ref, no incoming ref");
+    assert!(!git_ok(&s.repo.dir, &["cat-file", "-e", &format!("{unheld}^{{commit}}")]), "the unheld commit never reached the Mac");
+    assert_eq!(s.record(), None, "no record");
+    assert!(s.fetch_rows().is_empty(), "no codeout_fetch row");
+    let left: Vec<String> = std::fs::read_dir(s.paths.tmp()).map(|d| d.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    assert!(left.iter().all(|n| !n.starts_with("fetch-")), "the fetch's scratch went: {left:?}");
+    let next = fetch(&s.ctx, FetchOpts::per_result(&s.ctx.cfg)).await.unwrap();
+    assert_eq!(next.promoted.get(&format!("{BOX_REFS}evil")), Some(&unheld), "the lock was let go: {next:?}");
+}
+
+/// S11 (C.1.4): a 12.0 shim ignores the flag and answers 204 when nothing is
+/// new: the Mac takes that as S10 did, so after `git checkout -b topic` the
+/// record stays on `main` (S10's lag, until those VMs end at their wall),
+/// only its `at` refreshed, and no `box/topic` appears.
+#[tokio::test]
+async fn a_shim_answering_204_to_the_flag_keeps_s10s_record() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    s.vm.manifest_served.store(false, std::sync::atomic::Ordering::SeqCst);
+    let agent = s.commit("agent.txt");
+    let opts = FetchOpts { wip: false, max_bytes: 1 << 20 };
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    assert!(first.bytes > 0 && first.promoted.get(&format!("{BOX_REFS}main")) == Some(&agent), "{first:?}");
+    assert_eq!(s.holds(), holding_at(&agent, "main"));
+    s.at(&["checkout", "-q", "-b", "topic"]);
+    let second = fetch(&s.ctx, opts).await.unwrap();
+    assert!(second.ok && second.promoted.is_empty() && second.bytes == 0, "{second:?}");
+    assert_eq!(s.holds(), holding_at(&agent, "main"), "S10's record: still main");
+    assert_eq!(s.vm.flags(), [true, true], "asked both times; a 12.0 shim answers 204");
+    assert_eq!(s.fetch_rows().last(), Some(&fetched_row("nothing_new", "-")));
+    assert!(!git_ok(&s.repo.dir, &["rev-parse", "--verify", "--quiet", &format!("{BOX_REFS}topic")]), "no box/topic");
+}
+
+/// S11 (C.1.3): `manifest_when_empty` goes only to a VM whose recorded caps
+/// name `codeout_manifest_v1`: not without a row, nor with a row that
+/// recorded no caps, an S10 VM's caps, or an unreadable row. Without the
+/// flag nothing new stays a bare 204 (no record); with it the manifest
+/// comes back and the VM's record is written.
+#[tokio::test]
+async fn the_flag_goes_only_to_a_vm_whose_caps_name_it() {
+    let s = seeded(None).await;
+    let opts = FetchOpts { wip: false, max_bytes: 1 << 20 };
+    let s10 = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_PARK_V1];
+    fetch(&s.ctx, opts).await.unwrap();
+    vm_row(&s.paths, None);
+    fetch(&s.ctx, opts).await.unwrap();
+    vm_row(&s.paths, Some(&s10));
+    fetch(&s.ctx, opts).await.unwrap();
+    std::fs::write(row_path(&s.paths, VM).unwrap(), "caps = [\"codeout_manifest_v1\"\n").unwrap();
+    fetch(&s.ctx, opts).await.unwrap();
+    assert_eq!(s.vm.flags(), [false; 4], "no row, no caps, S10's caps, an unreadable row");
+    assert_eq!(s.record(), None, "four 204s: no record");
+    vm_row(&s.paths, Some(&S11_CAPS));
+    let report = fetch(&s.ctx, opts).await.unwrap();
+    assert_eq!(s.vm.flags(), [false, false, false, false, true]);
+    assert!(report.ok && report.bytes == 0, "{report:?}");
+    assert_eq!(s.holds(), holding_at(&s.repo.head(), "main"), "the manifest came back: the record");
+}
+
+/// S11 (C.1.3): an import without a pack (its file 0 bytes or absent)
+/// indexes nothing, so it refuses a wanted commit that is not one of the
+/// haves, `bad_pack` (exit 1), before any ref is written: a commit the Mac
+/// lacks, or one its store holds that it did not name. With every wanted
+/// commit a have, it promotes from the Mac's store alone.
+#[test]
+fn a_no_pack_import_refuses_a_wanted_id_that_is_no_have() {
+    let w = World::new();
+    let mac = w.repo("app");
+    let base = mac.head();
+    let vm = w.root.join("vm");
+    git(&w.root, &["clone", "-q", &mac.dir.display().to_string(), "vm"]);
+    let unsent = commit_with(&vm, &base, &[("100644", "dev.txt", b"dev\n")], "only in the VM");
+    let held = commit_with(&mac.dir, &base, &[("100644", "held.txt", b"held\n")], "in the Mac's store, never named");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &mac.dir, None).unwrap();
+    let empty = w.root.join("empty.pack");
+    std::fs::write(&empty, b"").unwrap();
+    let absent = w.root.join("absent.pack");
+    let manifest_of = |other: (&str, &String)| {
+        let refs = BTreeMap::from([("refs/heads/main".to_string(), base.clone()), (format!("refs/heads/{}", other.0), other.1.clone())]);
+        let m = CodeoutManifest { v: 1, object_format: ObjectFormat::Sha1, refs, head: base.clone(), branch: Some("main".into()), wip_ref: None, wip_skipped: None };
+        assert_eq!(m.check(), Ok(()));
+        m
+    };
+    let before = mac.state();
+    for (what, other, pack) in [("a commit the Mac lacks", ("dev", &unsent), &empty), ("one it holds but did not name", ("held", &held), &absent)] {
+        let manifest = manifest_of(other);
+        let e = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest, pack, haves: std::slice::from_ref(&base), max_blob: 64 << 20, keep_wip: 64 }).unwrap_err();
+        assert!(matches!(&e, BridgeError::WorkspaceFailed { code, message } if *code == refusal::BAD_PACK && message == "the code-out sent no pack for a tip the Mac did not name"), "{what}: {e:?}");
+        assert_eq!(CliError::from(e).exit_code(), 1, "{what}");
+        assert_eq!(mac.state().refs, before.refs, "{what}: no ref written");
+    }
+    let haves = [base.clone(), held.clone()];
+    for pack in [&empty, &absent] {
+        let got = import(&Import { paths: &paths, cfg: &cfg, ws: &ws, manifest: &manifest_of(("held", &held)), pack, haves: &haves, max_blob: 64 << 20, keep_wip: 64 }).unwrap();
+        let promoted = BTreeMap::from([(format!("{BOX_REFS}main"), base.clone()), (format!("{BOX_REFS}held"), held.clone())]);
+        assert_eq!((&got.promoted, got.quarantined.len()), (&promoted, 0), "{}", pack.display());
+    }
+    assert_eq!(mac.git(&["rev-parse", &format!("{BOX_REFS}held")]), held);
+    assert_eq!(mac.git(&["for-each-ref", INCOMING_REFS]), "", "no incoming ref is left");
+}
+
+/// S11 (C.1.3; the review's C2-R1): a per-result fetch asks for a snapshot
+/// (`--wip`), so the manifest it gets back says what the VM's worktree
+/// holds (`manifest_only` is handed `opts.wip`). After the agent drops its
+/// uncommitted file and makes a branch (no new object), the import without
+/// a pack records the branch with no snapshot: the old one is dropped, so a
+/// re-address does not carry the dropped file.
+#[tokio::test]
+async fn a_no_pack_import_after_a_revert_drops_the_records_snapshot() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    std::fs::write(s.vm.dir.join("edit.txt"), "the agent's edit\n").unwrap();
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    let wip = s.record().and_then(|f| f.wip).expect("the snapshot recorded");
+    assert!(first.bytes > 0 && first.wip_ref.is_some(), "{first:?}");
+    std::fs::remove_file(s.vm.dir.join("edit.txt")).unwrap();
+    s.at(&["checkout", "-q", "-b", "topic"]);
+    let report = fetch(&s.ctx, opts).await.unwrap();
+    assert!(report.ok && report.bytes == 0 && report.promoted.get(&format!("{BOX_REFS}topic")) == Some(&base), "{report:?}");
+    assert_eq!(s.vm.flags(), [true, true]);
+    assert_eq!(s.holds(), Some((base.clone(), Some("topic".to_string()), None)), "the branch recorded, the snapshot {wip} dropped");
+}
+
+/// S11 (C.1.3; the review's C2-R2): the helper keeps its newest snapshot
+/// while the worktree still holds it, and with every tip a have it sends no
+/// pack, whatever the snapshot. Asked for its manifest, the VM names the
+/// snapshot the Mac already holds, the record holds it too, and the fetch
+/// is nothing new (the cheap path): no second snapshot, the record's kept.
+#[tokio::test]
+async fn an_unchanged_snapshot_the_mac_holds_is_nothing_new() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    std::fs::write(s.vm.dir.join("edit.txt"), "the agent's edit\n").unwrap();
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    let held = s.holds();
+    assert!(first.bytes > 0 && held.as_ref().is_some_and(|h| h.2.is_some()), "{first:?}");
+    let again = fetch(&s.ctx, opts).await.unwrap();
+    assert!(again.ok && again.promoted.is_empty() && again.bytes == 0, "{again:?}");
+    assert_eq!(s.vm.flags(), [true, true]);
+    assert_eq!(s.outcomes(), ["promoted", "nothing_new"]);
+    assert_eq!(s.holds(), held, "the same snapshot");
+    assert_eq!(s.at(&["for-each-ref", "refs/wip/"]).lines().count(), 1, "the snapshot was kept, none made");
+}
+
+/// S11 (C.1.3; the review's C2-R2 and C2-R3): to a fetch that asked for a
+/// snapshot, a manifest without one says the VM's worktree is clean. After
+/// the agent reverts its edit (HEAD, branch and box tips as they were), the
+/// record's old snapshot keeps the fetch off the cheap path: the import
+/// without a pack records no snapshot, so a re-address does not bring back
+/// the reverted edit. The next fetch is nothing new.
+#[tokio::test]
+async fn a_reverted_edit_leaves_the_record_without_a_snapshot() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    let base = s.repo.head();
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    std::fs::write(s.vm.dir.join("README.md"), "the agent's edit\n").unwrap();
+    fetch(&s.ctx, opts).await.unwrap();
+    assert!(s.holds().is_some_and(|h| h.2.is_some()), "{:?}", s.holds());
+    s.at(&["checkout", "--", "."]);
+    let reverted = fetch(&s.ctx, opts).await.unwrap();
+    assert!(reverted.ok && reverted.bytes == 0, "{reverted:?}");
+    assert_eq!(s.holds(), holding_at(&base, "main"), "no snapshot");
+    let third = fetch(&s.ctx, opts).await.unwrap();
+    assert!(third.ok && third.promoted.is_empty(), "{third:?}");
+    assert_eq!(s.holds(), holding_at(&base, "main"));
+    assert_eq!(s.outcomes(), ["promoted", "promoted", "nothing_new"]);
+}
+
+/// S11 (the review's C2-R1): two VMs on one workspace, both seeded at the
+/// same commit. B's commit moves `box/main`. A is idle at the seeded commit
+/// (an ancestor of B's) and answers its manifest. The import does not move
+/// `box/main` back, as S10's 204 never did, so A's fetch is nothing new and
+/// A's record stays on main. B's next fetch then has nothing to send again.
+#[tokio::test]
+async fn an_idle_vms_manifest_never_moves_another_vms_box_tip_back() {
+    let a = seeded(Some(&S11_CAPS)).await;
+    let base = a.repo.head();
+    let (b, b_ctx) = a.second().await;
+    let opts = FetchOpts::per_result(&a.ctx.cfg);
+    fetch(&a.ctx, opts).await.unwrap();
+    assert_eq!(a.holds(), holding_at(&base, "main"));
+    std::fs::write(b.dir.join("b.txt"), "B's work\n").unwrap();
+    git(&b.dir, &["add", "b.txt"]);
+    git(&b.dir, &["commit", "-q", "-m", "B"]);
+    let x = git(&b.dir, &["rev-parse", "HEAD"]);
+    let from_b = fetch(&b_ctx, opts).await.unwrap();
+    assert!(from_b.bytes > 0 && from_b.promoted.get(&format!("{BOX_REFS}main")) == Some(&x), "{from_b:?}");
+    let idle = fetch(&a.ctx, opts).await.unwrap();
+    assert!(idle.ok && idle.promoted.is_empty() && idle.bytes == 0, "{idle:?}");
+    assert_eq!(a.repo.git(&["rev-parse", &format!("{BOX_REFS}main")]), x, "box/main stays B's");
+    assert_eq!(a.holds(), holding_at(&base, "main"), "A's record as it was");
+    let again = fetch(&b_ctx, opts).await.unwrap();
+    assert!(again.ok && again.promoted.is_empty() && again.bytes == 0, "B sends nothing again: {again:?}");
+    assert_eq!(a.outcomes(), ["promoted", "promoted", "nothing_new", "nothing_new"]);
+    assert_eq!((a.vm.flags(), b.flags()), (vec![true, true], vec![true, true]));
+}
+
+/// S11 (the review's F1-1), the swapped order: B's commit moves `box/main`
+/// before A has fetched at all (no record yet). A, idle at the seeded commit
+/// (an ancestor of B's), answers its manifest: its HEAD ref is held back (the
+/// box tip holds that commit already), so `box/main` stays B's, an import
+/// without a pack, and A's record still takes its HEAD and branch. A's next
+/// fetch is nothing new.
+#[tokio::test]
+async fn an_idle_vm_without_a_record_never_moves_another_vms_box_tip_back() {
+    let a = seeded(Some(&S11_CAPS)).await;
+    let base = a.repo.head();
+    let (b, b_ctx) = a.second().await;
+    let opts = FetchOpts::per_result(&a.ctx.cfg);
+    std::fs::write(b.dir.join("b.txt"), "B's work\n").unwrap();
+    git(&b.dir, &["add", "b.txt"]);
+    git(&b.dir, &["commit", "-q", "-m", "B"]);
+    let x = git(&b.dir, &["rev-parse", "HEAD"]);
+    let from_b = fetch(&b_ctx, opts).await.unwrap();
+    assert!(from_b.bytes > 0 && from_b.promoted.get(&format!("{BOX_REFS}main")) == Some(&x), "{from_b:?}");
+    assert_eq!(a.record(), None, "A has not fetched yet");
+    let idle = fetch(&a.ctx, opts).await.unwrap();
+    assert!(idle.ok && idle.promoted.is_empty() && idle.bytes == 0, "{idle:?}");
+    assert_eq!(a.repo.git(&["rev-parse", &format!("{BOX_REFS}main")]), x, "box/main stays B's");
+    assert_eq!(a.holds(), holding_at(&base, "main"), "A's record takes its HEAD all the same");
+    let again = fetch(&a.ctx, opts).await.unwrap();
+    assert!(again.ok && again.promoted.is_empty() && again.bytes == 0, "{again:?}");
+    assert_eq!(a.repo.git(&["rev-parse", &format!("{BOX_REFS}main")]), x);
+    assert_eq!(a.outcomes(), ["promoted", "promoted", "nothing_new"]);
+}
+
+/// S11 (the review's F1-1), only the snapshot changed: A's record holds a
+/// snapshot of an edit, B's commit then moves `box/main`, and A reverts its
+/// edit (HEAD and branch as they were). A's HEAD ref is held back, so
+/// `box/main` stays B's, and A's record ends with no snapshot (a re-address
+/// does not bring the reverted edit back).
+#[tokio::test]
+async fn a_reverted_edit_never_moves_another_vms_box_tip_back() {
+    let a = seeded(Some(&S11_CAPS)).await;
+    let base = a.repo.head();
+    let (b, b_ctx) = a.second().await;
+    let opts = FetchOpts::per_result(&a.ctx.cfg);
+    std::fs::write(a.vm.dir.join("README.md"), "the agent's edit\n").unwrap();
+    fetch(&a.ctx, opts).await.unwrap();
+    assert!(a.holds().is_some_and(|h| h.0 == base && h.2.is_some()), "{:?}", a.holds());
+    std::fs::write(b.dir.join("b.txt"), "B's work\n").unwrap();
+    git(&b.dir, &["add", "b.txt"]);
+    git(&b.dir, &["commit", "-q", "-m", "B"]);
+    let x = git(&b.dir, &["rev-parse", "HEAD"]);
+    let from_b = fetch(&b_ctx, opts).await.unwrap();
+    assert!(from_b.bytes > 0 && from_b.promoted.get(&format!("{BOX_REFS}main")) == Some(&x), "{from_b:?}");
+    a.at(&["checkout", "--", "."]);
+    let reverted = fetch(&a.ctx, opts).await.unwrap();
+    assert!(reverted.ok && reverted.bytes == 0 && !reverted.promoted.contains_key(&format!("{BOX_REFS}main")), "{reverted:?}");
+    assert_eq!(a.repo.git(&["rev-parse", &format!("{BOX_REFS}main")]), x, "box/main stays B's");
+    assert_eq!(a.holds(), holding_at(&base, "main"), "no snapshot");
+}
+
+/// S11 (the review's C2-R3): a VM on a branch under a name the box namespace
+/// keeps (`wip/x`) can never have its HEAD recorded (no box name), so once
+/// its other refs sit at their box tips its fetch is nothing new, as S10's
+/// 204 was, and not an import without a pack every time.
+#[tokio::test]
+async fn a_head_the_import_cannot_record_is_nothing_new_once_its_tips_sit() {
+    let s = seeded(Some(&S11_CAPS)).await;
+    s.at(&["checkout", "-q", "-b", "wip/x"]);
+    let opts = FetchOpts::per_result(&s.ctx.cfg);
+    let first = fetch(&s.ctx, opts).await.unwrap();
+    assert!(first.ok && first.bytes == 0 && first.promoted.contains_key(&format!("{BOX_REFS}main")), "{first:?}");
+    let again = fetch(&s.ctx, opts).await.unwrap();
+    assert!(again.ok && again.promoted.is_empty() && again.note.is_none(), "{again:?}");
+    assert_eq!(s.record(), None, "a HEAD on wip/x is never recorded");
+    assert_eq!(s.outcomes(), ["promoted", "nothing_new"]);
 }

@@ -1,0 +1,20 @@
+session 11111111-1111-4111-8111-111111111111
+  status     parked  mode remote  route remote
+  cwd        /w/project
+  extension  anthropic.claude-code-2.1.305
+  vm         microvm-0be03000-0000-4000-8000-00000000000b
+  wrapper    not live
+  seen       created 2026-10-22T09:00:00Z  last 2026-10-22T11:00:00Z
+generations (2)
+  4200/1  microvm-0a5fc800-0000-4000-8000-00000000000a  2026-10-22T09:00:00Z .. 2026-10-22T10:21:08Z  first  moved
+  4200/2  microvm-0be03000-0000-4000-8000-00000000000b  2026-10-22T10:21:05Z .. -  migrate:command  -
+moves (1)
+  2026-10-22T10:20:00Z  gen 1 migrate  command  microvm-0a5fc800-0000-4000-8000-00000000000a -> microvm-0be03000-0000-4000-8000-00000000000b  done  60000 ms  touchid yes  by wrapper  request 0199f000-0000-7000-8000-000000000001
+timeline (5)
+  microvm-0a5fc800-0000-4000-8000-00000000000a  running    2026-10-22T09:00:00Z .. 2026-10-22T09:25:00Z  inferred
+  microvm-0a5fc800-0000-4000-8000-00000000000a  suspended  2026-10-22T09:25:00Z .. 2026-10-22T10:00:00Z
+  microvm-0a5fc800-0000-4000-8000-00000000000a  running    2026-10-22T10:00:00Z .. 2026-10-22T10:21:08Z
+  microvm-0be03000-0000-4000-8000-00000000000b  running    2026-10-22T10:21:05Z .. 2026-10-22T11:00:00Z
+  microvm-0be03000-0000-4000-8000-00000000000b  suspended  2026-10-22T11:00:00Z .. 2026-10-22T12:00:00Z  inferred
+cost       $0.254 (range $0.241–0.267)  running 1h25m  suspended 1h35m
+settings captures  0

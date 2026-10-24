@@ -177,13 +177,12 @@ pub(crate) fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| CliError::Msg(format!("cannot start the async runtime: {e}")))
 }
 
-/// One audit row (`actor=cli` first, and the process's purpose, S8: see
-/// [`set_audit_purpose`], when `pairs` name none); a failure to write is a
+/// One audit row (with the process's purpose, S8: see [`set_audit_purpose`],
+/// when `pairs` name none; S11: its actor is `AuditRow::new`'s); a failure to write is a
 /// warning through the voice, never fatal, and never a panic: a command may
 /// audit after a stop that closed its terminal.
 pub fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
     let mut d = audit::detail(pairs);
-    d.insert("actor".into(), "cli".into());
     if let Some(purpose) = audit_purpose() {
         d.entry("purpose".into()).or_insert_with(|| purpose.into());
     }
@@ -244,9 +243,12 @@ fn ms_s(ms: u64) -> String {
     format!("{:.1} s", ms as f64 / 1000.0)
 }
 
-/// Refresh the row of `vm` (when there is one) from a `GetMicrovm` answer.
-fn refresh_row(paths: &Paths, vm: &VmInfo) {
+/// Refresh the row of `vm` (when there is one) from a `GetMicrovm` answer (S11: `vm::ops` too); a change of
+/// its recorded `state_seen` is audited `vm_observed` with `via` (B §B2.7).
+pub(crate) fn refresh_row(paths: &Paths, vm: &VmInfo, via: crate::bridge::vm::ops::Via) {
+    let mut was: Option<String> = None;
     let result = registry::update_row(paths, &vm.id, |row| {
+        was = row.state_seen.clone().filter(|w| w != vm.state.as_str());
         row.state_seen = Some(vm.state.as_str().to_string());
         row.state_seen_at = Some(unix_now());
         row.state_reason.clone_from(&vm.state_reason);
@@ -258,8 +260,14 @@ fn refresh_row(paths: &Paths, vm: &VmInfo) {
             }
         }
     });
-    if let Err(e) = result {
-        eprintln!("ai-env: warning: cannot update the row of {}: {e}", vm.id);
+    match result {
+        Ok(Some(_)) => {
+            if let Some(w) = was {
+                crate::bridge::vm::ops::audit_observed(paths, &vm.id, &w, vm.state.as_str(), via);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("ai-env: warning: cannot update the row of {}: {e}", vm.id),
     }
 }
 
@@ -303,6 +311,10 @@ pub(crate) fn main_with(store: &Keystore, cmd: VmCmd, chat: Option<crate::bridge
     // Everything that can be refused without AWS is refused before the Touch ID.
     let mut pre = Pre::check(&ctx, &cmd)?;
     if let Pre::Warm(w) = &mut pre {
+        // S11 (L5): a gzip-staged chat goes only to a VM that decodes it (`RunPlan.caps_required`).
+        if let Some(chat) = &chat {
+            w.plan.caps_required = crate::bridge::s3::manifest::caps_required(&ctx.paths, &chat.session);
+        }
         w.chat = chat;
     }
     // `vm warm --dry-run` (S8): the plan, said; no AWS call, no Touch ID.
@@ -421,16 +433,7 @@ impl Pre {
                 Pre::Smoke(Box::new(plan), cred)
             }
             VmCmd::Terminate { id: Some(id), all: false, yes, .. } => {
-                if !registry::is_vm_id(id) {
-                    return Err(CliError::Usage(format!("not a microvm id: {id:?}")));
-                }
-                let row = registry::read_row(&ctx.paths, id)?;
-                if row.is_none() {
-                    if !*yes {
-                        return Err(CliError::Msg(format!("{id} has no row in state/vms (not started by this ai-env): add --yes to terminate it anyway")));
-                    }
-                    ctx.image_arn()?;
-                }
+                crate::bridge::vm::ops::terminate_check(ctx, id, *yes)?;
                 Pre::None
             }
             VmCmd::Token { port, .. } => {
@@ -453,8 +456,8 @@ impl Pre {
                 Pre::Exec(Box::new(crate::bridge::agent::exec::check_exec(ctx, id, cwd.clone(), env, *detach_grace, argv.clone(), &cred)?))
             }
             VmCmd::Attach { id, spawn, from_seq } => Pre::Attach(Box::new(crate::bridge::agent::exec::check_attach(ctx, id, spawn, *from_seq)?)),
-            VmCmd::Warm { workspace, prewarm, .. } => {
-                let warm = warm_check(ctx, workspace, *prewarm);
+            VmCmd::Warm { workspace, prewarm, claude_version, .. } => {
+                let warm = warm_check(ctx, workspace, *prewarm, claude_version.as_deref());
                 if let (true, Err(e)) = (*prewarm, &warm) {
                     // The prewarm's stderr is /dev/null (S8 §11): why nothing was warmed goes to its log.
                     crate::bridge::voice::note(&format!("no prewarm: {e}"));
@@ -555,7 +558,7 @@ pub(crate) fn provisional_gate(ctx: &Ctx, plan: &run::RunPlan) -> Result<()> {
         }
     }
     let (version, r) = refused.expect("one version at least");
-    audit_event(&ctx.paths, "credential_gate", &[("id", "-".into()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into()), ("image_version", version.clone())]);
+    audit_event(&ctx.paths, crate::bridge::audit::event::CREDENTIAL_GATE, &[("id", "-".into()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into()), ("image_version", version.clone())]);
     let whose = if recorded_active {
         " (the active version state/infra.toml records; after a deploy, `make infra-status WRITE=1` records the new one)"
     } else if want == "active" {
@@ -765,6 +768,9 @@ struct Warm {
     prepared: std::cell::Cell<Option<crate::bridge::workspace::PreparedSeed>>,
     /// `session stage --warm`'s chat (S9), restored into the VM once warm ([`main_with`]).
     chat: Option<crate::bridge::s3::stage::ChatRestore>,
+    /// S11 (A.4, LD-9): the claude version the warm fetches into the VM: `--claude-version`'s (a prewarm passes
+    /// the wrapper's), else the installed Cursor bundle's; `None` without either.
+    claude: Option<String>,
 }
 
 /// `vm warm`'s prechecks (S7, S8), all before the Touch ID: the run plan;
@@ -774,7 +780,7 @@ struct Warm {
 /// (`workspace::prepare` with the CLI's caps, as `box seed` takes them): a
 /// finding or uncommitted changes over a `[seed]` cap are exit 9 here,
 /// nothing unsealed or started.
-fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool) -> Result<Warm> {
+fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool, claude_version: Option<&str>) -> Result<Warm> {
     let purpose = if prewarm { "prewarm" } else { "operator" };
     let flags = run::RunFlags { workspace: Some(workspace.to_path_buf()), egress: Some(run::Egress::Vpc), purpose, wait: true, ..run::RunFlags::default() };
     let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags)?;
@@ -791,7 +797,17 @@ fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool) -> Result<W
     plan.workspace_cap = seed.is_ok();
     // S9: and the transcript store's (a session's restore pulls its chat from S3 there).
     plan.transcript_cap = seed.is_ok();
-    Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared), chat: None })
+    Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared), chat: None, claude: warm_claude_version(claude_version) })
+}
+
+/// `vm warm`'s claude version (S11, LD-9): `flag`, else the installed Cursor bundle's (`doctor::pick_bundle` of
+/// `~/.cursor/extensions`, as `infra pin --bundle-version` reads it), `N.N.N` only.
+fn warm_claude_version(flag: Option<&str>) -> Option<String> {
+    if let Some(v) = flag {
+        return Some(v.to_string());
+    }
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cursor").join("extensions");
+    crate::bridge::doctor::pick_bundle(&crate::bridge::doctor::installed_extension_names(&dir)).map(|(v, _)| v).filter(|v| crate::wire::pin::is_version(v))
 }
 
 /// The workspace `vm warm` seeds (S8 §11): `workspace::resolve`'s. One the
@@ -1097,19 +1113,66 @@ async fn warm<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointCl
     if let Some(note) = &seed_note {
         crate::bridge::voice::note(&format!("seed: {note}"));
     }
-    if prewarm {
-        tracing::info!(vm = %vm.id, warmed = word, seed = seed_word.unwrap_or("none"), "prewarmed");
-        return Ok(None);
-    }
-    if json {
-        json_out(&serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "account": cred.account, "seed": seed_word, "seed_note": seed_note }))?;
-    } else {
+    // The delivery's lines before the claude step, so a stop during it leaves them said.
+    if !json && !prewarm {
         let how = if warmed == Warmed::Delivered { "now holds" } else { "already held" };
         let account = cred.account.as_ref().map(|a| format!(", Claude account {a}")).unwrap_or_default();
         outln!("{} {how} the setup-token (seal {}{account}): credentialed commands there need no Touch ID for it until the VM is suspended", vm.id, cred.tag);
         if let Some(word) = seed_word {
             outln!("{}: the workspace's checkout {word}", vm.id);
         }
+    }
+    // S11 (A.4, LD-8, LD-9): V into the VM's claude cache ahead of a chat, staged first when admitted and not
+    // staged; the workspace's `.active` stays held. A failure to stage or fetch is a line, never the warm's exit.
+    // A stop gives up the fetch's wait at once (the VM goes on fetching); a staging runs to its end (its stager VM
+    // is ended by it), and a stop that came meanwhile ends the warm right after it, before the fetch. Either exits
+    // with the stop's status.
+    let v = w.claude.as_deref().unwrap_or("unknown");
+    let claude_stopped = |stop: crate::bridge::signals::Stop, what: String| -> CliError {
+        say(&format!("ai-env: {} ({}) while claude {v} {what}", stop.word(), stop.name()));
+        if let Some(id) = started.borrow().as_deref() {
+            say(&format!("ai-env: {}", kept(id)));
+        }
+        CliError::Exit(stop.status())
+    };
+    let staging = w.claude.as_deref().is_some_and(|v| caps.iter().any(|c| c == crate::wire::frame::CAP_CLAUDE_STAGE_V1) && crate::bridge::claude::needs_staging(&ctx.paths, v));
+    let fetched = |stop: crate::bridge::signals::Stop| claude_stopped(stop, format!("was being fetched into {0}: {0} goes on fetching it", vm.id));
+    let claude = if staging {
+        let staged = crate::bridge::claude::fetch::warm_stage(ctx, &api, ep, &vm, &caps, w.claude.as_deref()).await;
+        if let Some(stop) = stops.pending().await {
+            if let Err(said) = &staged {
+                if let Some(line) = &said.line {
+                    say(&format!("ai-env: {line}"));
+                }
+            }
+            return Err(claude_stopped(stop, format!("was being staged and fetched into {}: the warm stopped once the staging was over", vm.id)));
+        }
+        match staged {
+            Ok(staged) => match stoppable(&mut stops, crate::bridge::claude::fetch::warm_fetch(ctx, &api, &row, &vm, staged, prewarm)).await {
+                Ok(claude) => claude,
+                Err(stop) => return Err(fetched(stop)),
+            },
+            Err(said) => said,
+        }
+    } else {
+        match stoppable(&mut stops, crate::bridge::claude::fetch::warm_claude(ctx, &api, ep, &row, &vm, &caps, w.claude.as_deref(), prewarm)).await {
+            Ok(claude) => claude,
+            Err(stop) => return Err(fetched(stop)),
+        }
+    };
+    if prewarm {
+        tracing::info!(vm = %vm.id, warmed = word, seed = seed_word.unwrap_or("none"), "prewarmed");
+        return Ok(None);
+    }
+    if json {
+        let mut doc = serde_json::json!({ "backend": ctx.backend_name(), "id": vm.id, "reused": reused, "warmed": word, "tag": cred.tag, "account": cred.account, "seed": seed_word, "seed_note": seed_note });
+        // S11: the claude step's field, left out while it says nothing (null).
+        if let (false, Some(obj)) = (claude.json.is_null(), doc.as_object_mut()) {
+            obj.insert("claude".into(), claude.json.clone());
+        }
+        json_out(&doc)?;
+    } else if let Some(line) = &claude.line {
+        outln!("{line}");
     }
     let Some(chat) = &w.chat else { return Ok(None) };
     let ws = w.seed.as_ref().map_err(|why| CliError::Msg(format!("{} was not restored into {}: {why}", chat.session, vm.id)))?;
@@ -1178,57 +1241,45 @@ async fn auto_gc<A: MicrovmApi + crate::bridge::s3::S3Sign>(ctx: &Ctx, api: &A, 
 }
 
 async fn list<A: MicrovmApi>(ctx: &Ctx, api: &A, all: bool, json: bool) -> Result<()> {
-    let arn = ctx.image_arn()?;
-    let listing = api.list(Some(&arn)).await?;
-    let rows = registry::list_rows(&ctx.paths)?;
-    let now = unix_now();
-    let mut out = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for s in &listing {
-        seen.insert(s.id.clone());
-        let row = rows.iter().find(|r| r.id == s.id);
-        if s.state == VmState::Terminated && !all {
-            continue;
-        }
-        out.push((s.id.clone(), s.state.as_str().to_string(), s.started_at_unix.and_then(|t| u64::try_from(t).ok()), row.cloned(), if row.is_some() { "both" } else { "list" }));
-    }
-    for r in &rows {
-        if r.is_pending_row() || seen.contains(&r.id) {
-            if r.is_pending_row() {
-                out.push((r.stem(), "PENDING-ROW".into(), None, Some(r.clone()), "row"));
-            }
-            continue;
-        }
-        if r.status == RowStatus::Terminated && !all {
-            continue;
-        }
-        out.push((r.id.clone(), format!("({})", r.status.as_str()), r.started_at, Some(r.clone()), "row"));
-    }
+    // S11: the survey is `vm::ops`' (the panel's too); `--json` runs no reconcile, as before.
+    let survey = crate::bridge::vm::ops::survey(ctx, api, all, !json).await?;
     if json {
-        let items: Vec<serde_json::Value> = out
-            .iter()
-            .map(|(id, state, started, row, source)| serde_json::json!({ "id": id, "state": state, "started_at": started, "source": source, "row": row.as_ref().map(registry::view) }))
-            .collect();
-        return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "vms": items }));
+        return json_out(&crate::bridge::vm::ops::survey_json(&survey));
     }
-    if out.is_empty() {
-        outln!("no VMs{}", if all { "" } else { " (TERMINATED hidden; --all shows them)" });
-    } else {
-        outln!("{:<46} {:<12} {:>7} {:>9}  {:<24} SOURCE", "ID", "STATE", "AGE", "WALL-LEFT", "WHERE");
-        for (id, state, started, row, source) in &out {
-            let age = started.map_or_else(|| "-".into(), |t| fmt_secs(i64::try_from(now.saturating_sub(t)).unwrap_or(i64::MAX)));
-            let left = wall_left_cell(state, row.as_ref(), now);
-            let place = row.as_ref().and_then(|r| r.workspace.clone().or_else(|| r.label.clone())).unwrap_or_else(|| "-".into());
-            outln!("{id:<46} {state:<12} {age:>7} {left:>9}  {place:<24} {source}");
-        }
+    for line in list_lines(&survey, all) {
+        outln!("{line}");
     }
-    gc_hint(gc::reconcile_applied(api, &ctx.paths, &arn).await);
+    if let Some(line) = &survey.hint {
+        eprintln!("ai-env: {line}");
+    }
     Ok(())
+}
+
+/// The stdout lines `vm list` prints for `survey` (the panel's `vm-refresh`
+/// result too, B §B5.8): the `ID STATE AGE WALL-LEFT …` header and one row
+/// per VM, or the `no VMs…` line; the hint is not among them (stderr).
+pub(crate) fn list_lines(survey: &crate::bridge::vm::ops::Survey, all: bool) -> Vec<String> {
+    let now = survey.now;
+    if survey.items.is_empty() {
+        return vec![format!("no VMs{}", if all { "" } else { " (TERMINATED hidden; --all shows them)" })];
+    }
+    let mut lines = vec![format!("{:<46} {:<12} {:>7} {:>9} {:>7} {:>8}  {:<24} SOURCE", "ID", "STATE", "AGE", "WALL-LEFT", "RUN", "COST", "WHERE")];
+    for item in &survey.items {
+        let (id, state, source) = (&item.id, &item.state, item.source);
+        let age = item.started_at.map_or_else(|| "-".into(), |t| fmt_secs(i64::try_from(now.saturating_sub(t)).unwrap_or(i64::MAX)));
+        let left = wall_left_cell(state, item.row.as_ref(), now);
+        let place = item.row.as_ref().and_then(|r| r.workspace.clone().or_else(|| r.label.clone())).unwrap_or_else(|| "-".into());
+        // S11 (B §B3.6): RUN and COST over the VM's life to now, `-` without a cell.
+        let run = item.cost.as_ref().map_or_else(|| "-".into(), |c| fmt_secs(i64::try_from(c.running_s).unwrap_or(i64::MAX)));
+        let cost = item.cost.as_ref().map_or_else(|| "-".into(), |c| format!("${:.3}", c.usd));
+        lines.push(format!("{id:<46} {state:<12} {age:>7} {left:>9} {run:>7} {cost:>8}  {place:<24} {source}"));
+    }
+    lines
 }
 
 async fn status<A: MicrovmApi>(ctx: &Ctx, api: &A, id: &str, json: bool) -> Result<()> {
     let vm = api.get(id).await?;
-    refresh_row(&ctx.paths, &vm);
+    refresh_row(&ctx.paths, &vm, crate::bridge::vm::ops::Via::Status);
     if json {
         let row = registry::read_row(&ctx.paths, id).ok().flatten();
         return json_out(&serde_json::json!({ "backend": ctx.backend_name(), "vm": vm, "row": row.as_ref().map(registry::view) }));
@@ -1274,7 +1325,7 @@ async fn health_cmd<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E
 
 async fn token_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, id: &str, port: u16, minutes: u16, reveal: bool) -> Result<()> {
     let tok = token::mint(api, &ctx.paths, id, port, minutes).await?;
-    audit_event(&ctx.paths, "vm_token", &[("id", id.to_string()), ("port", port.to_string()), ("minutes", minutes.to_string()), ("revealed", reveal.to_string())]);
+    audit_event(&ctx.paths, crate::bridge::audit::event::VM_TOKEN, &[("id", id.to_string()), ("port", port.to_string()), ("minutes", minutes.to_string()), ("revealed", reveal.to_string())]);
     if reveal {
         eprintln!("ai-env: warning: this token opens port {port} of {id} until {}; it is printed alone on stdout — do not paste it anywhere else", rfc3339_utc(tok.expires_at_unix));
         outln!("{}", tok.value()?.expose());
@@ -1285,21 +1336,8 @@ async fn token_cmd<A: MicrovmApi>(ctx: &Ctx, api: &A, id: &str, port: u16, minut
 }
 
 async fn suspend_resume<A: MicrovmApi>(ctx: &Ctx, api: &A, id: &str, suspend: bool, no_wait: bool) -> Result<()> {
-    let start = Instant::now();
-    if suspend {
-        api.suspend(id).await?;
-    } else {
-        api.resume(id).await?;
-    }
-    audit_event(&ctx.paths, if suspend { "vm_suspend" } else { "vm_resume" }, &[("id", id.to_string())]);
-    let want = if suspend { VmState::Suspended } else { VmState::Running };
-    if no_wait {
-        outln!("{id}: {} requested", if suspend { "suspend" } else { "resume" });
-        return Ok(());
-    }
-    let vm = run::wait_for_state(api, id, &want, ctx.poll(run::Poll::SETTLE)).await?;
-    refresh_row(&ctx.paths, &vm);
-    outln!("{id} {} in {}", vm.state.as_str(), ms_s(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)));
+    let done = crate::bridge::vm::ops::suspend_resume(ctx, api, id, suspend, no_wait).await?;
+    outln!("{}", done.line());
     Ok(())
 }
 
@@ -1345,33 +1383,12 @@ async fn terminate<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>
         return Ok(());
     }
     let id = id.ok_or_else(|| CliError::Usage("vm terminate needs an id or --all".into()))?;
-    let row = registry::read_row(&ctx.paths, id)?;
-    // A VM with a row is this ai-env's (whatever `--image` it ran); a row-less
-    // one must run the configured image (Pre::check required --yes and the ARN).
-    let own_image = row.as_ref().map(|r| r.image_arn.clone()).filter(|a| !a.is_empty()).or_else(|| ctx.cfg.aws.image_arn.clone());
-    match api.get(id).await {
-        Ok(vm) => match &own_image {
-            Some(arn) if &vm.image_arn != arn => {
-                return Err(BridgeError::Policy(format!("{id} runs image {}, not {arn}; this ai-env terminates only its own image's VMs", vm.image_arn)).into());
-            }
-            Some(_) => {}
-            None => return Err(BridgeError::Policy(format!("{id}: no image to compare with ([aws].image_arn is not set and there is no row)")).into()),
-        },
-        Err(BridgeError::VmNotFound(_)) if row.is_some() => {}
-        Err(e) => return Err(e.into()),
-    }
-    let start = Instant::now();
-    // S9: a running VM's sessions' transcripts to S3 first (best effort; its tails go up at /terminate; a suspended one is not woken: its /suspend pushed them, once).
-    for w in crate::bridge::s3::commands::sync_before_terminate(ctx, api, id).await {
+    // S11: the one-id terminate is `vm::ops`' (the panel's too).
+    let done = crate::bridge::vm::ops::terminate_one(ctx, api, id, no_wait).await?;
+    for w in &done.warnings {
         eprintln!("ai-env: warning: {w}");
     }
-    let vm = run::terminate_and_record(api, &ctx.paths, id, "operator", wait).await?;
-    if wait.is_none() {
-        outln!("{id} terminate requested");
-    } else {
-        let state = vm.as_ref().map_or("TERMINATED", |v| v.state.as_str());
-        outln!("{id} {state} ({})", ms_s(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)));
-    }
+    outln!("{}", done.line());
     Ok(())
 }
 
@@ -1389,15 +1406,22 @@ async fn gc_cmd<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ct
             .iter()
             .map(|i| serde_json::json!({ "class": i.class.name(), "id": i.id, "stem": i.stem, "age_s": i.age_s, "detail": i.detail, "action": i.action.name() }))
             .collect();
+        let (n, usd) = expired_running(ctx, &report.items);
         json_out(&serde_json::json!({
             "backend": ctx.backend_name(), "yes": opts.yes, "items": items, "terminated": report.terminated, "adopted": report.adopted,
             "removed": report.removed, "marked": report.marked, "errors": report.errors, "egress_mismatches": report.mismatches,
+            "expired_running": n, "expired_usd_per_hour": usd,
         }))?;
     } else {
         for i in &report.items {
             let who = i.id.clone().or_else(|| i.stem.clone()).unwrap_or_else(|| "-".into());
             let age = i.age_s.map_or_else(|| "-".into(), |a| fmt_secs(i64::try_from(a).unwrap_or(i64::MAX)));
             outln!("{:<16} {who:<46} {age:>7}  {} → {}", i.class.name(), i.detail, i.action.name());
+        }
+        // S11 (B §B3.8): what the expired VMs still running cost an hour, while a dry run leaves them.
+        let (n, usd) = expired_running(ctx, &report.items);
+        if n > 0 && !opts.yes {
+            outln!("{n} expired VM(s) still run: ${usd:.3} an hour now");
         }
         let acted = report.terminated + report.adopted + report.removed + report.marked;
         // What `--yes` would act on, and your own orphans (only with --include-orphans AGE).
@@ -1425,6 +1449,25 @@ async fn gc_cmd<A: MicrovmApi + crate::bridge::s3::S3Sign, E: EndpointClient>(ct
         }
         Err(CliError::Aws(format!("vm gc: {} action(s) failed", report.errors.len())))
     }
+}
+
+/// The `registry:expired` items gc's listing shows RUNNING, and what they cost an hour at their baseline (1 vCPU
+/// and the memory their `vm_run` row names, else `[vm].memory_mib`; B §B3.8).
+fn expired_running(ctx: &Ctx, items: &[gc::GcItem]) -> (usize, f64) {
+    let ids: Vec<&str> = items.iter().filter(|i| i.class == gc::GcClass::RegistryExpired && i.detail.starts_with("RUNNING ")).filter_map(|i| i.id.as_deref()).collect();
+    if ids.is_empty() {
+        return (0, 0.0);
+    }
+    let now = crate::bridge::lab::now();
+    let t = crate::bridge::cost::timeline_for(&ctx.paths, 0, now).ok();
+    let usd: f64 = ids
+        .iter()
+        .map(|id| {
+            let memory = t.as_ref().and_then(|t| t.vms.iter().find(|v| v.vm == *id)).map_or(ctx.cfg.vm.memory_mib, |v| v.memory_mib);
+            crate::bridge::cost::usd_per_hour(memory)
+        })
+        .sum();
+    (ids.len(), crate::bridge::cost::usd(usd))
 }
 
 // ---- smoke ----------------------------------------------------------------------------------

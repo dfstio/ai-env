@@ -15,7 +15,8 @@
 //! that starts it as the agent (`asagent`, on `childproc`'s child setup, the
 //! spawns' too) and the workspace routes that use it (`code`, `health`). S9
 //! adds git smart-HTTP on the code port (`gitcgi`) and the transcript
-//! store's transfers on the app port (`s3xfer`: curl as `ai-env-net`).
+//! store's transfers on the app port (`s3xfer`: curl as `ai-env-net`). S11
+//! adds the VM's claude cache (`claudebin`: staged claudes a spawn may run).
 //!
 //! Every log line goes through `errln!`: stderr is whatever PID 1 was
 //! given, and a reader that went away must not panic a hook (`eprintln!`
@@ -40,6 +41,7 @@ pub mod agent;
 pub mod asagent;
 pub mod auth;
 pub mod childproc;
+pub mod claudebin;
 pub mod code;
 pub mod credential;
 pub mod gitcgi;

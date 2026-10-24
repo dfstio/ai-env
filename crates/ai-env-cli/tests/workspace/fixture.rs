@@ -281,6 +281,16 @@ pub struct FakeVm {
     pub bodies: Mutex<Vec<Vec<u8>>>,
     /// Refusals the next `PUT /seed`s answer instead of applying (a race the test stages).
     pub refuse_next: Mutex<std::collections::VecDeque<WsRefusal>>,
+    /// S11 (C.1.1): each `POST /codeout`'s `manifest_when_empty`, in order.
+    pub flags: Mutex<Vec<bool>>,
+    /// S11 (C.1.1): the shim serves `codeout_manifest_v1` (13.0, the
+    /// default): asked for it, nothing new is the manifest line alone (200,
+    /// no pack byte); `false`, a 12.0 shim's 204 whatever the flag.
+    pub manifest_served: std::sync::atomic::AtomicBool,
+    /// S11: the manifest the next `POST /codeout` answers without a pack
+    /// (200, the line alone), whatever the request and the checkout: a
+    /// broken or hostile shim.
+    pub forge_next: Mutex<Option<CodeoutManifest>>,
 }
 
 fn refused<T>(code: &str, message: &str) -> DpReply<T> {
@@ -298,7 +308,16 @@ impl FakeVm {
             calls: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
             refuse_next: Mutex::new(std::collections::VecDeque::new()),
+            flags: Mutex::new(Vec::new()),
+            manifest_served: std::sync::atomic::AtomicBool::new(true),
+            forge_next: Mutex::new(None),
         }
+    }
+
+    /// The `manifest_when_empty` of each `POST /codeout` so far.
+    #[must_use]
+    pub fn flags(&self) -> Vec<bool> {
+        self.flags.lock().unwrap().clone()
     }
 
     fn call(&self, what: String) {
@@ -439,11 +458,22 @@ impl FakeVm {
     }
 
     /// A snapshot of the checkout's uncommitted work (a copy of the index,
-    /// `add -A`): `refs/wip/<n>` unless the checkout is HEAD's.
+    /// `add -A`): `refs/wip/<n>` unless the checkout is HEAD's. As the
+    /// helper's `take_snapshot`: the newest snapshot (by its stamp, then its
+    /// number) is kept when it holds this tree on this HEAD, none made.
     fn snapshot(&self) -> Option<String> {
         let tree = self.worktree_tree();
         if tree == git(&self.dir, &["rev-parse", "HEAD^{tree}"]) {
             return None;
+        }
+        let listed = git(&self.dir, &["for-each-ref", "--format=%(refname)", "refs/wip/"]);
+        let key = |n: &str| n.rsplit_once('-').map(|(stamp, k)| (stamp.to_string(), k.parse::<u64>().unwrap_or(0)));
+        if let Some(newest) = listed.lines().max_by_key(|n| key(n)) {
+            let shown = git_out(&self.dir, &["show", "-s", "--format=%T %P", newest], None);
+            let words: Vec<String> = String::from_utf8_lossy(&shown.stdout).split_whitespace().map(str::to_string).collect();
+            if shown.status.success() && words.first() == Some(&tree) && words.get(1) == Some(&git(&self.dir, &["rev-parse", "HEAD"])) {
+                return Some(newest.to_string());
+            }
         }
         let commit = git(&self.dir, &["commit-tree", tree.as_str(), "-p", "HEAD", "-m", "wip"]);
         let mut n = self.snapshots.lock().unwrap();
@@ -472,17 +502,22 @@ impl FakeVm {
         let o = git_out(&self.dir, &["pack-objects", "--revs", "--thin", "--stdout", "-q"], Some(input.as_bytes()));
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let count = u32::from_be_bytes(o.stdout[8..12].try_into().unwrap());
-        if count == 0 && wip_ref.is_none() {
-            let had: Vec<&String> = refs.values().filter(|id| req.haves.contains(id)).collect();
-            if had.len() == refs.len() {
+        let had = refs.values().all(|id| req.haves.contains(id));
+        let branch = (!detached).then(|| git(&self.dir, &["symbolic-ref", "--short", "HEAD"]));
+        let manifest = CodeoutManifest { v: SeedManifest::V, object_format: ObjectFormat::Sha1, refs, head, branch, wip_ref, wip_skipped: None };
+        // The helper's rule (wshelper.rs): no pack when it would hold no object and every tip is a have,
+        // whatever the snapshot (a kept one the Mac holds is a have).
+        if count == 0 && had {
+            if !(req.manifest_when_empty && self.manifest_served.load(std::sync::atomic::Ordering::SeqCst)) {
                 return DpReply::status(204);
             }
+            // S11 (C.1.1): the manifest line alone; the data plane leaves an empty pack file (`write_pack`).
+            std::fs::write(dest, b"").unwrap();
+            return DpReply::ok(200, CodeoutBody { manifest, pack_bytes: 0 });
         }
         if o.stdout.len() as u64 > cap {
             return DpReply::refused(WsRefusal::new(refusal::TOO_LARGE, "over max_bytes").with_size(o.stdout.len() as u64));
         }
-        let branch = (!detached).then(|| git(&self.dir, &["symbolic-ref", "--short", "HEAD"]));
-        let manifest = CodeoutManifest { v: SeedManifest::V, object_format: ObjectFormat::Sha1, refs, head, branch, wip_ref, wip_skipped: None };
         std::fs::write(dest, &o.stdout).unwrap();
         DpReply::ok(200, CodeoutBody { manifest, pack_bytes: o.stdout.len() as u64 })
     }
@@ -513,7 +548,12 @@ impl DataPlane for FakeVm {
 
     async fn post_codeout(&self, _: &AgentTarget, _: &AuthToken, req: &CodeoutRequest, dest: &Path, cap: u64) -> Result<DpReply<CodeoutBody>, BridgeError> {
         self.call(format!("POST /codeout wip={}", req.wip));
+        self.flags.lock().unwrap().push(req.manifest_when_empty);
         assert_eq!(req.check(), Ok(()));
+        if let Some(manifest) = self.forge_next.lock().unwrap().take() {
+            std::fs::write(dest, b"").unwrap();
+            return Ok(DpReply::ok(200, CodeoutBody { manifest, pack_bytes: 0 }));
+        }
         Ok(self.codeout(req, dest, cap))
     }
 

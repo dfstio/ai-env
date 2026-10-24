@@ -81,6 +81,61 @@ pub const RESUME_MISS_MARKER: &str = "No conversation found with session ID:";
 /// message of the transcript), carried as a resume miss's is.
 pub const CUT_MISS_MARKER: &str = "No message found with message.uuid of:";
 
+/// S11 (A.5): how the CLI (commander) refuses an option it does not know, on stderr, before it reads stdin:
+/// `error: unknown option '--x'` (or `'--x=value'`), a suggestion sometimes after it.
+pub const UNKNOWN_OPTION_MARKER: &str = "error: unknown option '";
+
+/// The longest name [`unknown_option`] takes after `--`.
+const OPTION_NAME_MAX: usize = 64;
+
+/// The long option an unknown-option line names, without its `=value`: the first line of `stderr` that starts,
+/// after leading blanks, with [`UNKNOWN_OPTION_MARKER`], whose quoted name is `--[A-Za-z0-9][A-Za-z0-9-]{0,63}`
+/// before an optional `=…` and the closing quote. `None` for anything else (a short option, a longer name, no
+/// closing quote, another text).
+#[must_use]
+pub fn unknown_option(stderr: &str) -> Option<String> {
+    let line = stderr.lines().find_map(|l| l.trim_start().strip_prefix(UNKNOWN_OPTION_MARKER))?;
+    let body = line.strip_prefix("--")?;
+    let name_len = body.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'-').count();
+    let (name, rest) = body.split_at(name_len);
+    if name.is_empty() || name_len > OPTION_NAME_MAX || !name.as_bytes()[0].is_ascii_alphanumeric() {
+        return None;
+    }
+    let closed = match rest.as_bytes().first() {
+        Some(b'\'') => true,
+        Some(b'=') => rest[1..].contains('\''),
+        _ => false,
+    };
+    closed.then(|| format!("--{name}"))
+}
+
+/// S11 (A.1): a text the code relies on, which a version's Linux binary must hold before it is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VMarker {
+    /// Its name in records and audit rows: a code word, never the text.
+    pub name: &'static str,
+    /// The forms, any one of which counts (a bundle keeps some texts escaped), searched as bytes.
+    pub forms: &'static [&'static str],
+}
+
+/// The texts an admitted version must hold (A §1.6): the Dockerfile's strings gate's four, in its order; the
+/// resume miss; the usage limit's two (`rate_limit_resets` in its UTF-8 form and its two escaped ones, LD-39); the
+/// four values `wire::managed::MANAGED_HARDENING` sets, by their last keys; the unknown option.
+pub const V_MARKERS: [VMarker; 12] = [
+    VMarker { name: "resume_session_at", forms: &["--resume-session-at"] },
+    VMarker { name: "cut_miss", forms: &[CUT_MISS_MARKER] },
+    VMarker { name: "session_id", forms: &["--session-id"] },
+    VMarker { name: "in_use", forms: &["is already in use"] },
+    VMarker { name: "resume_miss", forms: &[RESUME_MISS_MARKER] },
+    VMarker { name: "rate_limit_hit", forms: &[crate::wire::ratelimit::HIT] },
+    VMarker { name: "rate_limit_resets", forms: &[crate::wire::ratelimit::RESETS, " \\xB7 resets ", " \\u00B7 resets "] },
+    VMarker { name: "bypass_mode", forms: &["disableBypassPermissionsMode"] },
+    VMarker { name: "auto_mode", forms: &["disableAutoMode"] },
+    VMarker { name: "autoupdater", forms: &["DISABLE_AUTOUPDATER"] },
+    VMarker { name: "updates", forms: &["DISABLE_UPDATES"] },
+    VMarker { name: "unknown_option", forms: &[UNKNOWN_OPTION_MARKER] },
+];
+
 /// What the pump needs to know about one child → host line.
 #[derive(Debug, Clone)]
 pub enum ChildFrame<'a> {
@@ -517,7 +572,8 @@ mod tests {
         let b16 = include_str!("../../tests/fixtures/claude/valid-stream-json-2.1.296.jsonl").lines().find(|l| l.contains("rate_limit_event")).unwrap();
         let ChildFrame::RateLimit { info: Some(info) } = classify_child(b16.as_bytes()) else { panic!("not a rate limit: {b16}") };
         assert_eq!(info.get(), r#"{"status":"allowed"}"#);
-        let full = include_str!("../../tests/fixtures/claude/rate-limit-event-constructed-2.1.305.jsonl").lines().next().unwrap();
+        // The constructed 2.1.305 line, inlined (S11, C §C.7.1: C6 replaces the constructed fixture by a real one).
+        let full = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1792663200,"rateLimitType":"seven_day","utilization":0.81,"unifiedWindows":{"five_hour":{"utilization":0.23,"resetsAt":1792591200},"seven_day":{"utilization":0.81,"resetsAt":1792663200}},"overageStatus":"allowed","isUsingOverage":true,"surpassedThreshold":0.75},"uuid":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-0000000000a1"}"#;
         let ChildFrame::RateLimit { info: Some(info) } = classify_child(full.as_bytes()) else { panic!("not a rate limit: {full}") };
         assert!(info.get().starts_with(r#"{"status":"allowed_warning","#) && info.get().contains("unifiedWindows"), "{}", info.get());
         assert_eq!(classify_child(br#"{"type":"rate_limit_event"}"#), ChildFrame::RateLimit { info: None });
@@ -527,6 +583,67 @@ mod tests {
         assert_ne!(ChildFrame::RateLimit { info: Some(&a) }, ChildFrame::RateLimit { info: Some(&b) });
         assert_ne!(ChildFrame::RateLimit { info: None }, ChildFrame::Other);
         assert_eq!(classify_host(b16.as_bytes()), HostFrame::Other);
+    }
+
+    /// S11 (A.5): the long option an unknown-option line names, without its
+    /// value, from the first such line (after leading blanks, a suggestion
+    /// after it); never a short option, a name past 64 characters, an
+    /// unclosed quote or another text.
+    #[test]
+    fn unknown_option_names_the_long_flag() {
+        let cases: [(&str, Option<&str>); 16] = [
+            ("error: unknown option '--x'", Some("--x")),
+            ("error: unknown option '--thinking-display'\n", Some("--thinking-display")),
+            ("error: unknown option '--effort=high'", Some("--effort")),
+            ("error: unknown option '--effort=it's'", Some("--effort")),
+            ("warn: something\n  error: unknown option '--new-flag' (Did you mean --new-flags?)\n", Some("--new-flag")),
+            ("error: unknown option '--a1-b'\nerror: unknown option '--second'", Some("--a1-b")),
+            ("error: unknown option '-x'", None),
+            ("error: unknown option '--'", None),
+            ("error: unknown option '---x'", None),
+            ("error: unknown option '--x", None),
+            ("error: unknown option '--x=v", None),
+            ("error: unknown option '--x y'", None),
+            ("error: unknown option '--x_y'", None),
+            ("error: unknown command 'x'", None),
+            ("", None),
+            ("error: too many arguments. Expected 0 arguments but got 1.", None),
+        ];
+        for (stderr, want) in cases {
+            assert_eq!(unknown_option(stderr).as_deref(), want, "{stderr:?}");
+        }
+        let longest = format!("error: unknown option '--{}'", "a".repeat(64));
+        assert_eq!(unknown_option(&longest).map(|f| f.len()), Some(66));
+        assert_eq!(unknown_option(&format!("error: unknown option '--{}'", "a".repeat(65))), None, "a longer name");
+        assert!(UNKNOWN_OPTION_MARKER.ends_with('\''));
+    }
+
+    /// S11 (A §1.6): the markers' names are unique code words; the first four
+    /// are the Dockerfile's strings gate (its `for want in` line, in order),
+    /// the managed four `MANAGED_HARDENING`'s last keys, in order; the
+    /// others are the code's own constants.
+    #[test]
+    fn the_markers_hold_the_dockerfile_gate_and_the_code_constants() {
+        let names: std::collections::BTreeSet<&str> = V_MARKERS.iter().map(|m| m.name).collect();
+        assert_eq!(names.len(), V_MARKERS.len(), "unique names");
+        for m in V_MARKERS {
+            assert!(!m.forms.is_empty() && m.forms.iter().all(|f| !f.is_empty()), "{}", m.name);
+            assert!(m.name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{}", m.name);
+        }
+        let docker = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
+        let gate = docker.lines().find(|l| l.contains("for want in")).expect("the Dockerfile's strings gate");
+        let wants: Vec<&str> = gate.split_once("for want in").unwrap().1.split('\'').skip(1).step_by(2).collect();
+        assert_eq!(wants, V_MARKERS[..4].iter().map(|m| m.forms[0]).collect::<Vec<_>>(), "{gate}");
+        let managed: Vec<&str> = crate::wire::managed::MANAGED_HARDENING.iter().map(|(path, _)| *path.last().unwrap()).collect();
+        assert_eq!(managed, V_MARKERS[7..11].iter().map(|m| m.forms[0]).collect::<Vec<_>>());
+        let by_name = |n: &str| V_MARKERS.iter().find(|m| m.name == n).unwrap().forms;
+        assert_eq!(by_name("cut_miss"), [CUT_MISS_MARKER]);
+        assert_eq!(by_name("resume_miss"), [RESUME_MISS_MARKER]);
+        assert_eq!(by_name("rate_limit_hit"), [crate::wire::ratelimit::HIT]);
+        assert_eq!(by_name("rate_limit_resets"), [crate::wire::ratelimit::RESETS, " \\xB7 resets ", " \\u00B7 resets "]);
+        assert_eq!(by_name("rate_limit_resets")[1].len(), 13, "the four ASCII characters of the escape");
+        assert_eq!(by_name("rate_limit_resets")[2].len(), 15, "the six of the other");
+        assert_eq!(by_name("unknown_option"), [UNKNOWN_OPTION_MARKER]);
     }
 
     /// The two lines S10's pump writes to the host, byte for byte: the

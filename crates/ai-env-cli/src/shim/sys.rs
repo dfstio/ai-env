@@ -544,6 +544,9 @@ pub struct ReportFacts<'a> {
     /// S10: `/proc/meminfo`'s `MemTotal` and `MemAvailable` (kB).
     pub mem_total_kb: Option<u64>,
     pub mem_available_kb: Option<u64>,
+    /// S11: the claude cache's index (`shim::claudebin::index_at`), most
+    /// recently used first: empty without an index, `None` when unreadable.
+    pub claude_cache: Option<&'a [crate::wire::workspace::ClaudeCacheEntry]>,
 }
 
 impl std::fmt::Debug for ReportFacts<'_> {
@@ -562,6 +565,7 @@ impl std::fmt::Debug for ReportFacts<'_> {
             .field("gid", &self.gid)
             .field("mem_total_kb", &self.mem_total_kb)
             .field("mem_available_kb", &self.mem_available_kb)
+            .field("claude_cache", &format_args!("{}", self.claude_cache.map_or("None".to_string(), |c| format!("<{} entries>", c.len()))))
             .finish()
     }
 }
@@ -569,8 +573,10 @@ impl std::fmt::Debug for ReportFacts<'_> {
 /// The run report's JSON from [`ReportFacts`] (pure, so it is tested on every
 /// platform): `hook`, `microvm_id`, `boot_id`, `disk_total_bytes`,
 /// `disk_used_bytes`, `env` (`names`, `values`), `aws_credential_env`,
-/// `zombies`, `uid`, `gid`, and (S10) `mem_total_kb`, `mem_available_kb`;
-/// a missing source is `null`. No credential value can reach it:
+/// `zombies`, `uid`, `gid`, (S10) `mem_total_kb`, `mem_available_kb`, and
+/// (S11) `claude_cache`: the cache's binaries as `[{"version", "sha256",
+/// "size"}]`, most recently used first (`[]` without an index); a missing
+/// source is `null`. No credential value can reach it:
 /// `env.values` holds the [`REPORT_ENV_VALUES`] only.
 #[must_use]
 pub fn assemble_report(f: &ReportFacts<'_>) -> serde_json::Value {
@@ -588,6 +594,7 @@ pub fn assemble_report(f: &ReportFacts<'_>) -> serde_json::Value {
         "gid": f.gid,
         "mem_total_kb": f.mem_total_kb,
         "mem_available_kb": f.mem_available_kb,
+        "claude_cache": f.claude_cache.map(|entries| entries.iter().map(|e| serde_json::json!({"version": e.version, "sha256": e.sha256, "size": e.size})).collect::<Vec<_>>()),
     })
 }
 
@@ -612,8 +619,9 @@ fn proc_stat_lines(proc: &Path) -> Option<Vec<String>> {
 /// The Linux run report with every source under `root` (`/` on the machine;
 /// a planted tree in the tests, so the paths below are exercised on every
 /// platform): `proc/sys/kernel/random/boot_id`, `proc/1/environ`,
-/// `proc/<pid>/stat`, (S10) `proc/meminfo`, statvfs of `root`, and the
-/// shim's own uid/gid.
+/// `proc/<pid>/stat`, (S10) `proc/meminfo`, statvfs of `root`, the shim's
+/// own uid/gid, and (S11) the claude cache's index under `root`
+/// (`claudebin::index_at`).
 #[must_use]
 pub fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_json::Value {
     let proc = root.join("proc");
@@ -622,6 +630,7 @@ pub fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_j
     let stats = proc_stat_lines(&proc);
     let stat_refs: Option<Vec<&str>> = stats.as_ref().map(|v| v.iter().map(String::as_str).collect());
     let (mem_total_kb, mem_available_kb) = std::fs::read_to_string(proc.join("meminfo")).map_or((None, None), |t| parse_meminfo(&t));
+    let claude_cache = crate::shim::claudebin::index_at(root);
     assemble_report(&ReportFacts {
         hook,
         microvm_id,
@@ -633,6 +642,7 @@ pub fn read_report(root: &Path, hook: &str, microvm_id: Option<&str>) -> serde_j
         gid: nix::unistd::getegid().as_raw(),
         mem_total_kb,
         mem_available_kb,
+        claude_cache: claude_cache.as_deref(),
     })
 }
 
@@ -899,13 +909,13 @@ mod tests {
     }
 
     fn facts() -> ReportFacts<'static> {
-        ReportFacts { hook: "run", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None }
+        ReportFacts { hook: "run", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None, claude_cache: None }
     }
 
     #[test]
     fn report_shape_with_and_without_sources() {
         let empty = assemble_report(&facts());
-        for key in ["microvm_id", "boot_id", "disk_total_bytes", "disk_used_bytes", "env", "aws_credential_env", "zombies", "mem_total_kb", "mem_available_kb"] {
+        for key in ["microvm_id", "boot_id", "disk_total_bytes", "disk_used_bytes", "env", "aws_credential_env", "zombies", "mem_total_kb", "mem_available_kb", "claude_cache"] {
             assert!(empty[key].is_null(), "a missing source is null: {key} in {empty}");
         }
         assert_eq!((empty["hook"].as_str(), empty["uid"].as_u64(), empty["gid"].as_u64()), (Some("run"), Some(0), Some(0)));
@@ -922,7 +932,9 @@ mod tests {
             gid: 0,
             mem_total_kb: Some(8_000_000),
             mem_available_kb: Some(7_000_000),
+            claude_cache: Some(&[crate::wire::workspace::ClaudeCacheEntry { version: "2.1.308".into(), sha256: "ab".repeat(32), size: 7, fetched_at: 1, last_used: 2 }]),
         });
+        assert_eq!(full["claude_cache"], serde_json::json!([{"version": "2.1.308", "sha256": "ab".repeat(32), "size": 7}]), "S11: the cache's binaries, without their times");
         assert_eq!((full["mem_total_kb"].as_u64(), full["mem_available_kb"].as_u64()), (Some(8_000_000), Some(7_000_000)));
         assert_eq!(full["hook"], "terminate");
         assert_eq!(full["microvm_id"], "microvm-00000000-0000-4000-8000-000000000001");
@@ -951,7 +963,7 @@ mod tests {
         }
         assert_eq!(
             format!("{:?}", facts()),
-            "ReportFacts { hook: \"run\", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None }"
+            "ReportFacts { hook: \"run\", microvm_id: None, boot_id: None, disk: None, environ: None, stat_lines: None, uid: 0, gid: 0, mem_total_kb: None, mem_available_kb: None, claude_cache: None }"
         );
     }
 
@@ -1012,6 +1024,7 @@ mod tests {
             assert!(r[key].is_null(), "{key} in {r}");
         }
         assert!(r["disk_total_bytes"].as_u64().is_some_and(|t| t > 0), "{r}");
+        assert_eq!(r["claude_cache"], serde_json::json!([]), "S11: no index, an empty cache: {r}");
         // A /proc whose PID 1 environ is unreadable (a directory here) and an empty listing.
         std::fs::create_dir_all(empty.path().join("proc/1/environ")).unwrap();
         let r = read_report(empty.path(), "run", None);

@@ -147,7 +147,8 @@ pub struct RunFlags {
     /// Wait until RUNNING (`--no-wait` clears it).
     pub wait: bool,
     /// Who asks: `operator` | `smoke` | `probe` | `test`, or S8's `session`
-    /// (the remote wrapper) | `prewarm` (`vm warm --prewarm`) (audited).
+    /// (the remote wrapper) | `prewarm` (`vm warm --prewarm`), or S11's
+    /// `claude-stage` (`ai-env claude stage`'s credential-less stager VM) (audited).
     pub purpose: &'static str,
     /// `vm smoke` and `lab run`: internet egress without a flag (audited).
     pub imply_internet: bool,
@@ -240,6 +241,14 @@ pub struct RunPlan {
     /// VM while its retire counts its spawns; one kept loses the mark).
     /// Empty from [`RunPlan::from_cfg`]; honoured from S10 wave 1b (C).
     pub avoid: Vec<String>,
+    /// S11 (L5): capabilities every reused or pinned VM's recorded caps must
+    /// name: `reuse_candidate` passes over a row whose caps lack one
+    /// (`Capability::No`; a row whose caps are unknown passes, its `/health`
+    /// read later), and a pinned VM lacking one is refused (`NoCapability`,
+    /// exit 7, naming `make deploy`). Empty from [`RunPlan::from_cfg`]; the
+    /// reopen's P0, `vm warm` with a chat and the offline `session migrate`
+    /// set it from `s3::manifest::caps_required`.
+    pub caps_required: Vec<&'static str>,
 }
 
 /// Which VM SELECT_VM takes for a workspace (S8 plan §1, §3 P2).
@@ -327,7 +336,7 @@ impl RunPlan {
         if !(1..=MAX_DURATION_S).contains(&max_duration_s) {
             return Err(refuse(max_src, format!("{max_duration_s}: must be 1..={MAX_DURATION_S} s (the service maximum)")));
         }
-        debug_assert!(matches!(flags.purpose, "operator" | "smoke" | "probe" | "test" | "session" | "prewarm"), "unknown run purpose {:?}", flags.purpose);
+        debug_assert!(matches!(flags.purpose, "operator" | "smoke" | "probe" | "test" | "session" | "prewarm" | "claude-stage"), "unknown run purpose {:?}", flags.purpose);
         let idle = idle_spec(cfg, flags, max_duration_s)?;
         let (egress, egress_connectors) = effective_egress(cfg, flags.egress, flags.imply_internet)?;
         let ingress_connectors = if flags.shell { vec![api::managed_connector_arn("HTTP_INGRESS"), api::managed_connector_arn("SHELL_INGRESS")] } else { Vec::new() };
@@ -368,6 +377,7 @@ impl RunPlan {
             workspace_cap: false,
             transcript_cap: false,
             avoid: Vec::new(),
+            caps_required: Vec::new(),
         })
     }
 }
@@ -762,13 +772,13 @@ fn apply_echo(row: &mut VmRow, vm: &VmInfo, fallback_start: u64, now: u64) {
     refresh(row, vm, now);
 }
 
-/// Append one audit row with `actor=cli` (and the process's purpose, S8:
-/// `cmd::audit_purpose`, when `pairs` name none); a failed write is a
-/// warning through the voice (the action it records already happened), never
-/// a panic: a terminate after a stop that closed the terminal audits here.
+/// Append one audit row (with the process's purpose, S8: `cmd::audit_purpose`,
+/// when `pairs` name none; S11: its actor is `AuditRow::new`'s); a failed
+/// write is a warning through the voice (the action it records already
+/// happened), never a panic: a terminate after a stop that closed the
+/// terminal audits here.
 pub(crate) fn audit_event(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
-    let mut all: Vec<(&str, String)> = vec![("actor", "cli".to_string())];
-    all.extend(pairs.iter().cloned());
+    let mut all: Vec<(&str, String)> = pairs.to_vec();
     if let Some(purpose) = crate::bridge::vm::cmd::audit_purpose().filter(|_| !pairs.iter().any(|(k, _)| *k == "purpose")) {
         all.push(("purpose", purpose.to_string()));
     }
@@ -914,7 +924,7 @@ pub(crate) async fn reject_echo<A: MicrovmApi>(api: &A, paths: &Paths, id: &str,
     let expected: Vec<String> = expected.map(|e| e.connectors().to_vec()).unwrap_or_default();
     audit_event(
         paths,
-        "vm_egress_mismatch",
+        audit::event::VM_EGRESS_MISMATCH,
         &[
             ("id", id.to_string()),
             ("expected", if expected.is_empty() { "(none planned)".to_string() } else { expected.join(",") }),
@@ -1180,9 +1190,12 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
     if let Err(error) = registry::promote_pending(paths, &row) {
         return Err(fail(error, None, Some(row.id.clone())));
     }
+    // S11 (B §B2.7): what the VM bills by: its echoed wall, its idle policy (the echo's, else the plan's) and
+    // the image version's memory (else `[vm].memory_mib`: billing counts the image's baseline).
+    let (max_idle_s, suspended_s) = row.idle.as_ref().map_or((i64::from(plan.idle.max_idle_s), i64::from(plan.idle.suspended_s)), |i| (i64::from(i.max_idle_s), i64::from(i.suspended_s)));
     audit_event(
         paths,
-        "vm_run",
+        audit::event::VM_RUN,
         &[
             ("id", row.id.clone()),
             ("purpose", plan.purpose.to_string()),
@@ -1190,6 +1203,10 @@ pub async fn select_vm_detailed<A: MicrovmApi>(api: &A, paths: &Paths, plan: &Ru
             ("egress", plan.egress.to_string()),
             ("shell", plan.shell.to_string()),
             ("client_token", row.client_token.clone()),
+            ("max_duration_s", row.max_duration_s.to_string()),
+            ("max_idle_s", max_idle_s.to_string()),
+            ("suspended_s", suspended_s.to_string()),
+            ("memory_mib", version.memory_mib.map_or_else(|| plan.memory_mib.to_string(), |m| m.to_string())),
         ],
     );
     tracing::info!("vm run {} (image version {}, egress {}, purpose {})", row.id, row.image_version, plan.egress, plan.purpose);
@@ -1318,7 +1335,7 @@ async fn place<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, version: &
     // D10/D24: audited as soon as a run with internet egress may exist (an
     // ambiguous RunMicrovm can create the VM without ever answering).
     if plan.egress == Egress::Internet {
-        audit_event(paths, "vm_egress_internet", &[("client_token", row.client_token.clone()), ("purpose", plan.purpose.to_string())]);
+        audit_event(paths, audit::event::VM_EGRESS_INTERNET, &[("client_token", row.client_token.clone()), ("purpose", plan.purpose.to_string())]);
     }
     Ok((row, payload))
 }
@@ -1394,7 +1411,8 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted
 /// connectors than `wanted` (a row without connectors, written before S5,
 /// goes to the gate); with `workspace_cap`, none whose caps lack
 /// `workspace_v1`; with `transcript_cap` (S9), none whose caps lack
-/// `transcript_s3_v1`. S10: none in the plan's `avoid` (a move's old VM,
+/// `transcript_s3_v1`; S11, none whose caps lack one of `caps_required`
+/// (a row whose caps are unknown passes). S10: none in the plan's `avoid` (a move's old VM,
 /// even when `preferred`), and none whose chat a migration moved on
 /// (`leaving_for` set while its retire counts its spawns: synced and
 /// terminated when no other chat's spawn lives there; kept otherwise, and
@@ -1413,6 +1431,7 @@ pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, 
         && ExpectedEcho::for_row(r).is_none_or(|e| &e == wanted)
         && !(plan.workspace_cap && vm_capability(r) == Capability::No)
         && !(plan.transcript_cap && crate::bridge::workspace::vm_capability_of(r, crate::wire::frame::CAP_TRANSCRIPT_S3_V1) == Capability::No)
+        && plan.caps_required.iter().all(|cap| crate::bridge::workspace::vm_capability_of(r, cap) != Capability::No)
 }
 
 /// One reuse candidate, as [`try_reuse`] and a pinned VM ([`select_pinned`])
@@ -1523,7 +1542,7 @@ async fn reuse_row<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, row: V
     let seen = unix_now();
     let row = update_or_write(paths, &row, |r| refresh(r, &vm, seen))?;
     // S4's row as it was: the remote session's `vm_select` row says which choice took it.
-    audit_event(paths, "vm_reuse", &[("id", row.id.clone()), ("purpose", plan.purpose.to_string()), ("resumed", resumed.to_string())]);
+    audit_event(paths, audit::event::VM_REUSE, &[("id", row.id.clone()), ("purpose", plan.purpose.to_string()), ("resumed", resumed.to_string())]);
     tracing::info!("vm reuse {} (resumed {resumed}, {})", row.id, plan.choice.word());
     Ok(Ok(Selected::Reused { row, vm, resumed }))
 }
@@ -1565,6 +1584,10 @@ async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wa
         let cap = crate::wire::frame::CAP_TRANSCRIPT_S3_V1;
         return Err(BridgeError::NoCapability { cap, message: pinned(format!("image version {} predates the transcript store", row.image_version)) }.into());
     }
+    // S11 (L5): the first cap of `caps_required` the row lacks.
+    if let Some(cap) = plan.caps_required.iter().copied().find(|cap| crate::bridge::workspace::vm_capability_of(&row, cap) == Capability::No) {
+        return Err(BridgeError::NoCapability { cap, message: pinned(format!("image version {} predates {cap}", row.image_version)) }.into());
+    }
     match reuse_row(api, paths, plan, row, poll).await? {
         Ok(selected) => Ok(selected),
         Err(why) => Err(why.into()),
@@ -1576,7 +1599,7 @@ async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wa
 /// `TerminateMicrovm(id)` (a `ResourceNotFound` counts as done); then, at
 /// once, the row — when there is one — becomes `terminated` with
 /// `terminated_at`, `terminated_by = by` (`operator`, `gc-expired`,
-/// `gc-orphan`, `smoke`, `test`, `probe`, `timeout`) and `state_seen`
+/// `gc-orphan`, `smoke`, `test`, `probe`, `timeout`; S11 `claude-stage`) and `state_seen`
 /// TERMINATING (under the rows lock; a row already terminated keeps its
 /// first `terminated_at` and `terminated_by`), and `vm_terminate {id, by}`
 /// is audited (on every call); only then, with `wait`, TERMINATED is waited
@@ -1614,7 +1637,7 @@ pub(crate) async fn request_terminate<A: MicrovmApi>(api: &A, paths: &Paths, id:
     }
     let now = unix_now();
     let recorded = registry::update_row(paths, id, |row| mark_terminated(row, by, now));
-    audit_event(paths, "vm_terminate", &[("id", id.to_string()), ("by", by.to_string())]);
+    audit_event(paths, audit::event::VM_TERMINATE, &[("id", id.to_string()), ("by", by.to_string())]);
     tracing::info!("vm terminate {id} (by {by})");
     Ok(recorded.map(|_| ()))
 }
@@ -1796,7 +1819,7 @@ async fn promote_adopted<A: MicrovmApi>(api: &A, paths: &Paths, pending: &VmRow,
             _ => Err(BridgeError::Config(format!("pending row {} is gone (removed by another process): {} not adopted", pending.stem(), vm.id))),
         };
     };
-    audit_event(paths, "vm_adopt", &[("id", row.id.clone()), ("client_token", row.client_token.clone()), ("egress", row.egress.clone()), ("via", via.to_string())]);
+    audit_event(paths, audit::event::VM_ADOPT, &[("id", row.id.clone()), ("client_token", row.client_token.clone()), ("egress", row.egress.clone()), ("via", via.to_string())]);
     Ok(row)
 }
 
@@ -2064,7 +2087,7 @@ mod tests {
             std::fs::create_dir_all(blocked).unwrap();
         }
         crate::bridge::agent::credential::record_rejection(&paths, id, "seal0123456789ab", "text");
-        audit_event(&paths, "vm_test", &[]);
+        audit_event(&paths, audit::event::VM_TERMINATE, &[("id", id.to_string()), ("by", "test".to_string())]);
         let row = VmRow { id: id.into(), ..VmRow::default() };
         update_or_warn(&paths, &row, |r| r.status = RowStatus::Terminated);
         let api = api::FakeMicrovmApi::new();

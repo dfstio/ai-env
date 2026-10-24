@@ -962,3 +962,127 @@ fn the_fake_claudes_assistant_frames_carry_the_transcripts_uuid() {
     let t = |kind: &str, uuid: &str, parent: &str| (kind.to_string(), uuid.to_string(), parent.to_string());
     assert_eq!(typed, [t("user", &u1, ""), t("assistant", &reply1, &u1), t("user", &u2, &reply1), t("assistant", &tool2, &u2), t("user", &result2, &tool2), t("assistant", &reply2, &result2)], "{entries:#?}");
 }
+
+// ---- S11 (C3): the fake claude's compaction and part A's start-up knobs -----------------------
+
+/// (type, uuid, parentUuid) of each entry of the transcript at `path` that
+/// has a uuid, in file order (a null parent as "").
+fn typed_entries(path: &Path) -> Vec<(String, String, String)> {
+    json_lines(&read(path)).iter().filter(|e| e["uuid"].is_string()).map(|e| [&e["type"], &e["uuid"], &e["parentUuid"]].map(|v| v.as_str().unwrap_or_default().to_string()).into()).collect()
+}
+
+/// S11 (C-4, plans/s11-contracts-C.md §C.2.5): FAKE_COMPACT_BEFORE_TURN=2
+/// with FAKE_WRITE_TRANSCRIPT=1: at the start of the process's turn 2, after
+/// its echo and before its user entry, two entries as claude 2.1.302 writes
+/// a compaction: the boundary (a chain root, `logicalParentUuid` the reply
+/// turn 1 wrote; uuid kind 7000) and its summary (`isCompactSummary`,
+/// chained to the boundary; kind 6000), with `--session-mirror` in one
+/// mirror frame of their own (the frames carry the file but its
+/// api-request lines) and nothing else on stdout; the turn's user entry then
+/// chains to the summary, and the env log names it. Before a tool turn
+/// (turn 1, nothing written yet: `logicalParentUuid` null) the user entry
+/// and the tool_use follow the summary as the tool starts. Without
+/// FAKE_WRITE_TRANSCRIPT=1 nothing compacts.
+#[test]
+fn the_fake_claude_compacts_before_its_turn() {
+    let f = Fake::new();
+    let shown = f.at("mac").join(".claude");
+    let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_COMPACT_BEFORE_TURN", "2"), ("FAKE_CONFIG_DIR", shown.to_str().unwrap())];
+    let (u1, u2) = (common::uuid(0x1701), common::uuid(0x1702));
+    let stdin = format!("{INIT}\n{}\n{}\n", Harness::user_line(&u1, "before"), Harness::user_line(&u2, "after the compaction"));
+    let (code, out, err) = f.run(&["--session-mirror"], &knobs, &stdin);
+    assert_eq!(code, Some(0), "{err}");
+    let mirror = "transcript_mirror";
+    assert_eq!(shapes(&out), ["answer:i1", "init", &format!("echo:{u1}"), "reply", mirror, &format!("result:{u1}"), &format!("echo:{u2}"), mirror, "reply", mirror, &format!("result:{u2}")], "{out:#?}");
+    let sid = common::fake_fixed_sid();
+    let file = f.transcript(&sid);
+    let (boundary, summary) = (common::fake_compact_boundary_uuid(2, 1), common::fake_compact_summary_uuid(2, 1));
+    let (a1, a2) = (common::fake_reply_uuid(1, 1), common::fake_reply_uuid(2, 1));
+    let t = |kind: &str, uuid: &str, parent: &str| (kind.to_string(), uuid.to_string(), parent.to_string());
+    assert_eq!(typed_entries(&file), [t("user", &u1, ""), t("assistant", &a1, &u1), t("system", &boundary, ""), t("user", &summary, &boundary), t("user", &u2, &summary), t("assistant", &a2, &u2)]);
+    let lines: Vec<String> = read(&file).lines().map(str::to_string).collect();
+    let at = lines.iter().position(|l| l.contains(&format!(r#""uuid":"{boundary}""#))).expect("the boundary's line");
+    let (b, s): (Value, Value) = (serde_json::from_str(&lines[at]).unwrap(), serde_json::from_str(&lines[at + 1]).unwrap());
+    let init: Value = serde_json::from_str(&out[1]).unwrap();
+    assert_eq!(
+        (b["type"].as_str(), b["subtype"].as_str(), b["content"].as_str(), &b["isMeta"], &b["isSidechain"], &b["parentUuid"], b["logicalParentUuid"].as_str(), &b["compactMetadata"]),
+        (Some("system"), Some("compact_boundary"), Some("Conversation compacted"), &Value::Bool(false), &Value::Bool(false), &Value::Null, Some(a1.as_str()), &serde_json::json!({"trigger": "manual", "preTokens": 1000})),
+        "{b}"
+    );
+    assert_eq!((b["sessionId"].as_str(), &b["cwd"]), (Some(sid.as_str()), &init["cwd"]), "{b}");
+    let said = serde_json::json!({"role": "user", "content": "This session is being continued from a previous conversation."});
+    assert_eq!((&s["isCompactSummary"], &s["isVisibleInTranscriptOnly"], &s["isSidechain"], &s["message"], s["sessionId"].as_str(), &s["cwd"]), (&Value::Bool(true), &Value::Bool(true), &Value::Bool(false), &said, Some(sid.as_str()), &init["cwd"]), "{s}");
+    let frames: Vec<String> = out.iter().filter(|l| l.contains(r#""type":"transcript_mirror""#)).cloned().collect();
+    assert_eq!(mirror_entries(&frames[1..2]), format!("{}\n{}\n", lines[at], lines[at + 1]), "one frame of the two, byte for byte");
+    let named = serde_json::from_str::<Value>(&frames[1]).unwrap()["filePath"].as_str().map(PathBuf::from);
+    assert_eq!(named, Some(shown.join("projects").join(f.slug()).join(format!("{sid}.jsonl"))));
+    assert_eq!(mirror_entries(&out), String::from_utf8(common::mirrored(read(&file).as_bytes())).unwrap(), "the frames carry the file but its api-request lines");
+    assert_eq!(f.logged("compacted"), [format!("gen 1 turn 2 compacted summary={summary}")]);
+
+    // Before a tool turn, nothing written yet.
+    let g = Fake::new();
+    let u = common::uuid(0x1703);
+    let (code, out, err) = g.run(&[], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_COMPACT_BEFORE_TURN", "1"), ("FAKE_TURN_MS", "1")], &format!("{INIT}\n{}\n", Harness::user_line(&u, "a tool")));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(shapes(&out), ["answer:i1", "init", &format!("echo:{u}"), "tool_use:Bash", "tool_result:ok", "reply", &format!("result:{u}")], "nothing of the compaction on stdout");
+    let (boundary, summary) = (common::fake_compact_boundary_uuid(1, 1), common::fake_compact_summary_uuid(1, 1));
+    let (tool, result, reply) = (common::fake_tool_use_uuid(1, 1), common::fake_tool_result_uuid(1, 1), common::fake_reply_uuid(1, 1));
+    let file = g.transcript(&sid);
+    assert_eq!(typed_entries(&file), [t("system", &boundary, ""), t("user", &summary, &boundary), t("user", &u, &summary), t("assistant", &tool, &u), t("user", &result, &tool), t("assistant", &reply, &result)]);
+    assert_eq!(json_lines(&read(&file))[0]["logicalParentUuid"], Value::Null, "nothing written before it");
+    assert_eq!(g.logged("compacted"), [format!("gen 1 turn 1 compacted summary={summary}")]);
+
+    // Without FAKE_WRITE_TRANSCRIPT=1 the knob does nothing.
+    let n = Fake::new();
+    let (code, out, err) = n.run(&["--session-mirror"], &[("FAKE_COMPACT_BEFORE_TURN", "1")], &format!("{INIT}\n{}\n", Harness::user_line(&u, "no transcript")));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(shapes(&out), ["answer:i1", "init", &format!("echo:{u}"), "reply", &format!("result:{u}")]);
+    assert!(n.logged("compacted").is_empty() && !n.transcript(&sid).exists(), "{:?}", n.logged("compacted"));
+}
+
+/// S11 (part A, plans/s11-contracts-A.md §9.1): FAKE_REJECT_OPTION and
+/// FAKE_DIE_BEFORE_INIT end the CLI once its argv is logged and its
+/// generation counted, before its start-up log line and before stdin is
+/// read, exit 1 with nothing on stdout: the first argument in argv order
+/// that is a listed flag (`--x` or `--x=…`) gets the CLI's `error: unknown
+/// option '<flag>'`, the other `fake claude: died before init`, each with its
+/// env-log line; an argv with no listed flag runs as ever. `--version`
+/// prints FAKE_VERSION_PINNED over FAKE_VERSION (default 2.1.305), and
+/// FAKE_KNOBS_FILE is sourced in place of `<this path>.knobs`.
+#[test]
+fn the_fake_claude_rejects_an_option_or_dies_before_init_and_pins_its_version() {
+    let f = Fake::new();
+    let (count, argv) = (f.at("spawn.count").display().to_string(), f.at("argv.log").display().to_string());
+    let rejecting = [("FAKE_SPAWN_COUNT", count.as_str()), ("ARGV_LOG", argv.as_str()), ("FAKE_REJECT_OPTION", "--x-new --resume-session-at")];
+    let (code, out, err) = f.run(&["--verbose", "--resume-session-at=abc", "--x-new"], &rejecting, &format!("{INIT}\n"));
+    assert_eq!((code, out.len()), (Some(1), 0), "{out:?}");
+    assert_eq!(err.lines().collect::<Vec<_>>(), ["error: unknown option '--resume-session-at'"]);
+    assert_eq!(read(&f.at("argv.log")), "--- gen 1\n--verbose\n--resume-session-at=abc\n--x-new\n", "the argv logged first");
+    assert_eq!(f.logged("rejected="), ["gen 1 rejected=--resume-session-at"]);
+    let u = common::uuid(0x1801);
+    let (code, out, err) = f.run(&["--verbose"], &[("FAKE_SPAWN_COUNT", count.as_str()), ("FAKE_REJECT_OPTION", "--x-new")], &format!("{INIT}\n{}\n", Harness::user_line(&u, "runs")));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(shapes(&out), ["answer:i1", "init", &format!("echo:{u}"), "reply", &format!("result:{u}")]);
+    let (code, out, err) = f.run(&[], &[("FAKE_SPAWN_COUNT", count.as_str()), ("FAKE_DIE_BEFORE_INIT", "1")], &format!("{INIT}\n"));
+    assert_eq!((code, out.len()), (Some(1), 0), "{out:?}");
+    assert_eq!(err.lines().collect::<Vec<_>>(), ["fake claude: died before init"]);
+    assert_eq!(f.logged("died_before_init"), ["gen 3 died_before_init"]);
+    assert_eq!(f.logged("CLAUDE_CONFIG_DIR=").len(), 1, "only generation 2 got past its start: {:?}", f.logged("gen "));
+
+    let g = Fake::new();
+    let version = |knobs: &[(&str, &str)]| {
+        let (code, out, err) = g.run(&["--version"], knobs, "");
+        assert_eq!(code, Some(0), "{err}");
+        out.join("\n")
+    };
+    assert_eq!(version(&[]), "2.1.305 (Claude Code)");
+    assert_eq!(version(&[("FAKE_VERSION", "2.1.399")]), "2.1.399 (Claude Code)");
+    assert_eq!(version(&[("FAKE_VERSION", "2.1.399"), ("FAKE_VERSION_PINNED", "2.1.400")]), "2.1.400 (Claude Code)");
+    // claude.knobs pins a version staged.knobs leaves unset: sourcing both
+    // would print the pinned 2.1.401, so 2.1.402 proves "in place of".
+    std::fs::write(g.at("claude.knobs"), "export FAKE_VERSION_PINNED='2.1.401'\n").unwrap();
+    std::fs::write(g.at("staged.knobs"), "export FAKE_VERSION='2.1.402'\n").unwrap();
+    assert_eq!(version(&[]), "2.1.401 (Claude Code)", "<this path>.knobs");
+    let staged = g.at("staged.knobs").display().to_string();
+    assert_eq!(version(&[("FAKE_KNOBS_FILE", staged.as_str())]), "2.1.402 (Claude Code)", "FAKE_KNOBS_FILE in its place, not as well");
+}

@@ -908,7 +908,7 @@ async fn e1<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
     let expiry_ms = i64::try_from(token.expires_at_unix).unwrap_or(i64::MAX / 1000) * 1000;
     let (mut conn, _ok) = open_hello(&dial, &target, token.value()?, vec![], Some(3600), wait).await?;
     let sid = SpawnId::new_v7();
-    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300), credential: None }).await?;
+    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300), credential: None, claude: Vec::new() }).await?;
     let pid1 = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await?;
     let (cut, silent) = e1_hold(&mut conn, expiry_ms, Duration::from_secs(240), Duration::from_secs(20), crate::wire::frame::DEAD_AFTER).await;
     conn.close(CLOSE_NORMAL).await;
@@ -1062,7 +1062,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
         let _ = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await;
         tokio::time::sleep(phase).await;
         drop(conn);
@@ -1102,7 +1102,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
         let until = Instant::now() + phase;
         while Instant::now() < until {
             // Drain VM→Mac frames without acking; a closed socket (suspend) ends the drain.
@@ -1166,7 +1166,7 @@ async fn frames<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, st
     let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
     let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: agent_dial(ctx) };
     let input = frames_input();
-    let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None };
+    let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None, claude: Vec::new() };
     let t = Instant::now();
     let (stdout, stderr, _pid, exit) = exec_agent(&env, spec, input.clone()).await?;
     let secs = t.elapsed().as_secs_f64().max(0.001);
@@ -1196,7 +1196,7 @@ async fn reattach<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, 
     let env = AgentEnv { api, ep, paths: &ctx.paths, target: target.clone(), policy, dial };
 
     // Session 1: a producer with a null stdin, cut client-side after the first chunk.
-    let producer = SpawnSpec { argv: vec!["sh".into(), "-c".into(), REATTACH_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None };
+    let producer = SpawnSpec { argv: vec!["sh".into(), "-c".into(), REATTACH_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None, claude: Vec::new() };
     let (io1, c1) = spawn_channels(16);
     drop(c1.input); // null stdin → EOF
     let mut ev1 = c1.events;
@@ -1287,7 +1287,7 @@ async fn reattach_gap<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDial, targe
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let gsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
+        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
         await_spawned(&mut conn, &gsid, Duration::from_secs(30)).await?;
         // Ack up to a high seq so the shim trims past seq 1, until the output quiets.
         let mut hi = 0u64;
@@ -1325,7 +1325,7 @@ async fn reattach_window_kill<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDia
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let wsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None }).await?;
+        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
         await_spawned(&mut conn, &wsid, Duration::from_secs(30)).await?;
         // Read up to the window WITHOUT acking so it fills and the shim stops reading the child.
         let mut got = 0u64;
@@ -1403,7 +1403,7 @@ async fn clock_after_resume<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
     let proxy_env: BTreeMap<String, String> = egress::proxy_env(&egress::check::proxy_ip(&ctx.cfg, &ctx.paths), egress::PROXY_PORT).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     let env = AgentEnv { api, ep, paths: &ctx.paths, target: target.clone(), policy, dial };
     let curl = "s=$SECONDS; code=000; while [ $((SECONDS-s)) -lt 120 ]; do code=$(command curl -sS -o /dev/null -w '%{http_code}' -m 5 https://api.anthropic.com/v1/models 2>/dev/null); case $code in 401|200) break;; esac; command sleep 2; done; echo \"proxy code=$code after=$((SECONDS-s))s\"";
-    let proxy_note = match exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), curl.into()], cwd: None, env: proxy_env, detach_grace_s: Some(60), id: None }, Vec::new()).await {
+    let proxy_note = match exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), curl.into()], cwd: None, env: proxy_env, detach_grace_s: Some(60), id: None, claude: Vec::new() }, Vec::new()).await {
         Ok((o, _, _, _)) => String::from_utf8_lossy(&o).trim().to_string(),
         Err(e) => format!("first proxied success not measured: {e}"),
     };
@@ -1429,7 +1429,7 @@ async fn clock_after_resume<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
 /// bracket t0..t1): the stdout text and both instants.
 async fn conn_exec(conn: &mut AgentConn, argv: &[&str], budget: Duration) -> Result<(String, SystemTime, SystemTime), BridgeError> {
     let sid = SpawnId::new_v7();
-    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30), credential: None };
+    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30), credential: None, claude: Vec::new() };
     let t0 = SystemTime::now();
     conn.send(&spec).await?;
     let (mut out, mut t1, mut got) = (String::new(), t0, false);
@@ -1860,7 +1860,7 @@ async fn in_vm_firewall<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
     let guard = guard_mode(&before);
     let refused_before = refused_8080(&before);
     let foreign = foreign_listeners(before, &mut notes, &mut gaps);
-    let (rst, _, _, rst_ended) = exec_agent_partial(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_rst_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await;
+    let (rst, _, _, rst_ended) = exec_agent_partial(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_rst_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None, claude: Vec::new() }, Vec::new()).await;
     if let Err(e) = rst_ended {
         notes.push(format!("the RST abort's spawn: {e}"));
     }
@@ -1871,7 +1871,7 @@ async fn in_vm_firewall<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep
         argv.push(addr.clone());
         argv.push(port.to_string());
     }
-    let (stdout, _stderr, _pid, ended) = exec_agent_partial(&env, SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await;
+    let (stdout, _stderr, _pid, ended) = exec_agent_partial(&env, SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None, claude: Vec::new() }, Vec::new()).await;
     match ended {
         Ok(_) => {}
         // A drain ends every spawn (`hook_terminate`): recorded with what the script printed before it, never an abort.
@@ -1932,7 +1932,7 @@ async fn in_vm_firewall_shell<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: 
     let policy = RunPolicy::from_cfg(&ctx.cfg.transport, srow, ctx.knobs.backoff_ms);
     let target = AgentTarget { shell: false, ..starget.clone() };
     let env = AgentEnv { api, ep, paths: &ctx.paths, target, policy, dial: *dial };
-    let (out, _, _, _) = exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_shell_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, Vec::new()).await?;
+    let (out, _, _, _) = exec_agent(&env, SpawnSpec { argv: vec!["bash".into(), "-c".into(), firewall_shell_script()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None, claude: Vec::new() }, Vec::new()).await?;
     Ok(format!("--shell VM: {}; {}", platform_shell_note(&platform, &nonce), shell8022_note(&String::from_utf8_lossy(&out))))
 }
 
@@ -2150,7 +2150,7 @@ async fn held<A: MicrovmApi>(ctx: &Ctx, api: &A, row: &VmRow, vm: &VmInfo, plan:
 
 /// A spawn of `argv` with the proxy variables of a vpc row.
 fn cred_spec(ctx: &Ctx, row: &VmRow, argv: &[&str]) -> SpawnSpec {
-    SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: crate::bridge::agent::exec::spawn_env(ctx, row, &[]), detach_grace_s: Some(60), id: None }
+    SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: crate::bridge::agent::exec::spawn_env(ctx, row, &[]), detach_grace_s: Some(60), id: None, claude: Vec::new() }
 }
 
 /// Whether the first complete stream-json `result` line in `buf` is an
@@ -2739,7 +2739,7 @@ async fn fresh_claude_json<A: MicrovmApi + 'static, E: EndpointClient>(ctx: &Ctx
     let policy = RunPolicy::from_cfg(&ctx.cfg.transport, &row, ctx.knobs.backoff_ms);
     let env = AgentEnv { api: &**api, ep, paths: &ctx.paths, target: target.clone(), policy, dial: agent_dial(ctx) };
     let args = chat.argv.len() - 1;
-    let spec = SpawnSpec { argv: chat.argv.clone(), cwd: Some(ws.vm_cwd.clone()), env: crate::bridge::agent::exec::spawn_env(ctx, &row, &chat.env), detach_grace_s: Some(60), id: None };
+    let spec = SpawnSpec { argv: chat.argv.clone(), cwd: Some(ws.vm_cwd.clone()), env: crate::bridge::agent::exec::spawn_env(ctx, &row, &chat.env), detach_grace_s: Some(60), id: None, claude: Vec::new() };
     // The note names the entrypoint the spawn was given (none when `[wrapper].env_forward` leaves it out).
     let entrypoint = spec.env.get(CURSOR_ENTRYPOINT.0).map_or_else(|| "unset".to_string(), Clone::clone);
     let (init_window, turn_window) = (lab_wait(ctx, FRESH_INIT_WINDOW), lab_wait(ctx, FRESH_TURN_WINDOW));

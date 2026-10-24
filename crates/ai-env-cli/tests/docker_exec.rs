@@ -59,6 +59,13 @@
 //! Mac's next `box seed` finds the VM seeded (`up_to_date`, nothing sent);
 //! and `ai-env vm exec` never parks, on a shim that parks (`park_v1`) and
 //! whatever the parking quiet (`AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`).
+//!
+//! S11 (image 13.0's VM side, wave 2, K): F1's code-out answers its manifest
+//! alone (200, the framed line, no pack) when the Mac asks and nothing is
+//! new, and the Mac's `box fetch` then moves the VM's fetch record to its
+//! branch. The claude-facing tests run the claude under test, mounted over
+//! the image's, when `make claude-admit-docker` names one
+//! (`claude_under_test`): `ai-env claude admit`'s Docker step.
 #[path = "common/curl.rs"]
 mod curl;
 #[path = "common/docker_tunnel.rs"]
@@ -140,6 +147,47 @@ fn local_image() -> String {
 fn lock_version() -> String {
     let lock = std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).unwrap();
     ai_env_cli::wire::pin::parse_lock(&lock).unwrap().version
+}
+
+/// S11 (D2): the claude under test when `AI_ENV_CLAUDE_UNDER_TEST` names a file (`make claude-admit-docker`, which
+/// `ai-env claude admit` runs): its path and version (`AI_ENV_CLAUDE_UNDER_TEST_VERSION`), the file hashed once and
+/// required to equal `AI_ENV_CLAUDE_UNDER_TEST_SHA256` (a panic otherwise); `None` without it.
+fn claude_under_test() -> Option<(PathBuf, String)> {
+    static UNDER_TEST: std::sync::OnceLock<Option<(PathBuf, String)>> = std::sync::OnceLock::new();
+    UNDER_TEST
+        .get_or_init(|| {
+            use sha2::Digest as _;
+            use std::io::Read as _;
+            let path = std::env::var_os("AI_ENV_CLAUDE_UNDER_TEST").filter(|p| !p.is_empty()).map(PathBuf::from)?;
+            assert!(path.is_absolute() && path.is_file(), "AI_ENV_CLAUDE_UNDER_TEST={}: not an absolute path to a file", path.display());
+            let version = std::env::var("AI_ENV_CLAUDE_UNDER_TEST_VERSION").unwrap_or_default();
+            assert!(ai_env_cli::wire::pin::is_version(&version), "AI_ENV_CLAUDE_UNDER_TEST_VERSION={version:?}: not N.N.N");
+            let want = std::env::var("AI_ENV_CLAUDE_UNDER_TEST_SHA256").unwrap_or_default();
+            let mut f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut h = sha2::Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = f.read(&mut buf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            let got = hex::encode(h.finalize());
+            assert_eq!(got, want, "the claude under test ({}) is not AI_ENV_CLAUDE_UNDER_TEST_SHA256's bytes", path.display());
+            Some((path, version))
+        })
+        .clone()
+}
+
+/// The version the L2 tests expect: the claude under test's, else the lock's (`lock_version`).
+fn expected_claude() -> String {
+    claude_under_test().map_or_else(lock_version, |(_, v)| v)
+}
+
+/// `docker run`'s mount of the claude under test over the image's, read-only (none without one).
+fn claude_mount() -> Vec<String> {
+    claude_under_test().map(|(p, _)| vec!["-v".to_string(), format!("{}:/usr/local/bin/claude:ro", p.display())]).unwrap_or_default()
 }
 
 /// The agent guard the image's ENTRYPOINT (image/Dockerfile's exec-form
@@ -913,7 +961,11 @@ fn l2_claude_auth_status_json_is_logged_out_with_no_network() {
     assert!(docker(&["image", "inspect", &image]).status.success(), "{image} is missing: run make image-build-local");
     // Named and removed on drop like every container here (`--rm` removes it at its exit).
     let c = Container { id: container_name() };
-    let out = docker(&["run", "--rm", "--name", &c.id, "--platform", "linux/arm64", "--network", "none", "-u", "1000", "-e", "HOME=/Users/mike", "--entrypoint", "/usr/local/bin/claude", &image, "auth", "status", "--json"]);
+    let mount = claude_mount();
+    let mut args = vec!["run", "--rm", "--name", &c.id, "--platform", "linux/arm64", "--network", "none", "-u", "1000", "-e", "HOME=/Users/mike"];
+    args.extend(mount.iter().map(String::as_str));
+    args.extend(["--entrypoint", "/usr/local/bin/claude", &image, "auth", "status", "--json"]);
+    let out = docker(&args);
     let answer: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}\n{}", text(&out.stdout), text(&out.stderr)));
     let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/claude/auth-status-logged-out.json")).unwrap();
     let keys = |v: &serde_json::Value| {
@@ -1223,6 +1275,9 @@ impl DockerRig {
         let network = Network::internal(&format!("{net}.0/24"), &gateway);
         let mut args = vec!["--ip", PROXY_IP];
         args.extend_from_slice(docker_args);
+        // S11 (D2): the claude under test over the image's, when `make claude-admit-docker` names one.
+        let mount = claude_mount();
+        args.extend(mount.iter().map(String::as_str));
         let rig = DockerRig::build(Some(network), &args, flags);
         let port = PROXY_PORT.to_string();
         let started = docker(&["exec", "-d", "-u", "0", &rig.c.id, "gawk", "-v", &format!("out={DECOY_LOG}"), "-v", &format!("port={port}"), DECOY]);
@@ -2094,7 +2149,7 @@ fn l2_wrapper_remote_session_initializes_the_pinned_claude() {
     // The census end row: the pid rewritten, the VM's own CLI, the seed, one Touch ID.
     let note = rig.end_note();
     let part = |name: &str| note_part(&note, name).unwrap_or_else(|| panic!("{name}: {note}"));
-    let (vm_pid_text, claude) = (vm_pid.to_string(), lock_version());
+    let (vm_pid_text, claude) = (vm_pid.to_string(), expected_claude());
     let words = ["pid_rewrite", "vm_pid", "claude", "vm_how", "seed", "credential"].map(part);
     assert_eq!(words, ["ok", vm_pid_text.as_str(), claude.as_str(), "started", "seeded", "combined"].map(str::to_string), "{note}");
     assert!(part("close_ms").parse::<u64>().is_ok_and(|ms| ms < CLOSE_BUDGET_MS), "{note}");
@@ -2133,16 +2188,28 @@ fn l2_wrapper_remote_session_initializes_the_pinned_claude() {
 /// `Connection: close`: the status and the rest as it came (a chunked body
 /// with its framing).
 fn tunnel_request(addr: SocketAddr, method: &str, path: &str, extra: &str, body: &[u8]) -> (u16, String) {
+    let (status, _, rest) = tunnel_exchange(addr, method, path, extra, body);
+    (status, text(&rest))
+}
+
+/// [`tunnel_request`] with the answer's head kept (its status line and
+/// header lines) and the rest as the bytes that came.
+fn tunnel_exchange(addr: SocketAddr, method: &str, path: &str, extra: &str, body: &[u8]) -> (u16, String, Vec<u8>) {
     let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)).unwrap_or_else(|e| panic!("{method} {path}: connect: {e}"));
     s.set_read_timeout(Some(LIMIT)).expect("a read timeout");
     let head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
     s.write_all(head.as_bytes()).and_then(|()| s.write_all(body)).unwrap_or_else(|e| panic!("{method} {path}: send: {e}"));
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).unwrap_or_else(|e| panic!("{method} {path}: read: {e}"));
-    let raw = text(&buf);
-    let (head, rest) = raw.split_once("\r\n\r\n").unwrap_or_else(|| panic!("{method} {path}: no answer: {raw:?}"));
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or_else(|| panic!("{method} {path}: no answer: {:?}", text(&buf)));
+    let head = text(&buf[..end]);
     let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("{method} {path}: no status: {head:?}"));
-    (status, rest.to_string())
+    (status, head, buf[end + 4..].to_vec())
+}
+
+/// The value of the header `name` (any case) in an answer's head.
+fn header_of<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|l| l.split_once(':').filter(|(n, _)| n.trim().eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
 }
 
 impl DockerRig {
@@ -2321,7 +2388,7 @@ fn l2_push_pull_through_decoy_proxy() {
     let push = TranscriptPush { rel: rel.clone(), from: 0, len: body.len() as u64, sha256: sha.clone(), url: store_url(&S3Key::Base { session: session.into(), gen: 1 }, SIGNED_HEADERS_PUT, None, &push_sig), owner: owner.clone(), proxy: proxy.clone() };
     let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/push", &bearer, serde_json::to_string(&push).unwrap().as_bytes());
     assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the push: {said}");
-    let part = PullPart { url: store_url(&S3Key::Segment { session: session.into(), gen: 1, offset: 0 }, SIGNED_HEADERS_GET, Some("fv1"), &pull_sig), len: 9, sha256: Some("0".repeat(64)) };
+    let part = PullPart { url: store_url(&S3Key::Segment { session: session.into(), gen: 1, offset: 0 }, SIGNED_HEADERS_GET, Some("fv1"), &pull_sig), len: 9, sha256: Some("0".repeat(64)), encoding: None };
     let pull = TranscriptPull { rel, parts: vec![part], sha256: None, owner, proxy, share: 1 };
     let (status, said) = tunnel_request(rig.app.addr, "POST", "/transcript/pull", &bearer, serde_json::to_string(&pull).unwrap().as_bytes());
     assert_eq!((status, serde_json::from_str::<serde_json::Value>(&said).ok().and_then(|v| v["code"].as_str().map(str::to_string)).as_deref()), (500, Some("transfer_failed")), "the pull: {said}");
@@ -2417,4 +2484,79 @@ fn l2_wrapper_parks_on_its_own_and_unparks_on_the_next_line() {
     assert!(parks.is_some_and(|n| n >= 1) && note_part(&note, "unpark_ms").is_some(), "the park and the unpark in the census: {note}");
     assert_eq!(rig.decrypts() - touch, 1, "one Touch ID for the process (D1)");
     eprintln!("L2 park: parked {took:?} after the initialize answer (refusals {}), claude answered {} after the unpark; {note}", rig.audit("session_park_refused").len(), answered["response"]["subtype"]);
+}
+
+// ---- S11 L2 (wave 2, K): F1, a code-out that answers its manifest ------------------------------------
+
+/// S11 F1 (C.1) on the real image: after a seed, the agent makes a branch at
+/// the seeded HEAD (`git checkout -b topic`: no new object, every tip a
+/// have). A `POST /codeout` through the code tunnel without
+/// `manifest_when_empty` is still S10's bare 204; with it the image's shim
+/// answers 200 whose body is exactly the manifest's framed line
+/// (`Content-Length` its length, `application/octet-stream`, no pack byte),
+/// naming `topic` at the seeded HEAD and no snapshot. The Mac's own `box
+/// fetch` (the VM's recorded caps name `codeout_manifest_v1`, so it sets the
+/// flag) gets that answer: a no-pack import promotes `box/topic` (with
+/// `box/main`, both at the seeded HEAD; 0 bytes, `codeout_fetch` `promoted`), and
+/// the VM's fetch record follows its HEAD and branch (`topic`), which S10's
+/// 204 never moved. A second fetch takes the cheap path: nothing new, no
+/// ref moved (`nothing_new`). The Mac's branches, index, worktree and stash
+/// stay untouched, and nothing in the container tried a way out.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_codeout_answers_its_manifest_on_the_image() {
+    use ai_env_cli::bridge::workspace::rows;
+    use ai_env_cli::wire::frame::CAP_CODEOUT_MANIFEST_V1;
+    use ai_env_cli::wire::workspace::{head_line, CodeoutManifest, CodeoutRequest, CODEOUT_ROUTE, CODE_PORT};
+    let rig = DockerRig::new(&[], &[]);
+    // A 13.0 image's VM: its `/health` names the manifest's capability too, recorded when the VM runs.
+    rig.update_fake(|s| s.health_caps.push(CAP_CODEOUT_MANIFEST_V1.to_string()));
+    let (work, vm) = (rig.work(), rig.vm_dir());
+    let id = rig.start_vm();
+    assert_eq!(rig.box_json(&["seed", &vm])["outcome"].as_str(), Some("seeded"));
+    rig.c.agent_git(&vm, &["checkout", "-q", "-b", "topic"]);
+    let bearer = format!("{}Content-Type: application/json\r\n", rig.bearer(&id));
+    let request = |flag: bool| serde_json::to_vec(&CodeoutRequest { path: vm.clone(), haves: vec![rig.head.clone()], wip: true, max_bytes: 1 << 20, manifest_when_empty: flag }).expect("a code-out request");
+    let (status, head, body) = tunnel_exchange(rig.code.addr, "POST", CODEOUT_ROUTE, &bearer, &request(false));
+    assert!(status == 204 && body.is_empty(), "without the flag, S10's bare 204: {status} {head}: {}", text(&body));
+    let (status, head, body) = tunnel_exchange(rig.code.addr, "POST", CODEOUT_ROUTE, &bearer, &request(true));
+    assert_eq!(status, 200, "{head}: {}\n{}", text(&body), rig.c.logs());
+    let length = body.len().to_string();
+    assert_eq!((header_of(&head, "content-length"), header_of(&head, "content-type")), (Some(length.as_str()), Some("application/octet-stream")), "{head}");
+    assert!(body.ends_with(b"\n") && body.iter().filter(|b| **b == b'\n').count() == 1, "the manifest's line alone: {}", text(&body));
+    let manifest: CodeoutManifest = serde_json::from_slice(&body[..body.len() - 1]).unwrap_or_else(|e| panic!("{e}: {}", text(&body)));
+    manifest.check().unwrap_or_else(|e| panic!("the manifest {e}"));
+    assert_eq!(body, head_line(&manifest).expect("the framed line"), "the framed line, byte for byte");
+    assert_eq!((manifest.head.as_str(), manifest.branch.as_deref(), manifest.wip_ref.as_deref()), (rig.head.as_str(), Some("topic"), None), "topic at the seeded HEAD, no snapshot");
+    assert_eq!((manifest.refs.get("refs/heads/topic"), manifest.refs.get("refs/heads/main")), (Some(&rig.head), Some(&rig.head)));
+    // The Mac's own fetch: the flag set, the manifest-only answer taken, the record following topic.
+    let (mac, before) = (mac_view(&work), rig.endpoint.attempts().len());
+    let fetched = rig.box_json(&["fetch", &vm, "--wip"]);
+    let report = &fetched["report"];
+    assert_eq!((report["ok"].as_bool(), report["bytes"].as_u64()), (Some(true), Some(0)), "a no-pack import: {fetched}");
+    let promoted = report["promoted"].as_object().unwrap_or_else(|| panic!("promoted refs: {fetched}"));
+    assert_eq!(promoted.get("refs/remotes/box/topic").and_then(serde_json::Value::as_str), Some(rig.head.as_str()), "{fetched}");
+    let codeouts: Vec<u16> = rig.endpoint.attempts().into_iter().skip(before).filter(|a| a.port == CODE_PORT && a.path.starts_with(CODEOUT_ROUTE)).map(|a| a.status).collect();
+    assert_eq!(codeouts, [200], "one code-out, answered 200 (the flag sent): {codeouts:?}");
+    for r in ["refs/remotes/box/topic", "refs/remotes/box/main"] {
+        assert_eq!(mac_git(&work, &["rev-parse", r]), rig.head, "{r} on the Mac, at the seeded HEAD");
+    }
+    let paths = Paths::from_root_and_env(rig.root.join("bridge"), None);
+    let slug = ai_env_cli::wire::slug::project_dir_name(&work).expect("the workspace's slug");
+    let record = |paths: &Paths| rows::read(paths, &slug).expect("the workspace rows").ws.get(&work.display().to_string()).and_then(|r| r.vm.get(&id)).and_then(|v| v.fetched.clone());
+    let fetched_row = record(&paths).unwrap_or_else(|| panic!("no fetch record for {id}"));
+    assert_eq!((fetched_row.head.as_str(), fetched_row.branch.as_deref(), fetched_row.wip.as_deref()), (rig.head.as_str(), Some("topic"), None), "the record follows the VM's HEAD and branch: {fetched_row:?}");
+    let outcomes: Vec<serde_json::Value> = rig.audit("codeout_fetch").into_iter().map(|r| r["detail"].clone()).collect();
+    assert_eq!(outcomes.last().map(|d| (d["outcome"].clone(), d["bytes"].clone())), Some((serde_json::json!("promoted"), serde_json::json!("0"))), "{outcomes:?}");
+    // Nothing new since: the cheap path, no ref moved, the record kept.
+    let again = rig.box_json(&["fetch", &vm, "--wip"]);
+    assert_eq!((again["report"]["ok"].as_bool(), again["report"]["promoted"].as_object().map(serde_json::Map::len)), (Some(true), Some(0)), "{again}");
+    assert_eq!(rig.audit("codeout_fetch").last().map(|r| r["detail"]["outcome"].clone()), Some(serde_json::json!("nothing_new")));
+    assert_eq!(record(&paths).map(|r| (r.head, r.branch)), Some((rig.head.clone(), Some("topic".to_string()))), "the record kept");
+    assert_eq!(mac_view(&work), mac, "the Mac's branches, index, worktree and stash untouched");
+    let logs = rig.c.logs();
+    let answers: Vec<&str> = logs.lines().filter_map(|l| l.strip_prefix("ai-env: workspace codeout status=")).map(|l| l.split(' ').next().unwrap_or_default()).collect();
+    assert_eq!(answers, ["204", "200", "200", "200"], "the shim's code-out answers: S10's 204, then the line alone each time: {logs}");
+    let counters = rig.assert_no_way_out();
+    eprintln!("L2 F1: the manifest-only 200 ({} bytes) on the image; the record follows topic; container counters {counters:?}", body.len());
 }

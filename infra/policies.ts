@@ -782,8 +782,10 @@ export function deployerPolicy(n: Names): PolicyDocument {
 /**
  * ai-env-ops (S8 operators), held by ai-env-ops and by ai-env-deployer: the daily operator commands and the reads of
  * every status, nothing that deploys or widens egress (O3, O4). Each action is traced to its caller in
- * plans/s8-operators-design.md B5, plus two the ops-tier targets call: lambda:ListMicrovms (`make image-prune`'s dry
- * run) and lambda:GetMicrovmImageVersion (`make claude-update`'s active-version check).
+ * plans/s8-operators-design.md B5, plus one the ops-tier targets call: lambda:ListMicrovms (`make image-prune`'s dry
+ * run). lambda:GetMicrovmImageVersion stays with the image's other reads below: its caller, `make claude-update`'s
+ * active-version check, was retired in S11 (VMs follow Cursor's Claude Code with no deploy), and a read of the stack's
+ * own image changes nothing.
  *   - Reads on "*" (no resource type): the SSM command and agent reads, the ec2 Describe* calls of egress status and
  *     preflight P14 and P15, the DNS Firewall association list, the lambda connector, image and MicroVM lists, the log
  *     group list, the four CloudTrail reads of `ai-env lab run cloudtrail-payload`, the account summary (doctor's root
@@ -798,7 +800,8 @@ export function deployerPolicy(n: Names): PolicyDocument {
  *     image with its versions and builds, the stack's three log groups (never a CloudTrail group: the command
  *     cloudtrail-payload prints for one is the deployer's, deployerPolicy's CloudTrailLogs), two service quotas, the
  *     three users (G7's simulation, doctor's key rows, `creds aws-set --check`), the ai-env-* and the two AWS managed
- *     policies, the Lambda service-linked role (P16), S9's transcripts bucket's settings and policy (never an object).
+ *     policies, the Lambda service-linked role (P16), S9's transcripts bucket's settings and policy (never an object),
+ *     and (S11, L8) the stack's one budget, budgets:ViewBudget on its ARN only (doctor's budget row: describe-budget).
  * No IAM write (its own keys included), no iam:PassRole, no image, connector, Cloud Control, S3, budget or logs write.
  * `make check-policies` simulates both sides (its section 6).
  */
@@ -832,6 +835,8 @@ export function opsPolicy(n: Names): PolicyDocument {
         },
         { Sid: "ReadLogs", Effect: "Allow", Resource: [...logGroupArns(n), ...egressLogGroupArns(n), ...dnsQueryLogGroupArns(n)], Action: ["logs:FilterLogEvents", "logs:StartLiveTail"] },
         { Sid: "ReadQuotas", Effect: "Allow", Resource: [MICROVM_MEMORY_QUOTA, VPC_QUOTA].map((q) => `arn:aws:servicequotas:${n.region}:${acct}:${q}`), Action: ["servicequotas:GetServiceQuota"] },
+        // S11 (L8): doctor's budget row reads the stack's one budget (describe-budget), never another, never a write.
+        { Sid: "ViewBudget", Effect: "Allow", Resource: [`arn:aws:budgets::${acct}:budget/${BUDGET_NAME}`], Action: ["budgets:ViewBudget"] },
         {
             Sid: "StackUsers", Effect: "Allow", Resource: STACK_USERS.map((u) => userArn(n, u)),
             Action: ["iam:SimulatePrincipalPolicy", "iam:ListAccessKeys", "iam:ListAttachedUserPolicies", "iam:ListUserPolicies", "iam:ListGroupsForUser"],

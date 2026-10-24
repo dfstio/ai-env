@@ -1611,3 +1611,108 @@ fn install_mode_refuses_what_it_cannot_write_before_writing_anything() {
     }
     assert!(home.bridge_backups().is_empty());
 }
+
+// ---- S11 (B.4, T11.2): doctor names each broken precondition with its fix ----
+
+/// A stand-in for a tool doctor probes: each call exits 1 (never the real aws or claude).
+const REFUSED_TOOL: &str = "#!/bin/sh\nexit 1\n";
+
+/// T11.2's process test (S11 B.4): the real `ai-env doctor` (a copy, alone in its own bin directory) names each
+/// broken precondition `[NO ]` with its fix and exits 1: the sibling removed; a stale `ai-env-claude` printing
+/// 0.0.9; the wrapper setting at a missing path, then at a non-executable one; a finding planted in a checkout's
+/// `image/` (a temporary `git init` checkout whose `image/` holds `MANIFEST` and a regular `claude/settings.json`,
+/// `image_dir_of`'s two checks, doctor run from it). Every tool doctor's rows probe is a stand-in that exits 1 (aws
+/// and claude among them: no AWS call, never the real claude); the home and the bridge directory are temporary and
+/// the environment is cleared.
+#[cfg(unix)]
+#[test]
+fn doctor_names_each_broken_precondition_with_its_fix() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new();
+    let bin = home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let executable = |p: &Path, body: &str| {
+        std::fs::write(p, body).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // macOS assesses a new executable at its first exec, which on a busy Mac can outlast doctor's 5 s probes.
+        let _ = bounded::run_within(Command::new(p), None, LIMIT, "a stand-in's first run");
+    };
+    for tool in ["aws", "claude", "rustup", "cargo-lambda", "zig"] {
+        executable(&bin.join(tool), REFUSED_TOOL);
+    }
+    let copy = bin.join("ai-env");
+    std::fs::copy(ai_env(), &copy).unwrap();
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let doctor = |cwd: &Path| -> (Option<i32>, Vec<String>) {
+        let mut cmd = Command::new(&copy);
+        cmd.arg("doctor").current_dir(cwd).env_clear().env("HOME", home.path()).env("AI_ENV_BRIDGE_DIR", home.bridge_dir()).env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("TMPDIR", std::env::temp_dir());
+        let out = bounded::run_within(cmd, None, LIMIT, "ai-env doctor");
+        let stdout = text(&out.stdout);
+        (out.status.code(), stdout.lines().map(|l| l.trim_start().to_string()).collect())
+    };
+    let has = |rows: &[String], row: &str| assert!(rows.iter().any(|l| l == row), "no row {row:?} in:\n{}", rows.join("\n"));
+    let mine = env!("CARGO_PKG_VERSION");
+    let setting = WRAPPER_SETTING;
+    let gone = home.path().join("gone").join("ai-env-claude");
+    home.write_settings(&serde_json::json!({ WRAPPER_SETTING: gone.to_str().unwrap(), PERMISSION_SETTING: "default" }).to_string());
+
+    // The sibling removed: both rows name the install first (provable only without an ai-env-claude in a Homebrew bin dir).
+    if homebrew_sibling_present() {
+        eprintln!("doctor_names_each_broken_precondition_with_its_fix: the missing sibling skipped (an ai-env-claude is installed under a Homebrew bin dir)");
+    } else {
+        let (code, rows) = doctor(home.path());
+        assert_eq!(code, Some(1), "{}", rows.join("\n"));
+        has(&rows, "[NO ] ai-env-claude missing  <- install with: cargo install --path crates/ai-env-cli --locked");
+        has(&rows, &format!("[NO ] {setting} = {} does not exist  <- cargo install --path crates/ai-env-cli --locked, then ai-env wrapper install --write", gone.display()));
+        has(&rows, "[-  ] image/ not scanned: not in an ai-env checkout");
+    }
+
+    // A stale ai-env-claude next to ai-env: the skew; the wrapper path missing names the setting's fix alone.
+    executable(&bin.join("ai-env-claude"), "#!/bin/sh\necho 'ai-env-claude 0.0.9'\n");
+    let (code, rows) = doctor(home.path());
+    assert_eq!(code, Some(1), "{}", rows.join("\n"));
+    has(&rows, &format!("[NO ] version skew: ai-env {mine}, ai-env-claude 0.0.9  <- install with: cargo install --path crates/ai-env-cli --locked"));
+    has(&rows, &format!("[NO ] {setting} = {} does not exist  <- ai-env wrapper install --write", gone.display()));
+
+    // The setting at a file that is not executable.
+    let plain = home.path().join("plain").join("ai-env-claude");
+    std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+    std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+    home.write_settings(&serde_json::json!({ WRAPPER_SETTING: plain.to_str().unwrap(), PERMISSION_SETTING: "default" }).to_string());
+    let (code, rows) = doctor(home.path());
+    assert_eq!(code, Some(1), "{}", rows.join("\n"));
+    has(&rows, &format!("[NO ] {setting} = {} is not executable  <- ai-env wrapper install --write", plain.display()));
+
+    // A checkout: image/ with its MANIFEST and a regular claude/settings.json scans clean, then a planted symlink is a finding.
+    let checkout = home.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("image").join("claude")).unwrap();
+    let init = bounded::run_within(
+        {
+            let mut git = Command::new("git");
+            git.args(["init", "-q"]).current_dir(&checkout);
+            git
+        },
+        None,
+        LIMIT,
+        "git init",
+    );
+    assert!(init.status.success(), "{}", text(&init.stderr));
+    std::fs::write(checkout.join("image").join("MANIFEST"), "file claude/settings.json 0644\n").unwrap();
+    std::fs::write(checkout.join("image").join("claude").join("settings.json"), BASE_SETTINGS).unwrap();
+    let (_, rows) = doctor(&checkout);
+    has(&rows, "[ok ] image/ scan: clean (2 files)");
+    std::os::unix::fs::symlink("MANIFEST", checkout.join("image").join("planted")).unwrap();
+    let (code, rows) = doctor(&checkout.join("image"));
+    assert_eq!(code, Some(1), "{}", rows.join("\n"));
+    has(&rows, "[NO ] image/ has 1 finding(s): symlink  <- fix them, then make image-zip and make deploy");
+    // image_dir_of's second check: a claude/settings.json that is no regular file is a failed scan, not a clean one.
+    std::fs::remove_file(checkout.join("image").join("claude").join("settings.json")).unwrap();
+    std::os::unix::fs::symlink("../MANIFEST", checkout.join("image").join("claude").join("settings.json")).unwrap();
+    let (_, rows) = doctor(&checkout);
+    assert!(rows.iter().any(|l| l.starts_with("[!! ] image/ scan failed: ") && l.ends_with("/claude/settings.json is not a regular file")), "{}", rows.join("\n"));
+    // Without the MANIFEST it is no ai-env checkout.
+    std::fs::remove_file(checkout.join("image").join("MANIFEST")).unwrap();
+    let (_, rows) = doctor(&checkout);
+    has(&rows, "[-  ] image/ not scanned: not in an ai-env checkout");
+}

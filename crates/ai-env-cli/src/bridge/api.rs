@@ -563,10 +563,10 @@ fn default_retry_after_429() -> Option<u64> {
 /// The image the fakes serve unless told otherwise.
 pub const FAKE_IMAGE_ARN: &str = "arn:aws:lambda:eu-central-1:123456789012:microvm-image:ai-env-agent";
 
-/// The `stateReason` the fake gives a VM its wall ended (S10,
-/// [`FakeState::enforce_wall`]). A placeholder: part B records the
-/// platform's own, and no code may parse it.
-pub const FAKE_WALL_REASON: &str = "fake: maxDurationInSeconds reached";
+/// The `stateReason` the platform gives a VM its wall ended, as S10 part B
+/// recorded it (B3 (b), 22 Oct 2026), which the fake gives too
+/// ([`FakeState::enforce_wall`]). No code parses it.
+pub const FAKE_WALL_REASON: &str = "MicroVM exceeded maximum lifetime.";
 
 /// Whether `vm`'s wall has passed at `now` (unix seconds): its start plus its
 /// maximum duration at or before it, suspended time counted (S10). A VM with
@@ -1021,6 +1021,7 @@ impl FakeState {
             listeners: Vec::new(),
             listeners_omitted: 0,
             workspace: None,
+            claude_cache: None,
         };
         Ok(HealthDetailReply { status: 200, proxy_error: None, retry_after_s: None, detail: Some(detail), body: String::new() })
     }
@@ -1069,6 +1070,12 @@ mod r_tests {
         s.advance_all();
         s.age(&id, aged);
         id
+    }
+
+    /// S11 (C.5.5): the fake's wall reason is the platform's own, as S10 part B recorded it (B3 (b)).
+    #[test]
+    fn the_fake_wall_reason_is_the_platforms() {
+        assert_eq!(FAKE_WALL_REASON, "MicroVM exceeded maximum lifetime.");
     }
 
     /// Off by default, a VM past its wall runs on whoever looks; asked for,

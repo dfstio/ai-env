@@ -645,8 +645,8 @@ pub fn stamped(paths: &crate::bridge::config::Paths, spec: &ProbeSpec, verdict: 
 /// expectation.
 pub fn record(paths: &crate::bridge::config::Paths, row: &ProbeRow) -> Result<()> {
     let holds = append_row(&paths.probes(), row)?;
-    let detail = crate::bridge::audit::detail(&[("actor", "cli".into()), ("probe", row.probe.clone()), ("verdict", row.verdict.clone()), ("expected", row.expected.clone())]);
-    if let Err(e) = crate::bridge::audit::append(&paths.audit(), &crate::bridge::audit::AuditRow::new("lab_probe", None, detail)) {
+    let detail = crate::bridge::audit::detail(&[("probe", row.probe.clone()), ("verdict", row.verdict.clone()), ("expected", row.expected.clone())]);
+    if let Err(e) = crate::bridge::audit::append(&paths.audit(), &crate::bridge::audit::AuditRow::new(crate::bridge::audit::event::LAB_PROBE, None, detail)) {
         eprintln!("ai-env: warning: audit row lab_probe not written: {e}");
     }
     outln!("recorded {}={} (expected {})", row.probe, row.verdict, row.expected);

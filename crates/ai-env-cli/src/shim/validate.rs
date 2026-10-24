@@ -22,7 +22,11 @@
 //!   identity key (`userID`, `machineID`, …) and no project entry in either
 //!   `.claude.json` (D5 bakes none), and nothing under `<home>/.claude`
 //!   beyond the baked subset: the whole tree is walked without following
-//!   links, every baked entry has its kind, and no symlink exists.
+//!   links, every baked entry has its kind, and no symlink exists. S11:
+//!   the claude cache `/opt/ai-env/claude` is a directory, empty, mode 0755
+//!   (and `0:0` when the shim is root), and its index
+//!   `/var/lib/ai-env/claude-index.json` is absent (`shim::claudebin`: the
+//!   image bakes no claude into the cache).
 //! - V5 facts: logged only (boot report).
 //! - V6 guard (S6, critic M2): the peer guard tested on this very VM, so a
 //!   guard that would refuse the platform or admit the agent never becomes
@@ -274,7 +278,46 @@ fn v4(state: &ShimState) -> Check {
         }
     }
     problems.extend(baked_subset_problems(&claude_dir));
-    check("V4", problems, "no build-time state, no identity keys, no project entries, only the baked subset".into())
+    problems.extend(claude_cache_problems(state));
+    check("V4", problems, "no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache".into())
+}
+
+/// S11 (V4): the claude cache as the image leaves it: `CACHE_DIR` a real
+/// directory, empty, mode 0755 (owned `0:0` when the shim is root), and no
+/// index. Every problem named, never a value.
+fn claude_cache_problems(state: &ShimState) -> Vec<String> {
+    use crate::shim::claudebin::{CACHE_DIR, INDEX_PATH};
+    let mut problems = Vec::new();
+    let dir = state.at(Path::new(CACHE_DIR));
+    match std::fs::symlink_metadata(&dir) {
+        Err(_) => problems.push(format!("{CACHE_DIR} is missing (the image makes it root 0755 and empty)")),
+        Ok(md) if !md.is_dir() => problems.push(format!("{CACHE_DIR} is not a directory")),
+        Ok(md) => {
+            let mode = md.mode() & 0o7777;
+            if mode != 0o755 {
+                problems.push(format!("{CACHE_DIR} is mode {mode:04o}, not 0755"));
+            }
+            if nix::unistd::geteuid().is_root() && (md.uid(), md.gid()) != (0, 0) {
+                problems.push(format!("{CACHE_DIR} is owned by {}:{}, not 0:0", md.uid(), md.gid()));
+            }
+            match std::fs::read_dir(&dir) {
+                Ok(rd) => {
+                    let mut names: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().chars().take(80).collect()).collect();
+                    if !names.is_empty() {
+                        names.sort();
+                        let more = names.len().saturating_sub(5);
+                        names.truncate(5);
+                        problems.push(format!("{CACHE_DIR} is not empty: {}{}", names.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() }));
+                    }
+                }
+                Err(e) => problems.push(format!("{CACHE_DIR} cannot be listed: {e}")),
+            }
+        }
+    }
+    if std::fs::symlink_metadata(state.at(Path::new(INDEX_PATH))).is_ok() {
+        problems.push(format!("{INDEX_PATH} exists (a claude cache index baked into the image)"));
+    }
+    problems
 }
 
 /// The agent's self-test client (the image installs curl; V6 fails without it).

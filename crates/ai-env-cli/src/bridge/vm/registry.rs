@@ -153,13 +153,21 @@ pub struct VmRow {
     /// `creds status` and `creds forget` list it.
     pub credential_at: Option<u64>,
     pub credential_tag: Option<String>,
+    /// A1 joint review (J2): every seal ever sent to this VM, in the order
+    /// first sent, each once (`credential_tag`, the latest, among them). Two
+    /// chats on one VM may run as two Claude accounts, and a running claude
+    /// keeps its copy after the shim's slot takes another seal, so `creds
+    /// status` and `creds account forget` name each of them until the VM is
+    /// terminated ([`VmRow::held_tags`]). A row written before it has none.
+    pub credential_tags: Vec<String>,
     /// Port → expiry (Unix seconds) of the tokens minted for this VM.
     pub token_expiries: BTreeMap<String, u64>,
     /// S6.
     pub spawns: Vec<toml::Value>,
     pub terminated_at: Option<u64>,
     /// `operator` | `gc-expired` | `gc-orphan` | `smoke` | `test` | `probe` | `timeout` | `platform` | `policy` (the S5 egress gate);
-    /// S10: `readdress` (a lost VM a move left) | `migrate` (the VM a migration moved its chat off).
+    /// S10: `readdress` (a lost VM a move left) | `migrate` (the VM a migration moved its chat off);
+    /// S11: `claude-stage` (`ai-env claude stage`'s stager VM, at its end).
     pub terminated_by: Option<String>,
     /// S10 §B: the VM a migration moved this VM's chat to (written after the
     /// new generation's `Started`): `reuse_candidate` takes no such row.
@@ -168,6 +176,10 @@ pub struct VmRow {
     pub leaving_since: Option<u64>,
     /// S10: the guest's `MemTotal` its `/health` named, in MiB.
     pub mem_total_mib: Option<u32>,
+    /// S11: the sha256s of cached claudes that died before their init on this
+    /// VM (a `ClaudeRetry`): P4 never names them on this VM again; the row
+    /// goes with the VM.
+    pub claude_bad: Vec<String>,
 }
 
 impl std::fmt::Debug for VmRow {
@@ -187,6 +199,18 @@ impl VmRow {
     #[must_use]
     pub fn is_pending_row(&self) -> bool {
         self.id.is_empty()
+    }
+
+    /// A1 joint review (J2): every seal this VM may hold, oldest first:
+    /// `credential_tags`, with `credential_tag` last when the list lacks it
+    /// (a row written before the list).
+    #[must_use]
+    pub fn held_tags(&self) -> Vec<String> {
+        let mut tags = self.credential_tags.clone();
+        if let Some(t) = self.credential_tag.as_ref().filter(|t| !tags.contains(t)) {
+            tags.push(t.clone());
+        }
+        tags
     }
 
     /// Seconds of wall time left (negative once passed); `None` before the

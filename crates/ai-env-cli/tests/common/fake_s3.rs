@@ -42,6 +42,14 @@
 //! ([`S3Action::Throttle`]: an uplink the parts in flight share); a scripted
 //! status may be a 409 (`OperationAborted`, `ConditionalRequestConflict`)
 //! or a 400 (`RequestTimeout`).
+//! S11 (L5, the compressed stage): a PutObject's `content-encoding` header
+//! is stored with its version, a CreateMultipartUpload's with its upload and
+//! given to the version its Complete makes, and a GET of that version
+//! answers `Content-Encoding: <stored>` (its bytes as stored, never decoded);
+//! [`S3Action::NoContentEncoding`] makes the next GET answer without it.
+//! S11 (C4): every PUT (a PutObject or an UploadPart) is counted in flight
+//! from its head until its answer goes ([`FakeS3::max_in_flight`],
+//! [`FakeS3::flights`]).
 //! Every request is recorded ([`S3Request`]): never a signature's or a
 //! credential's value.
 #![allow(dead_code)]
@@ -74,6 +82,9 @@ pub struct S3Object {
     pub delete_marker: bool,
     /// The key's newest version.
     pub current: bool,
+    /// S11: the `content-encoding` it was stored with (a PutObject's, or its
+    /// CreateMultipartUpload's), which a GET answers.
+    pub content_encoding: Option<String>,
 }
 
 /// One request as it came: never the X-Amz-Signature or X-Amz-Credential values.
@@ -120,6 +131,10 @@ pub enum S3Action {
     /// S10 (F5): read the body at this many bytes a second, then answer as
     /// usual (one of the parts that share an uplink).
     Throttle { per_s: u64 },
+    /// S11: the next GET (a request of another method leaves it queued)
+    /// answers as usual but without its `Content-Encoding` (a proxy that
+    /// dropped it).
+    NoContentEncoding,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +143,8 @@ struct Version {
     bytes: Vec<u8>,
     sha256: String,
     delete_marker: bool,
+    /// S11: the `content-encoding` it was stored with.
+    content_encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,6 +152,8 @@ struct Upload {
     key: String,
     /// Part number → its bytes and its quoted ETag.
     parts: BTreeMap<u32, (Vec<u8>, String)>,
+    /// S11: the CreateMultipartUpload's `content-encoding`, the completed version's.
+    content_encoding: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +171,11 @@ struct State {
     put_script: VecDeque<S3Action>,
     /// What the next CompleteMultipartUploads do (taken before `script`).
     complete_script: VecDeque<S3Action>,
+    /// S11 (C4): the PUTs in flight now, the most at once so far, and each
+    /// one's start (`true`, its head read) and end (`false`), by key, in order.
+    in_flight: usize,
+    max_in_flight: usize,
+    flights: Vec<(bool, String)>,
 }
 
 impl State {
@@ -160,15 +184,43 @@ impl State {
     }
 
     fn add(&mut self, key: &str, bytes: Vec<u8>, delete_marker: bool) -> String {
+        self.add_encoded(key, bytes, delete_marker, None)
+    }
+
+    fn add_encoded(&mut self, key: &str, bytes: Vec<u8>, delete_marker: bool, content_encoding: Option<String>) -> String {
         self.versions += 1;
         let id = format!("fv{}", self.versions);
         let sha256 = if delete_marker { String::new() } else { hex::encode(Sha256::digest(&bytes)) };
-        self.objects.entry(key.to_string()).or_default().push(Version { id: id.clone(), bytes, sha256, delete_marker });
+        self.objects.entry(key.to_string()).or_default().push(Version { id: id.clone(), bytes, sha256, delete_marker, content_encoding });
         id
     }
 }
 
 type Shared = Arc<Mutex<State>>;
+
+/// S11 (C4): one PUT in flight, from its head until its answer goes (dropped).
+struct InFlight {
+    shared: Shared,
+    key: String,
+}
+
+impl InFlight {
+    fn start(shared: &Shared, key: &str) -> InFlight {
+        let mut st = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.in_flight += 1;
+        st.max_in_flight = st.max_in_flight.max(st.in_flight);
+        st.flights.push((true, key.to_string()));
+        InFlight { shared: shared.clone(), key: key.to_string() }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut st = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.in_flight = st.in_flight.saturating_sub(1);
+        st.flights.push((false, std::mem::take(&mut self.key)));
+    }
+}
 
 /// The fake S3 (the module doc). Dropped, it stops its thread.
 pub struct FakeS3 {
@@ -247,7 +299,15 @@ impl FakeS3 {
         let mut out = Vec::new();
         for (key, versions) in &st.objects {
             for (i, v) in versions.iter().enumerate() {
-                out.push(S3Object { key: key.clone(), version_id: v.id.clone(), len: v.bytes.len() as u64, sha256: v.sha256.clone(), delete_marker: v.delete_marker, current: i + 1 == versions.len() });
+                out.push(S3Object {
+                    key: key.clone(),
+                    version_id: v.id.clone(),
+                    len: v.bytes.len() as u64,
+                    sha256: v.sha256.clone(),
+                    delete_marker: v.delete_marker,
+                    current: i + 1 == versions.len(),
+                    content_encoding: v.content_encoding.clone(),
+                });
             }
         }
         out
@@ -264,10 +324,30 @@ impl FakeS3 {
         self.state().add(key, bytes.to_vec(), false)
     }
 
+    /// S11: plant an object stored with `content_encoding` (its bytes as
+    /// given, never encoded here): its version id.
+    pub fn put_encoded(&self, key: &str, bytes: &[u8], content_encoding: &str) -> String {
+        self.state().add_encoded(key, bytes.to_vec(), false, Some(content_encoding.to_string()))
+    }
+
     /// Every request so far, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<S3Request> {
         self.state().requests.clone()
+    }
+
+    /// S11 (C4): the most PUTs (PutObjects and UploadParts) in flight at once so far.
+    #[must_use]
+    pub fn max_in_flight(&self) -> usize {
+        self.state().max_in_flight
+    }
+
+    /// S11 (C4): every PUT's start (`true`, once its head came) and end
+    /// (`false`, just before its answer goes, or once its connection ended
+    /// unanswered), by key, in order.
+    #[must_use]
+    pub fn flights(&self) -> Vec<(bool, String)> {
+        self.state().flights.clone()
     }
 
     /// Queue `actions` for the next requests, in order.
@@ -523,14 +603,18 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
             None if is_complete => st.complete_script.pop_front(),
             None => None,
         };
-        own.or_else(|| st.script.pop_front())
+        // S11: NoContentEncoding waits in the queue for the next GET.
+        own.or_else(|| if req.method != "GET" && st.script.front() == Some(&S3Action::NoContentEncoding) { None } else { st.script.pop_front() })
     };
-    if let Some(S3Action::Delay(d)) = &action {
-        tokio::time::sleep(*d).await;
-    }
     let params = req.params();
     let in_bucket = req.raw_path.strip_prefix('/').unwrap_or_default();
     let (bucket, key) = in_bucket.split_once('/').map_or((in_bucket.to_string(), String::new()), |(b, k)| (decode(b), decode(k)));
+    // S11 (C4): a PUT is in flight from here (its scripted delay included) until its answer goes (or its
+    // connection ends unanswered): ended before the answer is written, so the client never sees one more in flight.
+    let flight = (req.method == "PUT" && !key.is_empty()).then(|| InFlight::start(&shared, &key));
+    if let Some(S3Action::Delay(d)) = &action {
+        tokio::time::sleep(*d).await;
+    }
     let chunked = req.header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
     let content_length = req.header("content-length").and_then(|v| v.parse::<u64>().ok());
     let mut record = S3Request {
@@ -582,11 +666,14 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
             return;
         }
     }
-    let answer = match (answer, &action) {
+    let mut answer = match (answer, &action) {
         (Some(a), _) => a,
         (None, Some(S3Action::Status { status, code })) => Answer::error(*status, code),
         (None, _) => respond(&req, &bucket, &key, &params, &shared),
     };
+    if action == Some(S3Action::NoContentEncoding) {
+        answer.headers.retain(|(k, _)| k != "content-encoding");
+    }
     if action == Some(S3Action::Drop) {
         // Done (its effect stands), the answer lost: the connection closes with none.
         record.code = answer.code.clone();
@@ -601,6 +688,7 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
     record.status = if cut.is_some() { 0 } else { answer.status };
     record.code = answer.code.clone();
     shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
+    drop(flight);
     let mut out = head_of(&answer, answer.body.len());
     out.extend_from_slice(&answer.body[..cut.unwrap_or(answer.body.len())]);
     let _ = stream.write_all(&out).await;
@@ -627,7 +715,8 @@ fn respond(req: &Req, bucket: &str, key: &str, params: &[(String, String)], shar
         ("POST", false) if has("uploads") => {
             st.upload_ids += 1;
             let id = format!("fu{}", st.upload_ids);
-            st.uploads.insert(id.clone(), Upload { key: key.to_string(), parts: BTreeMap::new() });
+            let content_encoding = req.header("content-encoding").map(str::to_string);
+            st.uploads.insert(id.clone(), Upload { key: key.to_string(), parts: BTreeMap::new(), content_encoding });
             Answer::ok(200, xml(), format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult><Bucket>{LAB_BUCKET}</Bucket><Key>{}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>", escape(key)).into_bytes())
         }
         ("POST", false) if has("uploadId") => complete_upload(&mut st, req, key),
@@ -707,7 +796,7 @@ fn put_object(st: &mut State, req: &Req, key: &str) -> Answer {
     if req.header("if-none-match") == Some("*") && st.current(key).is_some() {
         return Answer::error(412, "PreconditionFailed");
     }
-    let id = st.add(key, req.body.clone(), false);
+    let id = st.add_encoded(key, req.body.clone(), false, req.header("content-encoding").map(str::to_string));
     Answer::ok(200, vec![("x-amz-version-id".into(), id), ("etag".into(), etag(&sha)), ("x-amz-checksum-sha256".into(), b64_of_hex(&sha))], Vec::new())
 }
 
@@ -726,6 +815,9 @@ fn get_object(st: &State, req: &Req, key: &str) -> Answer {
     let mut headers = vec![("x-amz-version-id".into(), version.id.clone()), ("etag".into(), etag(&version.sha256))];
     if req.header("x-amz-checksum-mode").is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
         headers.push(("x-amz-checksum-sha256".into(), b64_of_hex(&version.sha256)));
+    }
+    if let Some(encoding) = &version.content_encoding {
+        headers.push(("content-encoding".into(), encoding.clone()));
     }
     Answer::ok(200, headers, version.bytes.clone())
 }
@@ -781,7 +873,7 @@ fn complete_upload(st: &mut State, req: &Req, key: &str) -> Answer {
     }
     st.uploads.remove(&id);
     let sha = hex::encode(Sha256::digest(&bytes));
-    let version = st.add(key, bytes, false);
+    let version = st.add_encoded(key, bytes, false, upload.content_encoding.clone());
     let tag = format!("\"{}-{}\"", &sha[..32], wanted.len());
     let body = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult><Bucket>{LAB_BUCKET}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>", escape(key), escape(&tag));
     Answer::ok(200, vec![("content-type".into(), "application/xml".into()), ("x-amz-version-id".into(), version)], body.into_bytes())

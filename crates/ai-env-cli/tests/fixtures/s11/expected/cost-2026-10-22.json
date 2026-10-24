@@ -1,0 +1,115 @@
+{
+  "v": 1,
+  "since": "2026-10-22T00:00:00Z",
+  "until": "2026-10-23T00:00:00Z",
+  "rates": "EUC1 2026-10-23",
+  "vms": [
+    {
+      "id": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "running_s": 4870,
+      "suspended_s": 3600,
+      "starts": 1,
+      "resumes": 2,
+      "suspends": 2,
+      "inferred_suspends": 2,
+      "usd": 0.247621,
+      "low_usd": 0.221108,
+      "high_usd": 0.274134,
+      "note": "2 idle suspends inferred; 1 auto-resume inferred; terminated (migrate)"
+    },
+    {
+      "id": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "running_s": 2370,
+      "suspended_s": 3600,
+      "starts": 1,
+      "resumes": 0,
+      "suspends": 1,
+      "inferred_suspends": 0,
+      "usd": 0.119088,
+      "low_usd": 0.119088,
+      "high_usd": 0.119088,
+      "note": "ended suspended (suspended_s)"
+    }
+  ],
+  "lines": [
+    {
+      "usage_type": "EUC1-Lambda-MicroVM-vCPU-Second-ARM",
+      "service": "AWS Lambda",
+      "quantity": 7240.0,
+      "unit": "vCPU-s",
+      "usd": 0.253371
+    },
+    {
+      "usage_type": "EUC1-Lambda-MicroVM-Memory-GB-Second-ARM",
+      "service": "AWS Lambda",
+      "quantity": 14480.0,
+      "unit": "GB-s",
+      "usd": 0.067086
+    },
+    {
+      "usage_type": "EUC1-Lambda-MicroVM-Snapshot-Write-GB",
+      "service": "AWS Lambda",
+      "quantity": 6.0,
+      "unit": "GB",
+      "usd": 0.029899
+    },
+    {
+      "usage_type": "EUC1-Lambda-MicroVM-Snapshot-Read-GB",
+      "service": "AWS Lambda",
+      "quantity": 8.0,
+      "unit": "GB",
+      "usd": 0.015824
+    },
+    {
+      "usage_type": "EUC1-Lambda-MicroVM-Snapshot-Storage-GB-Hour",
+      "service": "AWS Lambda",
+      "quantity": 162.823556,
+      "unit": "GB-h",
+      "usd": 0.021529
+    },
+    {
+      "usage_type": "EUC1-BoxUsage:t4g.nano",
+      "service": "EC2",
+      "quantity": 12.0,
+      "unit": "h",
+      "usd": 0.0576
+    },
+    {
+      "usage_type": "EUC1-PublicIPv4:InUseAddress",
+      "service": "EC2",
+      "quantity": 12.0,
+      "unit": "h",
+      "usd": 0.06
+    },
+    {
+      "usage_type": "EUC1-EBS:VolumeUsage.gp3",
+      "service": "EC2",
+      "quantity": 0.263014,
+      "unit": "GB-month",
+      "usd": 0.025039
+    }
+  ],
+  "usd": 0.530348,
+  "low_usd": 0.503835,
+  "high_usd": 0.556861,
+  "microvm_usd": 0.387709,
+  "proxy_usd": 0.142639,
+  "proxy_assumed": false,
+  "not_counted": [],
+  "anomalies": 0,
+  "not_estimated": [
+    "S3",
+    "CloudWatch",
+    "data transfer"
+  ],
+  "caveats": [
+    "idle suspends are inferred: a running stretch with no closing row ends max_idle_s after its last activity (the range puts it at that activity and at the next evidence)",
+    "GB per snapshot operation assumed 2 (a suspend's write, a resume's read; a start's image read unmeasured): T11.1 calibrates them",
+    "bursts above the baseline (1 vCPU and the image's memory) are billed while used and invisible here",
+    "the images' snapshot storage is taken as a constant ($0.021 a day)",
+    "VMs outside this registry (other owners, a deleted audit) are not counted",
+    "image builds during make deploy are not counted",
+    "Cost Explorer's days are UTC, lag 24 to 48 h and round",
+    "a sleeping Mac writes no rows (the idle rule covers it)"
+  ]
+}

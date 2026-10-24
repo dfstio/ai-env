@@ -439,23 +439,13 @@ fn import_with(i: &Import<'_>, mode: ScanMode) -> Result<Imported, BridgeError> 
         out.tips = existing;
         return Ok(out);
     }
-    // The pack into the scratch repository, its thin bases from the user's store.
-    let mut child = scratch.git().spawn_piped(["index-pack", "--stdin", "--fix-thin"]).map_err(git_failed("git index-pack of the code-out"))?;
-    let feeder = child.take_stdin().map(|mut stdin| {
-        let pack = i.pack.to_path_buf();
-        std::thread::spawn(move || -> std::io::Result<()> {
-            let mut f = std::fs::File::open(pack)?;
-            std::io::copy(&mut f, &mut stdin)?;
-            Ok(())
-        })
-    });
-    if let Some(mut stdout) = child.take_stdout() {
-        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-    }
-    let fed = feeder.map(|f| f.join());
-    child.finish().map_err(|e| BridgeError::WorkspaceFailed { code: refusal::BAD_PACK, message: format!("the code-out pack does not index: {e}") })?;
-    if let Some(Ok(Err(e))) = fed {
-        return Err(BridgeError::Io(e));
+    // S11 (C.1.3): a code-out without a pack (its file absent or 0 bytes: the shim's manifest-only 200, a
+    // smart-HTTP fetch whose tips the haves hold) indexes nothing, so every commit it wants must be one the
+    // Mac named, before any ref is written; the type check then reads them through the alternates.
+    if std::fs::metadata(i.pack).is_ok_and(|m| m.len() > 0) {
+        index_pack(&scratch, i.pack)?;
+    } else if wanted.values().any(|id| !i.haves.contains(id)) {
+        return Err(BridgeError::WorkspaceFailed { code: refusal::BAD_PACK, message: "the code-out sent no pack for a tip the Mac did not name".into() });
     }
     // Only commits go on (the helper lists nothing else): an object that is not there at all is no
     // type's, and `update-ref` below refuses its ref (`bad_refs`), as it always did. The `wip_ref`'s
@@ -496,6 +486,30 @@ fn import_with(i: &Import<'_>, mode: ScanMode) -> Result<Imported, BridgeError> 
         }
     }
     result
+}
+
+/// The code-out's pack (the file `pack`) into the scratch repository
+/// (`index-pack --stdin --fix-thin`), its thin bases from the user's store:
+/// a pack that does not index is `bad_pack`.
+fn index_pack(scratch: &Scratch, pack: &Path) -> Result<(), BridgeError> {
+    let mut child = scratch.git().spawn_piped(["index-pack", "--stdin", "--fix-thin"]).map_err(git_failed("git index-pack of the code-out"))?;
+    let feeder = child.take_stdin().map(|mut stdin| {
+        let pack = pack.to_path_buf();
+        std::thread::spawn(move || -> std::io::Result<()> {
+            let mut f = std::fs::File::open(pack)?;
+            std::io::copy(&mut f, &mut stdin)?;
+            Ok(())
+        })
+    });
+    if let Some(mut stdout) = child.take_stdout() {
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    }
+    let fed = feeder.map(|f| f.join());
+    child.finish().map_err(|e| BridgeError::WorkspaceFailed { code: refusal::BAD_PACK, message: format!("the code-out pack does not index: {e}") })?;
+    if let Some(Ok(Err(e))) = fed {
+        return Err(BridgeError::Io(e));
+    }
+    Ok(())
 }
 
 /// [`import`] after the fetch: the scans (`set`'s, by `mode`; the clean
@@ -723,10 +737,17 @@ fn scan_per_ref(user: &GitRun, set: &ScanSet, cache: &mut crate::bridge::workspa
 /// audit: `codeout_fetch` with `via` `codeout` and how many refs
 /// [`credential_shaped`] kept out, never a name; `box_fetch_finding` per
 /// quarantined ref). A 204 is nothing new. `box fetch --smart-http` is
-/// [`fetch_smart_http`], between the same two.
+/// [`fetch_smart_http`], between the same two. S11 (C.1.3): to a VM whose
+/// recorded caps name `codeout_manifest_v1` ([`wants_manifest`]) the
+/// request asks for the manifest when nothing is new
+/// (`manifest_when_empty`); a 200 without a pack (the manifest line alone)
+/// is then [`manifest_only`]'s, so the VM's fetch record follows its HEAD
+/// and branch. A 204 stays nothing new (a 12.0 shim's answer to the flag).
 pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, opts: FetchOpts) -> Result<FetchReport, BridgeError> {
     let begun = begin_fetch(ctx).await?;
-    let req = CodeoutRequest { path: ctx.ws.vm_root.clone(), haves: begun.haves.clone(), wip: opts.wip, max_bytes: opts.max_bytes };
+    let (paths, vm) = (ctx.paths.clone(), ctx.target.vm_id.clone());
+    let manifest_when_empty = blocking(move || wants_manifest(&paths, &vm)).await.unwrap_or(false);
+    let req = CodeoutRequest { path: ctx.ws.vm_root.clone(), haves: begun.haves.clone(), wip: opts.wip, max_bytes: opts.max_bytes, manifest_when_empty };
     let dest = begun.pack();
     let x = Exchange { api: &*ctx.api, tokens: &*ctx.tokens, vm_id: &ctx.target.vm_id, port: CODE_PORT, cap: crate::wire::frame::CAP_WORKSPACE_V1, route: "POST /codeout", deadline: None, idempotent: false };
     let (reply, verdict) = exchange(&x, |t| {
@@ -736,10 +757,152 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
     .await?;
     let body = match (reply.status, verdict, reply.body) {
         (204, _, _) => return Ok(nothing_new(ctx, begun, Via::Codeout).await),
+        (_, Verdict::Done, Some(body)) if body.pack_bytes == 0 => return manifest_only(ctx, begun, body.manifest, opts.wip, Via::Codeout).await,
         (_, Verdict::Done, Some(body)) => body,
         (status, _, _) => return Err(BridgeError::Protocol(format!("POST /codeout answered HTTP {status} where a pack was due"))),
     };
-    finish_fetch(ctx, begun, Received { manifest: body.manifest, pack_bytes: body.pack_bytes, snapshot: opts.wip }, Via::Codeout).await
+    finish_fetch(ctx, begun, Received { manifest: body.manifest, pack_bytes: body.pack_bytes, snapshot: opts.wip, head_held: false }, Via::Codeout).await
+}
+
+/// S11 (C.1.3): whether `vm`'s recorded caps (its `state/vms` row, as
+/// `/health` last wrote them) name `codeout_manifest_v1`, so a code-out may
+/// ask it for the manifest when nothing is new. An unreadable row, no row,
+/// or no recorded caps: `false` (no flag, S10's request).
+fn wants_manifest(paths: &Paths, vm: &str) -> bool {
+    let row = crate::bridge::vm::registry::read_row(paths, vm).ok().flatten();
+    row.and_then(|r| r.caps).is_some_and(|caps| caps.iter().any(|c| c == crate::wire::frame::CAP_CODEOUT_MANIFEST_V1))
+}
+
+/// S11 (C.1.3): a code-out whose answer holds the manifest and no pack (the
+/// shim's manifest-only 200 to `manifest_when_empty`; a smart-HTTP fetch
+/// whose listed tips the haves hold). Its tips must all be haves (the
+/// helper's own rule, `all_had`), else `Protocol` (exit 8). When every ref
+/// the import would take (past [`credential_shaped`], then [`box_refs`])
+/// already sits at its commit in the workspace row's `fetched` and the VM's
+/// fetch record holds the manifest's HEAD and branch
+/// ([`rows::fetch_unchanged`]) and the snapshot the import would record, or
+/// the import could not record that HEAD at all ([`no_pack_unchanged`]),
+/// nothing is new: [`nothing_new`], no git run.
+/// Otherwise [`finish_fetch`] imports it without a pack ([`import`] takes a
+/// 0-byte or absent pack file when every wanted commit is a have), and the
+/// record moves through the refs it promoted, as after any import; a box
+/// tip another VM's fetch left there is not moved back or aside by it
+/// ([`held_back`]), and with nothing else to move that is nothing new too,
+/// unless the VM's record must still take a HEAD that box tip holds
+/// already (F1-1: imported without a ref, the record moved).
+/// The scratch directory and the lock go with `begun`.
+async fn manifest_only<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, mut manifest: CodeoutManifest, snapshot: bool, via: Via) -> Result<FetchReport, BridgeError> {
+    if !all_had(&manifest, &begun.haves) {
+        return Err(BridgeError::Protocol("POST /codeout: a code-out without a pack names a tip the Mac did not name".into()));
+    }
+    let (paths, cfg, ws, vm) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone(), ctx.target.vm_id.clone());
+    let seen = manifest.clone();
+    // Off the runtime's thread: the tripwires and the row are files, and only a fetch that is not nothing new runs
+    // git. Anything unreadable is no shortcut and holds nothing back: the import decides.
+    let plan = blocking(move || -> Option<Held> {
+        let Ok(set) = ScanSet::load(&paths, &cfg, &ws) else { return Some(Held::default()) };
+        let Ok(Some(row)) = rows::row_of(&paths, &ws) else { return Some(Held::default()) };
+        let (checkout, by_name) = (Checkout::of(&seen), taken_refs_of(&seen.refs, &set.rules));
+        let taken = |held: &BTreeSet<String>| -> BTreeMap<String, String> { by_name.iter().filter(|(_, (r, _))| !held.contains(r)).map(|(name, (_, id))| (name.clone(), id.clone())).collect() };
+        if no_pack_unchanged(&row, &vm, &taken(&BTreeSet::new()), &checkout, snapshot) {
+            return None;
+        }
+        let held = held_back(&GitRun::mac(&ws.root), &row, &vm, &by_name, &checkout, snapshot);
+        // A HEAD held back where the box has it already still moves the record (F1-1): never nothing new.
+        (held.refs.is_empty() || held.head || !no_pack_unchanged(&row, &vm, &taken(&held.refs), &checkout, snapshot)).then_some(held)
+    })
+    .await
+    .unwrap_or_else(|_| Some(Held::default()));
+    let Some(held) = plan else { return Ok(nothing_new(ctx, begun, via).await) };
+    manifest.refs.retain(|r, _| !held.refs.contains(r));
+    finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0, snapshot, head_held: held.head }, via).await
+}
+
+/// What [`held_back`] keeps out of an import without a pack: the VM refs, and
+/// whether the ref that checks out the VM's HEAD is among them because the
+/// box tip there holds that HEAD already (F1-1), so the VM's fetch record
+/// still takes the HEAD ([`Received::head_held`]).
+#[derive(Debug, Default)]
+struct Held {
+    refs: BTreeSet<String>,
+    head: bool,
+}
+
+/// S11 (C.1.3; the review's C2-R2 and C2-R3): whether an import of a
+/// manifest without a pack would change nothing the row keeps, so the fetch
+/// is nothing new (pure, no git run): every ref it takes (`taken`: box name
+/// to commit) already sits at its commit among the row's box tips
+/// (`WsRow::fetched`), and either the import cannot record the VM's HEAD
+/// (the ref that checks it out is not taken at it: a branch under a name
+/// the box namespace keeps, or one that looks like a credential: only the
+/// record's `at` would move), or `vm`'s record holds the HEAD and branch
+/// ([`rows::fetch_unchanged`]) and the snapshot the import would leave
+/// there ([`record_holds`]).
+fn no_pack_unchanged(row: &rows::WsRow, vm: &str, taken: &BTreeMap<String, String>, checkout: &Checkout, snapshot: bool) -> bool {
+    if !taken_at(taken, &checkout.head_ref(), &checkout.head) {
+        return taken.iter().all(|(name, id)| row.fetched.get(name) == Some(id));
+    }
+    rows::fetch_unchanged(row, vm, taken, &checkout.head, checkout.branch.as_deref()) && record_holds(row, vm, taken, checkout, snapshot)
+}
+
+/// Whether `taken` (box name to commit) takes `vm_ref` at `id`.
+fn taken_at(taken: &BTreeMap<String, String>, vm_ref: &str, id: &str) -> bool {
+    box_ref_of(vm_ref).is_some_and(|name| taken.get(&name).is_some_and(|got| got == id))
+}
+
+/// Whether `vm`'s fetch record in `row` already holds what an import of
+/// `checkout` taking `taken` would write there ([`fetch_record`],
+/// [`rows::note_fetch`]): its HEAD and branch, and its snapshot: the
+/// manifest's when the import takes it (none: a clean worktree, or one kept
+/// out), when the fetch asked for one (`snapshot`) or the manifest names
+/// one; else the record's own, which a fetch that said nothing of the
+/// worktree keeps at the same HEAD.
+fn record_holds(row: &rows::WsRow, vm: &str, taken: &BTreeMap<String, String>, checkout: &Checkout, snapshot: bool) -> bool {
+    let wip = checkout.wip.as_ref().filter(|(r, id)| taken_at(taken, r, id)).map(|(_, id)| id);
+    let record = row.vm.get(vm).and_then(|e| e.fetched.as_ref());
+    record.is_some_and(|f| f.head == checkout.head && f.branch == checkout.branch && ((!snapshot && wip.is_none()) || f.wip.as_ref() == wip))
+}
+
+/// S11 (the review's C2-R1): the VM refs of a manifest without a pack whose
+/// import would move a box tip that another VM's fetch left there back or
+/// aside: their box tip (`WsRow::fetched`) is another commit, not an
+/// ancestor of theirs (`merge-base --is-ancestor`, in the Mac's repository,
+/// `user`). S10's 204 moved nothing, and moving it would make the other
+/// VM's next code-out send again what the box held. Never held back: this
+/// fetch's snapshot; a ref whose box tip the VM's own record names on that
+/// branch (its own earlier promotion, moved back since); and the ref that
+/// checks out the VM's HEAD when its record does not hold what the import
+/// would write there ([`record_holds`]), so the record still follows the
+/// VM, unless that box tip holds the HEAD already (F1-1: another VM's
+/// commits on it, a VM with no record yet idle at the seeded commit): then
+/// it is held back too, nothing of this VM is lost, and `Held::head` says
+/// so, for the record to take the HEAD all the same. A ref git cannot tell
+/// of is not held back: the import decides.
+fn held_back(user: &GitRun, row: &rows::WsRow, vm: &str, by_name: &BTreeMap<String, (String, String)>, checkout: &Checkout, snapshot: bool) -> Held {
+    let all: BTreeMap<String, String> = by_name.iter().map(|(name, (_, id))| (name.clone(), id.clone())).collect();
+    let record = row.vm.get(vm).and_then(|e| e.fetched.as_ref());
+    let own = record.and_then(|f| box_ref_of(&Checkout { head: f.head.clone(), branch: f.branch.clone(), wip: None }.head_ref()).map(|name| (name, f.head.as_str())));
+    let follows = !record_holds(row, vm, &all, checkout, snapshot);
+    let mut held = Held::default();
+    for (name, (vm_ref, id)) in by_name {
+        let Some(tip) = row.fetched.get(name).filter(|tip| *tip != id) else { continue };
+        let snapshot_ref = checkout.wip.as_ref().is_some_and(|(w, _)| w == vm_ref);
+        let own_earlier = own.as_ref().is_some_and(|(n, head)| n == name && head == tip);
+        if snapshot_ref || own_earlier {
+            continue;
+        }
+        if follows && *vm_ref == checkout.head_ref() && *id == checkout.head {
+            if user.output(["merge-base", "--is-ancestor", id.as_str(), tip.as_str()]).is_ok() {
+                held.refs.insert(vm_ref.clone());
+                held.head = true;
+            }
+            continue;
+        }
+        if let Err(crate::gitrun::GitError::Failed { code: Some(1), .. }) = user.output(["merge-base", "--is-ancestor", tip.as_str(), id.as_str()]) {
+            held.refs.insert(vm_ref.clone());
+        }
+    }
+    held
 }
 
 /// `box fetch --smart-http` (S9 plan §2, §4.3): [`fetch`] through git
@@ -748,10 +911,12 @@ pub async fn fetch<A: MicrovmApi, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx
 /// Mac's object format) and `ls-refs` (the four prefixes) give the VM's refs
 /// as a code-out manifest (`gitsmart::manifest_of`, the helper's rules); a
 /// ref [`credential_shaped`] keeps out, or one without a box name
-/// ([`box_refs`]), is never wanted ([`wants_of`]). Nothing new is every
-/// listed tip among the haves, the helper's rule for its 204 (`all_had`);
-/// a ref kept out counts there too (its tip is never a have), so [`import`]
-/// then counts or names it, as after a code-out. Else `fetch` brings the
+/// ([`box_refs`]), is never wanted ([`wants_of`]). Every listed tip among
+/// the haves, the helper's rule for its 204 (`all_had`), asks for no pack:
+/// S11 (C.1.3) takes that listing as a manifest without one
+/// ([`manifest_only`]: nothing new, or the record moved by an import
+/// without a pack); a ref kept out counts there too (its tip is never a
+/// have), so [`import`] then counts or names it, as after a code-out. Else `fetch` brings the
 /// wants' pack (thin against the haves, at most `opts.max_bytes`), and
 /// [`import`] takes it as it takes a code-out's, its commit-only rule
 /// leaving out (counted) a ref it takes whose object the pack shows to be a
@@ -773,14 +938,15 @@ pub async fn fetch_smart_http<A: MicrovmApi, D: crate::bridge::gitsmart::GitHttp
     let manifest = manifest_of(&client.ls_refs(&advert).await?, advert.object_format)?;
     let wants = wants_of(&manifest, &ScanSet::load(&ctx.paths, &ctx.cfg, &ctx.ws)?.rules);
     if all_had(&manifest, &begun.haves) {
-        return Ok(nothing_new(ctx, begun, Via::SmartHttp).await);
+        // S11 (C.1.3): the listing is the manifest, so the record follows the VM's HEAD and branch.
+        return manifest_only(ctx, begun, manifest, false, Via::SmartHttp).await;
     }
     if wants.is_empty() {
         // Every ref kept out: the import takes none and reads no pack, so none is asked for.
-        return finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0, snapshot: false }, Via::SmartHttp).await;
+        return finish_fetch(ctx, begun, Received { manifest, pack_bytes: 0, snapshot: false, head_held: false }, Via::SmartHttp).await;
     }
     let pack_bytes = client.fetch_pack(&advert, &wants, &begun.haves, &begun.pack(), opts.max_bytes).await?;
-    finish_fetch(ctx, begun, Received { manifest, pack_bytes, snapshot: false }, Via::SmartHttp).await
+    finish_fetch(ctx, begun, Received { manifest, pack_bytes, snapshot: false, head_held: false }, Via::SmartHttp).await
 }
 
 /// Whether every tip `manifest` lists is one of `haves`: the helper's rule
@@ -806,10 +972,23 @@ fn object_types(git: &GitRun, ids: &BTreeSet<&String>) -> Result<BTreeMap<String
 /// objects crosses.
 #[must_use]
 pub fn wants_of(manifest: &CodeoutManifest, rules: &Rules) -> Vec<String> {
-    let shown: BTreeMap<String, String> = manifest.refs.iter().filter(|(r, _)| !credential_shaped(r, rules)).map(|(r, id)| (r.clone(), id.clone())).collect();
-    let (taken, _) = box_refs(&shown);
-    let ids: BTreeSet<String> = taken.values().filter_map(|vm_ref| shown.get(vm_ref).cloned()).collect();
+    let ids: BTreeSet<String> = taken_of(&manifest.refs, rules).into_values().collect();
     ids.into_iter().collect()
+}
+
+/// The refs of a manifest (`refs`: VM ref to commit) that [`import`] takes
+/// before it reads any object, as `import_with` takes them: past
+/// [`credential_shaped`] (`rules`), then [`box_refs`]; each box name to its
+/// commit.
+fn taken_of(refs: &BTreeMap<String, String>, rules: &Rules) -> BTreeMap<String, String> {
+    taken_refs_of(refs, rules).into_iter().map(|(name, (_, id))| (name, id)).collect()
+}
+
+/// [`taken_of`], each box name to its VM ref and commit.
+fn taken_refs_of(refs: &BTreeMap<String, String>, rules: &Rules) -> BTreeMap<String, (String, String)> {
+    let shown: BTreeMap<String, String> = refs.iter().filter(|(r, _)| !credential_shaped(r, rules)).map(|(r, id)| (r.clone(), id.clone())).collect();
+    let (taken, _) = box_refs(&shown);
+    taken.into_iter().filter_map(|(name, vm_ref)| shown.get(&vm_ref).map(|id| (name, (vm_ref, id.clone())))).collect()
 }
 
 /// How a fetch reached the VM: the `codeout_fetch` audit row's `via`, and
@@ -859,6 +1038,11 @@ pub(crate) struct Received {
     /// held; without one (`box fetch` without `--wip`, a smart-HTTP fetch)
     /// the fetch said nothing of the worktree ([`rows::note_fetch`]).
     pub snapshot: bool,
+    /// S11 (F1-1): an import without a pack held back the ref that checks out
+    /// the manifest's HEAD because its box tip holds that commit already
+    /// ([`held_back`]): the record takes the HEAD, branch and snapshot as if
+    /// that ref were promoted.
+    pub head_held: bool,
 }
 
 /// Milliseconds since `started`.
@@ -904,7 +1088,7 @@ pub(crate) async fn begin_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>) -> Result<Be
 pub(crate) async fn finish_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begun, received: Received, via: Via) -> Result<FetchReport, BridgeError> {
     let dest = begun.pack();
     let Begun { lock, started, haves, scratch } = begun;
-    let Received { manifest, pack_bytes, snapshot } = received;
+    let Received { manifest, pack_bytes, snapshot, head_held } = received;
     let wip_skipped = manifest.wip_skipped.clone();
     let checkout = Checkout::of(&manifest);
     let (paths, cfg, ws) = (ctx.paths.clone(), ctx.cfg.clone(), ctx.ws.clone());
@@ -942,7 +1126,7 @@ pub(crate) async fn finish_fetch<A, D, T>(ctx: &CodeoutCtx<A, D, T>, begun: Begu
         ms: ms_since(started),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
     };
-    let fetched = fetch_record(&checkout, &imported, wip_parent.as_deref(), unix_now());
+    let fetched = fetch_record(&checkout, &imported, wip_parent.as_deref(), unix_now(), head_held);
     record_fetch(ctx, &report, &imported, via, fetched, snapshot).await;
     drop(lock);
     Ok(report)
@@ -1017,8 +1201,12 @@ fn first_parent(git: &GitRun, commit: &str) -> Option<String> {
 /// seed carries uncommitted), with its ref for the logs. `None` when the
 /// HEAD was not promoted (quarantined, kept out, skipped): the VM's record
 /// then says only when this fetch ended ([`rows::note_fetch`]).
-fn fetch_record(checkout: &Checkout, imported: &Imported, wip_parent: Option<&str>, at: u64) -> Option<rows::VmFetchRow> {
-    if !Checkout::promoted(imported, &checkout.head_ref(), &checkout.head) {
+///
+/// S11 (F1-1): with `head_held` (an import without a pack held the HEAD's
+/// ref back because its box tip holds that commit, a have, already) the
+/// HEAD and branch are recorded as if that ref were promoted.
+fn fetch_record(checkout: &Checkout, imported: &Imported, wip_parent: Option<&str>, at: u64, head_held: bool) -> Option<rows::VmFetchRow> {
+    if !head_held && !Checkout::promoted(imported, &checkout.head_ref(), &checkout.head) {
         return None;
     }
     let wip = checkout.promoted_wip(imported).filter(|_| wip_parent == Some(checkout.head.as_str()));
@@ -1673,7 +1861,7 @@ mod c2_tests {
         // VM 1 on main: its HEAD and this fetch's snapshot (first parent the HEAD) promoted.
         let on_main = Checkout { head: id(1), branch: Some("main".into()), wip: Some((snapshot.into(), id(2))) };
         let imported = Imported { promoted: promoted(&[("main", id(1)), ("wip/20261020T100000Z-1", id(2))]), wip_ref: Some(snapshot.into()), ..Imported::default() };
-        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&on_main, &imported, Some(&id(1)), 100), true).await;
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&on_main, &imported, Some(&id(1)), 100, false), true).await;
         let first = rows::VmFetchRow { at: 100, head: id(1), branch: Some("main".into()), wip: Some(id(2)), wip_ref: Some(snapshot.into()) };
         assert_eq!(record(VM1), Some(first.clone()));
         // VM 2, detached: its HEAD promoted as box/HEAD, its snapshot quarantined.
@@ -1684,13 +1872,13 @@ mod c2_tests {
             wip_ref: Some("refs/wip/y".into()),
             ..Imported::default()
         };
-        record_fetch(&ctx_of(dir.path(), VM2), &report, &imported, Via::Codeout, fetch_record(&detached, &imported, Some(&id(3)), 200), true).await;
+        record_fetch(&ctx_of(dir.path(), VM2), &report, &imported, Via::Codeout, fetch_record(&detached, &imported, Some(&id(3)), 200, false), true).await;
         assert_eq!(record(VM2), Some(rows::VmFetchRow { at: 200, head: id(3), branch: None, wip: None, wip_ref: None }));
         assert_eq!(record(VM1), Some(first.clone()), "each VM its own record");
         // VM 1's next HEAD quarantined: the ids it promoted before stay, dated by this fetch.
         let moved = Checkout { head: id(5), branch: Some("main".into()), wip: None };
         let imported = Imported { quarantined: BTreeMap::from([(format!("{BOX_QUARANTINE_REFS}main"), id(5))]), ..Imported::default() };
-        assert_eq!(fetch_record(&moved, &imported, None, 300), None);
+        assert_eq!(fetch_record(&moved, &imported, None, 300, false), None);
         record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, None, true).await;
         let kept = record(VM1).expect("VM 1's record");
         assert_eq!((kept.head.as_str(), kept.wip.as_deref(), kept.branch.as_deref()), (id(1).as_str(), Some(id(2).as_str()), Some("main")));
@@ -1698,13 +1886,13 @@ mod c2_tests {
         // A snapshot whose first parent is not the HEAD (made before a commit, sent again): the HEAD alone.
         let stale = Checkout { head: id(6), branch: Some("main".into()), wip: Some(("refs/wip/old".into(), id(7))) };
         let imported = Imported { promoted: promoted(&[("main", id(6)), ("wip/old", id(7))]), wip_ref: Some("refs/wip/old".into()), ..Imported::default() };
-        assert_eq!(fetch_record(&stale, &imported, Some(&id(1)), 400), Some(rows::VmFetchRow { at: 400, head: id(6), branch: Some("main".into()), wip: None, wip_ref: None }));
-        assert_eq!(fetch_record(&stale, &imported, None, 400).and_then(|f| f.wip), None, "no first parent read");
+        assert_eq!(fetch_record(&stale, &imported, Some(&id(1)), 400, false), Some(rows::VmFetchRow { at: 400, head: id(6), branch: Some("main".into()), wip: None, wip_ref: None }));
+        assert_eq!(fetch_record(&stale, &imported, None, 400, false).and_then(|f| f.wip), None, "no first parent read");
         // A branch whose name looks like a credential (the setup-token's shape, built here): the import kept it out.
         let token = format!("{}-{}-oat01-{}", "sk", "ant", "Kq4_".repeat(20));
         let hidden = Checkout { head: id(8), branch: Some(format!("x-{token}")), wip: None };
         let imported = Imported { promoted: promoted(&[("dev", id(8))]), hidden: 1, ..Imported::default() };
-        let fetched = fetch_record(&hidden, &imported, None, 500);
+        let fetched = fetch_record(&hidden, &imported, None, 500, false);
         assert_eq!(fetched, None, "the ref that checks the HEAD out was not promoted");
         record_fetch(&ctx_of(dir.path(), VM2), &report, &imported, Via::Codeout, fetched, true).await;
         assert_eq!(record(VM2).map(|f| f.head), Some(id(3)), "VM 2's ids stay");
@@ -1713,14 +1901,14 @@ mod c2_tests {
         // A snapshot ref the import kept out: no wip, no ref.
         let wip_hidden = Checkout { head: id(9), branch: Some("main".into()), wip: Some((format!("refs/wip/{token}"), id(10))) };
         let imported = Imported { promoted: promoted(&[("main", id(9))]), hidden: 1, ..Imported::default() };
-        assert_eq!(fetch_record(&wip_hidden, &imported, Some(&id(9)), 600).map(|f| (f.head, f.wip, f.wip_ref)), Some((id(9), None, None)));
+        assert_eq!(fetch_record(&wip_hidden, &imported, Some(&id(9)), 600, false).map(|f| (f.head, f.wip, f.wip_ref)), Some((id(9), None, None)));
         // VM 1 fetched with no snapshot asked, its HEAD promoted at the same commit (another branch moved): it said
         // nothing of the worktree, so the record's snapshot stays; a snapshot asked and none made: none.
         let no_wip = Checkout { head: id(1), branch: Some("main".into()), wip: None };
         let imported = Imported { promoted: promoted(&[("main", id(1)), ("topic", id(11))]), ..Imported::default() };
-        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::SmartHttp, fetch_record(&no_wip, &imported, None, 700), false).await;
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::SmartHttp, fetch_record(&no_wip, &imported, None, 700, false), false).await;
         assert_eq!(record(VM1), Some(rows::VmFetchRow { at: 700, ..first }), "the snapshot kept");
-        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&no_wip, &imported, None, 800), true).await;
+        record_fetch(&ctx_of(dir.path(), VM1), &report, &imported, Via::Codeout, fetch_record(&no_wip, &imported, None, 800, false), true).await;
         assert_eq!(record(VM1), Some(rows::VmFetchRow { at: 800, head: id(1), branch: Some("main".into()), wip: None, wip_ref: None }), "a clean worktree");
     }
 
@@ -1748,6 +1936,57 @@ mod c2_tests {
         assert_eq!(first_parent(&git, &index).as_deref(), Some(head.as_str()));
         assert_eq!(first_parent(&git, &head), None, "a root commit");
         assert_eq!(first_parent(&git, &"0".repeat(40)), None, "an id the repository lacks");
+    }
+
+    /// S11 (F1-1): an import without a pack never moves a box tip back to a
+    /// VM's HEAD that tip holds already, even when the VM's record does not
+    /// hold that HEAD yet (no record: a VM idle at the seeded commit after
+    /// another VM's commit moved `box/main`; or a record whose snapshot alone
+    /// differs): the ref is held back with `Held::head`, and the record takes
+    /// the HEAD all the same. A HEAD the tip lacks is still promoted for the
+    /// record; one the record holds is held back as any other ref.
+    #[test]
+    fn a_head_the_box_tip_holds_already_is_held_back_and_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitRun::mac(dir.path());
+        let run = |args: &[&str]| String::from_utf8_lossy(&git.output(args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))).trim().to_string();
+        run(&["init", "-q"]);
+        let tree = run(&["write-tree"]);
+        let commit = |parents: &[&str], msg: &str| {
+            let mut args = vec!["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgSign=false", "commit-tree", tree.as_str()];
+            for p in parents {
+                args.extend(["-p", p]);
+            }
+            args.extend(["-m", msg]);
+            run(&args)
+        };
+        let seeded = commit(&[], "seeded");
+        let b_work = commit(&[&seeded], "B's work");
+        let a_work = commit(&[&seeded], "A's own work");
+        let main = format!("{BOX_REFS}main");
+        let row = |record: Option<rows::VmFetchRow>| rows::WsRow {
+            fetched: BTreeMap::from([(main.clone(), b_work.clone())]),
+            vm: BTreeMap::from([(VM1.to_string(), rows::VmSeedRow { fetched: record, ..rows::VmSeedRow::default() })]),
+            ..rows::WsRow::default()
+        };
+        let by_name = |id: &str| BTreeMap::from([(main.clone(), ("refs/heads/main".to_string(), id.to_string()))]);
+        let at_seeded = Checkout { head: seeded.clone(), branch: Some("main".into()), wip: None };
+        let on_main = |wip: Option<String>| rows::VmFetchRow { at: 1, head: seeded.clone(), branch: Some("main".into()), wip_ref: wip.as_ref().map(|_| "refs/wip/x".to_string()), wip };
+        // No record yet, or one whose snapshot alone differs (a reverted edit): held back, the record follows.
+        for record in [None, Some(on_main(Some(id(7))))] {
+            let held = held_back(&git, &row(record.clone()), VM1, &by_name(&seeded), &at_seeded, true);
+            assert_eq!((held.refs.into_iter().collect::<Vec<_>>(), held.head), (vec!["refs/heads/main".to_string()], true), "{record:?}");
+        }
+        // A record that holds it: held back as any other ref, nothing for the record.
+        let held = held_back(&git, &row(Some(on_main(None))), VM1, &by_name(&seeded), &at_seeded, true);
+        assert_eq!((held.refs.len(), held.head), (1, false));
+        // A HEAD the box tip lacks (the VM's own commit beside B's): promoted, so the record follows, as before.
+        let at_own = Checkout { head: a_work.clone(), branch: Some("main".into()), wip: None };
+        let held = held_back(&git, &row(None), VM1, &by_name(&a_work), &at_own, true);
+        assert!(held.refs.is_empty() && !held.head, "{held:?}");
+        // The record of a HEAD held back so: its HEAD and branch, no ref promoted.
+        assert_eq!(fetch_record(&at_seeded, &Imported::default(), None, 9, false), None);
+        assert_eq!(fetch_record(&at_seeded, &Imported::default(), None, 9, true), Some(rows::VmFetchRow { at: 9, head: seeded.clone(), branch: Some("main".into()), wip: None, wip_ref: None }));
     }
 
     /// A VM that takes every tail URL it is handed (`POST /transcript/tail`,
@@ -2307,7 +2546,7 @@ mod tests {
         let many: BTreeMap<String, String> = (0..400).map(|n| (format!("{BOX_REFS}wip/{n:04}"), id(1000 + n))).collect();
         let haves = haves_of(Some(&id(1)), None, &many);
         assert_eq!((haves.len(), haves[1].clone()), (HAVES_MAX, id(1399)), "capped, the newest kept");
-        let req = CodeoutRequest { path: "/w".into(), haves, wip: true, max_bytes: 1 };
+        let req = CodeoutRequest { path: "/w".into(), haves, wip: true, max_bytes: 1, manifest_when_empty: false };
         assert_eq!(req.check(), Ok(()));
     }
 

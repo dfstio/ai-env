@@ -791,7 +791,7 @@ pub fn cmd_aws_set(store: &Keystore, user: &str, check: bool, force: bool) -> Re
     // The key is stored from here on: a failed audit write is a warning, not a
     // failure that would send the operator to delete a working key.
     let row = audit::AuditRow::new(
-        "creds_aws_set",
+        crate::bridge::audit::event::CREDS_AWS_SET,
         None,
         audit::detail(&[
             ("user", key.user.clone()),
@@ -876,7 +876,7 @@ pub fn cmd_aws_verify(store: &Keystore, user: &str) -> Result<()> {
             ("never-answered", Err(CliError::AuthUnavailable(format!("{label} never answered ({} tries, {} s apart; last: {last})", wait.tries, wait.step.as_secs()))))
         }
     };
-    let row = audit::AuditRow::new("creds_aws_verify", None, audit::detail(&[("user", user.to_string()), ("key_id_last4", key.tail().to_string()), ("result", result.to_string())]));
+    let row = audit::AuditRow::new(crate::bridge::audit::event::CREDS_AWS_VERIFY, None, audit::detail(&[("user", user.to_string()), ("key_id_last4", key.tail().to_string()), ("result", result.to_string())]));
     if let Err(e) = audit::append(&paths.audit(), &row) {
         voice::warn(&format!("the audit row was not written: {e}"));
     }

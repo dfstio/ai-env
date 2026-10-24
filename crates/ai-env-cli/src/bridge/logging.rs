@@ -25,6 +25,10 @@ pub const CAPPED_CRATES: &[&str] = &[
     "aws_config",
     "aws_runtime",
     "aws_credential_types",
+    // S11 B.5: the panel's server; a request path carries its bearer.
+    "axum",
+    "axum_core",
+    "tower",
 ];
 
 /// Crates held to ERROR: aws-config logs the resolved `Credentials` with

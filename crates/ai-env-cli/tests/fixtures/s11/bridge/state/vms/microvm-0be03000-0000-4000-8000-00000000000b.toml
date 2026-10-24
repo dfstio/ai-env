@@ -1,0 +1,26 @@
+v = 1
+status = "suspended"
+id = "microvm-0be03000-0000-4000-8000-00000000000b"
+client_token = "0199f001-0000-7000-8000-00000000000b"
+workspace = "/w/project"
+slug = "-w-project"
+image_arn = ""
+image_version = "1.0"
+owner = "mike@mac"
+created = "2026-10-22T10:20:28.000Z"
+commit = ""
+started_at = 1792664430
+wall_deadline = 1792693230
+max_duration_s = 28800
+egress = "internet"
+ingress = []
+egress_connectors = []
+egress_gate = "passed"
+shell = false
+state_seen = "SUSPENDED"
+state_seen_at = 1792666800
+
+[idle]
+max_idle_s = 300
+suspended_s = 3600
+auto_resume = true

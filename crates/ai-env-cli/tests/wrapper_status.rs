@@ -402,7 +402,7 @@ fn unreadable_settings_and_a_missing_wrapper() {
     assert_lines(
         &stdout,
         &[
-            format!("  [NO ] {WRAPPER_SETTING} = /nonexistent/ai-env-claude does not exist"),
+            format!("  [NO ] {WRAPPER_SETTING} = /nonexistent/ai-env-claude does not exist  <- ai-env wrapper install --write"),
             "  [-  ] effective mode not checked: Cursor cannot start the wrapper its settings name (the wrapper row above)".to_string(),
         ],
     );

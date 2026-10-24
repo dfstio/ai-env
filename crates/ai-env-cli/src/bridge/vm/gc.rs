@@ -554,7 +554,7 @@ where
                 terminate_and_record(api, paths, &id, by, None).await.map(|_| report.terminated += 1)
             }
             GcAction::MarkTerminated => match row_of(&item) {
-                Some(row) => mark_gone(paths, &row.id, now).map(|()| report.marked += 1),
+                Some(row) => mark_gone(paths, &row.id, now, crate::bridge::vm::ops::Via::Gc).map(|()| report.marked += 1),
                 None => Err(BridgeError::Config(format!("gc: no row for {id}"))),
             },
             GcAction::Adopt => match (row_of(&item), infos.get(&id)) {
@@ -587,7 +587,7 @@ where
     let orphans = opts.include_orphans.map_or_else(|| "-".to_string(), |d| d.as_secs().to_string());
     audit_event(
         paths,
-        "vm_gc",
+        crate::bridge::audit::event::VM_GC,
         &[
             ("terminated", report.terminated.to_string()),
             ("adopted", report.adopted.to_string()),
@@ -603,16 +603,25 @@ where
 /// The row of a VM the platform ended (`registry:gone`) says so: terminated
 /// at `now`, `terminated_by` `platform` unless it names who (`vm gc --yes`,
 /// and S10's reconcile, which terminates nothing). Under the rows lock: what
-/// another process wrote meanwhile is kept.
-fn mark_gone(paths: &Paths, id: &str, now: u64) -> Result<(), BridgeError> {
+/// another process wrote meanwhile is kept. S11: a recorded `state_seen` other
+/// than TERMINATED is audited `vm_observed` (`via` gc or reconcile); one a
+/// survey already set to TERMINATED, or none, writes no row.
+fn mark_gone(paths: &Paths, id: &str, now: u64, via: crate::bridge::vm::ops::Via) -> Result<(), BridgeError> {
+    let gone = VmState::Terminated.as_str();
+    let mut was: Option<String> = None;
     registry::update_row(paths, id, |r| {
+        was = r.state_seen.clone().filter(|w| w != gone);
         r.status = RowStatus::Terminated;
         r.terminated_at.get_or_insert(now);
         r.terminated_by.get_or_insert_with(|| "platform".to_string());
-        r.state_seen = Some(VmState::Terminated.as_str().to_string());
+        r.state_seen = Some(gone.to_string());
         r.state_seen_at = Some(now);
     })
-    .and_then(|written| written.map(|_| ()).ok_or_else(|| BridgeError::Config(format!("gc: row {id} vanished"))))
+    .and_then(|written| written.map(|_| ()).ok_or_else(|| BridgeError::Config(format!("gc: row {id} vanished"))))?;
+    if let Some(w) = was {
+        crate::bridge::vm::ops::audit_observed(paths, id, &w, gone, via);
+    }
+    Ok(())
 }
 
 /// The opportunistic reconcile of `vm run|list|smoke` (plan S4 D17): the
@@ -661,7 +670,7 @@ async fn apply_local<A: MicrovmApi>(api: &A, paths: &Paths, image_arn: &str, eve
     for item in classify_surveyed(&listing, &rows, &BTreeMap::new(), now, &owner(), &GcOpts::default(), &unsurveyed) {
         let row = item.stem.as_ref().and_then(|s| by_stem.get(s).copied());
         let done = match (item.class, row) {
-            (GcClass::RegistryGone, Some(row)) => mark_gone(paths, &row.id, now).map(|()| report.marked += 1),
+            (GcClass::RegistryGone, Some(row)) => mark_gone(paths, &row.id, now, crate::bridge::vm::ops::Via::Reconcile).map(|()| report.marked += 1),
             (GcClass::TerminatedOld, Some(row)) => registry::remove_row(paths, row).map(|_| report.removed += 1),
             _ => {
                 left.push(item);

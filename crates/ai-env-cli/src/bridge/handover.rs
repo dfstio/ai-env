@@ -178,7 +178,7 @@ impl Handover {
     /// stop signal then writes none of its own.
     fn audit(&self, result: &str) {
         stop::audited();
-        let row = audit::AuditRow::new("creds_deployer_key", None, self.detail(result));
+        let row = audit::AuditRow::new(crate::bridge::audit::event::CREDS_DEPLOYER_KEY, None, self.detail(result));
         if let Err(e) = audit::append(&self.paths.audit(), &row) {
             voice::warn(&format!("the audit row was not written: {e}"));
         }
@@ -188,7 +188,7 @@ impl Handover {
     /// goes to, made now: the handler only puts the time in and writes it.
     /// `None` when the log cannot be opened: a stop then writes no row.
     fn stop_row(&self) -> Option<stop::Row> {
-        let mut row = audit::AuditRow::new("creds_deployer_key", None, self.detail(STOPPED));
+        let mut row = audit::AuditRow::new(crate::bridge::audit::event::CREDS_DEPLOYER_KEY, None, self.detail(STOPPED));
         row.ts = stop::TS_PLACEHOLDER.to_string();
         let mut line = serde_json::to_vec(&row).ok()?;
         line.push(b'\n');

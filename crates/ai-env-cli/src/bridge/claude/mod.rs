@@ -1,0 +1,878 @@
+//! S11 part A: the Claude Code versions this Mac knows and the VMs follow
+//! (plan §A). Each version's record (`state/claude/<v>.toml`, written only
+//! through [`Record::update`] under `state/claude/records.lock`), its phase
+//! (seen, signed, admitted, failed, staged, stale), P0's plan of the claudes a
+//! session's spawn may name ([`plan_for`]), the census word `claude_src`
+//! ([`claude_src_of`]) and D5's automatic admission ([`maybe_auto_admit`]).
+//! The release's trust (`release`), the admission (`admit`), the stager
+//! (`stage`) and gc (`gc`) are A2's; the fetch into a VM (`fetch`) and the
+//! doctor and `wrapper status` rows (`rows`) are A3's, as are P0's plan, the
+//! census word, D5's trigger and `ai-env claude status` here. Whatever fails
+//! fails closed: a chat runs the image's claude.
+pub mod admit;
+pub mod fetch;
+pub mod gc;
+pub mod release;
+pub mod rows;
+pub mod stage;
+
+use crate::bridge::config::{BridgeConfig, Paths};
+use crate::bridge::errors::BridgeError;
+use crate::wire::workspace::ClaudeRef;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// D5 (LD-11): an automatic admission of a version is tried again only this long after the last one ended.
+pub const ADMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// The admission's Docker run (`make claude-admit-docker`) is ended past this.
+pub const ADMIT_MAKE_BOUND: Duration = Duration::from_secs(30 * 60);
+/// `ai-env claude gc` keeps this many newest staged versions' objects (beside the bundle's and every live window's).
+pub const CLAUDE_GC_KEEP_STAGED: usize = 3;
+/// This Mac keeps this many newest admitted binaries (LD-31).
+pub const CLAUDE_GC_KEEP_LOCAL: usize = 2;
+/// The stager VM's `max_duration_s`.
+pub const STAGER_MAX_DURATION_S: u32 = 900;
+/// The record's schema version (`Record.v`).
+pub const RECORD_V: u32 = 1;
+
+/// How long [`Record::update`] waits for `state/claude/records.lock`.
+const RECORDS_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// What this Mac knows of one Claude Code version. Strict: an unknown key, or `v` other than 1, is refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Record {
+    /// 1.
+    pub v: u32,
+    /// `N.N.N`.
+    pub version: String,
+    /// When this Mac first wrote it (RFC 3339 UTC).
+    pub created: String,
+    pub signature: Option<SignatureRow>,
+    pub download: Option<DownloadRow>,
+    pub admission: Option<AdmissionRow>,
+    pub staging: Option<StagingRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignatureRow {
+    /// `ok` or `failed`.
+    pub outcome: String,
+    /// `failed`: `manifest`, `version` or one of `status_ok`'s words (a failed fetch or a missing gpgv records
+    /// nothing).
+    pub why: Option<String>,
+    pub manifest_sha256: Option<String>,
+    /// `ok`: VALIDSIG's primary fingerprint.
+    pub signer: Option<String>,
+    /// `ok`: the linux-arm64 pin the signed manifest names.
+    pub linux_sha256: Option<String>,
+    pub linux_size: Option<u64>,
+    pub build_date: Option<String>,
+    /// Recorded only.
+    pub darwin_sha256: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DownloadRow {
+    /// `state/claude/<v>/claude`, checked against the signature's pin.
+    pub sha256: String,
+    pub size: u64,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdmissionRow {
+    /// `admitted` or `failed`.
+    pub outcome: String,
+    /// `failed`: `download`, `markers`, `docker`, `version` (a VM's 422) or `stage` (two bad stages in a row).
+    pub step: Option<String>,
+    /// `ok`, or `missing:<name>`.
+    pub markers: Option<String>,
+    /// The Docker run's last line.
+    pub docker: Option<String>,
+    /// The local image's id the tests ran on.
+    pub docker_image: Option<String>,
+    /// The ai-env version that ran it.
+    pub ai_env: String,
+    /// The wrapper's `--auto` child ran it.
+    pub auto: bool,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StagingRow {
+    /// `staged`, `stale` or `absent`.
+    pub state: String,
+    /// `v1/_claude/mac/<v>/<sha>`.
+    pub s3_key: String,
+    pub s3_version_id: Option<String>,
+    /// The stager VM of the last stage.
+    pub stager_vm: Option<String>,
+    /// VMs that answered 422 `checksum_mismatch` since the last good stage.
+    pub bad_reports: u32,
+    /// Stages in a row a VM then refused: at 2 the admission becomes `failed(stage)`.
+    pub bad_stages: u32,
+    pub at: String,
+}
+
+/// A version's phase, as every view says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    /// No record (the version is the bundle's, a window's or a census row's), or one with no signature yet.
+    Seen,
+    /// Signed, not admitted (an admission that stopped before its Docker run).
+    Signed,
+    /// `admission.outcome = admitted`, `staging` none or `absent`.
+    Admitted,
+    /// `signature.outcome = failed` (`signature`) or `admission.outcome = failed` (its step).
+    Failed(String),
+    /// `staging.state = staged`.
+    Staged,
+    /// `staging.state = stale`: a VM refused the object; it was deleted; a restage is due.
+    Stale,
+}
+
+impl Phase {
+    /// `seen`, `signed`, `admitted`, `failed(<step>)`, `staged`, `stale`.
+    #[must_use]
+    pub fn word(&self) -> String {
+        match self {
+            Phase::Seen => "seen".into(),
+            Phase::Signed => "signed".into(),
+            Phase::Admitted => "admitted".into(),
+            Phase::Failed(step) => format!("failed({step})"),
+            Phase::Staged => "staged".into(),
+            Phase::Stale => "stale".into(),
+        }
+    }
+}
+
+/// A version every record path takes: `N.N.N` (`wire::pin::is_version`), so a path only joins.
+fn checked_version(version: &str) -> Result<(), BridgeError> {
+    if crate::wire::pin::is_version(version) {
+        Ok(())
+    } else {
+        Err(BridgeError::Config(format!("not a claude version (N.N.N): {version:?}")))
+    }
+}
+
+/// Parse one record's TOML: strict (an unknown key, `v` other than [`RECORD_V`], or another version's record is
+/// refused); the error names `path` and the parser's message (never its snippet of the file).
+fn parse_record(path: &std::path::Path, version: &str, text: &str) -> Result<Record, BridgeError> {
+    let record: Record = toml::from_str(text).map_err(|e| BridgeError::Config(format!("{}: {}", path.display(), e.message())))?;
+    if record.v != RECORD_V {
+        return Err(BridgeError::Config(format!("{}: a claude record of schema {} (this ai-env reads {RECORD_V})", path.display(), record.v)));
+    }
+    if record.version != version {
+        return Err(BridgeError::Config(format!("{}: names claude {:?}, not {version}", path.display(), record.version)));
+    }
+    Ok(record)
+}
+
+/// `state/claude/records.lock`, polled for at most [`RECORDS_LOCK_WAIT`].
+fn lock_records(paths: &Paths) -> Result<crate::bridge::vm::lock::FlockGuard, BridgeError> {
+    let path = paths.claude_records_lock();
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(guard) = crate::bridge::vm::lock::try_lock_exclusive(&path)? {
+            return Ok(guard);
+        }
+        if start.elapsed() >= RECORDS_LOCK_WAIT {
+            return Err(BridgeError::Busy(format!("{} still held after {} s", path.display(), RECORDS_LOCK_WAIT.as_secs())));
+        }
+        std::thread::sleep(crate::bridge::vm::lock::POLL);
+    }
+}
+
+impl Record {
+    /// `state/claude/<v>.toml`: `Ok(None)` when absent.
+    pub fn load(paths: &Paths, version: &str) -> Result<Option<Record>, BridgeError> {
+        checked_version(version)?;
+        let path = paths.claude_record(version);
+        let Some(text) = crate::bridge::registry::read_regular_file(&path)? else {
+            return Ok(None);
+        };
+        parse_record(&path, version, &text).map(Some)
+    }
+
+    /// Read, changed by `f`, written, under `claude_records_lock` (2 s; a new record when absent).
+    pub fn update(paths: &Paths, version: &str, f: impl FnOnce(&mut Record)) -> Result<Record, BridgeError> {
+        checked_version(version)?;
+        crate::bridge::registry::ensure_private_dir(&paths.claude_dir())?;
+        let _held = lock_records(paths)?;
+        let mut record = Record::load(paths, version)?.unwrap_or_else(|| Record { v: RECORD_V, version: version.to_string(), created: crate::bridge::registry::now_rfc3339(), ..Record::default() });
+        f(&mut record);
+        // The record stays this version's, of this schema, whatever `f` did.
+        record.v = RECORD_V;
+        record.version = version.to_string();
+        let text = toml::to_string_pretty(&record).map_err(|e| BridgeError::Config(format!("claude {version}: cannot serialise the record: {e}")))?;
+        crate::bridge::infra::write_atomic_mode(&paths.claude_record(version), text.as_bytes(), 0o600)?;
+        Ok(record)
+    }
+
+    /// `claude forget`'s delete (A3's review): the record removed under `claude_records_lock`, so a verdict written
+    /// through [`Record::update_existing`] meanwhile never writes a forgotten version back. Whether there was one.
+    pub fn remove(paths: &Paths, version: &str) -> Result<bool, BridgeError> {
+        checked_version(version)?;
+        let path = paths.claude_record(version);
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(false);
+        }
+        let _held = lock_records(paths)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(BridgeError::Config(format!("cannot remove {}: {e}", path.display()))),
+        }
+    }
+
+    /// [`Record::update`] of a record that exists, never a new one: `f` sees it under `claude_records_lock` and says
+    /// whether it changed it; nothing is written when it is absent (forgotten meanwhile: it stays forgotten) or
+    /// unchanged. `Ok(None)` when absent.
+    pub fn update_existing(paths: &Paths, version: &str, f: impl FnOnce(&mut Record) -> bool) -> Result<Option<Record>, BridgeError> {
+        if Record::load(paths, version)?.is_none() {
+            return Ok(None);
+        }
+        let _held = lock_records(paths)?;
+        let Some(mut record) = Record::load(paths, version)? else {
+            return Ok(None);
+        };
+        if !f(&mut record) {
+            return Ok(Some(record));
+        }
+        record.v = RECORD_V;
+        record.version = version.to_string();
+        let text = toml::to_string_pretty(&record).map_err(|e| BridgeError::Config(format!("claude {version}: cannot serialise the record: {e}")))?;
+        crate::bridge::infra::write_atomic_mode(&paths.claude_record(version), text.as_bytes(), 0o600)?;
+        Ok(Some(record))
+    }
+
+    /// The phase: a failed signature or admission before any staging state, so a failed version is never
+    /// nameable, whatever S3 holds.
+    #[must_use]
+    pub fn phase(&self) -> Phase {
+        if let Some(sig) = &self.signature {
+            if sig.outcome == "failed" {
+                return Phase::Failed("signature".into());
+            }
+        }
+        if let Some(adm) = &self.admission {
+            match adm.outcome.as_str() {
+                "failed" => return Phase::Failed(adm.step.clone().unwrap_or_else(|| "admission".into())),
+                "admitted" => {
+                    return match self.staging.as_ref().map(|s| s.state.as_str()) {
+                        Some("staged") => Phase::Staged,
+                        Some("stale") => Phase::Stale,
+                        _ => Phase::Admitted,
+                    };
+                }
+                _ => {}
+            }
+        }
+        match &self.signature {
+            Some(sig) if sig.outcome == "ok" => Phase::Signed,
+            _ => Phase::Seen,
+        }
+    }
+
+    /// A spawn may name it (A.1's rule): admitted and its object present, `phase() == Staged`.
+    #[must_use]
+    pub fn nameable(&self) -> bool {
+        self.phase() == Phase::Staged
+    }
+
+    /// Its ref, once signed: the version and the linux-arm64 pin's sha256.
+    #[must_use]
+    pub fn claude_ref(&self) -> Option<ClaudeRef> {
+        let sig = self.signature.as_ref().filter(|s| s.outcome == "ok")?;
+        let sha256 = sig.linux_sha256.clone()?;
+        Some(ClaudeRef { version: self.version.clone(), sha256 })
+    }
+}
+
+/// `N.N.N` as numbers, for ordering versions part by part.
+#[must_use]
+pub fn version_key(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    let key = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(key)
+}
+
+/// Every record that reads (others logged and skipped), by version, oldest first.
+pub fn load_all(paths: &Paths) -> Vec<Record> {
+    let Ok(dir) = std::fs::read_dir(paths.claude_dir()) else {
+        return Vec::new();
+    };
+    let mut records: Vec<Record> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".toml")).filter(|v| crate::wire::pin::is_version(v)).map(str::to_string))
+        .filter_map(|v| match Record::load(paths, &v) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(version = %v, error = %e, "a claude record that does not read is skipped");
+                None
+            }
+        })
+        .collect();
+    records.sort_by_key(|r| version_key(&r.version));
+    records
+}
+
+/// P0's claude for one session (A.4, L2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudePlan {
+    /// V, when argv[1]'s bundle names an `N.N.N` one.
+    pub ext: Option<String>,
+    /// V's phase word (`seen` without a record); `None` without V.
+    pub phase: Option<String>,
+    /// Why V is not first in `prefs`: `no_ext`, `seen`, `failed`, `not_staged`; `None` when it is.
+    pub why_not: Option<&'static str>,
+    /// L2: V when nameable, then the other nameable versions newest first, at most `CLAUDE_REFS_MAX` in all.
+    pub prefs: Vec<ClaudeRef>,
+    /// The signed sizes of `prefs`' binaries, by sha256 (a fetch's `size`).
+    pub sizes: std::collections::BTreeMap<String, u64>,
+}
+
+/// From the records (local reads only, no AWS, a few ms): V (`ext`, when `N.N.N`), its phase word (`seen` without a
+/// record), why V does not lead (`no_ext`, `seen` for a version not admitted yet, `failed`, `not_staged` for an
+/// admitted one whose object is not present), and L2's preferences: V when nameable, then every other nameable
+/// version newest first (versions compared as numbers part by part), at most `CLAUDE_REFS_MAX` in all, a sha256
+/// named once; their signed sizes by sha256.
+#[must_use]
+pub fn plan_for(paths: &Paths, ext: Option<&str>) -> ClaudePlan {
+    plan_of(&load_all(paths), ext)
+}
+
+/// [`plan_for`] on `records` (pure).
+#[must_use]
+pub fn plan_of(records: &[Record], ext: Option<&str>) -> ClaudePlan {
+    let ext = ext.filter(|v| crate::wire::pin::is_version(v));
+    let mine = ext.and_then(|v| records.iter().find(|r| r.version == v));
+    let phase = ext.map(|_| mine.map_or_else(|| Phase::Seen.word(), |r| r.phase().word()));
+    let why_not = match (ext, mine.map(Record::phase)) {
+        (None, _) => Some("no_ext"),
+        (Some(_), None | Some(Phase::Seen | Phase::Signed)) => Some("seen"),
+        (Some(_), Some(Phase::Failed(_))) => Some("failed"),
+        (Some(_), Some(Phase::Admitted | Phase::Stale)) => Some("not_staged"),
+        (Some(_), Some(Phase::Staged)) => None,
+    };
+    let mut newest: Vec<&Record> = records.iter().filter(|r| r.nameable() && Some(r.version.as_str()) != ext).collect();
+    newest.sort_by_key(|r| std::cmp::Reverse(version_key(&r.version)));
+    let lead = mine.filter(|r| r.nameable());
+    let mut plan = ClaudePlan { ext: ext.map(str::to_string), phase, why_not, ..ClaudePlan::default() };
+    for r in lead.into_iter().chain(newest) {
+        if plan.prefs.len() >= crate::wire::workspace::CLAUDE_REFS_MAX {
+            break;
+        }
+        let Some(cref) = r.claude_ref().filter(|c| c.check().is_ok() && !plan.prefs.iter().any(|p| p.sha256 == c.sha256)) else { continue };
+        if let Some(size) = r.signature.as_ref().and_then(|s| s.linux_size).filter(|s| (1..=crate::wire::s3::CLAUDE_MAX).contains(s)) {
+            plan.sizes.insert(cref.sha256.clone(), size);
+        }
+        plan.prefs.push(cref);
+    }
+    plan
+}
+
+/// What P4 asked of a generation's VM, for the link's `claude_src` (`PipelineEnd.claude`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeAsk {
+    pub plan: ClaudePlan,
+    /// The VM's recorded caps name `claude_stage_v1`.
+    pub cap: bool,
+    /// The refs `spawn.claude` carried (`plan.prefs` minus the VM row's `claude_bad`; empty without the cap).
+    pub sent: Vec<ClaudeRef>,
+    /// This generation follows a `ClaudeRetry` of this chat.
+    pub after_start_failed: bool,
+}
+
+/// The census word (pure, §5.1): what ran (`Spawned`'s version and sha256) against what was asked and the image's
+/// version (`hello_ok`'s, else the VM row's). `cached`: V ran from the VM's cache; `image`: the image's claude ran
+/// and it is V; `older(<why>)`: another cached version ran (a newer one too, for an older window); `image(<why>)`:
+/// the image's claude ran and it is not V. `<why>` says why V did not run, the first that holds: `no_ext`,
+/// `start_failed` (this chat's cached claude died before its init), V's own (`seen`, `failed`, `not_staged`),
+/// `no_cap`, `bad` (V nameable but in the VM row's `claude_bad`), `not_cached` (named, the cache lacked it).
+#[must_use]
+pub fn claude_src_of(ask: &ClaudeAsk, image: Option<&str>, ran_version: Option<&str>, ran_sha256: Option<&str>) -> String {
+    let v = ask.plan.ext.as_deref();
+    let v_ref = v.and_then(|v| ask.plan.prefs.iter().find(|r| r.version == v));
+    match ran_sha256 {
+        Some(sha) if v_ref.is_some_and(|r| r.sha256 == sha) || (v.is_some() && ran_version == v) => return "cached".into(),
+        None if v.is_some() && ran_version.or(image) == v => return "image".into(),
+        _ => {}
+    }
+    let why = match v {
+        None => "no_ext",
+        Some(_) if ask.after_start_failed => "start_failed",
+        Some(_) => match (ask.plan.why_not, v_ref) {
+            (Some(why), _) => why,
+            (None, _) if !ask.cap => "no_cap",
+            (None, Some(r)) if !ask.sent.contains(r) => "bad",
+            (None, _) => "not_cached",
+        },
+    };
+    match ran_sha256 {
+        Some(_) => format!("older({why})"),
+        None => format!("image({why})"),
+    }
+}
+
+/// V admitted and its object not present (`admitted` or `stale`): an `auto` prewarm does not skip (§4.6). A record
+/// that does not read, or no record, is no such version.
+#[must_use]
+pub fn needs_staging(paths: &Paths, version: &str) -> bool {
+    matches!(Record::load(paths, version), Ok(Some(r)) if matches!(r.phase(), Phase::Admitted | Phase::Stale))
+}
+
+/// D5 (§4.7): when V's record is missing or `signed`, the cooldown is over and its lock is free, `ai-env claude
+/// admit <v> --auto` started detached. File reads, at most one double fork; never a wait. In order:
+/// `[claude].auto_admit` (`off`); under the fake API, the three admission knobs (`lab`); V's record (`has_record`
+/// for any phase past `signed`, or a record that does not read); `state/claude/<v>.lock` taken without waiting
+/// (`admitting` while held) and its `finished_at=` line (`recent` within [`ADMIT_COOLDOWN`]); the sibling `ai-env`
+/// next to the wrapper (`no_sibling`); then the prewarm's double fork (`spawn_failed`), the lock's open file on
+/// fd 3, stdio on `/dev/null`, the prewarm's environment.
+pub fn maybe_auto_admit(paths: &Paths, cfg: &BridgeConfig, version: &str) -> AutoAdmit {
+    let sibling = || match crate::bridge::sibling::find_sibling("ai-env") {
+        crate::bridge::sibling::Sibling::Next(p) => Some(p),
+        _ => None,
+    };
+    auto_admit_with(paths, cfg, &crate::bridge::lab::vm_knobs(), version, &sibling)
+}
+
+/// [`maybe_auto_admit`] with the knobs and the sibling given (tests).
+fn auto_admit_with(paths: &Paths, cfg: &BridgeConfig, knobs: &crate::bridge::lab::VmKnobs, version: &str, sibling: &dyn Fn() -> Option<std::path::PathBuf>) -> AutoAdmit {
+    if !cfg.claude.auto_admit {
+        return AutoAdmit::Skipped("off");
+    }
+    let set = |k: Result<Option<std::path::PathBuf>, String>| matches!(k, Ok(Some(_)));
+    if knobs.fake_api.is_some() && !(set(knobs.release_curl()) && set(knobs.gpgv()) && set(knobs.admit_make())) {
+        return AutoAdmit::Skipped("lab");
+    }
+    match Record::load(paths, version) {
+        Ok(None) => {}
+        Ok(Some(r)) if matches!(r.phase(), Phase::Seen | Phase::Signed) => {}
+        _ => return AutoAdmit::Skipped("has_record"),
+    }
+    let lock = match crate::bridge::remote::prewarm::cooldown_lock(&paths.claude_lock(version), ADMIT_COOLDOWN, "admitting") {
+        Ok(lock) => lock,
+        Err(why) => return AutoAdmit::Skipped(why),
+    };
+    let Some(program) = sibling() else {
+        return AutoAdmit::Skipped("no_sibling");
+    };
+    let args: [&std::ffi::OsStr; 4] = ["claude".as_ref(), "admit".as_ref(), version.as_ref(), "--auto".as_ref()];
+    match crate::bridge::remote::prewarm::spawn_detached(&program, &args, &lock) {
+        Ok(pid) => AutoAdmit::Spawned(pid),
+        Err(e) => {
+            tracing::warn!(version, "claude admit --auto: {e}");
+            AutoAdmit::Skipped("spawn_failed")
+        }
+    }
+}
+
+/// What `maybe_auto_admit` did (logged; no census part, no audit row: LD-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoAdmit {
+    Spawned(u32),
+    Skipped(&'static str),
+}
+
+/// The installed Cursor bundle's Claude Code version (`doctor::pick_bundle` of `~/.cursor/extensions`, as
+/// `infra pin --bundle-version` reads it), `N.N.N` only.
+#[must_use]
+pub fn installed_bundle() -> Option<String> {
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cursor").join("extensions");
+    crate::bridge::doctor::pick_bundle(&crate::bridge::doctor::installed_extension_names(&dir)).map(|(v, _)| v).filter(|v| crate::wire::pin::is_version(v))
+}
+
+/// Why a failed version failed, as `status` and the doctor rows say it: the signature's word, the markers' missing
+/// one, the Docker run's last line, or the step's own words.
+#[must_use]
+pub fn failed_why(r: &Record) -> Option<String> {
+    if let Some(sig) = r.signature.as_ref().filter(|s| s.outcome == "failed") {
+        return Some(sig.why.clone().unwrap_or_else(|| "signature".into()));
+    }
+    let adm = r.admission.as_ref().filter(|a| a.outcome == "failed")?;
+    Some(match adm.step.as_deref() {
+        Some("markers") => adm.markers.clone().unwrap_or_else(|| "a marker is missing".into()),
+        Some("docker") => adm.docker.clone().unwrap_or_else(|| "the Docker tests failed".into()),
+        Some("download") => "the binary is not the signed manifest's".into(),
+        Some("version") => "a VM found another version in it".into(),
+        Some("stage") => "VMs refused two stages in a row".into(),
+        other => other.unwrap_or("admission").to_string(),
+    })
+}
+
+/// `status --json`'s document (pure): every version the records, the installed bundle and the live windows name,
+/// newest first, with its phase, ref, size, staging state, admission time and why it failed (absent values `null`).
+#[must_use]
+pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], image: Option<&str>, auto_admit: bool) -> serde_json::Value {
+    let mut versions: Vec<String> = records.iter().map(|r| r.version.clone()).chain(bundle.map(str::to_string)).chain(windows.iter().cloned()).filter(|v| crate::wire::pin::is_version(v)).collect();
+    versions.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
+    versions.dedup();
+    let rows: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            let r = records.iter().find(|r| &r.version == v);
+            serde_json::json!({
+                "version": v,
+                "phase": r.map_or_else(|| Phase::Seen.word(), |r| r.phase().word()),
+                "sha256": r.and_then(Record::claude_ref).map(|c| c.sha256),
+                "size": r.and_then(|r| r.signature.as_ref()).and_then(|s| s.linux_size),
+                "staged": r.and_then(|r| r.staging.as_ref()).map(|s| s.state.clone()),
+                "admitted_at": r.and_then(|r| r.admission.as_ref()).filter(|a| a.outcome == "admitted").map(|a| a.at.clone()),
+                "why": r.and_then(failed_why),
+            })
+        })
+        .collect();
+    let mut win: Vec<&String> = windows.iter().collect();
+    win.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
+    win.dedup();
+    serde_json::json!({ "versions": rows, "bundle": bundle, "windows": win, "image": image, "auto_admit": auto_admit })
+}
+
+/// `status`'s text lines from its document: one per version (its phase, who runs it, why it failed), then the image's
+/// fallback and the automatic admission's setting.
+#[must_use]
+pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
+    let s = |v: &serde_json::Value| v.as_str().map(str::to_string);
+    let bundle = s(&doc["bundle"]);
+    let windows: Vec<String> = doc["windows"].as_array().map(|a| a.iter().filter_map(s).collect()).unwrap_or_default();
+    let mut lines = Vec::new();
+    for v in doc["versions"].as_array().into_iter().flatten() {
+        let version = s(&v["version"]).unwrap_or_default();
+        let mut runs = Vec::new();
+        if bundle.as_deref() == Some(version.as_str()) {
+            runs.push("the Cursor bundle");
+        }
+        if windows.contains(&version) {
+            runs.push("a live Cursor window");
+        }
+        let mut line = format!("claude {version}: {}", s(&v["phase"]).unwrap_or_default());
+        if let Some(why) = s(&v["why"]) {
+            line.push_str(&format!(" ({why})"));
+        }
+        if !runs.is_empty() {
+            line.push_str(&format!("; run by {}", runs.join(" and ")));
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push("no Claude Code version known yet (no record, no Cursor bundle, no live window)".into());
+    }
+    lines.push(format!("the image's claude {} runs where no staged version can", s(&doc["image"]).unwrap_or_else(|| "unknown".into())));
+    let auto = if doc["auto_admit"].as_bool() == Some(true) { "on: a wrapper starts ai-env claude admit <v> --auto while Docker answers" } else { "off: only ai-env claude admit or update admits" };
+    lines.push(format!("automatic admission ([claude].auto_admit): {auto}"));
+    lines
+}
+
+/// `ai-env claude status [--json]` (§7.1): local reads only, no Touch ID: the records, the installed bundle, the live
+/// windows (the census), the deployed image's claude (`state/infra.toml`) and `[claude].auto_admit`.
+pub fn cmd_status(json: bool) -> crate::errors::Result<()> {
+    let paths = Paths::resolve()?;
+    let auto_admit = BridgeConfig::load(&paths).ok().flatten().unwrap_or_default().claude.auto_admit;
+    let records = load_all(&paths);
+    let windows: Vec<String> = crate::bridge::doctor::running_windows().into_iter().map(|w| w.ext).filter(|e| crate::wire::pin::is_version(e)).collect();
+    let image = crate::bridge::infra::read_infra_state(&paths).ok().flatten().and_then(|s| s.claude_version);
+    let doc = status_doc(&records, installed_bundle().as_deref(), &windows, image.as_deref(), auto_admit);
+    if json {
+        crate::outln!("{}", serde_json::to_string_pretty(&doc).map_err(|e| crate::errors::CliError::Msg(format!("cannot render JSON: {e}")))?);
+    } else {
+        for line in status_lines(&doc) {
+            crate::outln!("{line}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    fn paths(dir: &std::path::Path) -> Paths {
+        Paths::from_root_and_env(dir.join("bridge"), None)
+    }
+
+    #[test]
+    fn records_round_trip_and_name_their_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        assert_eq!(Record::load(&p, "2.1.308").unwrap(), None);
+        assert!(load_all(&p).is_empty());
+        let seen = Record::update(&p, "2.1.308", |_| {}).unwrap();
+        assert_eq!((seen.v, seen.version.as_str(), seen.phase(), seen.phase().word()), (1, "2.1.308", Phase::Seen, "seen".to_string()));
+        assert_eq!(seen.claude_ref(), None);
+        assert!(!seen.created.is_empty());
+        let sha = "a".repeat(64);
+        let signed = Record::update(&p, "2.1.308", |r| {
+            r.signature = Some(SignatureRow { outcome: "ok".into(), signer: Some("F".into()), linux_sha256: Some(sha.clone()), linux_size: Some(290), at: "t".into(), ..SignatureRow::default() });
+        })
+        .unwrap();
+        assert_eq!((signed.phase(), signed.created.as_str()), (Phase::Signed, seen.created.as_str()));
+        assert_eq!(signed.claude_ref(), Some(ClaudeRef { version: "2.1.308".into(), sha256: sha.clone() }));
+        let admitted = Record::update(&p, "2.1.308", |r| r.admission = Some(AdmissionRow { outcome: "admitted".into(), markers: Some("ok".into()), ai_env: "0.1.0".into(), at: "t".into(), ..AdmissionRow::default() })).unwrap();
+        assert_eq!((admitted.phase(), admitted.nameable()), (Phase::Admitted, false));
+        let staged = Record::update(&p, "2.1.308", |r| r.staging = Some(StagingRow { state: "staged".into(), s3_key: format!("v1/_claude/mac/2.1.308/{sha}"), at: "t".into(), ..StagingRow::default() })).unwrap();
+        assert_eq!((staged.phase(), staged.nameable(), staged.phase().word()), (Phase::Staged, true, "staged".to_string()));
+        // What was written reads back the same, 0600 in a 0700 directory.
+        assert_eq!(Record::load(&p, "2.1.308").unwrap(), Some(staged.clone()));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(p.claude_record("2.1.308")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(p.claude_dir()).unwrap().permissions().mode() & 0o777, 0o700);
+        let stale = Record::update(&p, "2.1.308", |r| r.staging.as_mut().unwrap().state = "stale".into()).unwrap();
+        assert_eq!(stale.phase(), Phase::Stale);
+        let absent = Record::update(&p, "2.1.308", |r| r.staging.as_mut().unwrap().state = "absent".into()).unwrap();
+        assert_eq!(absent.phase(), Phase::Admitted);
+        // A failed admission or signature is read before any staging state: never nameable.
+        let failed = Record::update(&p, "2.1.308", |r| {
+            r.staging.as_mut().unwrap().state = "staged".into();
+            let a = r.admission.as_mut().unwrap();
+            a.outcome = "failed".into();
+            a.step = Some("version".into());
+        })
+        .unwrap();
+        assert_eq!((failed.phase().word(), failed.nameable()), ("failed(version)".to_string(), false));
+        let bad_sig = Record::update(&p, "2.1.309", |r| r.signature = Some(SignatureRow { outcome: "failed".into(), why: Some("wrong_key".into()), at: "t".into(), ..SignatureRow::default() })).unwrap();
+        assert_eq!((bad_sig.phase().word(), bad_sig.claude_ref()), ("failed(signature)".to_string(), None));
+        // Every record, oldest first; a file that is no version's is not read.
+        Record::update(&p, "2.1.10", |_| {}).unwrap();
+        std::fs::write(p.claude_dir().join("notes.toml"), "x = 1\n").unwrap();
+        let versions: Vec<String> = load_all(&p).into_iter().map(|r| r.version).collect();
+        assert_eq!(versions, ["2.1.10", "2.1.308", "2.1.309"]);
+        assert!(Record::update(&p, "2.1", |_| {}).is_err());
+        assert!(Record::load(&p, "../x").is_err());
+    }
+
+    #[test]
+    fn a_record_of_another_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        Record::update(&p, "2.1.308", |_| {}).unwrap();
+        let path = p.claude_record("2.1.308");
+        let good = std::fs::read_to_string(&path).unwrap();
+        for (bad, says) in [
+            (good.replace("v = 1", "v = 2"), "schema 2"),
+            (format!("{good}surprise = true\n"), "surprise"),
+            (good.replace("version = \"2.1.308\"", "version = \"2.1.309\""), "not 2.1.308"),
+            (format!("{good}\n[signature]\noutcome = \"ok\"\nextra = 1\n"), "extra"),
+        ] {
+            std::fs::write(&path, &bad).unwrap();
+            let e = Record::load(&p, "2.1.308").unwrap_err().to_string();
+            assert!(e.contains(says), "{e}");
+            // load_all skips it; update refuses to write over it.
+            assert!(load_all(&p).is_empty());
+            assert!(Record::update(&p, "2.1.308", |_| {}).is_err());
+        }
+    }
+
+    /// A record of `v` in `phase` (`seen`, `signed`, `admitted`, `staged`, `stale`, `absent`, `failed`), its linux
+    /// pin `c` repeated 64 times, 290 bytes.
+    pub(crate) fn put(p: &Paths, v: &str, c: char, phase: &str) -> Record {
+        let sha = c.to_string().repeat(64);
+        Record::update(p, v, |r| {
+            if phase == "seen" {
+                return;
+            }
+            r.signature = Some(SignatureRow { outcome: "ok".into(), signer: Some(crate::wire::pin::RELEASE_KEY_FPR.into()), linux_sha256: Some(sha.clone()), linux_size: Some(290), at: "2026-10-23T10:00:00Z".into(), ..SignatureRow::default() });
+            if phase == "signed" {
+                return;
+            }
+            let failed = phase == "failed";
+            r.admission = Some(AdmissionRow {
+                outcome: if failed { "failed" } else { "admitted" }.into(),
+                step: failed.then(|| "markers".into()),
+                markers: Some(if failed { "missing:auto_mode" } else { "ok" }.into()),
+                ai_env: "0.1.0".into(),
+                at: "2026-10-23T10:05:00Z".into(),
+                ..AdmissionRow::default()
+            });
+            if matches!(phase, "staged" | "stale" | "absent" | "failed") {
+                let state = if failed { "staged" } else { phase };
+                r.staging = Some(StagingRow { state: state.into(), s3_key: format!("v1/_claude/mac/{v}/{sha}"), at: "2026-10-23T10:10:00Z".into(), ..StagingRow::default() });
+            }
+        })
+        .unwrap()
+    }
+
+    fn cref(v: &str, c: char) -> ClaudeRef {
+        ClaudeRef { version: v.into(), sha256: c.to_string().repeat(64) }
+    }
+
+    /// A3's review: forget's delete under the records lock; a verdict after it writes nothing back.
+    #[test]
+    fn a_removed_record_stays_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        assert!(!Record::remove(&p, "2.1.306").unwrap(), "none to remove");
+        Record::update(&p, "2.1.306", |_| {}).unwrap();
+        assert!(Record::remove(&p, "2.1.306").unwrap());
+        assert_eq!(Record::update_existing(&p, "2.1.306", |_| true).unwrap(), None, "not written back");
+        assert!(Record::load(&p, "2.1.306").unwrap().is_none());
+    }
+
+    /// L2: V first when nameable, then every other nameable version newest first (2.1.9 before 2.1.306 as text,
+    /// after it as numbers), at most four, a sha256 once; a failed version is never named whatever its staging
+    /// says; V's phase and why it does not lead.
+    #[test]
+    fn plan_for_names_admitted_staged_versions_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        for (v, c, phase) in [("2.1.306", 'a', "staged"), ("2.1.310", 'b', "staged"), ("2.1.9", 'c', "staged"), ("2.1.311", 'a', "staged"), ("2.1.312", 'f', "staged"), ("2.1.308", 'd', "admitted"), ("2.1.307", 'e', "failed"), ("2.1.309", '9', "stale")] {
+            put(&p, v, c, phase);
+        }
+        let plan = plan_for(&p, Some("2.1.310"));
+        assert_eq!((plan.ext.as_deref(), plan.phase.as_deref(), plan.why_not), (Some("2.1.310"), Some("staged"), None));
+        assert_eq!(plan.prefs, [cref("2.1.310", 'b'), cref("2.1.312", 'f'), cref("2.1.311", 'a'), cref("2.1.9", 'c')]);
+        assert_eq!(plan.sizes.len(), 4);
+        assert!(plan.sizes.values().all(|s| *s == 290));
+        for (v, phase, why) in [("2.1.308", "admitted", "not_staged"), ("2.1.309", "stale", "not_staged"), ("2.1.307", "failed(markers)", "failed"), ("2.1.400", "seen", "seen")] {
+            let plan = plan_for(&p, Some(v));
+            assert_eq!((plan.phase.as_deref(), plan.why_not), (Some(phase), Some(why)), "{v}");
+            assert_eq!(plan.prefs, [cref("2.1.312", 'f'), cref("2.1.311", 'a'), cref("2.1.310", 'b'), cref("2.1.9", 'c')], "{v}: the others newest first");
+        }
+        put(&p, "2.1.401", '1', "signed");
+        assert_eq!(plan_for(&p, Some("2.1.401")).why_not, Some("seen"), "signed is not admitted yet");
+        for ext in [None, Some("2.1"), Some("x"), Some("2.1.310-beta")] {
+            let plan = plan_for(&p, ext);
+            assert_eq!((plan.ext.as_deref(), plan.phase.as_deref(), plan.why_not), (None, None, Some("no_ext")), "{ext:?}");
+            assert_eq!(plan.prefs.len(), 4);
+        }
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(plan_for(&paths(empty.path()), Some("2.1.310")), ClaudePlan { ext: Some("2.1.310".into()), phase: Some("seen".into()), why_not: Some("seen"), ..ClaudePlan::default() });
+    }
+
+    /// §5.1's words, each from what ran (`Spawned`) against what P4 asked.
+    #[test]
+    fn census_words_of_claude_src() {
+        let v = cref("2.1.310", 'b');
+        let older = cref("2.1.309", 'c');
+        let staged = ClaudePlan { ext: Some("2.1.310".into()), phase: Some("staged".into()), why_not: None, prefs: vec![v.clone(), older.clone()], ..ClaudePlan::default() };
+        let asked = |plan: &ClaudePlan, cap: bool, sent: Vec<ClaudeRef>, after: bool| ClaudeAsk { plan: plan.clone(), cap, sent, after_start_failed: after };
+        let both = asked(&staged, true, vec![v.clone(), older.clone()], false);
+        let sha = |r: &ClaudeRef| r.sha256.clone();
+        type Case<'a> = (ClaudeAsk, Option<&'a str>, Option<&'a str>, Option<String>, &'a str);
+        let cases: Vec<Case<'_>> = vec![
+            (both.clone(), Some("2.1.305"), Some("2.1.310"), Some(sha(&v)), "cached"),
+            (both.clone(), Some("2.1.305"), Some("2.1.309"), Some(sha(&older)), "older(not_cached)"),
+            (both.clone(), Some("2.1.305"), Some("2.1.305"), None, "image(not_cached)"),
+            (both.clone(), Some("2.1.310"), Some("2.1.310"), None, "image"),
+            (both.clone(), Some("2.1.310"), None, None, "image"),
+            (asked(&staged, false, Vec::new(), false), Some("2.1.305"), Some("2.1.305"), None, "image(no_cap)"),
+            (asked(&staged, true, vec![older.clone()], false), Some("2.1.305"), Some("2.1.309"), Some(sha(&older)), "older(bad)"),
+            (asked(&staged, true, vec![older.clone()], true), Some("2.1.305"), Some("2.1.309"), Some(sha(&older)), "older(start_failed)"),
+            (asked(&staged, true, Vec::new(), true), Some("2.1.305"), Some("2.1.305"), None, "image(start_failed)"),
+        ];
+        for (ask, image, ran, ran_sha, want) in cases {
+            assert_eq!(claude_src_of(&ask, image, ran, ran_sha.as_deref()), want, "{ask:?} ran {ran:?}");
+        }
+        for (why, phase) in [("seen", "seen"), ("failed", "failed(markers)"), ("not_staged", "admitted")] {
+            let plan = ClaudePlan { ext: Some("2.1.310".into()), phase: Some(phase.into()), why_not: Some(why), prefs: vec![older.clone()], ..ClaudePlan::default() };
+            let ask = asked(&plan, true, vec![older.clone()], false);
+            assert_eq!(claude_src_of(&ask, Some("2.1.305"), Some("2.1.305"), None), format!("image({why})"));
+            assert_eq!(claude_src_of(&ask, Some("2.1.305"), Some("2.1.309"), Some(&sha(&older))), format!("older({why})"));
+            assert_eq!(claude_src_of(&ask, Some("2.1.310"), Some("2.1.310"), None), "image", "the image's own is V");
+        }
+        let no_v = ClaudeAsk { plan: ClaudePlan { why_not: Some("no_ext"), prefs: vec![older.clone()], ..ClaudePlan::default() }, cap: true, sent: vec![older.clone()], after_start_failed: false };
+        assert_eq!(claude_src_of(&no_v, Some("2.1.305"), Some("2.1.305"), None), "image(no_ext)");
+        assert_eq!(claude_src_of(&no_v, Some("2.1.305"), Some("2.1.309"), Some(&sha(&older))), "older(no_ext)");
+        for word in crate::bridge::remote::CLAUDE_SRC_WHYS {
+            assert!(word.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'), "{word}");
+        }
+    }
+
+    /// `status` names every phase, the bundle's and the windows' versions (seen without a record), the image's
+    /// fallback and the automatic admission.
+    #[test]
+    fn status_lists_seen_signed_admitted_failed_staged_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        for (v, c, phase) in [("2.1.306", 'a', "seen"), ("2.1.307", 'b', "signed"), ("2.1.308", 'c', "admitted"), ("2.1.309", 'd', "failed"), ("2.1.310", 'e', "staged"), ("2.1.311", 'f', "stale")] {
+            put(&p, v, c, phase);
+        }
+        let doc = status_doc(&load_all(&p), Some("2.1.320"), &["2.1.310".to_string(), "2.1.310".to_string()], Some("2.1.305"), true);
+        let phases: Vec<(String, String)> = doc["versions"].as_array().unwrap().iter().map(|v| (v["version"].as_str().unwrap().to_string(), v["phase"].as_str().unwrap().to_string())).collect();
+        let want = [("2.1.320", "seen"), ("2.1.311", "stale"), ("2.1.310", "staged"), ("2.1.309", "failed(markers)"), ("2.1.308", "admitted"), ("2.1.307", "signed"), ("2.1.306", "seen")];
+        assert_eq!(phases, want.map(|(v, p)| (v.to_string(), p.to_string())));
+        let row = |v: &str| doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == v).unwrap().clone();
+        assert_eq!(row("2.1.310"), serde_json::json!({"version": "2.1.310", "phase": "staged", "sha256": "e".repeat(64), "size": 290, "staged": "staged", "admitted_at": "2026-10-23T10:05:00Z", "why": null}));
+        assert_eq!(row("2.1.320"), serde_json::json!({"version": "2.1.320", "phase": "seen", "sha256": null, "size": null, "staged": null, "admitted_at": null, "why": null}));
+        assert_eq!(row("2.1.309")["why"], "missing:auto_mode");
+        assert_eq!((doc["bundle"].as_str(), doc["image"].as_str(), doc["auto_admit"].as_bool()), (Some("2.1.320"), Some("2.1.305"), Some(true)));
+        assert_eq!(doc["windows"], serde_json::json!(["2.1.310"]));
+        let lines = status_lines(&doc);
+        for want in ["claude 2.1.320: seen; run by the Cursor bundle", "claude 2.1.310: staged; run by a live Cursor window", "claude 2.1.309: failed(markers) (missing:auto_mode)", "claude 2.1.311: stale", "the image's claude 2.1.305 runs where no staged version can"] {
+            assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
+        }
+        assert!(lines.last().unwrap().starts_with("automatic admission ([claude].auto_admit): on"), "{lines:?}");
+        let none = status_lines(&status_doc(&[], None, &[], None, false));
+        assert_eq!(none.len(), 3, "{none:?}");
+        assert!(none[1].contains("unknown") && none[2].contains(": off"), "{none:?}");
+    }
+
+    /// D5: one detached `ai-env claude admit <v> --auto` per version while its lock is held, none again within the
+    /// cooldown its child writes, one more once it passed; never for an admitted record, with the switch off, under
+    /// the fake API without the three admission knobs, or without the sibling.
+    #[test]
+    fn auto_admit_forks_once_per_version_and_cooldown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let cfg = BridgeConfig::default();
+        let knobs = crate::bridge::lab::VmKnobs::default();
+        // The child: what `claude admit --auto` writes at its end, on fd 3 (its lock's open file), then its exit.
+        let child = dir.path().join("admit.sh");
+        let log = dir.path().join("admit.log");
+        std::fs::write(&child, format!("#!/bin/sh\necho \"$@\" >> '{}'\nprintf 'finished_at=%s\\noutcome=skipped(no_docker)\\n' \"$(date +%s)\" >&3\n", log.display())).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sibling = || Some(child.clone());
+        let settled = |v: &str| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let r = auto_admit_with(&p, &cfg, &knobs, v, &sibling);
+                if r != AutoAdmit::Skipped("admitting") || std::time::Instant::now() > until {
+                    return r;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        assert!(matches!(auto_admit_with(&p, &cfg, &knobs, "2.1.310", &sibling), AutoAdmit::Spawned(pid) if pid > 0));
+        assert_eq!(settled("2.1.310"), AutoAdmit::Skipped("recent"), "its end within the cooldown");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "claude admit 2.1.310 --auto\n");
+        let lock = p.claude_lock("2.1.310");
+        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+        // Past the cooldown: once more.
+        let old = crate::wire::time::unix_now() - ADMIT_COOLDOWN.as_secs() - 60;
+        std::fs::write(&lock, format!("finished_at={old}\noutcome=error(fetch)\n")).unwrap();
+        assert!(matches!(auto_admit_with(&p, &cfg, &knobs, "2.1.310", &sibling), AutoAdmit::Spawned(_)));
+        assert_eq!(settled("2.1.310"), AutoAdmit::Skipped("recent"));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        // Another holds the lock (an admission or a stage of it runs): never a second.
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&p.claude_lock("2.1.311")).unwrap().expect("the lock is free");
+        assert_eq!(auto_admit_with(&p, &cfg, &knobs, "2.1.311", &sibling), AutoAdmit::Skipped("admitting"));
+        drop(held);
+        // A version past `signed`: never; a signed one: yes.
+        put(&p, "2.1.312", 'a', "admitted");
+        assert_eq!(auto_admit_with(&p, &cfg, &knobs, "2.1.312", &sibling), AutoAdmit::Skipped("has_record"));
+        put(&p, "2.1.313", 'b', "failed");
+        assert_eq!(auto_admit_with(&p, &cfg, &knobs, "2.1.313", &sibling), AutoAdmit::Skipped("has_record"));
+        put(&p, "2.1.314", 'c', "signed");
+        assert!(matches!(auto_admit_with(&p, &cfg, &knobs, "2.1.314", &sibling), AutoAdmit::Spawned(_)));
+        // The switch, the lab, the sibling.
+        let off = BridgeConfig { claude: crate::bridge::config::ClaudeCfg { auto_admit: false }, ..BridgeConfig::default() };
+        assert_eq!(auto_admit_with(&p, &off, &knobs, "2.1.315", &sibling), AutoAdmit::Skipped("off"));
+        let lab = crate::bridge::lab::VmKnobs { fake_api: Some(dir.path().join("fake.json")), ..crate::bridge::lab::VmKnobs::default() };
+        assert_eq!(auto_admit_with(&p, &cfg, &lab, "2.1.315", &sibling), AutoAdmit::Skipped("lab"));
+        assert_eq!(auto_admit_with(&p, &cfg, &knobs, "2.1.315", &|| None), AutoAdmit::Skipped("no_sibling"));
+        assert_eq!(maybe_auto_admit(&p, &off, "2.1.315"), AutoAdmit::Skipped("off"));
+        assert_eq!(settled("2.1.314"), AutoAdmit::Skipped("recent"));
+        assert!(!needs_staging(&p, "2.1.314") && needs_staging(&p, "2.1.312") && !needs_staging(&p, "2.1.316"));
+        put(&p, "2.1.316", 'd', "stale");
+        put(&p, "2.1.317", 'e', "staged");
+        assert!(needs_staging(&p, "2.1.316") && !needs_staging(&p, "2.1.317"));
+    }
+
+}

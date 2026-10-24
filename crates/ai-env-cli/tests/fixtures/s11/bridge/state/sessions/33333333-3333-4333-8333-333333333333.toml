@@ -1,0 +1,14 @@
+v = 2
+session_id = "33333333-3333-4333-8333-333333333333"
+slug = "-tmp-elsewhere"
+cwd = "/tmp/elsewhere"
+transcript_rel = "-tmp-elsewhere/33333333-3333-4333-8333-333333333333.jsonl"
+created = "2026-10-22T14:00:00Z"
+last_seen = "2026-10-22T15:00:00Z"
+status = "closed"
+mode = "local-child"
+route = "local:outside_roots"
+ext = "anthropic.claude-code-2.1.305"
+pid = 1
+argv_hash = "fixture"
+respawns = 0

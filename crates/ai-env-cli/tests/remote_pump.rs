@@ -185,7 +185,7 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     // stage's view first, then the sync's).
     synced(&mut h, &sid, 2);
     let manifest = ai_env_cli::bridge::s3::manifest::read(&ai_env_cli::bridge::config::Paths::from_root_and_env(h.rig().bridge(), None), &sid).unwrap().expect("the chat's manifest");
-    let synced: Vec<u8> = manifest.parts.iter().flat_map(|p| h.rig().s3().get(&p.key).expect("each part in S3")).collect();
+    let synced: Vec<u8> = manifest.parts.iter().flat_map(|p| decoded(p, h.rig().s3().get(&p.key).expect("each part in S3"))).collect();
     assert_eq!(synced, std::fs::read(&vm_transcript).unwrap(), "S3 holds the VM's transcript, the Mac's part first: {:?}", manifest.parts);
     let vm_head = git_in(&vm_dir, &["rev-parse", "HEAD"]);
     assert_eq!((git_in(&work, &["rev-parse", "refs/remotes/box/main"]), git_in(&work, &["rev-parse", "refs/remotes/box/main^"])), (vm_head.clone(), head.clone()), "the agent's commit on the seeded head");
@@ -784,7 +784,7 @@ mod remote_link {
                     let row = read_row(&paths, &vm).ok().flatten().expect("the VM's row");
                     let spawn_id = SpawnId::new_v7();
                     let argv = ["claude", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json"].map(String::from).to_vec();
-                    let spec = SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(spawn_id.clone()) };
+                    let spec = SpawnSpec { argv, cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(spawn_id.clone()), claude: Vec::new() };
                     let (session_paths, session_row, session_fake) = (paths.clone(), row.clone(), fake.clone());
                     let session = tokio::task::spawn_local(async move {
                         let api = FileFakeMicrovmApi::open(&session_fake)?;
@@ -805,7 +805,7 @@ mod remote_link {
                     let api = FileFakeMicrovmApi::open(&fake).expect("the fake API");
                     let target = AgentTarget::from_row(&row).expect("the VM's target");
                     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
-                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None, seal: None })
+                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None, seal: None, claude: None, after_output: None })
                 })
             }),
         )
@@ -1602,11 +1602,29 @@ fn synced(h: &mut Harness, sid: &str, views: usize) {
 }
 
 /// S9: what the tests' S3 holds of session `sid`, its manifest's parts in
-/// order (the rig's bridge): the transcript the Mac committed.
+/// order (the rig's bridge), each decoded ([`decoded`]): the transcript the
+/// Mac committed.
 fn held_in_s3(rig: &common::remote::RemoteRig, sid: &str) -> Vec<u8> {
     let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None);
     let m = ai_env_cli::bridge::s3::manifest::read(&paths, sid).unwrap().unwrap_or_else(|| panic!("no manifest of {sid}"));
-    m.parts.iter().flat_map(|p| rig.s3().get(&p.key).unwrap_or_else(|| panic!("{} not in S3", p.key))).collect()
+    m.parts.iter().flat_map(|p| decoded(p, rig.s3().get(&p.key).unwrap_or_else(|| panic!("{} not in S3", p.key)))).collect()
+}
+
+/// S11 (C4, L5): a manifest part's transcript bytes from its stored object:
+/// a gzip part (a Mac-begun chat's inline upload once the VM names
+/// `transcript_gzip_v1`) through `/usr/bin/gzip -dc`; an identity part as
+/// stored.
+fn decoded(p: &ai_env_cli::bridge::s3::manifest::ManifestPart, bytes: Vec<u8>) -> Vec<u8> {
+    if p.encoding != Some(ai_env_cli::wire::workspace::PartEncoding::Gzip) {
+        return bytes;
+    }
+    let mut child = std::process::Command::new("/usr/bin/gzip").arg("-dc").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feed = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &bytes));
+    let out = child.wait_with_output().unwrap();
+    feed.join().unwrap().unwrap();
+    assert!(out.status.success(), "gzip -dc of {}", p.key);
+    out.stdout
 }
 
 /// S9: whether `path` is a chat's view (its first bytes the view's mark).
@@ -2278,7 +2296,9 @@ fn a_401_from_the_vm_child_stops_it_and_exits_5_without_respawn() {
     let (status, _) = h.wait(EXIT);
     assert_eq!(status.code(), Some(5), "{}", h.transcript());
     let err = h.err_text();
-    assert_eq!(last_line(&err), "ai-env-claude: Anthropic refused the delivered setup-token (HTTP 401): the session was stopped and is not started again; seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`", "{err}");
+    // S11 I1 (A1 joint review J1): the line names the refused seal's account (the green world's adopted `default`,
+    // installed), never `creds setup-token`, which would seal the fresh token into the active account.
+    assert_eq!(last_line(&err), "ai-env-claude: Anthropic refused Claude account default's token (HTTP 401), so the session ended: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add default`, or `ai-env creds account use OTHER`", "{err}");
     let note = h.end_note();
     assert!(common::note_has(&note, "end:credential_rejected"), "{note}");
     assert_eq!((h.spawn_count(), h.audit_events("session_remote_start").len()), (1, 1), "nothing started again");
@@ -2695,7 +2715,7 @@ fn a_reopen_over_what_it_pulls_inline_is_refused_at_p0_or_p3_before_any_pull() {
         let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None);
         let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
         let mut m = Manifest::new(&sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
-        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len: 70 << 20, sha256: "a".repeat(64) });
+        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len: 70 << 20, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
         (m.gen, m.committed, m.fp) = (1, 70 << 20, "b".repeat(64));
         manifest::write(&paths, &m).expect("the chat's manifest");
         // P0: no VM of the workspace yet.
@@ -2748,7 +2768,7 @@ fn with_reuse_off_a_reopen_over_what_it_pulls_inline_names_the_switch() {
     let manifest_of = |rig: &common::remote::RemoteRig, len: u64| {
         let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
         let mut m = Manifest::new(&sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
-        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len, sha256: "a".repeat(64) });
+        m.parts.push(ManifestPart { key: base.clone(), version_id: "fv1".into(), from: 0, len, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
         (m.gen, m.committed, m.fp) = (1, len, "b".repeat(64));
         manifest::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None), &m).expect("the chat's manifest");
     };
@@ -2806,7 +2826,7 @@ fn chat_past_the_cap_in_s3(rig: &common::remote::RemoteRig, sid: &str, slug: &st
     let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
     let mut m = Manifest::new(sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
     let fp = sha256_of(&chat[chat.len() - usize::try_from(FP_SPAN).unwrap()..]);
-    m.parts.push(ManifestPart { key: base, version_id: version, from: 0, len: INLINE_MAX, sha256 });
+    m.parts.push(ManifestPart { key: base, version_id: version, from: 0, len: INLINE_MAX, sha256, encoding: None, stored_len: None, stored_sha256: None });
     (m.gen, m.committed, m.fp) = (1, INLINE_MAX, fp);
     manifest::write(&ai_env_cli::bridge::config::Paths::from_root_and_env(rig.bridge(), None), &m).expect("the chat's manifest");
     (chat, tail)
@@ -3974,12 +3994,15 @@ fn the_vm_settings_diff_is_captured_into_quarantine() {
 /// 8 MiB window) while the host stops reading after the 10th; the session
 /// reattaches (`agent_reconnect`), and once the host reads again every line
 /// arrives exactly once, in order, from the same VM process, the turn ends
-/// and EOF exits 0 within the close budget. The census counts the drop. A
-/// closed session, an unknown one or no session id are refused.
+/// and EOF exits 0 within the close budget, measured with the wall-clock
+/// lane alone (S11 I2: 1.545 s once beside the binary's other rigs). The
+/// census counts the drop. A closed session, an unknown one or no session id
+/// are refused.
 #[test]
 fn drop_transport_reattaches_without_a_lost_or_doubled_line() {
     use ai_env_cli::bridge::remote::CLOSE_BUDGET_MS;
     const LINES: u64 = 300;
+    let _alone = common::remote::alone();
     let pad = (64 * 1024).to_string();
     let lines = LINES.to_string();
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_INIT_AT_TURN", "1"), ("FAKE_STREAM_LINES", lines.as_str()), ("FAKE_STREAM_PAD", pad.as_str())]);
@@ -4692,4 +4715,460 @@ fn a_remote_session_writes_no_mirror() {
         let head: Vec<u8> = std::fs::read(mac.join(&rel)).unwrap().into_iter().take(ai_env_cli::wire::view::VIEW_HEAD_READ).collect();
         assert!(ai_env_cli::wire::view::is_view_head(&head), "{rel} is a view, if anything");
     }
+}
+
+// ---- S11 (A3): the start-up respawns and the census's claude (plans/s11-contracts-A.md §4.4, §5.1) -------------
+
+/// The arguments each generation of the VM's fake claude was given (`argv.log`'s `--- gen <n>` sections), in order.
+fn argv_by_gen(h: &Harness) -> Vec<Vec<String>> {
+    let mut gens: Vec<Vec<String>> = Vec::new();
+    for line in read(&h.root().join("argv.log")).lines() {
+        if line.starts_with("--- gen") {
+            gens.push(Vec::new());
+        } else if let Some(g) = gens.last_mut() {
+            g.push(line.to_string());
+        }
+    }
+    gens
+}
+
+/// A remote session whose VM claude refuses `flags` (in argv order) at its start, run to the end of one turn.
+fn refused_session(extra: &[&str], refuse: &str) -> Harness {
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", extra, &[("FAKE_REJECT_OPTION", refuse)]);
+    started(&mut h);
+    turn(&mut h, "after the refusal");
+    closed(&mut h);
+    h
+}
+
+/// S11 (A.5, L1): generation 1's CLI refuses an option before it reads its stdin (`error: unknown option`):
+/// one `argv_retry` on the same VM without it, the host's handshake replayed, the chat goes on; the census says
+/// `respawns:1` and `argv_dropped:<flag>`.
+#[test]
+fn an_unknown_option_respawns_generation_1_once_without_it() {
+    let h = refused_session(&["--from-the-future"], "--from-the-future");
+    let gens = argv_by_gen(&h);
+    assert_eq!(gens.len(), 2, "{gens:?}");
+    assert!(gens[0].iter().any(|a| a == "--from-the-future") && !gens[1].iter().any(|a| a == "--from-the-future"), "{gens:?}");
+    assert_eq!(gens[1].iter().filter(|a| a.as_str() != "--from-the-future").count(), gens[0].len() - 1, "nothing else dropped: {gens:?}");
+    let env = read(&h.root().join("env.log"));
+    assert!(env.lines().any(|l| l == "gen 1 rejected=--from-the-future"), "{env}");
+    let starts = h.audit_events("session_remote_start");
+    let whys: Vec<&str> = starts.iter().map(|r| r["detail"]["why"].as_str().unwrap_or_default()).collect();
+    assert_eq!(whys, ["first", "argv_retry"], "{starts:?}");
+    assert_eq!(starts[0]["detail"]["id"], starts[1]["detail"]["id"], "the same VM");
+    let note = h.end_note();
+    for part in ["respawns:1", "argv_dropped:--from-the-future"] {
+        assert!(note.split("; ").any(|p| p == part), "{part}: {note}");
+    }
+}
+
+/// A second refused option is dropped too (up to `ARGV_DROP_MAX`), each from then on: two respawns, the census
+/// naming both in drop order.
+#[test]
+fn a_second_unknown_option_is_dropped_too() {
+    let h = refused_session(&["--one", "--include-partial-messages", "--two"], "--one --two");
+    let gens = argv_by_gen(&h);
+    assert_eq!(gens.len(), 3, "{gens:?}");
+    let has = |g: &Vec<String>, f: &str| g.iter().any(|a| a == f);
+    assert!(has(&gens[0], "--one") && has(&gens[0], "--two"));
+    assert!(!has(&gens[1], "--one") && has(&gens[1], "--two"));
+    assert!(!has(&gens[2], "--one") && !has(&gens[2], "--two") && has(&gens[2], "--include-partial-messages"), "{gens:?}");
+    let note = h.end_note();
+    for part in ["respawns:2", "argv_dropped:--one,--two"] {
+        assert!(note.split("; ").any(|p| p == part), "{part}: {note}");
+    }
+    let rows = h.audit_events("argv_dropped");
+    assert_eq!(rows.iter().map(|r| r["detail"]["flag"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>(), ["--one", "--two"]);
+}
+
+/// `argv_dropped` once per flag and claude version on this Mac (its marker under `state/argv-dropped/`): a
+/// second chat refusing the same flag respawns as the first did but writes no second row.
+#[test]
+fn argv_dropped_is_audited_once_per_flag_and_version() {
+    let mut p = Harness::prepare();
+    let knobs = [("FAKE_REJECT_OPTION", "--from-the-future")];
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper(&["--from-the-future"], &knobs), rig.wrapper(&["--from-the-future"], &knobs))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    closed(&mut first);
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    started(&mut second);
+    turn(&mut second, "two");
+    closed(&mut second);
+    let rows = first.audit_events("argv_dropped");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0]["detail"];
+    let claude = d["claude"].as_str().unwrap_or_default().to_string();
+    assert_eq!((d["flag"].as_str(), d["gen"].as_str()), (Some("--from-the-future"), Some("1")));
+    assert!(!claude.is_empty() && d["vm"].as_str().is_some_and(|v| v.starts_with("microvm-")), "{d}");
+    assert!(first.rig().bridge().join("state").join("argv-dropped").join(&claude).join("--from-the-future").is_file(), "the marker");
+    assert_eq!(first.audit_events("session_remote_start").iter().filter(|r| r["detail"]["why"] == "argv_retry").count(), 2, "both chats respawned");
+}
+
+/// The start-up respawns take the VM's cached token: one Touch ID for the whole wrapper (D1), however many
+/// generations started.
+#[test]
+fn the_start_up_respawns_take_no_touch_id() {
+    let mut p = Harness::prepare();
+    let before = p.rig().decrypts();
+    let mut h = p.spawn_on(common::Link::Remote, "", &["--one", "--two"], &[("FAKE_REJECT_OPTION", "--one --two")]);
+    started(&mut h);
+    turn(&mut h, "hello");
+    closed(&mut h);
+    assert_eq!(argv_by_gen(&h).len(), 3);
+    assert_eq!(h.rig().decrypts() - before, 1, "one Touch ID per wrapper process (D1)");
+    assert!(h.end_note().split("; ").any(|p| p == "credential:cached"), "the respawns' token is the VM's copy: {}", h.end_note());
+}
+
+/// S11 (A.4, §5.1): the census's `claude:` comes from `spawned` (the shim always names the claude that ran) and
+/// `claude_src:` right after it says where it came from: the image's own when it is V (argv[1]'s bundle), else
+/// `image(<why>)` (V not admitted on this Mac: `seen`; no bundle path: `no_ext`).
+#[test]
+fn the_census_says_claude_and_claude_src_from_spawned() {
+    for (ext, src) in [(Some("2.1.305"), "image"), (Some("2.1.310"), "image(seen)"), (None, "image(no_ext)")] {
+        let mut p = Harness::prepare();
+        let cmd = match ext {
+            Some(v) => p.rig().wrapper_for_bundle(v, &[], &[]),
+            None => p.rig().wrapper(&[], &[]),
+        };
+        let mut h = p.launch_wrapper(cmd);
+        started(&mut h);
+        turn(&mut h, "hello");
+        closed(&mut h);
+        let note = h.end_note();
+        let claude = part_of(&note, "claude").unwrap_or_else(|| panic!("a claude part: {note}"));
+        assert_eq!(claude, "2.1.305", "the image's, from spawned: {note}");
+        assert_eq!(part_of(&note, "claude_src").as_deref(), Some(src), "{ext:?}: {note}");
+        assert!(note.contains(&format!("; claude:{claude}; claude_src:{src}; ")), "right after claude: {note}");
+        assert!(part_of(&note, "argv_dropped").is_none(), "{note}");
+        assert!(h.audit_events("claude_fetch").is_empty(), "nothing nameable: no fetch");
+    }
+}
+
+/// I1 (A1's cache): a staged V not in the VM's cache runs the image's claude (`image(not_cached)`), is fetched
+/// after the first output (`claude_fetch` `fetched`), and the next chat on that VM runs it (`cached`).
+#[test]
+fn a_staged_claude_runs_on_the_next_chat() {
+    let mut p = Harness::prepare();
+    let v = p.rig().stage_claude("2.1.310", &[]);
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper_for_bundle(&v.version, &[], &[]), rig.wrapper_for_bundle(&v.version, &[], &[]))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    first.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    closed(&mut first);
+    let note = end_note_of(&first, first.pid());
+    assert_eq!(part_of(&note, "claude_src").as_deref(), Some("image(not_cached)"), "{note}");
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    started(&mut second);
+    turn(&mut second, "two");
+    closed(&mut second);
+    let note = end_note_of(&first, second.pid());
+    assert_eq!((part_of(&note, "claude").as_deref(), part_of(&note, "claude_src").as_deref()), (Some("2.1.310"), Some("cached")), "{note}");
+}
+
+/// I1 (A1's cache): a cached claude that dies before its init respawns once on the next best (here the image's),
+/// its sha256 in the VM row's `claude_bad`, `claude_start_failed` audited, the census `image(start_failed)`.
+#[test]
+fn a_cached_claude_dead_before_init_respawns_on_the_live_shim() {
+    let mut p = Harness::prepare();
+    let v = p.rig().stage_claude("2.1.310", &[("FAKE_DIE_BEFORE_INIT", "1")]);
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper_for_bundle(&v.version, &[], &[]), rig.wrapper_for_bundle(&v.version, &[], &[]))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    first.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    closed(&mut first);
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    started(&mut second);
+    turn(&mut second, "two");
+    closed(&mut second);
+    let note = end_note_of(&first, second.pid());
+    assert_eq!(part_of(&note, "claude_src").as_deref(), Some("image(start_failed)"), "{note}");
+    assert!(note.split("; ").any(|p| p == "respawns:1"), "{note}");
+    let failed = first.audit_events("claude_start_failed");
+    assert_eq!((failed.len(), failed[0]["detail"]["sha256"].as_str()), (1, Some(v.sha256.as_str())));
+    let vm = part_of(&note, "vm").expect("the VM");
+    let row = ai_env_cli::bridge::vm::registry::read_row(&first.rig().paths(), &vm).unwrap().unwrap();
+    assert_eq!(row.claude_bad, std::slice::from_ref(&v.sha256));
+}
+
+/// I1 (A1's cache, A2's stager): `vm warm` stages an admitted, unstaged V, then fetches it into the warmed VM and
+/// says so in a line.
+#[test]
+fn warm_claude_stages_then_fetches_and_says_so() {
+    let mut p = Harness::prepare();
+    let rig = p.rig();
+    let v = rig.stage_claude("2.1.310", &[]);
+    ai_env_cli::bridge::claude::Record::update(&rig.paths(), &v.version, |r| r.staging.as_mut().expect("staged").state = "absent".into()).unwrap();
+    let work = rig.work();
+    let out = rig.run(&["vm", "warm", work.to_str().unwrap(), "--claude-version", &v.version], None);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.lines().any(|l| l.starts_with("claude 2.1.310: staged in ") && l.contains(" s, fetched into microvm-")), "{text}");
+    assert_eq!(ai_env_cli::bridge::claude::Record::load(&rig.paths(), &v.version).unwrap().unwrap().phase(), ai_env_cli::bridge::claude::Phase::Staged);
+}
+
+/// A-CONT-2 (the claude area's R4): a stop during `vm warm`'s claude fetch (V staged, nothing to stage; the VM's
+/// curl holds V's GET a minute) gives the fetch's wait up at once while the VM goes on fetching: 130 after SIGINT,
+/// 143 after SIGTERM, a line naming the VM, and the delivery's line already said (it comes before the claude step).
+#[test]
+fn a_stop_during_warms_claude_fetch_leaves_the_vm_fetching() {
+    for (sig, name, word, status) in [(libc::SIGINT, "SIGINT", "interrupted", 130), (libc::SIGTERM, "SIGTERM", "terminated", 143)] {
+        let mut p = Harness::prepare();
+        let rig = p.rig();
+        let v = rig.stage_claude("2.1.310", &[]);
+        let object = rig.root().join("v-object");
+        std::fs::write(&object, rig.s3().get(&v.key().render()).expect("V's object in S3")).expect("V's bytes for the VM's curl");
+        rig.set_vm_curl_knobs(&[("S3CURL_BODY", object.to_str().expect("a path")), ("S3CURL_SLOW_MS", "60000")]);
+        let work = rig.work();
+        let mut child = rig.ai_env(&["vm", "warm", work.to_str().expect("a path"), "--claude-version", &v.version]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("vm warm");
+        wait_for("V's fetch under way in the warmed VM", T, || rig.vm_ids().iter().any(|vm| claude_fetching(rig, vm).as_deref() == Some(v.sha256.as_str())));
+        // SAFETY: kill(2) of the child this test spawned.
+        assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).expect("a pid"), sig) }, 0);
+        let t0 = std::time::Instant::now();
+        while child.try_wait().expect("the warm's status").is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{name}: the warm went on waiting for the fetch");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().expect("the warm's output");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        assert_eq!(out.status.code(), Some(status), "{name}: {stdout}{stderr}");
+        let vm = rig.vm_ids().into_iter().find(|vm| claude_fetching(rig, vm).as_deref() == Some(v.sha256.as_str())).expect("the VM goes on fetching V");
+        assert!(stderr.contains(&format!("ai-env: {word} ({name}) while claude {} was being fetched into {vm}: {vm} goes on fetching it", v.version)), "{name}: {stderr}");
+        assert!(stdout.contains(&format!("{vm} now holds the setup-token")), "{name}: the delivery's line, said before the claude step: {stdout}");
+        assert!(!stdout.contains("claude 2.1.310:"), "{name}: no claude line after the stop: {stdout}");
+    }
+}
+
+// ---- S11 I2 (the lead): the plan's joint cases (plans/s11-plan.md wave 1b; the index §6 #26 and X-7) -------------
+
+/// The rig's VMs name each of `caps` in their `/health` (each pushed there under its served flag): a joint case
+/// needs them all.
+fn assert_rig_names(rig: &common::remote::RemoteRig, caps: &[&str]) {
+    let named = rig.fake().health_caps;
+    for cap in caps {
+        assert!(named.iter().any(|c| c == cap), "the rig's VMs name {cap} (its served flag): {named:?}");
+    }
+}
+
+/// `vm`'s fetch record (`WsRow.vm[<vm>].fetched` in `state/workspaces/*.toml`): what a carry off `vm` seeds from.
+fn fetch_record(rig: &common::remote::RemoteRig, vm: &str) -> Option<ai_env_cli::bridge::workspace::rows::VmFetchRow> {
+    let paths = rig.paths();
+    std::fs::read_dir(paths.workspaces())
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".toml")).map(str::to_string))
+        .filter_map(|slug| ai_env_cli::bridge::workspace::rows::read(&paths, &slug).ok())
+        .flat_map(|rows| rows.ws.into_values())
+        .find_map(|row| row.vm.get(vm).and_then(|r| r.fetched.clone()))
+}
+
+/// The sha256 `vm`'s shim is fetching into its claude cache now (`/health/detail`'s `claude_cache.fetching`).
+fn claude_fetching(rig: &common::remote::RemoteRig, vm: &str) -> Option<String> {
+    rig.shim_of(vm).claude_cache.view().and_then(|c| c.fetching)
+}
+
+/// I2 (A §11.4, C §C.7.4; the plan's "a re-address after `checkout -b` with a claude fetch in flight"): parts A and
+/// C at once, the rig's VMs naming `claude_stage_v1` and `codeout_manifest_v1`. The chat, opened from a staged V's
+/// bundle, runs the image's claude, and V's fetch into its VM starts at the first output (`after_output`); the VM's
+/// curl plays V's GET only after a minute (`S3CURL_SLOW_MS`; the transcript's PUTs still go to the tests' S3), so
+/// that fetch stays in flight. The agent makes a branch with no new object (`git checkout -b topic`, its worktree
+/// clean): the turn's code-out asks for the manifest and gets it alone (F1), so the VM's fetch record follows it
+/// (`topic` at this Mac's HEAD, `box/topic` promoted, no pack) while V's fetch goes on. The VM is terminated and
+/// the next line re-addresses the chat: the new VM is carried from the box on that record, on `topic` at that
+/// commit, this Mac's checkout untouched. V's fetch into the lost VM ends with no verdict on V (never `fetched`;
+/// V's record stays `staged`, no bad stage or report), and the new VM, which runs the image's claude
+/// (`image(not_cached)`), fetches V for itself.
+#[test]
+fn i2_a_readdress_after_checkout_b_with_a_claude_fetch_in_flight() {
+    use ai_env_cli::bridge::claude::{Phase, Record};
+    use ai_env_cli::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1};
+    let mut p = Harness::prepare();
+    let (v, cmd) = {
+        let rig = p.rig();
+        assert_rig_names(rig, &[CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1]);
+        let v = rig.stage_claude("2.1.310", &[]);
+        let object = rig.root().join("v-object");
+        std::fs::write(&object, rig.s3().get(&v.key().render()).expect("V's object in S3")).expect("V's bytes for the VM's curl");
+        let object = object.display().to_string();
+        rig.set_vm_curl_knobs(&[("S3CURL_REAL", common::remote::REAL_CURL), ("S3CURL_REAL_ONLY", "PUT"), ("S3CURL_BODY", &object), ("S3CURL_SLOW_MS", "60000")]);
+        let cmd = rig.wrapper_for_bundle(&v.version, &[], &[]);
+        (v, cmd)
+    };
+    let mut h = p.launch_wrapper(cmd);
+    started(&mut h);
+    let vm1 = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    let head = h.rig().head().to_string();
+    wait_for("V's fetch under way in the VM", T, || claude_fetching(h.rig(), &vm1).as_deref() == Some(v.sha256.as_str()));
+    git_in(&h.rig().vm_path_of(&vm1, &h.rig().work()), &["checkout", "-q", "-b", "topic"]);
+    turn(&mut h, "on a branch of its own");
+    wait_for_fetch(h.rig());
+    let rig = h.rig();
+    let codeouts = audit_rows(rig, "codeout_fetch");
+    let promoted = codeouts.iter().find(|r| r["detail"]["outcome"] == "promoted").expect("the turn's code-out");
+    assert_eq!((promoted["detail"]["vm"].as_str(), promoted["detail"]["bytes"].as_str()), (Some(vm1.as_str()), Some("0")), "F1: the manifest alone, no pack: {promoted}");
+    let record = fetch_record(rig, &vm1).unwrap_or_else(|| panic!("{vm1}'s fetch record"));
+    assert_eq!((record.head.as_str(), record.branch.as_deref(), record.wip.as_deref()), (head.as_str(), Some("topic"), None), "F1's record follows the VM: {record:?}");
+    assert_eq!(git_in(&rig.work(), &["rev-parse", "refs/remotes/box/topic"]), head, "box/topic promoted");
+    assert_eq!(claude_fetching(rig, &vm1).as_deref(), Some(v.sha256.as_str()), "V's fetch still in flight after the code-out");
+    let o = rig.run(&["vm", "terminate", &vm1, "--yes"], None);
+    assert!(o.status.success(), "vm terminate: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(claude_fetching(rig, &vm1).as_deref(), Some(v.sha256.as_str()), "V's fetch in flight as the VM goes");
+    // The new VM's restore and its own fetch of V go through the real curl (the lost VM's still waits).
+    rig.set_vm_curl_knobs(&[("S3CURL_REAL", common::remote::REAL_CURL)]);
+    h.expect_out(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm1) && c.contains("with your next message")), T);
+    turn(&mut h, "after the terminate");
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    let vm2 = starts[1]["detail"]["id"].as_str().expect("the new VM").to_string();
+    assert_ne!(vm2, vm1, "a new VM");
+    assert_eq!(starts[1]["detail"]["why"].as_str(), Some("readdress:vm_gone"));
+    let rig = h.rig();
+    let seeds = audit_rows(rig, "seed");
+    let carry = seeds.iter().find(|r| r["detail"]["vm"] == vm2.as_str()).unwrap_or_else(|| panic!("the new VM's seed: {seeds:?}"));
+    assert_eq!(carry["detail"]["source"].as_str(), Some("box"), "carried from F1's record: {carry}");
+    let moved = rig.vm_path_of(&vm2, &rig.work());
+    assert_eq!((git_in(&moved, &["symbolic-ref", "--short", "HEAD"]), git_in(&moved, &["rev-parse", "HEAD"])), ("topic".to_string(), head.clone()), "the new VM is on topic at the record's head");
+    assert_eq!(git_in(&rig.work(), &["symbolic-ref", "--short", "HEAD"]), common::remote::FIXTURE_BRANCH, "this Mac's checkout untouched");
+    h.wait_until("V's fetch into the lost VM ended", Duration::from_secs(60), |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["vm"] == vm1.as_str()));
+    h.wait_until("V fetched into the new VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["vm"] == vm2.as_str() && r["detail"]["outcome"] == "fetched"));
+    let fetches = h.audit_events("claude_fetch");
+    let lost: Vec<&str> = fetches.iter().filter(|r| r["detail"]["vm"] == vm1.as_str()).map(|r| r["detail"]["outcome"].as_str().unwrap_or_default()).collect();
+    // `failed` once the VM is gone (`fetching` only had its polls run out first): either leaves V's record alone.
+    assert!(lost.len() == 1 && matches!(lost[0], "failed" | "fetching"), "{fetches:#?}");
+    let record = Record::load(&h.rig().paths(), &v.version).unwrap().expect("V's record");
+    let staging = record.staging.clone().expect("V's staging row");
+    assert_eq!((record.phase(), staging.bad_stages, staging.bad_reports), (Phase::Staged, 0, 0), "no verdict on V: {record:?}");
+    closed(&mut h);
+    let note = h.end_note();
+    assert!(common::note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
+    assert_eq!((part_of(&note, "claude").as_deref(), part_of(&note, "claude_src").as_deref()), (Some("2.1.305"), Some("image(not_cached)")), "the new VM ran the image's claude: {note}");
+}
+
+/// I2 (A §11.4; the plan's "an unknown-flag respawn on a staged claude"): A1's cache, A2's staged record and A3's
+/// start-up respawns at once. A staged V that refuses an option (`FAKE_REJECT_OPTION` in V's own bytes; the image's
+/// claude knows it) is fetched into the workspace's VM by a first chat; a second chat there, with that option, runs
+/// V from the cache, which refuses it before its init. Rule (a) comes before rule (b): the refusal is an
+/// `argv_retry` on the same VM that runs V again without the flag, never a `claude_retry`: no
+/// `claude_start_failed`, V's sha256 stays out of the VM row's `claude_bad`, and the census says `claude:<V>`,
+/// `claude_src:cached`, `respawns:1` and `argv_dropped:<flag>`. The `argv_dropped` row and its marker name V, the
+/// claude that refused the flag.
+#[test]
+fn i2_an_unknown_flag_respawn_on_a_staged_claude() {
+    const FLAG: &str = "--from-the-future";
+    let mut p = Harness::prepare();
+    let v = p.rig().stage_claude("2.1.310", &[("FAKE_REJECT_OPTION", FLAG)]);
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper_for_bundle(&v.version, &[], &[]), rig.wrapper_for_bundle(&v.version, &[FLAG], &[]))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    first.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    closed(&mut first);
+    let note = end_note_of(&first, first.pid());
+    assert_eq!(part_of(&note, "claude_src").as_deref(), Some("image(not_cached)"), "{note}");
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    started(&mut second);
+    turn(&mut second, "two");
+    closed(&mut second);
+    let gens = argv_by_gen(&first);
+    assert_eq!(gens.len(), 3, "the first chat's generation, then the second's two: {gens:?}");
+    assert!(gens[1].iter().any(|a| a == FLAG) && !gens[2].iter().any(|a| a == FLAG), "{gens:?}");
+    assert_eq!(gens[2].len(), gens[1].len() - 1, "nothing else dropped: {gens:?}");
+    let env = read(&first.root().join("env.log"));
+    assert!(env.lines().any(|l| l == format!("gen 2 rejected={FLAG}")), "V refused it: {env}");
+    let starts = first.audit_events("session_remote_start");
+    let whys: Vec<&str> = starts.iter().map(|r| r["detail"]["why"].as_str().unwrap_or_default()).collect();
+    assert_eq!(whys, ["first", "first", "argv_retry"], "{starts:?}");
+    let vm = starts[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    assert!(starts.iter().all(|r| r["detail"]["id"] == vm.as_str()), "one VM throughout: {starts:?}");
+    let note = end_note_of(&first, second.pid());
+    for part in [format!("claude:{}", v.version), "claude_src:cached".to_string(), "respawns:1".to_string(), format!("argv_dropped:{FLAG}")] {
+        assert!(note.split("; ").any(|p| p == part), "{part}: {note}");
+    }
+    let rows = first.audit_events("argv_dropped");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0]["detail"];
+    assert_eq!((d["flag"].as_str(), d["claude"].as_str(), d["ext"].as_str(), d["vm"].as_str()), (Some(FLAG), Some(v.version.as_str()), Some(v.version.as_str()), Some(vm.as_str())), "{d}");
+    assert!(first.rig().bridge().join("state").join("argv-dropped").join(&v.version).join(FLAG).is_file(), "the marker names V");
+    assert!(first.audit_events("claude_start_failed").is_empty(), "V is not blamed: {:?}", first.audit_events("claude_start_failed"));
+    let row = ai_env_cli::bridge::vm::registry::read_row(&first.rig().paths(), &vm).unwrap().expect("the VM's row");
+    assert!(row.claude_bad.is_empty(), "V stays good on this VM: {:?}", row.claude_bad);
+}
+
+/// I2 (C §C.3.6, §C.7.4; the plan's "a gzip chat's reopen avoiding a 12.0 VM"): a chat begun on this Mac and
+/// gzip-staged (`session stage`: its manifest encoded) is reopened while its workspace's VM runs an image without
+/// `transcript_gzip_v1` (a 12.0 one: its `/health` named no such cap, as its row records). P0's `caps_required`
+/// names the cap, so SELECT_VM passes that VM over and starts one that decodes, whose shim pulls the chat with
+/// curl's `compressed`: the new VM holds it byte for byte, the CLI resumes from it, nothing reaches the 12.0 VM.
+/// Pinned to the 12.0 VM, the reopen is refused at P0, before any Touch ID: exit 7 naming that VM, the cap and
+/// `make deploy`, nothing pulled.
+#[test]
+fn i2_a_gzip_chats_reopen_passes_over_a_vm_without_the_cap() {
+    use ai_env_cli::wire::frame::{CAP_TRANSCRIPT_GZIP_V1, CAP_TRANSCRIPT_S3_V1};
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9201);
+    let cwd = p.work();
+    let lines: Vec<String> = (0..3).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0x9210 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("turn {i}")}}).to_string()).collect();
+    let chat = p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let bytes = std::fs::read(&chat).expect("the chat");
+    let slug = p.slug();
+    let resume = format!("--resume={sid}");
+    let old = {
+        let rig = p.rig();
+        assert_rig_names(rig, &[CAP_TRANSCRIPT_GZIP_V1]);
+        let o = rig.run(&["session", "stage", &sid, "--json"], None);
+        assert!(o.status.success(), "session stage: {}", String::from_utf8_lossy(&o.stderr));
+        let m = ai_env_cli::bridge::s3::manifest::read(&rig.paths(), &sid).unwrap().expect("the manifest");
+        assert!(m.encoded(), "gzip-staged: {m:?}");
+        // The workspace's VM runs a 12.0 image: its /health names no transcript_gzip_v1, as its row records.
+        rig.update_fake(|s| s.health_caps.retain(|c| c != CAP_TRANSCRIPT_GZIP_V1));
+        let old = rig.start_vm();
+        let o = rig.run(&["vm", "health", &old], None);
+        assert!(o.status.success(), "vm health: {}", String::from_utf8_lossy(&o.stderr));
+        rig.update_fake(|s| s.health_caps.push(CAP_TRANSCRIPT_GZIP_V1.to_string()));
+        let caps = ai_env_cli::bridge::vm::registry::read_row(&rig.paths(), &old).ok().flatten().and_then(|r| r.caps).unwrap_or_default();
+        assert!(caps.iter().any(|c| c == CAP_TRANSCRIPT_S3_V1) && !caps.iter().any(|c| c == CAP_TRANSCRIPT_GZIP_V1), "a 12.0 VM's caps in its row: {caps:?}");
+        old
+    };
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    let init = started(&mut h);
+    assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "{init}");
+    closed(&mut h);
+    let note = h.end_note();
+    let vm = part_of(&note, "vm").expect("the reopen's VM");
+    assert_ne!(vm, old, "the 12.0 VM passed over: {note}");
+    assert_eq!((part_of(&note, "vm_how").as_deref(), part_of(&note, "transcript").as_deref()), (Some("started"), Some("restored")), "{note}");
+    assert!(h.env_log().iter().any(|l| *l == format!("gen 1 resumed lines={}", lines.len())), "the CLI resumed from the restored copy: {:?}", h.env_log());
+    let rig = h.rig();
+    assert_eq!(runs(rig), 2, "the 12.0 VM, then the reopen's own");
+    let held = std::fs::read(rig.vm_projects_of(&vm).join(&slug).join(format!("{sid}.jsonl"))).expect("the new VM's copy");
+    assert_eq!(held, bytes, "decoded, byte for byte");
+    let pulls = audit_rows(rig, "transcript_pull");
+    assert!(!pulls.is_empty() && pulls.iter().all(|r| r["detail"]["vm"] == vm.as_str()), "pulled into the new VM alone: {pulls:#?}");
+    assert!(rig.vm_curl_calls().iter().any(|c| c.config.lines().any(|l| l == "compressed")), "the pull asked curl to decode its gzip part");
+    // Pinned to the 12.0 VM, the same reopen is refused at P0 (exit 7, naming the VM), before any Touch ID, nothing pulled.
+    let touch = rig.decrypts();
+    let mut pinned = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("AI_ENV_BRIDGE_VM", old.as_str())]));
+    pinned.send_initialize();
+    let (status, _) = pinned.wait(EXIT);
+    let err = pinned.err_text();
+    assert_eq!(status.code(), Some(7), "{}", pinned.transcript());
+    assert!(last_line(&err).ends_with(&format!("{old} runs an image older than S11 (no {CAP_TRANSCRIPT_GZIP_V1}): run make deploy, then reopen the chat")), "{err}");
+    assert_eq!(h.rig().decrypts(), touch, "no Touch ID for the pinned reopen");
+    assert_eq!(audit_rows(h.rig(), "transcript_pull").len(), pulls.len(), "nothing pulled for the pinned reopen");
 }

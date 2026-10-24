@@ -735,6 +735,7 @@ mod tests {
             listeners_omitted: 0,
             credential: Default::default(),
             workspace: None,
+            claude_cache: None,
         }
     }
 

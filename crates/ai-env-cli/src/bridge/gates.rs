@@ -738,7 +738,7 @@ pub fn trailer(existing_md: &str) -> Option<String> {
 /// `s` with every run of exactly 12 ASCII digits, an AWS account id (in G7's
 /// ARN, or in the aws CLI's text), replaced by `<acct>`; a longer or shorter
 /// run of digits is left alone.
-fn mask_account_ids(s: &str) -> String {
+pub(crate) fn mask_account_ids(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {

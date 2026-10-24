@@ -24,12 +24,24 @@
 #   S3CURL_LOG       the log above (unset: nothing is logged)
 #   S3CURL_REAL      a real curl: the call is logged, then that curl runs
 #                    `-q -K /dev/fd/3` with the kept configuration on fd 3
+#   S3CURL_REAL_ONLY S11: with S3CURL_REAL, a method (`PUT`): only a call
+#                    whose configuration says `request = "<it>"` runs the
+#                    real curl; any other is played as without S3CURL_REAL
+#                    (a claude relay's release GET from S3CURL_BODY, never
+#                    the network; its PUT to the tests' S3)
 #   Without S3CURL_REAL the fake plays S3:
 #   S3CURL_FAIL      <n>: exit n after logging, with no status line
 #   S3CURL_SLOW_MS   ms to sleep first
 #   S3CURL_SAVE      <dir>: a PUT's body (stdin, read to its end) is kept as <dir>/<n>.put
 #   S3CURL_BODIES    <dir>: a GET writes <dir>/<n> when present,
 #   S3CURL_BODY      else this file (else nothing)
+#   S3CURL_ENCODING  S11: gzip (else unset): the GET bodies above are gzip
+#                    streams stored with Content-Encoding: gzip; a
+#                    configuration holding a `compressed` line writes them
+#                    decoded (/usr/bin/gzip -dc), one without as stored, as
+#                    curl does. Unset: bodies are served as they are, with or
+#                    without `compressed`. With S3CURL_REAL the real curl
+#                    behind it decodes by the fake S3's header.
 #   S3CURL_STATUS    the HTTP status reported (default 200); 400 or more also
 #                    writes <Error><Code><S3CURL_CODE or AccessDenied></Code></Error>
 #                    to stdout (not for a GET whose configuration says `fail`)
@@ -37,6 +49,14 @@
 # then stderr gets the configuration's write-out line:
 #   ai-env-curl status=<status> version=<version> checksum=<the config's
 #   x-amz-checksum-sha256 value, or empty> etag="fake-<n>"
+# and ` redirects=0` after it when the write-out names %{num_redirects} (S11:
+# the claude relay's release GET, LD-19).
+# S11: a configuration's `max-filesize = N` is honoured as curl does with S3's
+# (or the release's) Content-Length: a GET body whose stored size (the bytes
+# served, before any gzip decode) is over N is refused before the transfer:
+# nothing on stdout, stderr gets `curl: (63) Maximum file size exceeded` before
+# the write-out line (still status=<status>), and the exit is 63. A body of N
+# bytes or fewer is served whole.
 
 # The descriptors open at the start, from 3 to 254 (macOS /bin/sh keeps this
 # script on 255).
@@ -108,7 +128,7 @@ if [ -n "${S3CURL_LOG:-}" ]; then
   rmdir "$S3CURL_LOG.lock"
 fi
 
-if [ -n "${S3CURL_REAL:-}" ]; then
+if [ -n "${S3CURL_REAL:-}" ] && { [ -z "${S3CURL_REAL_ONLY:-}" ] || grep -qx "request = \"$S3CURL_REAL_ONLY\"" "$config"; }; then
   exec 3<"$config"
   if [ -z "${S3CURL_LOG:-}" ]; then
     rm -f "$config"
@@ -126,6 +146,17 @@ fail_on_error=0
 if grep -qx 'fail' "$config"; then
   fail_on_error=1
 fi
+compressed=0
+if grep -qx 'compressed' "$config"; then
+  compressed=1
+fi
+# S11: `max-filesize = N` (the shim writes it unquoted).
+max_filesize=$(sed -n 's/^max-filesize = "*\([0-9][0-9]*\)"*$/\1/p' "$config" | head -n 1)
+# S11 (LD-19): a write-out that asks how many redirects were followed (the claude relay's release GET) is told 0.
+redirects=
+if grep -q '%{num_redirects}' "$config"; then
+  redirects=" redirects=0"
+fi
 if [ -z "${S3CURL_LOG:-}" ]; then
   rm -f "$config"
 fi
@@ -137,6 +168,7 @@ if [ -n "${S3CURL_SLOW_MS:-}" ]; then
   sleep "$(awk -v ms="$S3CURL_SLOW_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
 fi
 status=${S3CURL_STATUS:-200}
+over=0
 case "$method" in
   PUT)
     if [ -n "${S3CURL_SAVE:-}" ]; then
@@ -148,10 +180,22 @@ case "$method" in
     ;;
   GET)
     if [ "$status" -lt 400 ]; then
+      body=""
       if [ -n "${S3CURL_BODIES:-}" ] && [ -f "$S3CURL_BODIES/$count" ]; then
-        cat "$S3CURL_BODIES/$count"
+        body="$S3CURL_BODIES/$count"
       elif [ -n "${S3CURL_BODY:-}" ]; then
-        cat "$S3CURL_BODY"
+        body=$S3CURL_BODY
+      fi
+      if [ -n "$body" ]; then
+        # S11: curl compares the advertised size (the stored bytes) with max-filesize before the transfer.
+        if [ -n "$max_filesize" ] && [ "$(($(wc -c < "$body")))" -gt "$max_filesize" ]; then
+          over=1
+        # S11: a gzip-stored body is written decoded only when the configuration asks (`compressed`).
+        elif [ "${S3CURL_ENCODING:-}" = "gzip" ] && [ "$compressed" = "1" ]; then
+          /usr/bin/gzip -dc < "$body" || exit 61
+        else
+          cat "$body"
+        fi
       fi
     fi
     ;;
@@ -159,5 +203,11 @@ esac
 if [ "$status" -ge 400 ] && ! { [ "$method" = "GET" ] && [ "$fail_on_error" = "1" ]; }; then
   printf '<Error><Code>%s</Code></Error>' "${S3CURL_CODE:-AccessDenied}"
 fi
-printf 'ai-env-curl status=%s version=%s checksum=%s etag="fake-%s"\n' "$status" "${S3CURL_VERSION:-fake-version-$count}" "$checksum" "$count" >&2
+if [ "$over" = "1" ]; then
+  echo "curl: (63) Maximum file size exceeded" >&2
+fi
+printf 'ai-env-curl status=%s version=%s checksum=%s etag="fake-%s"%s\n' "$status" "${S3CURL_VERSION:-fake-version-$count}" "$checksum" "$count" "$redirects" >&2
+if [ "$over" = "1" ]; then
+  exit 63
+fi
 exit 0

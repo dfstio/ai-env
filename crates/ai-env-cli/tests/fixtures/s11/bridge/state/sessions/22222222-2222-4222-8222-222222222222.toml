@@ -1,0 +1,25 @@
+v = 2
+session_id = "22222222-2222-4222-8222-222222222222"
+slug = "-w-project"
+cwd = "/w/project"
+transcript_rel = "-w-project/22222222-2222-4222-8222-222222222222.jsonl"
+created = "2026-10-22T08:00:00Z"
+last_seen = "2026-10-22T08:30:00Z"
+status = "closed"
+mode = "remote"
+route = "remote"
+ext = "anthropic.claude-code-2.1.305"
+pid = 1
+argv_hash = "fixture"
+respawns = 0
+microvm_id = "microvm-0a5fc800-0000-4000-8000-00000000000a"
+
+[[vms]]
+gen = 1
+vm = "microvm-0a5fc800-0000-4000-8000-00000000000a"
+spawn = "spawn-s1"
+from = "2026-10-22T08:00:05Z"
+to = "2026-10-22T08:30:00Z"
+why = "first"
+end = "close"
+pid = 4101

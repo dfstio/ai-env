@@ -83,6 +83,12 @@ pub enum Seen {
     Limited(LimitHit),
     /// An answered turn after a limit: the account answers again.
     Answered,
+    /// A1 joint review (F3): a check's answered turn whose event named no
+    /// status ai-env knows, or that had none: the status reads `allowed`
+    /// (any warning gone, no limit), as the check's `--json` says; what an
+    /// event carried (windows, overage) is its `Info`'s, so an overage
+    /// recorded before stands when there was none.
+    Allowed,
 }
 
 /// One observation, made at `at` (unix seconds).
@@ -201,7 +207,9 @@ fn in_force(l: &LimitedRecord, now: u64) -> bool {
 ///   text, its kind (the result's, else that of a `limited` written within
 ///   [`LIMIT_MERGE_S`] before it, else `unknown`) and its reset (the
 ///   result's, else that recent one's of the same kind);
-/// - an answer clears `limited`, and a `rejected` status reads `allowed`.
+/// - an answer clears `limited`, and a `rejected` status reads `allowed`;
+/// - a check's answer with no known status (`Seen::Allowed`) clears
+///   `limited` and `warning`, and the status reads `allowed`.
 pub fn apply(rec: &mut UsageRecord, obs: &Observed, source: &str, now: u64) {
     for w in [&mut rec.five_hour, &mut rec.seven_day] {
         if w.is_some_and(|w| w.resets_at <= now) {
@@ -251,6 +259,11 @@ pub fn apply(rec: &mut UsageRecord, obs: &Observed, source: &str, now: u64) {
             if rec.status.as_deref() == Some("rejected") {
                 rec.status = Some("allowed".to_string());
             }
+        }
+        Seen::Allowed => {
+            rec.limited = None;
+            rec.status = Some("allowed".to_string());
+            rec.warning = None;
         }
     }
     rec.seen_at = Some(rec.seen_at.map_or(obs.at, |seen| seen.max(obs.at)));
@@ -413,7 +426,30 @@ pub fn others(state: &AccountsState, except: &str, now: u64) -> Vec<Standing> {
         .map(|r| {
             let rec = state.usage.get(&r.name).map(read_record).unwrap_or_default();
             let limited = rec.limited.as_ref().is_some_and(|l| in_force(l, now));
-            Standing { name: r.name.clone(), limited, weekly: rec.seven_day.filter(|w| w.resets_at > now).map(|w| w.utilization), seen: rec.seen_at.is_some() }
+            // A1 joint review (F2): a stored weekly window whose reset has passed is a new week at 0 % (the store
+            // drops it only when that account is seen again), never an unknown use ranked behind a known one.
+            let weekly = rec.seven_day.map(|w| if w.resets_at > now { w.utilization } else { 0.0 });
+            Standing { name: r.name.clone(), limited, weekly, seen: rec.seen_at.is_some() }
+        })
+        .collect()
+}
+
+/// A1 joint review (J4, F1): [`others`] as the usage note may offer them.
+/// An account whose seal Anthropic refused (its row's tag in `refused`),
+/// or any account while which seals were refused is unknown (`refused`
+/// `None`: the refusal record cannot be read), counts as limited:
+/// `creds account use` refuses it (exit 5), so the note never names it,
+/// and with none free it says every other account is limited or refused.
+#[must_use]
+pub fn others_usable(state: &AccountsState, except: &str, now: u64, refused: Option<&std::collections::BTreeSet<String>>) -> Vec<Standing> {
+    let tag_of = |name: &str| state.account.iter().find(|r| r.name == name).map(|r| r.tag.as_str());
+    others(state, except, now)
+        .into_iter()
+        .map(|mut s| {
+            if refused.is_none_or(|set| tag_of(&s.name).is_some_and(|t| set.contains(t))) {
+                s.limited = true;
+            }
+            s
         })
         .collect()
 }
@@ -425,8 +461,9 @@ pub fn others(state: &AccountsState, except: &str, now: u64) -> Vec<Standing> {
 /// the result names the time, else the CLI's own words, else nothing), then
 /// one of: the account to switch to (a free one: the lowest weekly use
 /// known, then one seen, then one never seen, which the note says), how
-/// (`creds account use`, then reopen the chat, or `session migrate` it now);
-/// that every other one is limited too; or that there is no other.
+/// (`creds account use`, then reopen the chat, or `session migrate` it now:
+/// `session` is `None` where the move is refused); that every other one is
+/// limited or refused ([`others_usable`]); or that there is no other.
 #[must_use]
 pub fn note_usage_limit(account: &str, hit: &LimitHit, others: &[Standing], session: Option<&str>, now: u64) -> String {
     use crate::bridge::remote::part;
@@ -446,7 +483,7 @@ pub fn note_usage_limit(account: &str, hit: &LimitHit, others: &[Standing], sess
     });
     match free.first() {
         None if others.is_empty() => format!("{head}; no other account to switch to: ai-env creds account add NAME seals one"),
-        None => format!("{head}; every other account is limited too, as far as ai-env knows: ai-env creds account check measures them"),
+        None => format!("{head}; every other account is limited or refused, as far as ai-env knows: ai-env creds account check measures them"),
         Some(pick) => {
             let name = part(&pick.name, 32);
             let unknown = if pick.seen { "" } else { " (its limits are unknown: ai-env creds account check)" };
@@ -516,7 +553,7 @@ impl UsageTap {
                 }
                 true
             }
-            Seen::Answered => true,
+            Seen::Answered | Seen::Allowed => true,
         };
         let slots = self.pending.entry(tag.to_string()).or_default();
         match obs.what {
@@ -608,7 +645,14 @@ mod tests {
     const THU_10: u64 = 1_792_663_200;
     const SAT_10: u64 = 1_792_836_000;
     const B2: &str = include_str!("../../../tests/fixtures/claude/usage-limit-result-2.1.305.json");
-    const CONSTRUCTED: &str = include_str!("../../../tests/fixtures/claude/rate-limit-event-constructed-2.1.305.jsonl");
+    /// The real events of 2.1.306 (A1's check, 21 Oct 2026): an `allowed`
+    /// one with both unified windows, a `rejected` one with both.
+    const REAL: &str = include_str!("../../../tests/fixtures/claude/rate-limit-event-2.1.306.jsonl");
+    /// The two shapes no real line has shown yet (built from 2.1.305's
+    /// schema, S10): an `allowed_warning` with both windows beside the top
+    /// level, and a `rejected` one with no windows.
+    const WARNING: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1792663200,"rateLimitType":"seven_day","utilization":0.81,"unifiedWindows":{"five_hour":{"utilization":0.23,"resetsAt":1792591200},"seven_day":{"utilization":0.81,"resetsAt":1792663200}},"overageStatus":"allowed","isUsingOverage":true,"surpassedThreshold":0.75},"uuid":"00000000-0000-4000-8000-000000000001","session_id":"00000000-0000-4000-8000-0000000000a1"}"#;
+    const WINDOWLESS: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1792836000,"rateLimitType":"seven_day","utilization":1.02,"overageStatus":"rejected","isUsingOverage":false},"uuid":"00000000-0000-4000-8000-000000000002","session_id":"00000000-0000-4000-8000-0000000000a1"}"#;
 
     fn info(text: &str) -> Seen {
         Seen::Info(parse_info(text).unwrap())
@@ -626,23 +670,50 @@ mod tests {
         Some(Window { utilization, resets_at })
     }
 
-    /// The constructed full event sets the status, both windows, the
-    /// warning's kind and overage; the rejected one sets `limited` with its
-    /// type and reset, keeping the windows; an `allowed` clears it.
+    /// The warning with both windows (inline) sets the status, both
+    /// windows, the warning's kind and overage; the windowless rejection
+    /// sets `limited` with its type and reset, keeping the windows; an
+    /// `allowed` clears it. The real events of 2.1.306 set both windows
+    /// each, the rejected one its limit with them.
     #[test]
     fn an_event_sets_the_status_and_its_windows() {
-        let lines: Vec<&str> = CONSTRUCTED.lines().collect();
         let mut rec = UsageRecord::default();
-        apply(&mut rec, &at(NOW, Seen::Info(parse_event_line(lines[0].as_bytes()).unwrap())), SOURCE_CHAT, NOW);
+        apply(&mut rec, &at(NOW, Seen::Info(parse_event_line(WARNING.as_bytes()).unwrap())), SOURCE_CHAT, NOW);
         assert_eq!(
             rec,
             UsageRecord { seen_at: Some(NOW), source: Some("chat".into()), status: Some("allowed_warning".into()), warning: Some("seven_day".into()), overage: Some(true), five_hour: w(0.23, AT_14), seven_day: w(0.81, THU_10), limited: None }
         );
-        apply(&mut rec, &at(NOW + 10, Seen::Info(parse_event_line(lines[1].as_bytes()).unwrap())), SOURCE_CHAT, NOW);
+        apply(&mut rec, &at(NOW + 10, Seen::Info(parse_event_line(WINDOWLESS.as_bytes()).unwrap())), SOURCE_CHAT, NOW);
         assert_eq!(rec.limited, Some(LimitedRecord { at: NOW + 10, text: String::new(), kind: "seven_day".into(), resets_at: Some(SAT_10) }));
         assert_eq!((rec.status.as_deref(), rec.seven_day, rec.five_hour), (Some("rejected"), w(1.02, SAT_10), w(0.23, AT_14)), "the top level stands in for the weekly window");
         apply(&mut rec, &at(NOW + 20, info(r#"{"status":"allowed"}"#)), SOURCE_CHAT, NOW);
         assert_eq!((rec.status.as_deref(), &rec.limited, &rec.warning), (Some("allowed"), &None, &None), "allowed clears the limit");
+        let real: Vec<&str> = REAL.lines().collect();
+        let mut rec = UsageRecord::default();
+        apply(&mut rec, &at(NOW, Seen::Info(parse_event_line(real[0].as_bytes()).unwrap())), SOURCE_CHAT, NOW);
+        assert_eq!(
+            rec,
+            UsageRecord { seen_at: Some(NOW), source: Some("chat".into()), status: Some("allowed".into()), warning: None, overage: Some(false), five_hour: w(0.02, 1_792_618_200), seven_day: w(0.0, 1_792_839_600), limited: None }
+        );
+        apply(&mut rec, &at(NOW + 10, Seen::Info(parse_event_line(real[1].as_bytes()).unwrap())), SOURCE_CHAT, NOW);
+        assert_eq!((rec.status.as_deref(), rec.five_hour, rec.seven_day), (Some("rejected"), w(0.0, 1_792_627_800), w(1.0, THU_10)));
+        assert_eq!(rec.limited, Some(LimitedRecord { at: NOW + 10, text: String::new(), kind: "seven_day".into(), resets_at: Some(THU_10) }));
+        assert_eq!(standing(&rec, NOW).as_deref(), Some("limited: weekly (Thu 10:00Z)"));
+    }
+
+    /// The real fixture (A1's check's `--json`, scrubbed there, copied by a
+    /// script that printed nothing) holds no secret: no `sk-ant-`, the
+    /// scrubber leaves each line as it is, and the built-in tripwires find
+    /// nothing in it.
+    #[test]
+    fn the_real_rate_limit_fixture_holds_no_secret() {
+        assert!(!REAL.contains("sk-ant-"), "a token prefix in the fixture");
+        assert_eq!(REAL.lines().count(), 2);
+        for (n, line) in REAL.lines().enumerate() {
+            assert!(crate::wire::redact::scrub(line) == line, "the scrubber masks something in line {}", n + 1);
+            assert!(parse_event_line(line.as_bytes()).is_some(), "line {} is an event", n + 1);
+        }
+        assert_eq!(crate::bridge::scan::Rules::defaults().scan_bytes(REAL.as_bytes()), Vec::<(usize, String)>::new(), "a built-in tripwire matches");
     }
 
     /// B2's result after its turn's `rejected` event: the text is the
@@ -750,7 +821,13 @@ mod tests {
         let limited = Standing { name: "spare".into(), limited: true, weekly: Some(1.0), seen: true };
         assert_eq!(
             note_usage_limit("work", &hit, &[limited], Some(sid), NOW),
-            "ai-env: account work hit its weekly limit (it resets 10am (UTC)); every other account is limited too, as far as ai-env knows: ai-env creds account check measures them"
+            "ai-env: account work hit its weekly limit (it resets 10am (UTC)); every other account is limited or refused, as far as ai-env knows: ai-env creds account check measures them"
+        );
+        // A1 joint review (F2): a weekly window that reset since (a new week at 0 %) beats one at 90 %.
+        let reset = Standing { name: "a".into(), limited: false, weekly: Some(0.0), seen: true };
+        assert_eq!(
+            note_usage_limit("work", &hit, &[free("c", Some(0.9)), reset], None, NOW),
+            "ai-env: account work hit its weekly limit (it resets 10am (UTC)); to go on now with account a: ai-env creds account use a, then reopen this chat; ai-env creds account check shows every account's limits"
         );
         assert_eq!(note_usage_limit("work", &hit, &[], Some(sid), NOW), "ai-env: account work hit its weekly limit (it resets 10am (UTC)); no other account to switch to: ai-env creds account add NAME seals one");
         let several = [free("b", Some(0.7)), free("c", None), free("a", Some(0.3)), Standing { name: "d".into(), limited: false, weekly: None, seen: false }];
@@ -776,7 +853,7 @@ mod tests {
     #[test]
     fn the_others_standing_comes_from_the_store() {
         let row = |name: &str| AccountRow { name: name.into(), tag: format!("{name:0>16}"), ..AccountRow::default() };
-        let names = ["work", "spare", "gone", "new", "week", "lastweek", "hour", "hours"];
+        let names = ["work", "spare", "gone", "new", "week", "lastweek", "hour", "hours", "renewed"];
         let mut state = AccountsState { active: Some("work".into()), account: names.iter().copied().map(row).collect(), usage: BTreeMap::new() };
         let limited = UsageRecord { seen_at: Some(NOW), limited: Some(LimitedRecord { at: NOW, text: String::new(), kind: "seven_day".into(), resets_at: Some(SAT_10) }), ..UsageRecord::default() };
         let passed = UsageRecord { seen_at: Some(NOW), limited: Some(LimitedRecord { at: NOW, text: String::new(), kind: "five_hour".into(), resets_at: Some(NOW - 1) }), seven_day: w(0.4, THU_10), ..UsageRecord::default() };
@@ -787,6 +864,8 @@ mod tests {
         state.usage.insert("lastweek".into(), to_value(&unreset("unknown", 7 * 86_400)));
         state.usage.insert("hour".into(), to_value(&unreset("five_hour", 4 * 3600)));
         state.usage.insert("hours".into(), to_value(&unreset("five_hour", 5 * 3600)));
+        // A1 joint review (F2): its stored weekly window reset an hour ago: a new week, 0 % used.
+        state.usage.insert("renewed".into(), to_value(&UsageRecord { seen_at: Some(NOW - 86_400), seven_day: w(0.97, NOW - 3600), ..UsageRecord::default() }));
         let got = others(&state, "work", NOW);
         let standing = |name: &str, limited: bool, weekly: Option<f64>, seen: bool| Standing { name: name.into(), limited, weekly, seen };
         assert_eq!(
@@ -799,8 +878,32 @@ mod tests {
                 standing("lastweek", false, None, true),
                 standing("hour", true, None, true),
                 standing("hours", false, None, true),
+                standing("renewed", false, Some(0.0), true),
             ]
         );
+    }
+
+    /// A1 joint review (J4, F1): the note never offers an account `creds
+    /// account use` would refuse: a refused one (here never seen, the store
+    /// tests/accounts_check.rs builds: aa answers, bb limited, cc refused)
+    /// counts as limited, as does every one while the refusal record cannot
+    /// be read; one free account left is still offered.
+    #[test]
+    fn a_refused_account_is_never_offered() {
+        let row = |name: &str| AccountRow { name: name.into(), tag: format!("{name:0>16}"), ..AccountRow::default() };
+        let mut state = AccountsState { active: Some("aa".into()), account: ["aa", "bb", "cc", "dd"].map(row).to_vec(), usage: BTreeMap::new() };
+        let limited = UsageRecord { seen_at: Some(NOW), limited: Some(LimitedRecord { at: NOW, text: String::new(), kind: "seven_day".into(), resets_at: Some(SAT_10) }), ..UsageRecord::default() };
+        state.usage.insert("bb".into(), to_value(&limited));
+        state.account.retain(|r| r.name != "dd");
+        let refused: std::collections::BTreeSet<String> = [format!("{:0>16}", "cc")].into();
+        let got = others_usable(&state, "aa", NOW, Some(&refused));
+        assert!(got.iter().all(|s| s.limited), "{got:?}");
+        let note = note_usage_limit("aa", &b2(), &got, None, NOW);
+        assert!(!note.contains("account use cc") && note.ends_with("every other account is limited or refused, as far as ai-env knows: ai-env creds account check measures them"), "{note}");
+        assert!(others_usable(&state, "aa", NOW, None).iter().all(|s| s.limited), "the refusal record unreadable: none offered");
+        state.account.push(row("dd"));
+        let note = note_usage_limit("aa", &b2(), &others_usable(&state, "aa", NOW, Some(&refused)), None, NOW);
+        assert!(note.contains("ai-env creds account use dd, then reopen this chat") && !note.contains("use cc"), "{note}");
     }
 
     /// `record_all` names a tag by the store's rows, under its lock: an

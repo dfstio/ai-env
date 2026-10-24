@@ -14,9 +14,8 @@
 #   the account root (its own credentials, ai-env as root): operator-keys, once after the bootstrap deploy, and destroy
 #     (BREAKGLASS=1 only); the bootstrap deploy itself, and BREAKGLASS=1 on the command line for any deployer target;
 #   no tier: infra-status, allowlist-reload, proxy-stop, proxy-start, proxy-patch (and gates, check-base-image) are one
-#     ai-env command each, which resolves its identity itself (credentials/ops.env, one Touch ID; none under a runner),
-#     and claude-update, whose ops.sh asks once for ops, or the deployer when a deploy is due (after the stack's
-#     passphrase, below).
+#     ai-env command each, which resolves its identity itself (credentials/ops.env, one Touch ID; none under a runner).
+#     claude-update is retired (S11: ai-env claude update).
 # Nothing falls back to this shell's own AWS settings: `ai-env as` clears them for its command.
 # Every aws call carries --region $(REGION), and the lambda-core, ec2 and logs ones the pinned --endpoint-url; nothing
 # here runs `pulumi login` or uses --yes / --show-secrets (D17; `ai-env proxy stop --yes` is the operator CLI's own
@@ -115,7 +114,7 @@ BREAKGLASS_ON       = $(filter 1,$(call cmdline,BREAKGLASS))
 RUNNER_ENV          = $(LAB_UNSET) -u AI_ENV_PASTE_STDIN
 # A39 (above). PASS_SET_SH: the stack's passphrase is set as Pulumi takes it: PULUMI_CONFIG_PASSPHRASE when it is set
 # at all, even empty (an empty one is none), else a PULUMI_CONFIG_PASSPHRASE_FILE that is not empty (only tested, never
-# expanded; pass-exec.sh and ops.sh's pass_set test the same). PASS_CHECK, the first line of deploy and deploy-policies
+# expanded; pass-exec.sh tests the same). PASS_CHECK, the first line of deploy and deploy-policies
 # (their plan check cannot prompt): refused before the build when it is not set and there is no sealed file to unseal.
 # PASS_SH, TIER's: u=unseal for a PASS_TARGET when it is not set and the sealed file exists, and `unseal CMD...`, which
 # says so on stderr, then runs CMD under the passphrase through pass-exec.sh's guard, the lab and paste knobs dropped as
@@ -289,22 +288,11 @@ deploy-policies-run:
 	cd $(INFRA) && $(PULUMI_ENV) pulumi up --stack $(STACK) $(foreach p,$(STACK_POLICIES),--target urn:pulumi:$(STACK)::ai-env::aws:iam/policy:Policy::$(p))
 	@echo "deploy-policies: done: wait about 15 s for IAM, then make deploy"
 
-# The daily Claude Code update (ops.sh claude-update): every step is its own make run started by ops.sh, never a
-# $(MAKE) on this line (GNU make runs such a line even under -n), so `make -n claude-update` stays a dry parse. Its
-# make deploy is the ordinary one: the plan gate, then Pulumi's own confirmation. S8 operators: no TIER here: ops.sh
-# decides from local reads whether a deploy is due, runs the steps that need no AWS (make claude-pin, make
-# test-docker) without any key, then asks once for the identity the rest needs (ai-env as ops, or ai-env as deployer
-# when a deploy is due) and runs every later step under it. A deploy needs the stack's passphrase (A39): when it is not
-# set as Pulumi takes it (ops.sh's pass_set, as PASS_SET_SH), ops.sh unseals PULUMI_SEALED with `ai-env run -f` (one
-# Touch ID) before the deployer's paste, and refuses before anything runs when there is no such file; only its make
-# deploy gets the passphrase (ops.sh keeps it unexported). Never break-glass: BREAKGLASS=1 on its command line would
-# reach the nested make deploy through MAKEFLAGS (TIER then asks for ai-env as root under the deployer's runner, which
-# refuses it after the paste), so it is refused first, before ops.sh runs; exported, it counts for nothing, as
-# anywhere.
-CLAUDE_UPDATE_GLASS  = test -z "$(BREAKGLASS_ON)" || { echo "claude-update: never break-glass (BREAKGLASS=1 is on the make command line): as the account root, run make deploy BREAKGLASS=1, then the remaining steps by hand (README \"Break-glass\"): nothing changed"; exit 2; }
-claude-update: ## (ops, or the deployer when a deploy is due: asked once, before the first step that needs AWS, a deploy's after the stack's passphrase: one Touch ID unless set) S3/S5 part B (interactive: the identity, Pulumi's confirmation, the egress check's Touch ID): follow the Cursor extension's Claude Code: make claude-pin (its version), make test-docker, make deploy, make infra-status WRITE=1, make proxy-start, ai-env egress check --if-needed; when already pinned and deployed only the status and the check; run again to resume after a failure
-	@$(CLAUDE_UPDATE_GLASS)
-	@$(LAB_UNSET) AI_ENV_CLI='$(AI_ENV)' LOCK='$(IMAGE_DIR)/claude.lock' CLAUDE_RELEASES='$(CLAUDE_RELEASES)' CLAUDE_GPG_FPR='$(CLAUDE_GPG_FPR)' PULUMI_SEALED='$(PULUMI_SEALED)' $(OPS) claude-update
+# S11 (A.7): the daily Claude Code update is retired: VMs follow the Cursor extension's claude with no deploy (an
+# admitted version staged in S3, fetched into each VM's claude cache: plans/s11-plan.md part A). The target stays so
+# that a habit or a runbook typing it is told what replaced it; it changes nothing (exit 2).
+claude-update: ## (retired, S11) VMs follow Cursor's Claude Code with no deploy: ai-env claude update admits and stages the installed bundle's version (one Touch ID); ai-env claude status shows where each version is
+	@echo "claude-update: retired (S11): VMs follow Cursor's Claude Code with no deploy: ai-env claude update (admits and stages the installed bundle's version; ai-env claude status shows where each version is)"; exit 2
 
 # D29: the wait decides from the versions against the pre-deploy snapshot; the post-deploy snapshot and
 # versions-diff run even after a failed build (T3.4 records both).
@@ -533,7 +521,7 @@ egress-logs-run:
 # One ai-env command each: the binary resolves its identity itself (an ai-env as marker, else credentials/ops.env with
 # one Touch ID), so no runner; egress allow, which widens egress, is the deployer's (ai-env as deployer -- ...). Each
 # (and infra-status, check-base-image) builds the binary first without any key ($(AI_ENV_BUILD), D18): typed under
-# `ai-env as ops --` or claude-update's runner, the command itself then compiles nothing with the key.
+# `ai-env as ops --`, the command itself then compiles nothing with the key.
 allowlist-reload: ## (ops: one Touch ID, none under ai-env as) S5 part B: ai-env egress reload (the proxy re-reads its parameters; squid -k parse first, the old config kept on any error)
 	@$(AI_ENV_BUILD)
 	$(LAB_UNSET) $(AI_ENV) egress reload

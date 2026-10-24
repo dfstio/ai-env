@@ -844,7 +844,7 @@ pub fn install_mode(write: bool, permission_mode: Option<String>, mode: WrapperM
 /// The image directory `settings-sync` writes into: `--image-dir`, else
 /// `image/` at the top of the git repository the current directory is in;
 /// it must hold `MANIFEST` and a regular `claude/settings.json`.
-fn image_dir_of(given: Option<&Path>) -> Result<PathBuf> {
+pub(crate) fn image_dir_of(given: Option<&Path>) -> Result<PathBuf> {
     let dir = match given {
         Some(d) => d.to_path_buf(),
         None => {
@@ -888,7 +888,7 @@ fn read_optional(path: &Path) -> Result<Option<(String, u32)>> {
 
 /// The scan `make image-stage-scan` runs, over `image` itself: the image
 /// profile, the tripwires and the settings policy read from disk now.
-fn image_findings(paths: &Paths, cfg: &BridgeConfig, image: &Path) -> Result<(Vec<crate::bridge::scan::Finding>, usize)> {
+pub(crate) fn image_findings(paths: &Paths, cfg: &BridgeConfig, image: &Path) -> Result<(Vec<crate::bridge::scan::Finding>, usize)> {
     let (rules, policy) = crate::bridge::scan::load_lists(Some((paths, &cfg.review)), None, None, true).map_err(CliError::Msg)?;
     crate::bridge::scan::scan_dir(image, crate::bridge::scan::Profile::Image, &rules, &policy).map_err(CliError::Msg)
 }
@@ -1232,7 +1232,7 @@ pub fn install(write: bool, permission_mode: Option<String>) -> Result<()> {
     outln!("claudeCode.disableLoginPrompt is left alone (set it only once S8 runs Cursor's sessions in MicroVMs with the delivered credential).");
     outln!("Wrapped setups start in Manual mode: the extension now passes --permission-mode {mode} on every spawn (choose with --permission-mode).");
     outln!("Cursor reads this setting each time it starts a process: chats it starts from now on use it; a chat already running keeps its process until it ends (a window reload restarts open chats through the wrapper).");
-    outln!("With a wrapper set the extension stops following CLAUDE_CONFIG_DIR changes. Cursor still updates the extension and its bundled claude (turn off Auto Update for the Claude Code extension to keep a version); make claude-update brings the image to it.");
+    outln!("With a wrapper set the extension stops following CLAUDE_CONFIG_DIR changes. Cursor still updates the extension and its bundled claude; VMs follow it with no deploy (ai-env claude status).");
     outln!("AI_ENV_BRIDGE_LOCAL=1 is the kill switch: the wrapper execs the bundled binary directly, without a census.");
     Ok(())
 }

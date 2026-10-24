@@ -1113,7 +1113,7 @@ async fn live_agent_exec_roundtrip() {
     input.extend_from_slice(&[0x00, 0xff, 0xfe, b'\n']);
     input.extend(std::iter::repeat_n(b'x', 200_000));
     let t = std::time::Instant::now();
-    let (out, err, pid, exit) = agent_exec(&env, SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None }, input.clone()).await;
+    let (out, err, pid, exit) = agent_exec(&env, SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: None, claude: Vec::new() }, input.clone()).await;
     eprintln!("live_agent_exec_roundtrip: {} bytes round trip in {} ms; pid {pid:?}; exit {exit:?}", input.len(), t.elapsed().as_millis());
     assert_eq!(out.len(), input.len(), "stdout length");
     assert!(out == input, "stdout differs from stdin");
@@ -1151,7 +1151,7 @@ async fn live_agent_reattach() {
     let mut ev1 = c1.events;
     let consumed1 = c1.consumed.clone();
     let (mut out, mut last_seq, mut sid, mut pid1, mut chunks) = (Vec::new(), 0u64, None, None, 0u32);
-    let mut s1 = Box::pin(run_spawn(&env, Start::New(SpawnSpec { argv: vec!["sh".into(), "-c".into(), LIVE_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None }), io1));
+    let mut s1 = Box::pin(run_spawn(&env, Start::New(SpawnSpec { argv: vec!["sh".into(), "-c".into(), LIVE_PRODUCER.into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None, claude: Vec::new() }), io1));
     loop {
         tokio::select! {
             ev = ev1.recv() => match ev {
@@ -1260,7 +1260,7 @@ async fn live_agent_rotation() {
         }
         (lines, notes)
     });
-    let outcome = run_spawn(&env, Start::New(SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None }), io).await;
+    let outcome = run_spawn(&env, Start::New(SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(300), id: None, claude: Vec::new() }), io).await;
     drop(c.input);
     drop(c.control);
     feeder.abort();
@@ -2110,9 +2110,21 @@ impl Chat {
     /// entrypoint; the lab knobs and every other `CLAUDE_CODE_` name of this shell removed. argv[1] names no file: in
     /// remote mode no Mac binary runs, and a local run of it fails at once.
     fn open(test: &'static str, live: &Live, cwd: &std::path::Path, extra: &[&str]) -> Chat {
+        Chat::open_as(test, live, cwd, &live.paths.root.join("no-claude-on-this-mac").join("claude"), extra)
+    }
+
+    /// S11: [`Chat::open`] as a chat of the Cursor bundle `version` (`bundle_argv1`: argv[1] names that bundle's
+    /// binary under the temporary root, where no file is), so P0 has a V as Cursor's chats do (the census's `ext`,
+    /// `claude::plan_for`).
+    fn open_bundled(test: &'static str, live: &Live, cwd: &std::path::Path, version: &str, extra: &[&str]) -> Chat {
+        Chat::open_as(test, live, cwd, &bundle_argv1(&live.paths.root, version), extra)
+    }
+
+    /// [`Chat::open`] with `argv1` as argv[1].
+    fn open_as(test: &'static str, live: &Live, cwd: &std::path::Path, argv1: &std::path::Path, extra: &[&str]) -> Chat {
         assert_eq!(CRED_SIGNAL.load(Ordering::SeqCst), 0, "{test}: interrupted before a chat opened");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env-claude"));
-        cmd.arg(live.paths.root.join("no-claude-on-this-mac").join("claude")).args(CURSOR_CHAT).args(extra).current_dir(cwd);
+        cmd.arg(argv1).args(CURSOR_CHAT).args(extra).current_dir(cwd);
         for (k, _) in std::env::vars_os() {
             let k = k.to_string_lossy().to_string();
             if k.starts_with("AI_ENV_BRIDGE_") || k.starts_with("CLAUDE_CODE_") {
@@ -3350,7 +3362,7 @@ fn wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed() {
     let live = Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds() };
     let sid = uuid::Uuid::now_v7().to_string();
     let target = ai_env_cli::bridge::s3::S3Target { bucket: "ai-env-transcripts-123456789012".into(), owner: "123456789012".into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Aws };
-    let part = |key: S3Key, version: &str, from: u64, len: u64| ManifestPart { key: key.render(), version_id: version.into(), from, len, sha256: "0".repeat(64) };
+    let part = |key: S3Key, version: &str, from: u64, len: u64| ManifestPart { key: key.render(), version_id: version.into(), from, len, sha256: "0".repeat(64), encoding: None, stored_len: None, stored_sha256: None };
     let (fp, at) = ("0".repeat(64), "2026-10-19T00:00:00.000Z");
     // A chat begun on the Mac (its object: 0..100), then a segment of the VM's whose version S3 did not name.
     let mut m = Manifest::new(&sid, &target, manifest::ORIGIN_MAC, &format!("-w/{sid}.jsonl"), at);
@@ -3632,6 +3644,72 @@ fn rate(bytes: u64, ms: u64) -> f64 {
     bytes as f64 / 1_000_000.0 / (ms.max(1) as f64 / 1000.0)
 }
 
+/// C §C.3.10: the words of the gib test's filler. Twenty, drawn uniformly, so that `/usr/bin/gzip -n -6` compresses
+/// the filler about 4x (4.0x measured at the builder: 32 words gave 3.8x, 100 gave 3.6x); the fox sentence S10
+/// repeated compressed over 100x and proved nothing.
+const FILLER_WORDS: [&str; 20] = ["the", "of", "and", "to", "in", "is", "was", "for", "on", "that", "with", "as", "by", "at", "from", "it", "his", "an", "were", "are"];
+
+/// A line's filler in the gib test's chat (C.3.10): 64 KiB.
+const FILLER_LINE: usize = 64 * 1024;
+
+/// splitmix64's next output, `state` advanced.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// C.3.10: `bytes` of plain words seeded by `seed` (a line's number): [`FILLER_WORDS`] drawn by [`splitmix64`],
+/// spaces between, a period after every 12th word, cut at `bytes` (ASCII).
+fn filler(seed: u64, bytes: usize) -> String {
+    let mut state = seed;
+    let mut out = String::with_capacity(bytes + 16);
+    let mut words = 0u64;
+    while out.len() < bytes {
+        let n = u64::try_from(FILLER_WORDS.len()).expect("a count");
+        let word = FILLER_WORDS[usize::try_from(splitmix64(&mut state) % n).expect("an index")];
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+        words += 1;
+        if words.is_multiple_of(12) {
+            out.push('.');
+        }
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// C.3.10, offline: 4 MiB of the gib test's filler (lines of [`FILLER_LINE`], seeded by their numbers) through
+/// `/usr/bin/gzip -n -6 -c` compress 3.0x to 6.0x (about 4x), the ratio printed; the filler is seeded (the same
+/// seed, the same text) and plain words.
+#[test]
+fn the_gib_filler_compresses_about_four_times() {
+    use std::io::Write as _;
+    let mut text = String::with_capacity(4 << 20);
+    let mut line = 0u64;
+    while text.len() < 4 << 20 {
+        text.push_str(&filler(line, FILLER_LINE));
+        line += 1;
+    }
+    text.truncate(4 << 20);
+    assert_eq!(filler(7, 1000), filler(7, 1000), "seeded");
+    assert_ne!(filler(7, 1000), filler(8, 1000));
+    assert!(filler(1, 1000).len() == 1000 && filler(1, 1000).bytes().all(|b| b.is_ascii_lowercase() || b == b' ' || b == b'.'), "plain words");
+    let mut gzip = std::process::Command::new("/usr/bin/gzip").args(["-n", "-6", "-c"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().expect("/usr/bin/gzip");
+    let mut stdin = gzip.stdin.take().expect("gzip's stdin");
+    let feed = std::thread::spawn(move || stdin.write_all(text.as_bytes()).map(|()| text.len()));
+    let out = gzip.wait_with_output().expect("gzip's output");
+    let fed = feed.join().expect("the feed").expect("written");
+    assert!(out.status.success() && !out.stdout.is_empty(), "gzip: {:?}", out.status);
+    let ratio = fed as f64 / out.stdout.len() as f64;
+    eprintln!("the gib filler: {fed} bytes, gzip -n -6 {} bytes: {ratio:.2}x", out.stdout.len());
+    assert!((3.0..=6.0).contains(&ratio), "about 4x: {ratio:.2}x");
+}
+
 /// The synthetic chat's shape for [`live_s3_gib_round_trip_timing`] (S10
 /// F12): its main transcript's MiB, and its subtree's MiB in `files`
 /// subagent files. AI_ENV_S3_CHAT gives it as
@@ -3651,8 +3729,10 @@ impl ChatShape {
     /// AI_ENV_S3_CHAT's value: unset, [`ChatShape::GIB`]; else exactly
     /// `main=<MiB>,subtree=<MiB>,files=<n>` in that order, decimal, a main of
     /// 1 MiB or more, a subtree with files and files with a subtree, the whole
-    /// at most what `session stage` takes (`STAGE_MAX`). Anything else is
-    /// refused naming the form it should have.
+    /// at most what `session stage` takes (`STAGE_MAX`), and (S11, C.3.5) the
+    /// main and each subtree file at most what one file may be
+    /// (`STAGE_FILE_MAX`: the last subtree file, which takes the remainder, is
+    /// the largest). Anything else is refused naming the form it should have.
     fn parse(value: Option<&str>) -> Result<ChatShape, String> {
         let Some(text) = value else { return Ok(ChatShape::GIB) };
         let bad = || format!("AI_ENV_S3_CHAT={text:?} is not main=<MiB>,subtree=<MiB>,files=<n> (make test-aws S3=1 CHAT=dev sets it from S3_CHAT_DEV)");
@@ -3667,8 +3747,12 @@ impl ChatShape {
         }
         let [main_mib, subtree_mib, files] = nums;
         let max_mib = ai_env_cli::bridge::s3::stage::STAGE_MAX >> 20;
-        if main_mib == 0 || (subtree_mib == 0) != (files == 0) || main_mib.saturating_add(subtree_mib) > max_mib {
-            return Err(format!("{}: a main of 1 MiB or more, a subtree with files (and files with a subtree), {max_mib} MiB at most in all", bad()));
+        let file_max = ai_env_cli::bridge::s3::stage::STAGE_FILE_MAX;
+        let shaped = main_mib > 0 && (subtree_mib == 0) == (files == 0) && main_mib.saturating_add(subtree_mib) <= max_mib;
+        // Within the whole's cap the bytes cannot overflow; the last subtree file takes the remainder.
+        let largest_file = |total: u64| total.checked_div(files).map_or(0, |each| each + total % files);
+        if !shaped || main_mib << 20 > file_max || largest_file(subtree_mib << 20) > file_max {
+            return Err(format!("{}: a main of 1 MiB or more, a subtree with files (and files with a subtree), each file {} MiB at most and {max_mib} MiB at most in all", bad(), file_max >> 20));
         }
         Ok(ChatShape { main_mib, subtree_mib, files })
     }
@@ -3699,6 +3783,13 @@ fn chat_shape_reads_main_subtree_files_or_defaults_to_s9s_gib() {
     assert_eq!((sizes.len(), sizes.iter().sum::<u64>()), (40, 1650 << 20));
     assert_eq!(ChatShape::parse(Some("main=1,subtree=1,files=3")).unwrap().file_sizes(), [349_525, 349_525, 349_526], "the remainder in the last");
     assert_eq!(ChatShape::parse(Some("main=1024,subtree=0,files=0")), Ok(ChatShape::GIB));
+    // S11 (C.3.5): each file 4 GiB at most, 16 GiB at most in all; both caps exactly parse.
+    let edge = ChatShape::parse(Some("main=4096,subtree=12288,files=4")).unwrap();
+    assert_eq!((edge.main_bytes(), edge.file_sizes()), (4096 << 20, vec![3072 << 20; 4]));
+    for capped in ["main=4097,subtree=0,files=0", "main=4096,subtree=12289,files=4", "main=1,subtree=4097,files=1"] {
+        let e = ChatShape::parse(Some(capped)).expect_err(capped);
+        assert!(e.ends_with("a main of 1 MiB or more, a subtree with files (and files with a subtree), each file 4096 MiB at most and 16384 MiB at most in all"), "{capped}: {e}");
+    }
     for bad in [
         "",
         "main=215",
@@ -3712,7 +3803,9 @@ fn chat_shape_reads_main_subtree_files_or_defaults_to_s9s_gib() {
         "main=0,subtree=0,files=0",
         "main=215,subtree=0,files=4",
         "main=215,subtree=10,files=0",
-        "main=4096,subtree=1,files=1",
+        "main=4097,subtree=0,files=0",
+        "main=4096,subtree=12289,files=4",
+        "main=1,subtree=4097,files=1",
         "main=99999999999999999999,subtree=0,files=0",
     ] {
         let e = ChatShape::parse(Some(bad)).expect_err(bad);
@@ -3802,7 +3895,6 @@ fn live_s3_gib_round_trip_timing() {
     {
         use std::io::Write as _;
         let mut w = std::io::BufWriter::new(std::fs::File::create(dir.join(format!("{session}.jsonl"))).unwrap());
-        let filler = "the quick brown fox jumps over the lazy dog ".repeat(1490);
         let (cwd, start) = (ws.display().to_string(), ai_env_cli::wire::time::unix_now_ms() - 3_600_000);
         let at = |ms: u64| ai_env_cli::wire::time::rfc3339_utc_ms(start + ms);
         let entry = |kind: &str, uuid: &str, parent: serde_json::Value, ms: u64, content: serde_json::Value| {
@@ -3816,7 +3908,7 @@ fn live_s3_gib_round_trip_timing() {
         let (mut written, mut parent, mut n) = (0u64, serde_json::Value::Null, 0u64);
         while written < main || n % 2 == 1 {
             let uuid = uuid::Uuid::now_v7().to_string();
-            let text = format!("{n} {filler}");
+            let text = filler(n, FILLER_LINE);
             let line = if n % 2 == 0 { entry("user", &uuid, parent, n, serde_json::json!(text)) } else { entry("assistant", &uuid, parent, n, serde_json::json!([{"type": "text", "text": text}])) };
             written += put(&line);
             parent = serde_json::Value::String(uuid);
@@ -3849,7 +3941,7 @@ fn live_s3_gib_round_trip_timing() {
             while written < size || n == 0 {
                 let uuid = uuid::Uuid::now_v7().to_string();
                 let kind = if n % 2 == 0 { "user" } else { "assistant" };
-                let mut line = entry(kind, &uuid, parent, 60_000 + n, serde_json::json!([{"type": "text", "text": format!("{n} {filler}")}]));
+                let mut line = entry(kind, &uuid, parent, 60_000 + n, serde_json::json!([{"type": "text", "text": filler(n, FILLER_LINE)}]));
                 line["isSidechain"] = serde_json::Value::Bool(true);
                 line["agentId"] = serde_json::Value::String(agent.clone());
                 let text = format!("{line}\n");
@@ -3872,6 +3964,11 @@ fn live_s3_gib_round_trip_timing() {
     assert!(v["bytes"].as_u64().is_some_and(|b| b >= main + subtree), "{TEST}: the whole chat went up, its subtree too: {v}");
     assert_eq!(v["view"].as_str(), Some(format!("{slug}/{session}.jsonl").as_str()), "{TEST}: the view (the exchange after the compaction) in the chat's place: {v}");
     let (up, up_ms) = timed_row(TEST, &live, "transcript_stage", &session);
+    // C.3.10: the chat's gzip ratio, and the stored bytes' rate (the stage row's `stored` and `rate`).
+    let stage_rows = live_audit(&live, "transcript_stage");
+    let stage_row = stage_rows.iter().rev().find(|r| r["detail"]["session"] == session.as_str()).unwrap_or_else(|| panic!("{TEST}: no transcript_stage row of {session}"));
+    let stored = stage_row["detail"]["stored"].as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or_else(|| panic!("{TEST}: the stage's stored bytes: {stage_row}"));
+    eprintln!("{TEST}: the chat's gzip ratio: {up}/{stored} = {:.2}x; the stored bytes went up at {:.1} MB/s (the row's rate: {})", up as f64 / stored.max(1) as f64, rate(stored, up_ms), stage_row["detail"]["rate"]);
     let vm = v["restore"]["vm"].as_str().unwrap_or_else(|| panic!("{TEST}: the warm restored nothing: {v}")).to_string();
     // The pull's own bytes and ms, from its audit row; the command's `restore` says the same bytes (its ms is the whole restore's).
     let (down, down_ms) = timed_row(TEST, &live, "transcript_pull", &session);
@@ -5078,4 +5175,791 @@ fn live_s10_reopen_after_wall() {
     eprintln!("{TEST}: the reopen's transcript_pull rows into {vm2} (the Mac's manifest held {parts_before:?} part(s) before it; a part more may be a tail the VM pushed at a /terminate the wall posted): {pulls:?}");
     let (a, b) = (first.output(), second.output());
     sweep_live(&live, &[&a, &b], &[]);
+}
+
+// ---- S11: claude always fresh and S10's leftovers, live (part B: B3 (e) and B4 (a), `make test-aws S11=1`) ----
+//
+// S11 wave 2 (L). Chats of the real `ai-env-claude` in remote mode on S8's
+// rig (`wrapper_world`, `Chat`; the setup-token sealed) against image 13.0,
+// each in a fixture under this checkout's `target/s8/` (never the
+// development chat), in S10's kind of world with `[claude] auto_admit =
+// false` (`s11_world`: no wall and no migration inside a test, and no
+// automatic admission started in a test's root). Part A: an option the VM's
+// claude does not know, dropped by a same-VM respawn
+// (`live_s11_unknown_option_respawns`, B3 (e)); the installed Cursor bundle's
+// claude admitted in the test's root, staged through a stager VM and fetched
+// ahead by `vm warm` (`live_s11_stager_stages_the_bundle`); a cold VM's chat
+// on the image's claude fetching the bundle's after its first output, and the
+// next chat there running it cached (`live_s11_claude_src_cached_after_fetch`,
+// on this Mac's admitted and staged record of it). Part C: F1, a `git
+// checkout -b` carried across a re-address
+// (`live_s11_checkout_b_then_readdress`); C-4, a move mid-turn after
+// `/compact` (`live_s11_compact_then_move`); and what the CLI writes into a
+// fork's file, against the fake's FK-3 (`live_s11_fork_first_write`, a
+// measurement). Each Touch ID is announced as S10's are
+// (`announce_touch_id`); each test's count includes the test process's
+// runtime key, as when it runs alone, and one for its chats' S3 objects
+// (`PurgeTranscripts`; none for a test without a chat). No S11 test reads
+// AI_ENV_AWS_SLOW or the code token's minutes.
+
+use ai_env_cli::bridge::claude::{Phase as ClaudePhase, Record as ClaudeRecord};
+
+/// Whether S11's live tests run: [`live`], and AI_ENV_S11_TESTS=1 (`make test-aws S11=1`).
+fn s11_live() -> bool {
+    if !live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_S11_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_S11_TESTS=1 too (make test-aws S11=1) for S11's chats");
+    false
+}
+
+/// [`s10_world`] (no wall and no migration inside a test, then `vm`'s keys)
+/// with `[claude] auto_admit = false` in the temporary root's bridge.toml: no
+/// chat of a test starts an automatic admission there (D5; the runbook's
+/// Found 4). Part A's tests hold the record they need, or make it with
+/// `ai-env claude admit`, which the switch never stops.
+fn s11_world(vm: &[(&str, toml::Value)]) -> Live {
+    let mut live = s10_world(vm);
+    let mut doc: toml::Table = toml::from_str(&std::fs::read_to_string(&live.paths.config).unwrap()).expect("the copied bridge.toml");
+    let table = doc.entry("claude").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    table.as_table_mut().expect("[claude] is a table").insert("auto_admit".into(), toml::Value::Boolean(false));
+    std::fs::write(&live.paths.config, toml::to_string(&doc).unwrap()).unwrap();
+    live.cfg = BridgeConfig::load(&live.paths).unwrap().expect("bridge.toml");
+    assert!(!live.cfg.claude.auto_admit, "the test's root admits nothing by itself");
+    live
+}
+
+/// argv[1] of a chat of the Cursor bundle `version`, under `root`:
+/// `<root>/extensions/anthropic.claude-code-<version>-darwin-arm64/resources/native-binary/claude`,
+/// whose bundle the census reads as the chat's `ext` (P0's V). No file is
+/// there: in remote mode no Mac binary runs, and a local run of it fails at
+/// once.
+fn bundle_argv1(root: &std::path::Path, version: &str) -> std::path::PathBuf {
+    root.join("extensions").join(format!("anthropic.claude-code-{version}-darwin-arm64")).join("resources").join("native-binary").join("claude")
+}
+
+/// The installed Cursor bundle's Claude Code version (`claude::installed_bundle`:
+/// `~/.cursor/extensions`' names, as `ai-env infra pin --bundle-version`
+/// reads them): V, which part A's tests admit, stage and fetch.
+fn s11_bundle_version(test: &str) -> String {
+    let v = ai_env_cli::bridge::claude::installed_bundle().unwrap_or_else(|| panic!("{test}: no installed Cursor bundle names a claude version (~/.cursor/extensions)"));
+    eprintln!("{test}: the installed Cursor bundle's claude: {v}");
+    v
+}
+
+/// This Mac's record of claude `version` (`state/claude/<v>.toml` of the real
+/// bridge root) written into the test's root (`Record::update`), so that a
+/// chat of that bundle names it to its VM. Part B's B3 (a) and (b) admitted
+/// and staged it: any other phase fails the test naming them.
+fn adopt_claude_record(test: &str, live: &Live, version: &str) {
+    let real = Paths::resolve().expect("the real bridge root");
+    let record = ClaudeRecord::load(&real, version)
+        .unwrap_or_else(|e| panic!("{test}: this Mac's record of claude {version}: {e}"))
+        .unwrap_or_else(|| panic!("{test}: this Mac has no record of claude {version}: ai-env claude admit {version}, then ai-env claude stage {version} (part B's B3 (a) and (b))"));
+    assert_eq!(record.phase(), ClaudePhase::Staged, "{test}: claude {version} is {} on this Mac: ai-env claude stage {version} (part B's B3 (b)) stages it", record.phase().word());
+    let adopted = ClaudeRecord::update(&live.paths, version, |r| *r = record.clone()).unwrap_or_else(|e| panic!("{test}: claude {version}'s record into the test's root: {e}"));
+    let staging = adopted.staging.unwrap_or_default();
+    eprintln!("{test}: claude {version} staged at {} since {} (this Mac's record)", staging.s3_key, staging.at);
+}
+
+/// The lines of `session`'s view on the Mac as they are now, none while its
+/// row names no view or the file cannot be read (a poll's probe;
+/// [`assert_a_view`] judges the file).
+fn view_lines_now(live: &Live, session: &str) -> Vec<String> {
+    let Some(view) = ai_env_cli::bridge::registry::read(&live.paths, session).ok().flatten().and_then(|r| r.view) else { return Vec::new() };
+    std::fs::read_to_string(mac_projects().join(view)).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// How many of a view's `lines` are a user's prompt holding `marker` (C-4:
+/// the nonce's): a `user` line whose content is text (a string, or text
+/// blocks) holding it. The assistant's call and the tool's result that hold
+/// it too never count.
+fn prompt_lines(lines: &[String], marker: &str) -> usize {
+    lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["type"] == "user")
+        .filter(|v| match &v["message"]["content"] {
+            serde_json::Value::String(s) => s.contains(marker),
+            serde_json::Value::Array(blocks) => blocks.iter().any(|b| b["type"] == "text" && b["text"].as_str().is_some_and(|t| t.contains(marker))),
+            _ => false,
+        })
+        .count()
+}
+
+/// One JSONL file's shape as [`fork_shape_script`] prints it: whether it
+/// exists, and each line's type and uuid (`None`: none), in order.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FileShape {
+    present: bool,
+    lines: Vec<(String, Option<String>)>,
+}
+
+impl FileShape {
+    /// The uuids of its `user` and `assistant` lines, in order.
+    fn messages(&self) -> Vec<&str> {
+        self.lines.iter().filter(|(t, _)| t == "user" || t == "assistant").filter_map(|(_, u)| u.as_deref()).collect()
+    }
+}
+
+/// The `sh -c` script `vm exec` runs for the fork's shape (C §C.6.3, small
+/// item f), shell builtins alone (the image has no jq): for the files
+/// `<x>.jsonl` (tag `x`) and `<f>.jsonl` (tag `f`) under
+/// `$HOME/.claude/projects/<slug>/`, `<tag>_file=present` (or `absent`), one
+/// line `<tag> <n> <type> <uuid>` per JSONL line, then `<tag>_lines=<n>`. The
+/// type is the line's own: `user`, `assistant`, `system` or `summary` by its
+/// `"type":"…"` pair (an assistant line's message carries a type of its own
+/// first; a JSON string's quotes are escaped, so a quoted type never
+/// matches), else the first such pair's word; the uuid is the first
+/// `"uuid":"…"` pair's (a message has none of its own). Each is printed only
+/// when it is a plain word (lowercase letters, `_` and `-`; hex digits and
+/// `-`), else `?` and `-`: uuids and types, never content.
+fn fork_shape_script(slug: &str, x: &str, f: &str) -> String {
+    for (what, word) in [("slug", slug), ("x", x), ("f", f)] {
+        assert!(!word.is_empty() && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "the fork's shape script: its {what} is no plain word: {word:?}");
+    }
+    let body = r#"d="$HOME/.claude/projects/@SLUG@"
+kind() {
+  case "$1" in
+    *'"type":"user"'*) k=user ;;
+    *'"type":"assistant"'*) k=assistant ;;
+    *'"type":"system"'*) k=system ;;
+    *'"type":"summary"'*) k=summary ;;
+    *) r=${1#*'"type":"'}
+       if [ "$r" = "$1" ]; then k='?'; else k=${r%%'"'*}; fi
+       case "$k" in ''|*[!a-z_-]*) k='?' ;; esac ;;
+  esac
+}
+uid() {
+  r=${1#*'"uuid":"'}
+  if [ "$r" = "$1" ]; then u=-; else u=${r%%'"'*}; fi
+  case "$u" in ''|*[!0-9a-f-]*) u=- ;; esac
+}
+shape() {
+  if [ ! -f "$2" ]; then echo "$1_file=absent"; return; fi
+  echo "$1_file=present"
+  n=0
+  while IFS= read -r l || [ -n "$l" ]; do
+    n=$((n + 1)); kind "$l"; uid "$l"; echo "$1 $n $k $u"
+  done < "$2"
+  echo "$1_lines=$n"
+}
+shape x "$d/@X@.jsonl"
+shape f "$d/@F@.jsonl"
+"#;
+    body.replace("@SLUG@", slug).replace("@X@", x).replace("@F@", f)
+}
+
+/// X's and F's shapes from [`fork_shape_script`]'s output; `None` when its
+/// lines do not add up (an unknown line, a line out of its order, a count
+/// that is not its lines').
+fn fork_shapes(out: &str) -> Option<(FileShape, FileShape)> {
+    let slot = |tag: &str| match tag {
+        "x" => Some(0usize),
+        "f" => Some(1usize),
+        _ => None,
+    };
+    let mut shapes = [FileShape::default(), FileShape::default()];
+    let mut counted = [0usize; 2];
+    for line in out.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            let (tag, what) = key.split_once('_')?;
+            let i = slot(tag)?;
+            match (what, value) {
+                ("file", "present") => shapes[i].present = true,
+                ("file", "absent") => shapes[i].present = false,
+                ("lines", n) => counted[i] = n.parse().ok()?,
+                _ => return None,
+            }
+            continue;
+        }
+        let words: Vec<&str> = line.split(' ').collect();
+        let [tag, n, kind, uuid] = words.as_slice() else { return None };
+        let i = slot(tag)?;
+        if n.parse::<usize>().ok()? != shapes[i].lines.len() + 1 {
+            return None;
+        }
+        shapes[i].lines.push(((*kind).to_string(), (*uuid != "-").then(|| (*uuid).to_string())));
+    }
+    let [x, f] = shapes;
+    (counted == [x.lines.len(), f.lines.len()]).then_some((x, f))
+}
+
+/// FK-3 (S10 §8.4, `plans/s10-contracts.md`): the fake's fork copies X's user
+/// and assistant lines into F's file at its first write. `Ok` when F's file
+/// shows that (all of X's user and assistant uuids, in X's order, are F's
+/// first user and assistant lines), else what differs.
+fn fk3_verdict(x: &FileShape, f: &FileShape) -> Result<(), String> {
+    let (xs, fs) = (x.messages(), f.messages());
+    if !xs.is_empty() && fs.starts_with(&xs) {
+        return Ok(());
+    }
+    let found = xs.iter().filter(|u| fs.contains(u)).count();
+    let lead: Vec<&str> = fs.iter().take(xs.len().max(1)).copied().collect();
+    Err(format!("{found} of X's {} user and assistant uuids are in F's file; F's first user and assistant uuids {lead:?}, X's {xs:?}", xs.len()))
+}
+
+/// F's own user and assistant lines (each with a uuid none of X's): how many of each.
+fn own_messages(x: &FileShape, f: &FileShape) -> (usize, usize) {
+    let xs = x.messages();
+    let own = |kind: &str| f.lines.iter().filter(|(t, u)| t == kind && u.as_deref().is_some_and(|u| !xs.contains(&u))).count();
+    (own("user"), own("assistant"))
+}
+
+/// Offline (S11): a bundled chat's argv[1] names its bundle's version as the
+/// census reads it (the chat's `ext`), under the temporary root.
+#[test]
+fn a_bundled_chats_argv1_names_its_version() {
+    let p = bundle_argv1(std::path::Path::new("/tmp/live-root"), "2.1.308");
+    assert!(p.starts_with("/tmp/live-root"), "{}", p.display());
+    let os = p.into_os_string();
+    assert_eq!(ai_env_cli::bridge::census::ext_version_from_real_binary(Some(&os)).as_deref(), Some("2.1.308"));
+}
+
+/// Offline (S11, C-4): [`prompt_lines`] counts a view's prompts holding a
+/// marker, as a string or as text blocks, and never the assistant's call or
+/// the tool's result that hold it too.
+#[test]
+fn a_views_prompt_is_counted_apart_from_its_call_and_result() {
+    let marker = "slept-ab12";
+    let lines: Vec<String> = [
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": format!("run this: sleep 90; echo {marker}")}}),
+        serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": format!("sleep 90; echo {marker}")}}]}}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": marker}]}}),
+        serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": marker}]}}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": format!("again: {marker}")}]}}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": "Reply with exactly OK"}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .chain(std::iter::once("not json".to_string()))
+    .collect();
+    assert_eq!(prompt_lines(&lines, marker), 2);
+    assert_eq!(prompt_lines(&lines[..1], marker), 1);
+    assert_eq!(prompt_lines(&lines, "absent"), 0);
+}
+
+/// Offline (S11, the fork's shape): [`fork_shape_script`] under this Mac's
+/// `/bin/sh`, on files of the forms claude writes (an assistant line whose
+/// message carries its own type, a tool's result whose text quotes a type, a
+/// summary with no uuid of its own, a snapshot, a last line without its
+/// newline), prints each line's type and uuid and no content; a missing file
+/// is absent. [`fork_shapes`] reads it back (and refuses lines that do not
+/// add up); [`fk3_verdict`] and [`own_messages`] judge it.
+#[test]
+fn the_fork_shape_is_types_and_uuids_only() {
+    const WORD: &str = "contentwordnevershown";
+    let home = tempfile::tempdir().unwrap();
+    let slug = "-tmp-live-s11-fork";
+    let (x, f) = ("0199a1b2-0000-7000-8000-00000000000a", "0199a1b2-0000-7000-8000-00000000000f");
+    let dir = home.path().join(".claude").join("projects").join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    let u = |n: u32| format!("0199a1b2-0000-7000-8000-{n:012x}");
+    let user = |id: &str, content: serde_json::Value| serde_json::json!({"parentUuid": null, "isSidechain": false, "type": "user", "message": {"role": "user", "content": content}, "uuid": id, "timestamp": "2026-10-23T08:00:00Z"}).to_string();
+    let assistant = |id: &str| {
+        serde_json::json!({"parentUuid": null, "isSidechain": false, "message": {"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": WORD}]}, "requestId": "req_1", "type": "assistant", "uuid": id, "timestamp": "2026-10-23T08:00:01Z"}).to_string()
+    };
+    let summary = serde_json::json!({"type": "summary", "summary": WORD, "leafUuid": u(2)}).to_string();
+    let snapshot = serde_json::json!({"type": "file-history-snapshot", "messageId": u(9), "snapshot": {"files": [WORD]}}).to_string();
+    let quoted = user(&u(5), serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": format!("{WORD} \"type\":\"assistant\" \"uuid\":\"{}\"", u(7))}]));
+    let x_lines = [user(&u(1), serde_json::json!(format!("Reply {WORD}"))), assistant(&u(2)), summary];
+    std::fs::write(dir.join(format!("{x}.jsonl")), format!("{}\n", x_lines.join("\n"))).unwrap();
+    let f_lines = [user(&u(1), serde_json::json!(format!("Reply {WORD}"))), assistant(&u(2)), snapshot, user(&u(3), serde_json::json!(WORD)), assistant(&u(4)), quoted];
+    // The last line without its newline.
+    std::fs::write(dir.join(format!("{f}.jsonl")), f_lines.join("\n")).unwrap();
+    let run = |script: &str| {
+        let out = std::process::Command::new("/bin/sh").arg("-c").arg(script).env_clear().env("HOME", home.path()).env("PATH", "/usr/bin:/bin").output().expect("/bin/sh");
+        assert!(out.status.success(), "the script: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).expect("UTF-8")
+    };
+    let out = run(&fork_shape_script(slug, x, f));
+    assert!(!out.contains(WORD) && !out.contains("Reply"), "no content: {out}");
+    let (xs, fs) = fork_shapes(&out).unwrap_or_else(|| panic!("the shape lines add up: {out}"));
+    let shape = |lines: &[(&str, Option<u32>)]| FileShape { present: true, lines: lines.iter().map(|(t, n)| ((*t).to_string(), n.map(u))).collect() };
+    assert_eq!(xs, shape(&[("user", Some(1)), ("assistant", Some(2)), ("summary", None)]), "{out}");
+    assert_eq!(fs, shape(&[("user", Some(1)), ("assistant", Some(2)), ("file-history-snapshot", None), ("user", Some(3)), ("assistant", Some(4)), ("user", Some(5))]), "{out}");
+    assert_eq!(fk3_verdict(&xs, &fs), Ok(()));
+    assert_eq!(own_messages(&xs, &fs), (2, 1));
+    // F without X's lines: what differs is said; F's own turn is still there.
+    let bare = FileShape { present: true, lines: fs.lines[3..].to_vec() };
+    let differs = fk3_verdict(&xs, &bare).expect_err("no copy of X's lines");
+    assert!(differs.starts_with("0 of X's 2 user and assistant uuids are in F's file"), "{differs}");
+    assert_eq!(own_messages(&xs, &bare), (2, 1));
+    // A file that is not there is absent.
+    let (_, gone) = fork_shapes(&run(&fork_shape_script(slug, x, "0199a1b2-0000-7000-8000-0000000000ff"))).expect("absent adds up");
+    assert_eq!(gone, FileShape::default());
+    for bad in ["x 2 user -", "x 1 user", "y 1 user -", "x_lines=2", "x_file=maybe", "x 1 user - extra"] {
+        assert_eq!(fork_shapes(bad), None, "{bad}");
+    }
+}
+
+/// T11 live, plan B3 (e) (A.5, L1): an option the VM's claude does not know
+/// costs a chat nothing. The real `ai-env-claude` starts with
+/// `--ai-env-s11-probe` after the extension's argv; claude refuses it before
+/// `initialize` (`error: unknown option '--ai-env-s11-probe'`), and the
+/// wrapper starts it again on the same VM without it and without a Touch ID
+/// (`session_remote_start` of generation 2, `why` `argv_retry`, on generation
+/// 1's VM): `initialize` is answered (its time printed against Cursor's 60 s,
+/// the respawn inside it) and a turn answers; the end row says
+/// `argv_dropped:--ai-env-s11-probe` and exit 0, and the audit holds one
+/// `argv_dropped` row of the flag (once per flag and claude version). Three
+/// Touch IDs: the chat, the test process's runtime key, the purge. About
+/// three minutes.
+#[test]
+#[ignore = "live, S11 part A, an unknown option dropped by a same-VM respawn (about three minutes; three Touch IDs: the chat, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_unknown_option_respawns() {
+    const TEST: &str = "live_s11_unknown_option_respawns";
+    const PROBE: &str = "--ai-env-s11-probe";
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s11-unknown-option");
+    let mut chat = Chat::open(TEST, &live, &ws, &[PROBE]);
+    // Cursor's window with the respawn inside it: said, not judged (the contract judges the drop and the exit).
+    let init = chat.initialize_within(LIVE_INIT_LIMIT * 2);
+    eprintln!("{TEST}: initialize answered after {} ms, the respawn inside it (Cursor waits {} s)", init.as_millis(), LIVE_INIT_LIMIT.as_secs());
+    let turn = chat.turn("Reply with exactly OK");
+    assert_eq!(turn.result["is_error"], false, "{TEST}: the turn on the respawned claude: {}", turn.result);
+    let pid = chat.pid();
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    eprintln!(
+        "{TEST}: claude:{:?} claude_src:{:?} argv_dropped:{:?}",
+        note_part(&row, census_part::CLAUDE),
+        note_part(&row, census_part::CLAUDE_SRC),
+        note_part(&row, census_part::ARGV_DROPPED)
+    );
+    assert_eq!(note_part(&row, census_part::ARGV_DROPPED).as_deref(), Some(PROBE), "{TEST}: the end row names the dropped option");
+    let starts = audit_of(&live, audit_event::SESSION_REMOTE_START, pid);
+    eprintln!("{TEST}: session_remote_start {:?}", starts.iter().map(|r| r["detail"].clone()).collect::<Vec<_>>());
+    let gen = |n: &str| starts.iter().find(|r| r["detail"]["gen"] == n).map(|r| (r["detail"]["why"].as_str().unwrap_or_default().to_string(), r["detail"]["id"].as_str().unwrap_or_default().to_string()));
+    let (Some((why1, vm1)), Some((why2, vm2))) = (gen("1"), gen("2")) else { panic!("{TEST}: generations 1 and 2 started: {starts:?}") };
+    assert_eq!((why1.as_str(), why2.as_str()), ("first", "argv_retry"), "{TEST}: generation 2 is the start-up respawn");
+    assert_eq!(vm2, vm1, "{TEST}: the respawn stayed on generation 1's VM");
+    let dropped = audit_of(&live, audit_event::ARGV_DROPPED, pid);
+    let [one] = dropped.as_slice() else { panic!("{TEST}: one argv_dropped row: {dropped:?}") };
+    eprintln!("{TEST}: argv_dropped {}", one["detail"]);
+    assert_eq!(one["detail"]["flag"].as_str(), Some(PROBE), "{TEST}: {one}");
+    let refused = chat.stderr_now().contains(&format!("unknown option '{PROBE}'"));
+    eprintln!("{TEST}: claude's refusal of {PROBE} in the wrapper's stderr: {refused}");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
+}
+
+/// T11 live, plan B3 (a), (b) and (d) in a test's root (D1, D2, D3): the
+/// installed Cursor bundle's claude V is admitted there (`ai-env claude admit
+/// V --json`, no Touch ID: the release's signature by the pinned key, the
+/// binary's size and sha256, its markers, then the Docker tests on the local
+/// image, so Docker must answer), then staged through a stager VM (`ai-env
+/// claude stage V --force --json`, one Touch ID). `--force` deletes the
+/// object S3 holds first: part B's B3 (b) staged V already, and without it
+/// the Mac's listing would answer `already_staged` with no VM. The stager is a
+/// credential-less internet VM (`vm_run` `purpose` `claude-stage`) that relays
+/// the signed release into the presigned PUT, then ends (`vm_terminate` `by`
+/// `claude-stage`, its row `terminated_by` too): `staged` (S3's 200), or
+/// `exists` (412: counted as staged, unverified) when the object came back
+/// meanwhile; the record says `staged` at `v1/_claude/mac/<V>/<sha256>`
+/// through that VM. Then `vm warm` of a fresh fixture fetches V ahead into the
+/// workspace's new VM (`fetched`, a `claude_fetch` row `why` `warm`;
+/// `fetching` past its 120 s is said), and a second warm finds it `cached`
+/// there. The admission's and the stage's times are printed. Four Touch IDs:
+/// the test process's runtime key, the stage, two `vm warm`. About ten
+/// minutes, the Docker tests most of them.
+#[test]
+#[ignore = "live, S11 part A, the installed bundle's claude admitted in the test's root (Docker running), staged through a stager MicroVM, then fetched ahead by vm warm (about ten minutes; four Touch IDs: the test process's runtime key, the stage, two vm warm): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_stager_stages_the_bundle() {
+    const TEST: &str = "live_s11_stager_stages_the_bundle";
+    // A warm: the VM, the seed, the delivery, then the fetch's wait (`WARM_CLAUDE_WAIT`).
+    const WARM_LIMIT: Duration = Duration::from_secs(600);
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let v = s11_bundle_version(TEST);
+    // D2: the admission in the test's root: the release's download, then the Docker tests (`ADMIT_MAKE_BOUND`).
+    let t = Instant::now();
+    let admitted = ai_env_live_within(&live, &["claude", "admit", &v, "--json"], ai_env_cli::bridge::claude::ADMIT_MAKE_BOUND + Duration::from_secs(600));
+    let admit_ms = t.elapsed().as_millis();
+    let doc: serde_json::Value = serde_json::from_slice(&admitted.stdout).unwrap_or_else(|e| panic!("{TEST}: claude admit {v} --json ({e}): {}", String::from_utf8_lossy(&admitted.stdout)));
+    eprintln!("{TEST}: claude admit {v} took {admit_ms} ms: {doc}");
+    assert_eq!(admitted.status.code(), Some(0), "{TEST}: claude admit {v} (Docker must answer: its tests run on {v}): {doc}");
+    assert_eq!(
+        (doc["outcome"].as_str(), doc["phase"].as_str(), doc["signer"].as_str(), doc["markers"].as_str()),
+        (Some("admitted"), Some("admitted"), Some(ai_env_cli::wire::pin::RELEASE_KEY_FPR), Some("ok")),
+        "{TEST}: signed by the release key, its markers there, its Docker tests passed: {doc}"
+    );
+    let sha = doc["sha256"].as_str().unwrap_or_else(|| panic!("{TEST}: the admitted binary's sha256: {doc}")).to_string();
+    let admits = live_audit(&live, audit_event::CLAUDE_ADMIT);
+    assert!(admits.iter().any(|r| r["detail"]["version"] == v.as_str() && r["detail"]["outcome"] == "admitted"), "{TEST}: the claude_admit row: {admits:?}");
+    // D1: the stage through a stager VM; --force deletes what S3 holds first.
+    announce_touch_id(TEST, &format!("claude stage {v} --force: the runtime key (a stager VM relays the release into S3)"));
+    let t = Instant::now();
+    let staged = ai_env_live_within(&live, &["claude", "stage", &v, "--force", "--json"], Duration::from_secs(u64::from(ai_env_cli::bridge::claude::STAGER_MAX_DURATION_S)));
+    let stage_ms = t.elapsed().as_millis();
+    let doc: serde_json::Value = serde_json::from_slice(&staged.stdout).unwrap_or_else(|e| panic!("{TEST}: claude stage {v} --json ({e}): {}", String::from_utf8_lossy(&staged.stdout)));
+    eprintln!("{TEST}: claude stage {v} --force took {stage_ms} ms: {doc}");
+    assert_eq!(staged.status.code(), Some(0), "{TEST}: claude stage {v}: {doc}");
+    let outcome = doc["outcome"].as_str().unwrap_or_default().to_string();
+    assert!(outcome == "staged" || outcome == "exists", "{TEST}: staged (S3's 200), or exists (its 412: counted as staged): {doc}");
+    let key = format!("v1/_claude/mac/{v}/{sha}");
+    assert_eq!(doc["key"].as_str(), Some(key.as_str()), "{TEST}: the object's key: {doc}");
+    let stager = doc["vm"].as_str().unwrap_or_else(|| panic!("{TEST}: no stager VM: {doc}")).to_string();
+    let runs = live_audit(&live, "vm_run");
+    let run = runs.iter().find(|r| r["detail"]["id"] == stager.as_str()).unwrap_or_else(|| panic!("{TEST}: no vm_run row of {stager}: {runs:?}"));
+    assert_eq!((run["detail"]["purpose"].as_str(), run["detail"]["egress"].as_str()), (Some("claude-stage"), Some("internet")), "{TEST}: the stager's run: {}", run["detail"]);
+    let ends = live_audit(&live, "vm_terminate");
+    assert!(ends.iter().any(|r| r["detail"]["id"] == stager.as_str() && r["detail"]["by"] == "claude-stage"), "{TEST}: the stage ended its stager: {ends:?}");
+    let row = vm_rows::read_row(&live.paths, &stager).unwrap().unwrap_or_else(|| panic!("{TEST}: no row of {stager}"));
+    assert_eq!((row.status, row.terminated_by.as_deref()), (RowStatus::Terminated, Some("claude-stage")), "{TEST}: the stager's row");
+    let stages: Vec<serde_json::Value> = live_audit(&live, audit_event::CLAUDE_STAGE).into_iter().map(|r| r["detail"].clone()).collect();
+    eprintln!("{TEST}: claude_stage {stages:?}");
+    assert!(stages.iter().any(|d| d["outcome"] == "deleted" && d["why"] == "force"), "{TEST}: --force deleted the object first: {stages:?}");
+    assert!(stages.iter().any(|d| d["outcome"] == outcome.as_str() && d["vm"] == stager.as_str()), "{TEST}: the stage's row: {stages:?}");
+    let record = ClaudeRecord::load(&live.paths, &v).unwrap().unwrap_or_else(|| panic!("{TEST}: no record of claude {v}"));
+    let staging = record.staging.clone().unwrap_or_default();
+    assert_eq!((record.phase(), staging.s3_key.as_str(), staging.stager_vm.as_deref()), (ClaudePhase::Staged, key.as_str(), Some(stager.as_str())), "{TEST}: the record");
+    // D3: vm warm fetches V ahead into a fresh workspace's VM; a second warm finds it cached there.
+    let ws = s8_fixture(&live, "live-s11-stager-warm");
+    let w = ws.display().to_string();
+    let warm = |n: u32| -> (serde_json::Value, std::process::Output) {
+        announce_touch_id(TEST, &format!("vm warm {w} ({n} of 2): the runtime key and the setup-token"));
+        let out = ai_env_live_within(&live, &["vm", "warm", &w, "--claude-version", &v, "--json"], WARM_LIMIT);
+        assert_eq!(out.status.code(), Some(0), "{TEST}: vm warm ({n} of 2): {}", String::from_utf8_lossy(&out.stdout));
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{TEST}: vm warm --json ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+        eprintln!("{TEST}: vm warm ({n} of 2): {doc}");
+        (doc, out)
+    };
+    let (first, warmed) = warm(1);
+    let vm = first["id"].as_str().unwrap_or_else(|| panic!("{TEST}: no id in {first}")).to_string();
+    announce_holder(TEST, &vm);
+    let fetched = first["claude"]["outcome"].as_str().unwrap_or_default().to_string();
+    assert_eq!((first["reused"].as_bool(), first["claude"]["version"].as_str()), (Some(false), Some(v.as_str())), "{TEST}: a new VM, claude {v}: {first}");
+    assert!(fetched == "fetched" || fetched == "fetching", "{TEST}: the first warm fetched claude {v} into {vm} (or still fetched it after {} s): {first}", remote::WARM_CLAUDE_WAIT.as_secs());
+    let (second, again) = warm(2);
+    assert_eq!(
+        (second["id"].as_str(), second["reused"].as_bool(), second["claude"]["outcome"].as_str()),
+        (Some(vm.as_str()), Some(true), Some("cached")),
+        "{TEST}: the second warm found claude {v} cached on {vm}: {second}"
+    );
+    let fetches: Vec<serde_json::Value> = live_audit(&live, audit_event::CLAUDE_FETCH).into_iter().map(|r| r["detail"].clone()).filter(|d| d["vm"] == vm.as_str()).collect();
+    eprintln!("{TEST}: claude_fetch into {vm}: {fetches:?}");
+    if fetched == "fetched" {
+        assert!(fetches.iter().any(|d| d["why"] == "warm" && d["outcome"] == "fetched" && d["version"] == v.as_str()), "{TEST}: the warm's fetch row: {fetches:?}");
+    } else {
+        eprintln!("{TEST}: the first warm was still fetching after its {} s (part B records it)", remote::WARM_CLAUDE_WAIT.as_secs());
+    }
+    // The release's own binary and the Docker tests' log are not this test's output: the sweep reads the rest.
+    let _ = std::fs::remove_dir_all(live.paths.claude_bin_dir(&v));
+    let _ = std::fs::remove_file(live.paths.logs().join(format!("claude-admit-{v}.log")));
+    sweep_live(&live, &[&admitted, &staged, &warmed, &again], &[]);
+}
+
+/// T11 live, plan B3 (c) on a cold VM (D3): a VM that lacks V runs the
+/// image's claude, fetches V after the chat's first output, and the next chat
+/// there runs V. The test's root holds this Mac's record of V, the installed
+/// bundle's, admitted and staged by part B's B3 (a) and (b)
+/// ([`adopt_claude_record`]); the chats name V's bundle
+/// ([`Chat::open_bundled`]); `[claude] auto_admit = false` there, and V's
+/// record is past `signed`, so P0 starts no admission. The first chat starts
+/// the workspace's VM: `claude_src:image(not_cached)` (V nameable and sent,
+/// the cache lacking it), its `claude:` the image's (which must not be V);
+/// its first output starts V's fetch, a `claude_fetch` row (`why`
+/// `after_output`, `outcome` `fetched`) while it stays open. The next chat
+/// there (the VM kept running: `suspend_on_close = false`) says
+/// `claude:<V>; claude_src:cached`, its `auth_timers` printed. Four Touch IDs:
+/// two chats, the test process's runtime key, the purge. About five minutes.
+#[test]
+#[ignore = "live, S11 part A, a cold MicroVM's chat on the image's claude fetches the bundle's after its first output, and the next chat there runs it cached (about five minutes; four Touch IDs: two chats, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_claude_src_cached_after_fetch() {
+    const TEST: &str = "live_s11_claude_src_cached_after_fetch";
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[("suspend_on_close", toml::Value::Boolean(false)), ("reuse_per_workspace", toml::Value::Boolean(true))]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let v = s11_bundle_version(TEST);
+    adopt_claude_record(TEST, &live, &v);
+    let ws = s8_fixture(&live, "live-s11-claude-src");
+    let mut first = Chat::open_bundled(TEST, &live, &ws, &v, &[]);
+    first.initialize();
+    let turn = first.turn("Reply with exactly OK");
+    assert_eq!(turn.result["is_error"], false, "{TEST}: the cold VM's chat: {}", turn.result);
+    let (vm1, pid) = (first.session_vm(&live), first.pid());
+    let fetch = first.wait_for(&format!("claude {v}'s fetch into {vm1} after the chat's first output"), remote::CLAUDE_POLL_FOR + Duration::from_secs(60), Asks::AllowAll, || {
+        audit_of(&live, audit_event::CLAUDE_FETCH, pid).into_iter().find(|r| r["detail"]["vm"] == vm1.as_str() && r["detail"]["why"] == "after_output")
+    });
+    eprintln!("{TEST}: claude_fetch {}", fetch["detail"]);
+    assert_eq!((fetch["detail"]["version"].as_str(), fetch["detail"]["outcome"].as_str()), (Some(v.as_str()), Some("fetched")), "{TEST}: V's fetch after the first output: {}", fetch["detail"]);
+    let (code, close) = first.close();
+    let cold = assert_closed_well(TEST, &live, &first, code, close);
+    let (image, src) = (note_part(&cold, census_part::CLAUDE), note_part(&cold, census_part::CLAUDE_SRC));
+    eprintln!("{TEST}: the cold VM's chat on {vm1}: claude:{image:?} claude_src:{src:?}");
+    assert_ne!(image.as_deref(), Some(v.as_str()), "{TEST}: the image's claude is {v} already: no cold case to show");
+    assert_eq!((note_part(&cold, census_part::VM).as_deref(), src.as_deref()), (Some(vm1.as_str()), Some("image(not_cached)")), "{TEST}: the cold VM ran the image's claude, {v} not cached there yet");
+    let mut second = Chat::open_bundled(TEST, &live, &ws, &v, &[]);
+    second.initialize();
+    let again = second.turn("Reply with exactly OK");
+    assert_eq!(again.result["is_error"], false, "{TEST}: the next chat: {}", again.result);
+    let (code, close) = second.close();
+    let cached = assert_closed_well(TEST, &live, &second, code, close);
+    eprintln!(
+        "{TEST}: the next chat: vm_how:{:?} claude:{:?} claude_src:{:?} auth_timers:{:?}",
+        note_part(&cached, census_part::VM_HOW),
+        note_part(&cached, census_part::CLAUDE),
+        note_part(&cached, census_part::CLAUDE_SRC),
+        note_part(&cached, census_part::AUTH_TIMERS)
+    );
+    assert_eq!(note_part(&cached, census_part::VM).as_deref(), Some(vm1.as_str()), "{TEST}: the next chat ran on the same VM");
+    assert_eq!(
+        (note_part(&cached, census_part::CLAUDE).as_deref(), note_part(&cached, census_part::CLAUDE_SRC).as_deref()),
+        (Some(v.as_str()), Some("cached")),
+        "{TEST}: the next chat ran {v} from the VM's cache"
+    );
+    let (a, b) = (first.output(), second.output());
+    sweep_live(&live, &[&a, &b], &[]);
+}
+
+/// T11 live, F1 (C §C.1): a `git checkout -b` survives a re-address. Turn 1
+/// runs `git checkout -b topic` (allowed if claude asks); the code-out after
+/// its result is a manifest-only 200 (the VM names `codeout_manifest_v1`): its
+/// `codeout_fetch` row's `bytes` 0, and the workspace row's fetch record of
+/// that VM names `topic` (`rows::row_of`). `vm terminate` ends the VM with the
+/// chat idle (L5's note), the next line re-addresses the chat
+/// (`session_move_end` `readdress`, `done`, its seed `box`: the dead VM's
+/// record, on a branch other than this Mac's `main`, is the box's), and `git
+/// -C <path> branch --show-current` on the new VM (`vm exec`) prints `topic`.
+/// Six Touch IDs: the chat, the test process's runtime key, the terminate, the
+/// move, `vm exec`, the purge. About six minutes.
+#[test]
+#[ignore = "live, S11 part C, F1: a git checkout -b carried across a re-address (about six minutes; six Touch IDs: the chat, the test process's runtime key, the terminate, the move, vm exec, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_checkout_b_then_readdress() {
+    const TEST: &str = "live_s11_checkout_b_then_readdress";
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s11-checkout-b");
+    let path = ws.display().to_string();
+    let wsref = ai_env_cli::bridge::workspace::resolve(&live.cfg, &ws, None).unwrap_or_else(|e| panic!("{TEST}: the fixture's workspace: {e}"));
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let fetched = live_audit(&live, audit_event::CODEOUT_FETCH).len();
+    let made = chat.turn("Run exactly this command with your Bash tool, then reply with its output only: git checkout -b topic && git branch --show-current");
+    assert_eq!(made.result["is_error"], false, "{TEST}: {}", made.result);
+    assert!(made.tool_output.contains("topic"), "{TEST}: the VM's checkout on topic: {}", made.tool_output);
+    chat.wait_for("the turn's codeout_fetch row", LIVE_SYNC_LIMIT, Asks::AllowAll, || (live_audit(&live, audit_event::CODEOUT_FETCH).len() > fetched).then_some(()));
+    let vm1 = chat.session_vm(&live);
+    // The turn's own fetch: the first row of that VM after the turn (a later one may say nothing new).
+    let fetches = live_audit(&live, audit_event::CODEOUT_FETCH);
+    let codeout = fetches.iter().skip(fetched).find(|r| r["detail"]["vm"] == vm1.as_str()).unwrap_or_else(|| panic!("{TEST}: no codeout_fetch row of {vm1} after the turn: {fetches:?}"));
+    eprintln!("{TEST}: codeout_fetch {}", codeout["detail"]);
+    assert_eq!(codeout["detail"]["bytes"].as_str(), Some("0"), "{TEST}: a manifest-only 200, no pack: {}", codeout["detail"]);
+    let record = ai_env_cli::bridge::workspace::rows::row_of(&live.paths, &wsref)
+        .unwrap_or_else(|e| panic!("{TEST}: the workspace row: {e}"))
+        .and_then(|r| r.vm.get(&vm1).and_then(|s| s.fetched.clone()))
+        .unwrap_or_else(|| panic!("{TEST}: no fetch record of {vm1} in the workspace row"));
+    eprintln!("{TEST}: {vm1}'s fetch record: head {} branch {:?}", record.head, record.branch);
+    assert_eq!(record.branch.as_deref(), Some("topic"), "{TEST}: the fetch record names the VM's branch");
+    let terminate = chat.terminate_mid_turn(&live, &vm1, None);
+    // Idle: the move waits for the next message (L5), and the note says so.
+    let note = remote::note_move_at_next(&vm1, LossCause::VmGone);
+    if chat.read_until(LIVE_LOSS_NOTE_LIMIT, Asks::AllowAll, |v| is_note(v, &note)).is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: no note within {LIVE_LOSS_NOTE_LIMIT:?} that the chat moves with the next message ({note:?}); the wrapper's stderr: {err}");
+    }
+    announce_touch_id(TEST, &format!("the move off {vm1} with the next message: the setup-token for the new VM (M1)"));
+    let next = chat.turn_within("Reply with exactly OK", LIVE_MOVE_TURN_LIMIT);
+    assert_eq!(next.result["is_error"], false, "{TEST}: {}", next.result);
+    let vm2 = chat.session_vm(&live);
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert!(next.notes.contains(&remote::note_continues(&vm2)), "{TEST}: the notes: {:?}", next.notes);
+    let session = chat.session.clone().expect("the chat's session id");
+    let (_, end) = moved_rows(TEST, &live, chat.pid(), &session, "readdress", ("cause", "vm_gone"), (&vm1, &vm2));
+    assert_eq!((end["detail"]["seed"].as_str(), end["detail"]["touchid"].as_str()), (Some("box"), Some("asked")), "{TEST}: the seed is the dead VM's fetch record (on topic); the move asked its Touch ID (M1)");
+    announce_touch_id(TEST, &format!("vm exec in {vm2}: git branch --show-current"));
+    let exec = ai_env_live(&live, &["vm", "exec", &vm2, "--", "git", "-C", &path, "branch", "--show-current"]);
+    let branch = String::from_utf8_lossy(&exec.stdout).trim().to_string();
+    eprintln!("{TEST}: {vm2}'s checkout at {path} is on {branch:?}");
+    assert_eq!((exec.status.code(), branch.as_str()), (Some(0), "topic"), "{TEST}: the new VM's branch");
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "{TEST}: one re-address in the census");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &terminate, &exec], &[]);
+}
+
+/// T11 live, C-4 (C §C.2): a move mid-turn after `/compact` cuts at the turn's
+/// parent. Turn 1 `Reply with exactly OK`; turn 2 `/compact`: claude writes
+/// its boundary and summary (a `compact_boundary` line in the stream), and the
+/// turn's sync commits it before turn 3 ([`Chat::wait_for_sync`]). Turn 3, a
+/// prompt holding a nonce, runs `sleep 90; echo slept-<nonce>` (S10's 90 s:
+/// under the Bash tool's 2-minute default, which the second run must not
+/// reach; claude 2.1.305 runs it unasked, `is_tool_use`); at its Bash call
+/// `vm terminate` ends the VM, the wrapper moves the chat and sends the line
+/// again. The move's `session_move_end` `cut` and the end row's `cut:` agree
+/// and are `at` (the cut at the compaction's parent) or `none` (after a cut
+/// miss's retry): printed, part B records which. Turn 3's result comes once,
+/// and the chat's view on the Mac lists the nonce's prompt once. Five Touch
+/// IDs: the chat, the test process's runtime key, the terminate, the move, the
+/// purge. About eight minutes.
+#[test]
+#[ignore = "live, S11 part C, C-4: a MicroVM terminated mid-turn after /compact and the chat moved (about eight minutes; five Touch IDs: the chat, the test process's runtime key, the terminate, the move, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_compact_then_move() {
+    const TEST: &str = "live_s11_compact_then_move";
+    // /compact asks the model for the summary.
+    const COMPACT_LIMIT: Duration = Duration::from_secs(300);
+    // The sleep's turn: its first run cut by the terminate, the move, then its second run whole.
+    const SLEEP_TURN_LIMIT: Duration = Duration::from_secs(600);
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s11-compact-move");
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let ok = chat.turn("Reply with exactly OK");
+    assert_eq!(ok.result["is_error"], false, "{TEST}: turn 1: {}", ok.result);
+    let committed = chat.wait_for_sync(&live, 0);
+    let uuid = chat.send_user("/compact");
+    let mut systems: Vec<String> = Vec::new();
+    let ended = chat.read_until(COMPACT_LIMIT, Asks::AllowAll, |v| {
+        if v["type"] == "system" {
+            systems.push(v["subtype"].as_str().unwrap_or("?").to_string());
+        }
+        v["type"] == "result"
+    });
+    if ended.is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: /compact ended no turn within {COMPACT_LIMIT:?} (the stream's system lines: {systems:?}); the wrapper's stderr: {err}");
+    }
+    let compacted = chat.turn_to_result(&uuid, COMPACT_LIMIT);
+    // A boundary said just after the result counts too.
+    let _ = chat.read_until(Duration::from_secs(3), Asks::AllowAll, |v| {
+        if v["type"] == "system" {
+            systems.push(v["subtype"].as_str().unwrap_or("?").to_string());
+        }
+        false
+    });
+    eprintln!("{TEST}: /compact took {} ms; the stream's system lines {systems:?}", compacted.ms);
+    assert_eq!(compacted.result["is_error"], false, "{TEST}: /compact: {}", compacted.result);
+    assert!(systems.iter().any(|s| s == "compact_boundary"), "{TEST}: /compact wrote no boundary (the stream's system lines: {systems:?})");
+    chat.wait_for_sync(&live, committed);
+    let vm1 = chat.session_vm(&live);
+    let nonce = live_word("ember");
+    let marker = format!("slept-{nonce}");
+    let uuid = chat.send_user(&format!("Run exactly this command with your Bash tool, then reply with its output only: sleep 90; echo {marker}"));
+    if chat.read_until(LIVE_TURN_LIMIT, Asks::AllowAll, |v| is_permission_for(v, "Bash") || is_tool_use(v, "Bash")).is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: no Bash call within {LIVE_TURN_LIMIT:?}; the wrapper's stderr: {err}");
+    }
+    // The sleep runs in the VM: the VM ends under it.
+    chat.idle(Duration::from_secs(5));
+    let terminate = chat.terminate_mid_turn(&live, &vm1, Some(&format!("right after vm terminate's: the move off {vm1}, the setup-token for the new VM (M1)")));
+    let turn = chat.turn_to_result(&uuid, SLEEP_TURN_LIMIT);
+    let vm2 = chat.session_vm(&live);
+    eprintln!(
+        "{TEST}: turn 3 ended after {} ms on {vm2}: notes {:?}, asked {:?}, withdrawn {:?}, echoes {}, inits {}, results {}",
+        turn.ms, turn.notes, turn.asked, turn.cancels, turn.echoes, turn.inits, turn.results
+    );
+    assert_eq!(turn.result["is_error"], false, "{TEST}: turn 3 sent again: {}", turn.result);
+    assert_ne!(vm2, vm1, "{TEST}: a new VM");
+    assert_eq!(turn.results, 1, "{TEST}: turn 3's result came once");
+    let session = chat.session.clone().expect("the chat's session id");
+    let (_, end) = moved_rows(TEST, &live, chat.pid(), &session, "readdress", ("cause", "vm_gone"), (&vm1, &vm2));
+    let cut = end["detail"]["cut"].as_str().unwrap_or_default().to_string();
+    eprintln!("{TEST}: the move's cut after /compact: {cut} (at: the cut at the compaction's parent; none: after a cut miss's retry)");
+    assert!(cut == "at" || cut == "none", "{TEST}: the move's cut: {}", end["detail"]);
+    chat.wait_for("the view lists turn 3's prompt", LIVE_SYNC_LIMIT, Asks::AllowAll, || (prompt_lines(&view_lines_now(&live, &session), &marker) > 0).then_some(()));
+    let (code, close) = chat.close();
+    let row = assert_closed_well(TEST, &live, &chat, code, close);
+    assert_eq!(row_moves(&row), Some([1, 0, 0]), "{TEST}: one re-address in the census");
+    assert_eq!(note_part(&row, census_part::CUT).as_deref(), Some(cut.as_str()), "{TEST}: the end row's cut is the move's");
+    let view = assert_a_view(TEST, &live, &session);
+    assert_eq!(prompt_lines(&view, &marker), 1, "{TEST}: the view lists the nonce's prompt once");
+    let out = chat.output();
+    sweep_live(&live, &[&out, &terminate], &[]);
+}
+
+/// T11 live, small item f (C §C.6.3): what the CLI writes into a fork's file
+/// at its first write, against the fake's FK-3 (S10 §8.4: the fork's first
+/// write copies X's user and assistant lines). Chat X: one turn, closed;
+/// chat F (`--resume=<X> --fork-session`): one turn, closed, a session of its
+/// own. The VM kept running (`suspend_on_close = false`), `vm exec` prints
+/// the shape of the two files there ([`fork_shape_script`]: each line's type
+/// and uuid, never content), and the test says F's line count and types,
+/// whether each of X's user and assistant uuids is in F's file (and the
+/// test's own uuid for F's turn), then `matches FK-3` or what differs (a
+/// difference is a fix of the fake, C3's file, in part B's step L). It asserts
+/// only that F's file exists and holds F's own turn: a user and an assistant
+/// line none of X's. Five Touch IDs: two chats, the test process's runtime
+/// key, `vm exec`, the purge. About four minutes.
+#[test]
+#[ignore = "live, S11 part C, the shape of a fork's first transcript write against FK-3 (about four minutes; five Touch IDs: two chats, the test process's runtime key, vm exec, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S11_TESTS=1 make test-aws S11=1"]
+fn live_s11_fork_first_write() {
+    const TEST: &str = "live_s11_fork_first_write";
+    if !s11_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[("suspend_on_close", toml::Value::Boolean(false)), ("reuse_per_workspace", toml::Value::Boolean(true))]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s11-fork");
+    let slug = ai_env_cli::wire::slug::project_dir_name(&ws).expect("the fixture's project directory name");
+    let mut x = Chat::open(TEST, &live, &ws, &[]);
+    x.initialize();
+    let said = x.turn("Reply with exactly OK");
+    assert_eq!(said.result["is_error"], false, "{TEST}: chat X: {}", said.result);
+    let (code, close) = x.close();
+    let xrow = assert_closed_well(TEST, &live, &x, code, close);
+    let x_sid = x.session.clone().expect("chat X's session id");
+    let resume = format!("--resume={x_sid}");
+    let mut f = Chat::open(TEST, &live, &ws, &[&resume, "--fork-session"]);
+    f.initialize();
+    let own = f.turn("Reply with exactly FORKED");
+    assert_eq!(own.result["is_error"], false, "{TEST}: chat F: {}", own.result);
+    let (code, close) = f.close();
+    let frow = assert_closed_well(TEST, &live, &f, code, close);
+    let f_sid = f.session.clone().expect("chat F's session id");
+    assert_ne!(f_sid, x_sid, "{TEST}: the fork is a session of its own");
+    let vm = note_part(&frow, census_part::VM).expect("chat F's VM");
+    eprintln!("{TEST}: X {x_sid} on {:?}, F {f_sid} on {vm} ({:?})", note_part(&xrow, census_part::VM), note_part(&frow, census_part::VM_HOW));
+    announce_touch_id(TEST, &format!("vm exec in {vm}: the shape of the fork's file (types and uuids only)"));
+    let exec = ai_env_live(&live, &["vm", "exec", &vm, "--", "sh", "-c", &fork_shape_script(&slug, &x_sid, &f_sid)]);
+    assert_eq!(exec.status.code(), Some(0), "{TEST}: vm exec");
+    let lines = String::from_utf8_lossy(&exec.stdout).to_string();
+    let (xs, fs) = fork_shapes(&lines).unwrap_or_else(|| panic!("{TEST}: the shape's lines do not add up:\n{lines}"));
+    let types: Vec<&str> = fs.lines.iter().map(|(t, _)| t.as_str()).collect();
+    eprintln!("{TEST}: F's file ({}): {} line(s), types in order {types:?}", if fs.present { "present" } else { "absent" }, fs.lines.len());
+    let in_f: Vec<&str> = fs.lines.iter().filter_map(|(_, u)| u.as_deref()).collect();
+    let yes = |u: &str| if in_f.contains(&u) { "yes" } else { "no" };
+    eprintln!("{TEST}: X's file ({}): {} line(s); its user and assistant uuids in F's file: {:?}", if xs.present { "present" } else { "absent" }, xs.lines.len(), xs.messages().iter().map(|u| format!("{u} {}", yes(u))).collect::<Vec<_>>());
+    eprintln!("{TEST}: the test's uuid for F's turn ({}) in F's file: {}", own.uuid, yes(&own.uuid));
+    match fk3_verdict(&xs, &fs) {
+        Ok(()) => eprintln!("{TEST}: matches FK-3"),
+        Err(differs) => eprintln!("{TEST}: differs from FK-3: {differs}"),
+    }
+    assert!(fs.present, "{TEST}: F's file {f_sid}.jsonl exists on {vm}");
+    let (own_user, own_assistant) = own_messages(&xs, &fs);
+    assert!(own_user >= 1 && own_assistant >= 1, "{TEST}: F's file holds F's own turn: {own_user} user and {own_assistant} assistant line(s) none of X's");
+    let (a, b) = (x.output(), f.output());
+    sweep_live(&live, &[&a, &b, &exec], &[]);
 }

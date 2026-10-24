@@ -207,10 +207,20 @@ fn main() {
         }
     };
 
+    // S11 (A.4, A.6): V, the Claude Code version argv[1]'s bundle names, read once.
+    let ext = census::ext_version_from_real_binary(argv.get(1)).filter(|v| ai_env_cli::wire::pin::is_version(v));
     // The prewarm (S8 §11): for exactly `auth status --json` in remote mode, a
     // detached `ai-env vm warm <cwd> --prewarm`, before the census and the exec.
-    if let Some(p) = prewarm::maybe_prewarm(&loaded, mode, &inv.args, cwd.as_deref()) {
+    if let Some(p) = prewarm::maybe_prewarm(&loaded, mode, &inv.args, cwd.as_deref(), ext.as_deref()) {
         notes.push(p.census_part());
+    }
+    // S11 (D5, LD-10): beside it, V's automatic admission when this Mac has not admitted it (a detached
+    // `ai-env claude admit <v> --auto`); logged only: no census part, no audit row.
+    if mode == route::Mode::Remote && inv.args == prewarm::AUTH_STATUS {
+        if let (Some(v), Some(paths), Some(cfg)) = (ext.as_deref(), &loaded.paths, &loaded.cfg) {
+            let admit = ai_env_cli::bridge::claude::maybe_auto_admit(paths, cfg, v);
+            tracing::info!(version = v, ?admit, "claude: automatic admission");
+        }
     }
     // S9: a local resume of a view is refused once its census row is written (below).
     let view_hit = view_refusal(&inv.args, cwd.as_deref(), remote);

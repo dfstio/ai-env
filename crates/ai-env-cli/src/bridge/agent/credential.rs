@@ -236,7 +236,7 @@ pub fn check(cfg: &BridgeConfig, paths: &Paths, row: &VmRow, argv: &[String], fl
     let verified = EgressVerified::load(paths)?;
     let dns = newest_dns_path(paths);
     if let Err(r) = credential_precheck(cfg, row, &verified, &dns, unix_now()) {
-        audit_event(paths, "credential_gate", &[("id", row.id.clone()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into())]);
+        audit_event(paths, crate::bridge::audit::event::CREDENTIAL_GATE, &[("id", row.id.clone()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "local".into())]);
         return Err(r.policy(&row.id).into());
     }
     let Some(path) = &flags.file else {
@@ -315,6 +315,13 @@ pub fn read_rejection(paths: &Paths, tag: &str) -> std::result::Result<Option<Re
     Ok(read_creds_state(paths)?.rejected.into_iter().find(|r| r.tag == tag))
 }
 
+/// A1 joint review (J4, F1): the seal ids Anthropic refused, or why the
+/// store cannot be read (which then reads as "any of them", M53): what the
+/// usage note leaves out, since `creds account use` refuses them.
+pub fn rejected_tags(paths: &Paths) -> std::result::Result<std::collections::BTreeSet<String>, String> {
+    Ok(read_creds_state(paths)?.rejected.into_iter().map(|r| r.tag).collect())
+}
+
 /// Exit 5, before any Touch ID, for a seal Anthropic already refused: S8's
 /// wrapper would otherwise unseal and deliver a known-bad token again and
 /// again. A newly sealed token has another seal id, so sealing one clears it.
@@ -378,7 +385,7 @@ pub(crate) fn record_rejection(paths: &Paths, vm_id: &str, tag: &str, how: &str)
         // Never a panic (the voice): `vm exec` gets here after its pump, when a stop may have closed the terminal.
         voice::warn(&format!("the rejection of seal {tag} is not recorded ({e})"));
     }
-    audit_event(paths, "credential_rejected", &[("id", vm_id.to_string()), ("tag", tag.to_string()), ("how", how.to_string())]);
+    audit_event(paths, crate::bridge::audit::event::CREDENTIAL_REJECTED, &[("id", vm_id.to_string()), ("tag", tag.to_string()), ("how", how.to_string())]);
 }
 
 /// Read `state/creds.toml`, apply `f`, write it back — under
@@ -425,11 +432,11 @@ pub async fn gate<A: MicrovmApi>(cfg: &BridgeConfig, paths: &Paths, api: &A, row
     let dns = newest_dns_path(paths);
     match credential_gate(cfg, row, &live, &verified, &dns, unix_now()) {
         Ok(pass) => {
-            audit_event(paths, "credential_gate", &[("id", row.id.clone()), ("result", "passed".into()), ("image_version", pass.image_version().to_string())]);
+            audit_event(paths, crate::bridge::audit::event::CREDENTIAL_GATE, &[("id", row.id.clone()), ("result", "passed".into()), ("image_version", pass.image_version().to_string())]);
             Ok(pass)
         }
         Err(r) => {
-            audit_event(paths, "credential_gate", &[("id", row.id.clone()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "live".into())]);
+            audit_event(paths, crate::bridge::audit::event::CREDENTIAL_GATE, &[("id", row.id.clone()), ("result", "refused".into()), ("condition", r.condition.into()), ("half", "live".into())]);
             Err(r.policy(&row.id).into())
         }
     }
@@ -751,7 +758,7 @@ impl<'a> UnsealRow<'a> {
         let mut pairs = std::mem::take(&mut self.fields);
         pairs.push(("ms", self.started.elapsed().as_millis().to_string()));
         pairs.push(("outcome", outcome));
-        audit_event(self.paths, "credential_unseal", &pairs);
+        audit_event(self.paths, crate::bridge::audit::event::CREDENTIAL_UNSEAL, &pairs);
     }
 }
 
@@ -1136,8 +1143,9 @@ pub(crate) enum Held {
 static UNRECORDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The VM may hold the credential sealed as `tag` from now on: its row's
-/// `credential_at` and `credential_tag`, which `creds status` and `creds
-/// forget` list until it is terminated (an over-approximation by design:
+/// `credential_at` and `credential_tag`, and `tag` added to its
+/// `credential_tags` (every seal it was sent, A1 joint review J2), which
+/// `creds status` and `creds forget` list until it is terminated (an over-approximation by design:
 /// recorded before the value leaves, whatever comes back). A row that cannot
 /// be written, or none at all, is a warning (once per VM, through the
 /// voice): the holder list would miss the VM.
@@ -1149,6 +1157,12 @@ pub(crate) fn record_holder(paths: &Paths, vm_id: &str, tag: &str, how: Held) {
     let now = unix_now();
     let why = match update_row(paths, vm_id, |r| {
         if how == Held::Sent || r.credential_at.is_none() {
+            // A1 joint review (J2): every seal sent is kept (the one a row written before the list named first),
+            // never only the latest: a chat still running on an earlier one holds it until the VM is terminated.
+            r.credential_tags = r.held_tags();
+            if !r.credential_tags.iter().any(|t| t == tag) {
+                r.credential_tags.push(tag.to_string());
+            }
             r.credential_at = Some(now);
             r.credential_tag = Some(tag.to_string());
         }
@@ -1181,7 +1195,7 @@ pub(crate) fn record_delivery(paths: &Paths, vm_id: &str, spawn: Option<&str>, d
         pairs.push(("account", account.to_string()));
     }
     pairs.extend([("source", source.to_string()), ("deliver", deliver.to_string())]);
-    audit_event(paths, "credential_deliver", &pairs);
+    audit_event(paths, crate::bridge::audit::event::CREDENTIAL_DELIVER, &pairs);
 }
 
 /// What `vm warm` found.
@@ -1292,7 +1306,7 @@ async fn warm_socket<A: MicrovmApi, E: EndpointClient>(env: &super::AgentEnv<'_,
                 let b = backoff();
                 let wait = retry_after_s.map_or(b, |s| p.backoff_min.saturating_mul(u32::try_from(s).unwrap_or(u32::MAX)).max(b));
                 let retry_after = retry_after_s.map_or_else(|| "none".to_string(), |s| s.to_string());
-                audit_event(env.paths, "endpoint_429", &[("id", vm.to_string()), ("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
+                audit_event(env.paths, crate::bridge::audit::event::ENDPOINT_429, &[("id", vm.to_string()), ("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
                 voice::note(&format!("the endpoint throttled /agent (HTTP 429); retrying in {:.1} s", wait.as_secs_f64()));
                 (wait, e.to_string(), Some(retry_after_s))
             }
@@ -1326,6 +1340,28 @@ mod tests {
         assert_eq!(seal_tag(&p), Some(a.clone()), "stable");
         std::fs::write(&p, "sealed two").unwrap();
         assert_ne!(seal_tag(&p).unwrap(), a, "a new seal is a new id");
+    }
+
+    /// A1 joint review (J2): every seal sent to a VM stays on its row, each
+    /// once, oldest first (the one a row written before the list named comes
+    /// first); `credential_tag` is the latest; a hit seen later sends nothing
+    /// and adds nothing; `creds` lists the VM under each seal.
+    #[test]
+    fn every_seal_sent_to_a_vm_is_kept_until_it_is_terminated() {
+        use crate::bridge::vm::registry::{read_row, write_row, RowStatus, VmRow};
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let (a, b, c) = ("a".repeat(16), "b".repeat(16), "c".repeat(16));
+        let row = VmRow { id: "microvm-1".into(), client_token: "ct".into(), status: RowStatus::Running, credential_at: Some(1), credential_tag: Some(a.clone()), ..VmRow::default() };
+        write_row(&paths, &row).unwrap();
+        assert_eq!(row.held_tags(), std::slice::from_ref(&a), "a row written before the list: its one seal");
+        record_holder(&paths, "microvm-1", &b, Held::Sent);
+        record_holder(&paths, "microvm-1", &a, Held::Sent);
+        record_holder(&paths, "microvm-1", &c, Held::Seen);
+        let got = read_row(&paths, "microvm-1").unwrap().unwrap();
+        assert_eq!((got.credential_tags.clone(), got.credential_tag.as_deref()), (vec![a.clone(), b.clone()], Some(a.as_str())), "{got:?}");
+        let (held, _) = crate::bridge::setup_token::holders(&paths).unwrap();
+        assert_eq!(held.iter().map(|h| (h.id.as_str(), h.tags.clone())).collect::<Vec<_>>(), [("microvm-1", vec![a, b])]);
     }
 
     /// A refusal is recorded once per seal and refuses only that seal: the
@@ -1910,7 +1946,7 @@ mod e2e {
             }
             out
         });
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None, claude: Vec::new() };
         let outcome = tokio::time::timeout(LIMIT, run_spawn_with(env, Start::New(spec), io, Some(delivery))).await.expect("the spawn ends in time");
         drop(c.control);
         let out = tokio::time::timeout(LIMIT, consumer).await.expect("the events end").unwrap();

@@ -253,7 +253,7 @@ mod i2_tests {
     fn committed_by(paths: &Paths, committer: Option<&str>) {
         let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
         let mut m = Manifest::new(SID, &target, manifest::ORIGIN_VM, &format!("-w/{SID}.jsonl"), "2026-10-20T10:15:30.000Z");
-        m.parts.push(ManifestPart { key: format!("v1/{SID}/vm/g1/b"), version_id: "v1".into(), from: 0, len: 10, sha256: "a".repeat(64) });
+        m.parts.push(ManifestPart { key: format!("v1/{SID}/vm/g1/b"), version_id: "v1".into(), from: 0, len: 10, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
         (m.gen, m.committed, m.vm) = (1, 10, committer.map(str::to_string));
         manifest::write(paths, &m).unwrap();
     }
@@ -744,7 +744,8 @@ pub async fn migrate_one<A: MicrovmApi + S3Sign>(ctx: &Ctx, api: &A, target: &S3
                     if manifest::read(&ctx.paths, &sid)?.is_some() {
                         return Err(BridgeError::Config(format!("{sid}: a manifest appeared before the upload: not an S8 mirror any more; nothing uploaded or deleted")));
                     }
-                    let mut up = stage::upload_chat(&client, &ctx.paths, &sid, &m.chat, &digests, crate::wire::s3::MULTIPART_PART, &at).await?;
+                    // S11 (C.3.7): S8's legacy path stays identity.
+                    let mut up = stage::upload_chat(&client, &ctx.paths, &sid, &m.chat, &digests, crate::wire::s3::MULTIPART_PART, &at, None).await?;
                     up.manifest.origin = ORIGIN_VM.to_string();
                     manifest::write(&ctx.paths, &up.manifest)?;
                 }

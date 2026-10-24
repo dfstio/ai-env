@@ -118,6 +118,7 @@
 //! `session_remote_start` and a move's `session_move_end` (`account`, and
 //! `account_from` when the account's name changed).
 use crate::bridge::accounts::{self, Seal};
+use crate::bridge::claude::{ClaudeAsk, ClaudePlan};
 use crate::bridge::agent::credential::{self, CredentialPlan, CredentialSupply, InstalledSeal};
 use crate::bridge::agent::exec::{agent_env, spawn_env};
 use crate::bridge::agent::{run_spawn_with, AgentTarget, Delivery, DeliveryParts, DeliveryReport, SpawnIo, SpawnOutcome, SpawnSpec, Start};
@@ -277,6 +278,15 @@ pub struct SessionPlan {
     /// that spawn's `Started`: the old VM a moved CLI that never started
     /// falls back to (the pump's next `Migrate` start, with no VM prepared).
     left: RefCell<Option<Current>>,
+    /// S11 (A.4, L2): P0's claude for this session (`claude::plan_for`):
+    /// V and the staged claudes a spawn may name.
+    pub claude: ClaudePlan,
+    /// S11 (A.5, L1): the flags start-up respawns dropped, in drop order:
+    /// every later generation spawns without them; the link renders them
+    /// (`argv_dropped`) and the pump counts them.
+    pub dropped: RefCell<Vec<String>>,
+    /// S11 (A.5): a `ClaudeRetry` ran: every later generation's `claude_src` says `start_failed` when V did not run.
+    claude_retried: Cell<bool>,
 }
 
 /// S10 §B: a migration's prepared VM ([`prepare_move`]): its row (its caps
@@ -305,6 +315,17 @@ impl std::fmt::Debug for AfterStarted {
     }
 }
 
+/// S11 (A.4): what a generation's pipeline leaves to run at its CLI's first stdout line, or
+/// `remote::AFTER_OUTPUT_FALLBACK` after its `Started`: V's fetch into the VM for the next generation. A task the
+/// process drops at its exit.
+pub struct AfterOutput(pub std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>);
+
+impl std::fmt::Debug for AfterOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterOutput")
+    }
+}
+
 /// The latest generation's VM, row, how it was taken, its seed's word and
 /// seeded head (S10 §2.7, in place of S9's `Held`): rewritten by every
 /// generation that reaches its spawn (generation 1's `onwards`, a resume
@@ -325,6 +346,19 @@ struct Current {
 }
 
 impl SessionPlan {
+    /// S11 (A.5, L1): P0's argv with every flag start-up respawns dropped removed, in drop order
+    /// (`argv::drop_option`; one that no longer occurs is skipped). Every generation spawns with it.
+    #[must_use]
+    pub fn argv_now(&self) -> Vec<String> {
+        let mut argv = self.argv.clone();
+        for flag in self.dropped.borrow().iter() {
+            if let Some(without) = argv::drop_option(&argv, flag) {
+                argv = without;
+            }
+        }
+        argv
+    }
+
     /// T0 + `remote::INIT_DEADLINE`: the bound on P1–P4 (plan §3), a timeout
     /// past it naming the step.
     #[must_use]
@@ -485,6 +519,7 @@ impl SessionPlan {
             workspace_cap: true,
             transcript_cap: true,
             avoid: Vec::new(),
+            caps_required: Vec::new(),
         };
         SessionPlan {
             paths: Paths::from_root_and_env(root.join("bridge"), None),
@@ -516,6 +551,9 @@ impl SessionPlan {
             phase_a: RefCell::new(None),
             moving: Cell::new(false),
             left: RefCell::new(None),
+            claude: ClaudePlan::default(),
+            dropped: RefCell::new(Vec::new()),
+            claude_retried: Cell::new(false),
             cfg,
         }
     }
@@ -584,6 +622,11 @@ pub struct PipelineEnd {
     /// link's `RemoteSnapshot.seal`, which the usage tap and a refusal read);
     /// `None`: no delivery (a test's own pipeline).
     pub seal: Option<Seal>,
+    /// S11 (A.4): what P4 asked of the generation's VM, for the link's `claude_src`; `None` from a test's pipeline.
+    pub claude: Option<ClaudeAsk>,
+    /// S11 (A.4): V's fetch after the CLI's first output ([`AfterOutput`]); `None`: nothing (V not nameable, or
+    /// the VM's image lacks `claude_stage_v1`).
+    pub after_output: Option<AfterOutput>,
 }
 
 /// What the moved CLI resumes (S10 L2).
@@ -641,6 +684,12 @@ pub fn cut_of(view: &crate::wire::view::TranscriptViewReply, outstanding: &[Stri
     match at.checked_sub(1).map(|before| view.entries[before].uuid.as_str()).filter(|u| !u.is_empty()) {
         Some(before) => Cut::At(before.to_string()),
         None => {
+            // S11 (C-4): U opens the view (after a compaction its chain starts there): its chain parent, when the
+            // view names one other than U itself (a resume at U would keep the line twice).
+            if let Some(parent) = view.first_parent.as_deref().filter(|p| at == 0 && !p.is_empty() && *p != first.as_str()) {
+                tracing::info!(at, "the cut: the first outstanding line opens the view: at its chain parent");
+                return Cut::At(parent.to_string());
+            }
             tracing::info!(at, "the cut: the first outstanding line opens the view and no leaf is listed: plain --resume");
             Cut::None
         }
@@ -783,6 +832,13 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     cfg.wrapper.validate().map_err(|e| config(&e))?;
     cfg.seed.validate().map_err(|e| config(&e))?;
     let ctx = Ctx::for_wrapper(&sess.paths, cfg).map_err(|e| config(&e))?;
+    // S11 (A.4): V from argv[1]'s bundle, and the staged claudes a spawn may name (local reads only); D5 (LD-10): V
+    // seen or signed starts its admission detached (logged), before any refusal below: nothing here waits or refuses.
+    let claude = crate::bridge::claude::plan_for(&sess.paths, sess.start_row.ext.as_deref());
+    if let (Some(v), Some("seen" | "signed")) = (claude.ext.as_deref(), claude.phase.as_deref()) {
+        let admit = crate::bridge::claude::maybe_auto_admit(&sess.paths, cfg, v);
+        tracing::info!(version = v, ?admit, "claude: automatic admission");
+    }
     // S10 (§5): `for_wrapper`'s `VmCfg::validate` refused a bad continuity key already; its warnings go to the log.
     for warning in cfg.vm.validate_continuity().unwrap_or_default() {
         tracing::warn!("{warning}");
@@ -812,6 +868,17 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     run.workspace_cap = true;
     // S9: a VM without the transcript store is never reused (its chat lives in S3).
     run.transcript_cap = true;
+    // S11 (L5): a gzip-staged chat goes only to a VM that decodes it; moves and migrations take this plan.
+    if let Some(id) = resume.as_deref() {
+        run.caps_required = crate::bridge::s3::manifest::caps_required(&ctx.paths, id);
+    }
+    // A pinned VM that lacks one is refused here, before any Touch ID, naming it (as `choice_of` does for S8's and
+    // S9's caps); `vm::run::select_pinned`'s check stays the backstop.
+    if let Choice::Pin(id) = &run.choice {
+        if let Some(cap) = pinned_lacks(&ctx, id, &run.caps_required) {
+            return Err(Failure::OldImage { vm: id.clone(), cap });
+        }
+    }
     // A1: accounts exist and none is installed: no account to spawn as (exit 5, its own fix).
     if let Some(why) = accounts::spawn_problem(&ctx.paths) {
         return Err(Failure::NoAccount { why });
@@ -882,6 +949,9 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
         phase_a: RefCell::new(None),
         moving: Cell::new(false),
         left: RefCell::new(None),
+        claude,
+        dropped: RefCell::new(Vec::new()),
+        claude_retried: Cell::new(false),
     })
 }
 
@@ -1071,6 +1141,13 @@ fn choice_of(ctx: &Ctx, resume: Option<&str>, env: &dyn Fn(&str) -> Option<OsStr
     Ok(preferred.map_or(Choice::Workspace, Choice::Prefer))
 }
 
+/// The first of `caps` the pinned VM `id`'s row lacks, as last read (a row that cannot be read lacks none here:
+/// `choice_of` read it just before, and `select_pinned` checks again).
+fn pinned_lacks(ctx: &Ctx, id: &str, caps: &[&'static str]) -> Option<&'static str> {
+    let row = vm_registry::read_row(&ctx.paths, id).ok().flatten()?;
+    caps.iter().copied().find(|cap| workspace::vm_capability_of(&row, cap) == Capability::No)
+}
+
 /// P0 in container mode, when an unseal will happen: the runtime key is
 /// sealed (`credentials/aws.env`), else exit 5 naming `make runtime-key`.
 fn runtime_key_sealed(ctx: &Ctx) -> Result<(), Failure> {
@@ -1110,9 +1187,26 @@ fn argv_fits(argv: &[String]) -> Result<(), Failure> {
 }
 
 /// The spawn frame P4 sends (the proxy variables included, as the vpc row
-/// gets them) fits `CONTROL_FRAME_MAX`, else exit 9: the shim would close
-/// the socket on it.
+/// gets them, and S11's claude refs at their most: `CLAUDE_REFS_MAX` of the
+/// longest version, since a later generation reads the records again and may
+/// name more than P0's plan) fits `CONTROL_FRAME_MAX`, else exit 9: the shim
+/// would close the socket on it.
 fn spawn_frame_fits(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMap<String, String>) -> Result<(), Failure> {
+    let size = spawn_frame_size(ctx, argv, ws, env, worst_claude_refs());
+    if size > CONTROL_FRAME_MAX {
+        return Err(Failure::Refused { what: format!("the session's argv and environment make a {size}-byte spawn frame (at most {CONTROL_FRAME_MAX})") });
+    }
+    Ok(())
+}
+
+/// `CLAUDE_REFS_MAX` refs of the longest form P4 can send (`N.N.N` of six digits each, a sha256).
+fn worst_claude_refs() -> Vec<crate::wire::workspace::ClaudeRef> {
+    let r = crate::wire::workspace::ClaudeRef { version: "999999.999999.999999".into(), sha256: "0".repeat(64) };
+    vec![r; crate::wire::workspace::CLAUDE_REFS_MAX]
+}
+
+/// The JSON size of the spawn frame P4 would send with `argv`, `env` and `claude` (the vpc row's proxy variables).
+fn spawn_frame_size(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMap<String, String>, claude: Vec<crate::wire::workspace::ClaudeRef>) -> usize {
     let vpc = VmRow { egress: Egress::Vpc.as_str().to_string(), ..VmRow::default() };
     let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let frame = Frame::Spawn {
@@ -1124,12 +1218,9 @@ fn spawn_frame_fits(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMa
         deliver_secret: Deliver::Fd,
         detach_grace_s: Some(u32::MAX),
         credential: None,
+        claude,
     };
-    let size = frame.to_json().len();
-    if size > CONTROL_FRAME_MAX {
-        return Err(Failure::Refused { what: format!("the session's argv and environment make a {size}-byte spawn frame (at most {CONTROL_FRAME_MAX})") });
-    }
-    Ok(())
+    frame.to_json().len()
 }
 
 /// The Mac's config dir from `env` (`CLAUDE_CONFIG_DIR`, else `HOME/.claude`), as `mirror::mac_config_dir`.
@@ -1326,10 +1417,11 @@ pub async fn run(plan: Rc<SessionPlan>, gen: u32, why: StartWhy, io: SpawnIo) ->
 /// §3.7).
 fn deadline_of(plan: &SessionPlan, why: &StartWhy) -> Instant {
     match why {
-        StartWhy::ResumeRetry { init_answered: true, .. } => Instant::now() + RETRY_WINDOW,
+        // S11: a start-up respawn's window is a resume miss's retry's.
+        StartWhy::ResumeRetry { init_answered: true, .. } | StartWhy::ArgvRetry { init_answered: true, .. } | StartWhy::ClaudeRetry { init_answered: true, .. } => Instant::now() + RETRY_WINDOW,
         // S10: a move has its own window from its start, but one the host's `initialize` waits on keeps T0 + 50 s.
         StartWhy::Move(m) if m.init_answered => Instant::now() + MOVE_WINDOW,
-        StartWhy::First | StartWhy::ResumeRetry { .. } | StartWhy::Move(_) => plan.init_deadline(),
+        StartWhy::First | StartWhy::ResumeRetry { .. } | StartWhy::ArgvRetry { .. } | StartWhy::ClaudeRetry { .. } | StartWhy::Move(_) => plan.init_deadline(),
     }
 }
 
@@ -1351,18 +1443,81 @@ async fn generation(plan: &Rc<SessionPlan>, gen: u32, why: &StartWhy, io: SpawnI
                 Backend::Fake(f) => move_gen(plan, gen, Arc::new(f.clone()), Arc::new(f.clone()), current, m, io, progress, deadline).await,
             }
         }
-        StartWhy::ResumeRetry { session_id, .. } => {
+        // A resume miss's retry, and S11's start-up respawns (A.5): the same VM, no Touch ID ([`same_vm`]).
+        StartWhy::ResumeRetry { .. } | StartWhy::ArgvRetry { .. } | StartWhy::ClaudeRetry { .. } => {
             let current = plan.current.borrow().clone();
             let Some(current) = current else {
-                return Err(Failed { step: StartStep::Precheck, failure: Failure::Other { code: 1, step: StartStep::Precheck.name(), first_line: "the resume's retry has no first generation to respawn on".into() }, vm: None });
+                return Err(Failed { step: StartStep::Precheck, failure: Failure::Other { code: 1, step: StartStep::Precheck.name(), first_line: "the retry has no first generation to respawn on".into() }, vm: None });
             };
+            let (current, word) = match why {
+                StartWhy::ArgvRetry { flag, .. } => {
+                    // The refused flag, gone from this generation's argv and every later one's (`argv_now`).
+                    let mut dropped = plan.dropped.borrow_mut();
+                    if !dropped.contains(flag) {
+                        dropped.push(flag.clone());
+                    }
+                    (current, "argv_retry")
+                }
+                StartWhy::ClaudeRetry { bad_sha256, .. } => (mark_claude_bad(plan, gen, current, bad_sha256), "claude_retry"),
+                _ => (current, "retry"),
+            };
+            let restore = same_vm_restore(plan, why);
             let backend = Rc::clone(&current.backend);
             match &*backend {
-                Backend::Sdk(api, ep) => retry(plan, gen, Arc::clone(api), Arc::clone(ep), current, session_id, io, progress).await,
-                Backend::Fake(f) => retry(plan, gen, Arc::new(f.clone()), Arc::new(f.clone()), current, session_id, io, progress).await,
+                Backend::Sdk(api, ep) => same_vm(plan, gen, Arc::clone(api), Arc::clone(ep), current, restore, word, io, progress).await,
+                Backend::Fake(f) => same_vm(plan, gen, Arc::new(f.clone()), Arc::new(f.clone()), current, restore, word, io, progress).await,
             }
         }
     }
+}
+
+/// S11 (A.5): what a same-VM respawn restores before its spawn: a resume miss's session, else a resumed chat's
+/// (`--resume`); a fresh chat's start-up respawn restores nothing (its CLI never wrote a transcript).
+fn same_vm_restore<'a>(plan: &'a SessionPlan, why: &'a StartWhy) -> Option<&'a str> {
+    match why {
+        StartWhy::ResumeRetry { session_id, .. } => Some(session_id.as_str()),
+        StartWhy::ArgvRetry { .. } | StartWhy::ClaudeRetry { .. } => plan.resume.as_deref(),
+        StartWhy::First | StartWhy::Move(_) => None,
+    }
+}
+
+/// S11 (A.5): a `ClaudeRetry` names no more the cached claude `bad` that died before its init on the current VM:
+/// its sha256 joins the VM row's `claude_bad` (the row goes with the VM), every later generation's `claude_src`
+/// says `start_failed` when V does not run, and `claude_start_failed` is audited with what the respawn names first
+/// (`next`: a version, or `image`).
+fn mark_claude_bad(plan: &SessionPlan, gen: u32, mut current: Current, bad: &str) -> Current {
+    let id = current.vm.id.clone();
+    let marked = vm_registry::update_row(&plan.paths, &id, |r| {
+        if !r.claude_bad.iter().any(|s| s == bad) {
+            r.claude_bad.push(bad.to_string());
+        }
+    });
+    match marked {
+        Ok(Some(row)) => current.row = row,
+        Ok(None) => current.row.claude_bad.push(bad.to_string()),
+        Err(e) => {
+            tracing::warn!(vm = %id, "the VM row's claude_bad was not written ({e}): this process still names it no more");
+            current.row.claude_bad.push(bad.to_string());
+        }
+    }
+    plan.claude_retried.set(true);
+    let ask = claude_ask(plan, gen, &current.row);
+    let next = ask.sent.first().map_or_else(|| "image".to_string(), |r| r.version.clone());
+    let version = crate::bridge::claude::load_all(&plan.paths).into_iter().find(|r| r.claude_ref().is_some_and(|c| c.sha256 == bad)).map_or_else(|| "unknown".to_string(), |r| r.version);
+    tracing::warn!(gen, vm = %id, version = %version, next = %next, "a cached claude died before its init: the respawn names it no more");
+    let pairs = [("session", plan.resume.clone().unwrap_or_else(|| "-".to_string())), ("vm", id), ("version", version), ("sha256", bad.to_string()), ("gen", gen.to_string()), ("next", next)];
+    audit_event(&plan.paths, event::CLAUDE_START_FAILED, &pairs);
+    current
+}
+
+/// S11 (A.4, L2): what P4 asks of generation `gen`'s VM (`row`): P0's plan for generation 1, the records read again
+/// for a later one (LD-43: a stage may have finished meanwhile); the refs only to a VM whose recorded caps name
+/// `claude_stage_v1`, never one of its `claude_bad`.
+fn claude_ask(plan: &SessionPlan, gen: u32, row: &VmRow) -> ClaudeAsk {
+    let claude = if gen == 1 { plan.claude.clone() } else { crate::bridge::claude::plan_for(&plan.paths, plan.claude.ext.as_deref()) };
+    let cap = row.caps.as_ref().is_some_and(|caps| caps.iter().any(|c| c == crate::wire::frame::CAP_CLAUDE_STAGE_V1));
+    let sent = if cap { claude.prefs.iter().filter(|r| !row.claude_bad.contains(&r.sha256)).cloned().collect() } else { Vec::new() };
+    ClaudeAsk { plan: claude, cap, sent, after_start_failed: plan.claude_retried.get() }
 }
 
 /// Milliseconds since `t`.
@@ -1560,7 +1715,7 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
     // The code-out trigger's code-port tokens are the session's 5 minutes, never the seed's 15 (plan §10).
     let code_tokens = Arc::new(MintingTokens::new(Arc::clone(&api), &ctx.paths, &vm.id, false));
     let why = plan.carry.as_ref().map_or_else(|| "first".to_string(), carry_why);
-    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why, account: seal.account.clone() };
+    let spawning = Spawning { argv: plan.argv_now(), session: plan.resume.clone(), why, account: seal.account.clone() };
     let end = spawn(plan, gen, ctx, Arc::clone(&api), Arc::clone(&ep), dp, code_tokens, target, row, vm, prepared.delivery, io, progress, spawning).await?;
     plan.note_account(plan.resume.as_deref(), gen, "first", &plan.token.seal(), &seal);
     *plan.current.borrow_mut() = Some(current);
@@ -1602,17 +1757,22 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
         moved: None,
         after_started: Some(AfterStarted(Box::pin(after))),
         seal: Some(seal),
+        claude: Some(end.claude),
+        after_output: end.after_output,
     })
 }
 
-/// The retry of a resume miss (plan §2): the latest generation's VM
+/// The retry of a resume miss (plan §2), and S11's start-up respawns (A.5:
+/// `argv_retry`, `claude_retry`, `word`): the latest generation's VM
 /// (generation 1's), running again if a closing suspend raced it; the
-/// transcript restored; the gate again with no prompt; the token from the
+/// transcript restored for a resumed chat (`restore`: the miss's session, else
+/// a `--resume`'s); the gate again with no prompt; the token from the
 /// VM's cache (no value in hand: a VM that lost it is exit 5, never a second
 /// Touch ID), under generation 1's seal (A1: `current.seal`, whatever is
-/// installed now); the spawn with P0's argv.
+/// installed now); the spawn with P0's argv less the dropped flags
+/// ([`SessionPlan::argv_now`]).
 #[allow(clippy::too_many_arguments)]
-async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &Rc<SessionPlan>, gen: u32, api: Arc<A>, ep: Arc<E>, current: Current, session_id: &str, io: SpawnIo, progress: &Progress) -> Result<PipelineEnd, Failed> {
+async fn same_vm<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointClient + 'static>(plan: &Rc<SessionPlan>, gen: u32, api: Arc<A>, ep: Arc<E>, current: Current, restore: Option<&str>, word: &'static str, io: SpawnIo, progress: &Progress) -> Result<PipelineEnd, Failed> {
     let ctx = plan.ctx();
     let mut legs = Vec::new();
     progress.at(StartStep::SelectVm);
@@ -1628,7 +1788,10 @@ async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     let caps = current.row.caps.clone().unwrap_or_default();
     let progress_log = |p: workspace::SeedProgress| tracing::info!("seed: {p:?}");
     let ectx = EnsureCtx { api: &*api, dp: &*dp, tokens: &*tokens, paths: &plan.paths, cfg: &plan.cfg, target: &target, caps: &caps, ws: &plan.ws, lim: SeedLimits::wrapper(&plan.cfg), deadline: None, progress: &progress_log };
-    let transcript = restore_transcript(plan, &ectx, session_id).await.map_err(|e| failed(StartStep::Workspace, e, at))?;
+    let transcript = match restore {
+        Some(session_id) => Some(restore_transcript(plan, &ectx, session_id).await.map_err(|e| failed(StartStep::Workspace, e, at))?),
+        None => None,
+    };
     legs.push(("workspace", ms(t)));
     progress.workspace_done.set(true);
     progress.at(StartStep::Gate);
@@ -1640,7 +1803,7 @@ async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     plan.credential.set(Some(credential::CACHED));
     legs.push(("gate", ms(t)));
     progress.gate_done.set(true);
-    let spawning = Spawning { argv: plan.argv.clone(), session: plan.resume.clone(), why: "retry".to_string(), account: current.seal.account.clone() };
+    let spawning = Spawning { argv: plan.argv_now(), session: plan.resume.clone(), why: word.to_string(), account: current.seal.account.clone() };
     let end = spawn(plan, gen, &ctx, api, ep, dp, tokens, target, current.row.clone(), vm.clone(), delivery, io, progress, spawning).await?;
     let (how, seed, seeded_head, seal) = (current.how, current.seed, current.seeded_head.clone(), current.seal.clone());
     *plan.current.borrow_mut() = Some(Current { vm, ..current });
@@ -1649,7 +1812,7 @@ async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
         vm_how: how,
         legs,
         seed,
-        transcript: Some(transcript.word()),
+        transcript: transcript.map(|t| t.word()),
         seeded_head,
         credential: plan.credential.get(),
         delivery: Some(end.delivery),
@@ -1661,6 +1824,8 @@ async fn retry<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
         moved: None,
         after_started: None,
         seal: Some(seal),
+        claude: Some(end.claude),
+        after_output: end.after_output,
     })
 }
 
@@ -1764,6 +1929,9 @@ struct Spawned {
     session: JoinHandle<Result<SpawnOutcome, BridgeError>>,
     /// What becomes of the delivery's token in the session.
     delivery: DeliveryReport,
+    /// S11 (A.4): what P4 asked of the VM, and V's fetch after the first output.
+    claude: ClaudeAsk,
+    after_output: Option<AfterOutput>,
 }
 
 /// What a generation spawns (S10: its argv is its own): the CLI's argv,
@@ -1805,7 +1973,11 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Spawn, e, at))?;
     let spawn_id = SpawnId::new_v7();
     let Spawning { argv, session: session_id, why, account } = spawning;
-    let spec = spawn_spec(plan, ctx, &row, &spawn_id, argv);
+    // S11 (A.4): the staged claudes this spawn may name ([`claude_ask`]), and V's fetch into the VM after the CLI's
+    // first output for the next generation (the link starts it only when V did not run). Nothing here waits.
+    let claude = claude_ask(plan, gen, &row);
+    let spec = spawn_spec(plan, ctx, &row, &spawn_id, argv, claude.sent.clone());
+    let after_output = crate::bridge::claude::fetch::after_output(plan, ctx, Arc::clone(&api), &row, &vm, session_id.clone());
     let transcript = session_sync(plan);
     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::clone(&api), dp, tokens, paths: plan.paths.clone(), cfg: Arc::new(plan.cfg.clone()), target, ws: plan.ws.clone(), capture_settings: plan.capture_settings, transcript });
     if let Some(id) = &session_id {
@@ -1826,7 +1998,7 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     pairs.extend(account.map(|a| ("account", a)));
     audit_event(&plan.paths, event::SESSION_REMOTE_START, &pairs);
     tracing::info!(gen, vm = %id, spawn = %spawn_id, "the remote spawn went to its session");
-    Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report })
+    Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report, claude, after_output })
 }
 
 /// What the code-out trigger syncs the session's transcript with (S9):
@@ -1989,7 +2161,8 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
     plan.credential.set(Some(prepared.source));
     // M3: the reaper (D5), then the spawn with the moved argv, within P0's caps.
     reap(plan, &ctx, &*api, &*ep, &row, &vm, why.session_id.as_deref()).await?;
-    let argv = move_argv(&plan.argv, why.session_id.as_deref(), &cut);
+    // S11 (A.5): without the flags a start-up respawn dropped.
+    let argv = move_argv(&plan.argv_now(), why.session_id.as_deref(), &cut);
     argv_fits(&argv).and_then(|()| spawn_frame_fits(&ctx, &argv, &plan.ws, &plan.env)).map_err(|failure| Failed { step: StartStep::Spawn, failure, vm: at.map(str::to_string) })?;
     tracing::info!(gen, kind = kind.word(), vm = %vm.id, cut = cut.word(), touchid, seed = source, "the move spawns");
     let code_tokens = Arc::new(MintingTokens::new(Arc::clone(&api), &ctx.paths, &vm.id, false));
@@ -2015,6 +2188,8 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
         moved: Some(moved),
         after_started: None,
         seal: Some(seal),
+        claude: Some(end.claude),
+        after_output: end.after_output,
     })
 }
 
@@ -2351,7 +2526,9 @@ pub(crate) async fn carry_seed<A: MicrovmApi, D: DataPlane, T: TokenSource>(ectx
 async fn view_cut<A: MicrovmApi, D: DataPlane, T: TokenSource>(plan: &SessionPlan, ectx: &EnsureCtx<'_, A, D, T>, sid: &str, why: &MoveWhy, until: Instant) -> Cut {
     use crate::bridge::dataplane::{exchange, Exchange, Verdict};
     let Some(sync) = &plan.transcript_sync else { return Cut::None };
-    let q = crate::wire::workspace::ViewQuery { rel: crate::bridge::s3::sync::main_rel(&sync.slug, sid), n: crate::wire::view::VIEW_MESSAGES_DEFAULT };
+    // S11 (C-4): the first entry's chain parent, asked only of a VM that answers it.
+    let parent = ectx.caps.iter().any(|c| c == crate::wire::frame::CAP_VIEW_PARENT_V1);
+    let q = crate::wire::workspace::ViewQuery { rel: crate::bridge::s3::sync::main_rel(&sync.slug, sid), n: crate::wire::view::VIEW_MESSAGES_DEFAULT, parent };
     let x = Exchange { api: ectx.api, tokens: ectx.tokens, vm_id: &ectx.target.vm_id, port: crate::wire::workspace::APP_PORT, cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, route: "GET /transcript/view", deadline: Some(until), idempotent: true };
     let read = exchange(&x, |t| {
         let q = &q;
@@ -2468,6 +2645,7 @@ mod c1_tests {
             version: None,
             git_branch: None,
             entries: vec![entry(ViewRole::User, "u1"), entry(ViewRole::Assistant, "a1"), entry(ViewRole::User, "u2"), entry(ViewRole::Assistant, "a2"), entry(ViewRole::User, "u3")],
+            first_parent: None,
         };
         let at = |l: &str| Cut::At(l.into());
         let cases: [(&[&str], Option<&str>, Cut); 9] = [
@@ -2485,6 +2663,12 @@ mod c1_tests {
         for (outstanding, leaf, want) in cases {
             assert_eq!(cut_of(&view, &strings(outstanding), leaf), want, "{outstanding:?} at {leaf:?}");
         }
+        // S11 (C-4): U opening the view cuts at the view's `first_parent`, never at U itself.
+        let parented = TranscriptViewReply { first_parent: Some("s0".into()), ..view.clone() };
+        assert_eq!(cut_of(&parented, &strings(&["u1"]), None), at("s0"));
+        assert_eq!(cut_of(&parented, &strings(&["u1"]), Some("zz")), at("s0"));
+        let own = TranscriptViewReply { first_parent: Some("u1".into()), ..view.clone() };
+        assert_eq!(cut_of(&own, &strings(&["u1"]), None), Cut::None);
         let empty = TranscriptViewReply { present: false, entries: Vec::new(), ..view.clone() };
         assert_eq!(cut_of(&empty, &strings(&["u1"]), Some("a1")), Cut::None);
         let mut w = why(MoveKind::Readdress, LossCause::VmGone, "microvm-1", &[]);
@@ -3237,7 +3421,7 @@ mod g4_tests {
         // A manifest: S3 holds it, whatever is here.
         let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
         let mut m = Manifest::new(SID, &target, ORIGIN_MAC, &format!("{SLUG}/{SID}.jsonl"), "2026-10-17T10:15:30.000Z");
-        m.parts.push(ManifestPart { key: format!("v1/{SID}/mac/{}", "a".repeat(64)), version_id: "fv1".into(), from: 0, len: 1, sha256: "a".repeat(64) });
+        m.parts.push(ManifestPart { key: format!("v1/{SID}/mac/{}", "a".repeat(64)), version_id: "fv1".into(), from: 0, len: 1, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
         m.committed = 1;
         manifest::write(&paths, &m).unwrap();
         assert!(too_large(&paths, &projects).is_ok(), "staged already");
@@ -3265,11 +3449,11 @@ mod g4_tests {
 /// Mac's spelling: on the VM's disk an NFD path names another directory); the
 /// proxy variables of `row`, then the session's; the session grace for
 /// `row`'s idle policy (a reused VM's may be longer than `[vm].max_idle_s`);
-/// `spawn_id`.
-fn spawn_spec(plan: &SessionPlan, ctx: &Ctx, row: &VmRow, spawn_id: &SpawnId, argv: Vec<String>) -> SpawnSpec {
+/// `spawn_id`; S11: `refs`, the staged claudes the spawn may run (`SpawnSpec.claude`).
+fn spawn_spec(plan: &SessionPlan, ctx: &Ctx, row: &VmRow, spawn_id: &SpawnId, argv: Vec<String>, refs: Vec<crate::wire::workspace::ClaudeRef>) -> SpawnSpec {
     let pairs: Vec<(String, String)> = plan.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let grace = session_grace(&plan.cfg, row.idle.map(|i| i.max_idle_s));
-    SpawnSpec { argv, cwd: Some(plan.ws.vm_cwd.clone()), env: spawn_env(ctx, row, &pairs), detach_grace_s: Some(grace), id: Some(spawn_id.clone()) }
+    SpawnSpec { argv, cwd: Some(plan.ws.vm_cwd.clone()), env: spawn_env(ctx, row, &pairs), detach_grace_s: Some(grace), id: Some(spawn_id.clone()), claude: refs }
 }
 
 /// The session task: the spawn over `/agent` until its exit is delivered
@@ -3409,7 +3593,7 @@ fn audit_suspend(paths: &Paths, vm: &str, outcome: &str, why: Option<&str>, from
         pairs.push(("why", why.to_string()));
     }
     pairs.push(("ms", ms(from).to_string()));
-    audit_event(paths, "vm_suspend", &pairs);
+    audit_event(paths, crate::bridge::audit::event::VM_SUSPEND, &pairs);
 }
 
 /// The closing suspend (L2), within [`CLOSING_BOUND`]: first the
@@ -3576,7 +3760,8 @@ fn owner_alive(owner: crate::wire::frame::ParkOwner) -> bool {
 pub fn audit_auth_timers(paths: &Paths, claude: &str) {
     use std::os::unix::fs::OpenOptionsExt as _;
     let measured = crate::bridge::authwatch::AUTH_TIMERS.claude;
-    if claude == measured {
+    // S11 (L3): every version a reviewed `oauth-t1` run measured (`authwatch::timers_for`), not only the last.
+    if crate::bridge::authwatch::timers_for(claude).is_some() {
         return;
     }
     let plain = !claude.is_empty() && claude.len() <= 64 && !claude.starts_with('.') && claude.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'));
@@ -3719,6 +3904,8 @@ async fn prepare_on<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
     progress.at(StartStep::Token);
     let env = agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Token, e, at))?;
     credential::deliver_only(&env, prepared.delivery).await.map_err(|e| failed(StartStep::Token, e, at))?;
+    // S11 (A.4, LD-7): V into the prepared VM's claude cache, as a task of its own that phase A never awaits.
+    crate::bridge::claude::fetch::prefetch_phase_a(plan, ctx, Arc::clone(&api), &row, &vm);
     Ok((row, vm, how, installed.seal))
 }
 
@@ -3806,7 +3993,8 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
     let t = Instant::now();
     progress.kind.set(Some(MoveKind::Migrate));
     progress.touchid.set(Some("asked"));
-    let argv = move_argv(&plan.argv, why.session_id.as_deref(), &Cut::None);
+    // S11 (A.5): without the flags a start-up respawn dropped.
+    let argv = move_argv(&plan.argv_now(), why.session_id.as_deref(), &Cut::None);
     argv_fits(&argv).and_then(|()| spawn_frame_fits(&ctx, &argv, &plan.ws, &plan.env)).map_err(|failure| Failed { step: StartStep::Spawn, failure, vm: None })?;
     let (base, fallback) = switch_base(plan, current);
     let until_std = until.into_std();
@@ -3873,6 +4061,8 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
         moved: Some(moved),
         after_started,
         seal: Some(seal),
+        claude: Some(end.claude),
+        after_output: end.after_output,
     })
 }
 
@@ -3932,6 +4122,10 @@ where
         let at = Some(p.vm.id.as_str());
         // What the spawn there takes of its row (the endpoint, the session token), before anything moves.
         target_of(&p.row, &p.vm).map_err(|e| failed(StartStep::Spawn, e, at))?;
+        // A1 joint review (J3): phase A's seal, unless what happened since says otherwise (the fallback re-plans).
+        if let Some((step, failure)) = stale_seal(&ctx.paths, &p.seal, &base.seal) {
+            return Err(Failed { step, failure, vm: Some(p.vm.id.clone()) });
+        }
         leave().await?;
         let delivery = async {
             let prepared = credential::move_delivery(ctx, api, ep, &p.row, &p.vm, plan.token.deliver, &p.seal, None, until_std).await.map_err(|e| failed_cli(StartStep::Gate, e, at))?;
@@ -3980,6 +4174,30 @@ where
     };
     row_.audit(&plan.paths);
     Ok(SwitchTo::Stayed { row, vm, how, prepared, touchid })
+}
+
+/// A1 joint review (J3): why a switch must not deliver phase A's seal
+/// `prepared` to a chat that runs as `running` (neither needs a Touch ID):
+/// Anthropic refused `prepared` since phase A, or which seals it refused is
+/// unknown (the refusal record cannot be read: 5 at the gate, as P0's
+/// refusal); or the chat runs as the installed account already while
+/// `prepared` is another (a `creds account use` back to its account, or a
+/// respawn as the active account since phase A: 1 at select, as a prepared
+/// VM that is none to switch to). `None`: the switch goes on with it. The
+/// fallback ([`stay_on`]) re-plans on the installed seal; the next wall
+/// check prepares again.
+fn stale_seal(paths: &Paths, prepared: &Seal, running: &Seal) -> Option<(StartStep, Failure)> {
+    let refused = |first_line: String| Some((StartStep::Gate, Failure::Other { code: 5, step: StartStep::Gate.name(), first_line }));
+    match credential::read_rejection(paths, &prepared.tag) {
+        Ok(None) => {}
+        Ok(Some(r)) => return refused(format!("Anthropic refused the seal phase A left on the prepared VM ({}) since: the chat is not moved onto it", r.at)),
+        Err(e) => return refused(format!("{e}: which seals Anthropic refused is unknown, so the seal phase A left on the prepared VM is not used")),
+    }
+    let installed = credential::seal_tag(&paths.setup_token_env());
+    (prepared.tag != running.tag && installed.as_deref() == Some(running.tag.as_str())).then(|| {
+        let first_line = "the chat runs as the active Claude account already, and the prepared VM holds another one's seal".to_string();
+        (StartStep::SelectVm, Failure::Other { code: 1, step: StartStep::SelectVm.name(), first_line })
+    })
 }
 
 /// A switch's fallback (S10 §B), a respawn on the old VM `base` as M1's
@@ -5013,6 +5231,61 @@ mod c3_tests {
         }
     }
 
+    /// A1 joint review (J3): before the old VM's work is touched, the switch
+    /// gives up phase A's seal when Anthropic refused it since (gate, 5), or
+    /// which seals it refused is unknown (gate, 5), or when the chat runs as
+    /// the installed account already while the prepared VM holds another
+    /// one's (a `use` back, a respawn as the active account: select, 1); the
+    /// fallback re-plans on the old VM, audited `stayed`. A chat that runs
+    /// as an account no longer installed still moves onto phase A's seal.
+    #[tokio::test]
+    async fn the_switch_gives_up_phase_as_seal_when_refused_or_left_behind() {
+        for case in ["refused", "unreadable", "reverted", "moved_on"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (plan, api) = gated(dir.path());
+            let (mut current, prepared) = switching(dir.path(), &plan, &api).await;
+            let paths = plan.paths.clone();
+            std::fs::create_dir_all(paths.credentials()).unwrap();
+            std::fs::write(paths.setup_token_env(), "the installed copy\n").unwrap();
+            let installed = credential::seal_tag(&paths.setup_token_env()).unwrap();
+            match case {
+                "refused" => credential::record_rejection(&paths, "microvm-elsewhere", &plan.token.tag, "text"),
+                "unreadable" => {
+                    std::fs::create_dir_all(paths.creds_state().parent().unwrap()).unwrap();
+                    std::fs::write(paths.creds_state(), "rejected = [ not toml").unwrap();
+                }
+                "reverted" => current.seal = Seal { tag: installed.clone(), account: Some("default".into()) },
+                _ => current.seal = Seal { tag: "x".repeat(16), account: Some("old".into()) },
+            }
+            let ep = Cache { fake: &api, tag: plan.token.tag.clone(), holding: vec![current.vm.endpoint.clone(), prepared.endpoint.clone()] };
+            let (ctx, progress) = (plan.ctx(), Progress::default());
+            let left = Cell::new(false);
+            let leave = || async {
+                left.set(true);
+                Ok(())
+            };
+            let arrive = |_: VmRow, _: VmInfo| async { Ok(arrived()) };
+            let read = || Ok(stand_in(&plan));
+            let unseal = |_: InstalledSeal| async { Ok::<_, CliError>(unsealed()) };
+            let switched = switch_vm(&plan, &ctx, &api, &ep, &current, &migrating(&current.vm.id), 2, Instant::now() + MOVE_WINDOW, &progress, leave, arrive, read, unseal).await;
+            match (case, switched) {
+                ("moved_on", Ok(SwitchTo::New { prepared: delivery, .. })) => {
+                    assert!(left.get(), "the old VM's work was taken");
+                    assert_eq!(delivery.seal, plan.token.seal(), "phase A's seal");
+                }
+                (_, Ok(SwitchTo::Stayed { vm, .. })) => {
+                    assert!(!left.get(), "{case}: given up before the old VM's work was touched");
+                    assert_eq!(vm.id, current.vm.id, "{case}");
+                    let ends = rows(&plan, "session_move_end");
+                    let want = if case == "reverted" { ("select", "1") } else { ("gate", "5") };
+                    assert_eq!((ends[0]["detail"]["outcome"].as_str(), ends[0]["detail"]["step"].as_str(), ends[0]["detail"]["code"].as_str()), (Some("stayed"), Some(want.0), Some(want.1)), "{case}: {ends:?}");
+                }
+                (case, other) => panic!("{case}: {}", if other.is_ok() { "the other way" } else { "failed" }),
+            }
+            assert!(plan.prepared.borrow().is_none() && !plan.moving.get(), "{case}");
+        }
+    }
+
     /// §2.7: a reopen's carry off its `--resume` row's VM, from that row
     /// alone (P0, no AWS call): terminated, or past its wall (the platform
     /// ended it there), a re-address, migration on or off; within
@@ -5512,7 +5785,7 @@ mod tests {
         let mut from = 0;
         for (i, len) in lens.iter().enumerate() {
             let key = if i == 0 { S3Key::Base { session: sid.into(), gen: 1 } } else { S3Key::Segment { session: sid.into(), gen: 1, offset: from } };
-            m.parts.push(ManifestPart { key: key.render(), version_id: format!("fv{}", i + 1), from, len: *len, sha256: "a".repeat(64) });
+            m.parts.push(ManifestPart { key: key.render(), version_id: format!("fv{}", i + 1), from, len: *len, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
             from += len;
         }
         (m.gen, m.committed, m.fp) = (1, from, "b".repeat(64));
@@ -6072,6 +6345,11 @@ mod tests {
         };
         audit_auth_timers(&paths, crate::bridge::authwatch::AUTH_TIMERS.claude);
         assert!(audited().is_empty(), "the measured version");
+        // S11 (L3): every reviewed version is measured, not only the last.
+        for reviewed in crate::bridge::authwatch::AUTH_TIMERS_REVIEWED {
+            audit_auth_timers(&paths, reviewed.claude);
+        }
+        assert!(audited().is_empty(), "the reviewed versions");
         for v in ["2.1.300", "2.1.300", "unknown", "2.1.300", "unknown"] {
             audit_auth_timers(&paths, v);
         }
@@ -6221,7 +6499,7 @@ mod tests {
         plan.ws.vm_cwd = crate::wire::workspace::vm_path_of(Path::new(nfd)).unwrap();
         assert_eq!(plan.ws.vm_cwd, "/w/\u{0419}\u{043e}\u{0433}\u{0430}", "the NFC form");
         let id = SpawnId::new_v7();
-        let spec = spawn_spec(&plan, &plan.ctx(), &VmRow::default(), &id, plan.argv.clone());
+        let spec = spawn_spec(&plan, &plan.ctx(), &VmRow::default(), &id, plan.argv.clone(), Vec::new());
         assert_eq!(spec.cwd.as_deref(), Some(plan.ws.vm_cwd.as_str()), "{spec:?}");
         assert_eq!((spec.id.as_ref(), spec.detach_grace_s), (Some(&id), Some(session_grace(&plan.cfg, None))));
         assert_eq!((&spec.argv, &spec.env), (&plan.argv, &plan.env), "the plan's argv and environment (no proxy for a row without vpc egress)");
@@ -6240,7 +6518,7 @@ mod tests {
         assert_eq!(plan.cfg.vm.max_idle_s, 300, "the sample's config");
         let grace = |max_idle_s: u32| {
             let row = VmRow { idle: Some(IdleRow { max_idle_s, suspended_s: 28_800, auto_resume: true }), ..VmRow::default() };
-            spawn_spec(&plan, &plan.ctx(), &row, &SpawnId::new_v7(), plan.argv.clone()).detach_grace_s
+            spawn_spec(&plan, &plan.ctx(), &row, &SpawnId::new_v7(), plan.argv.clone(), Vec::new()).detach_grace_s
         };
         assert_eq!(grace(3600), Some(3750));
         assert_eq!(grace(300), Some(900));
@@ -6255,4 +6533,200 @@ mod tests {
         assert_eq!(format!("{plan:?}"), "SessionPlan(argc=3, env=1, vm_cwd=/w, resume=false)");
         assert_eq!(plan.credential.get(), None);
     }
+}
+
+#[cfg(test)]
+mod a3_tests {
+    use super::*;
+    use crate::bridge::claude::tests::put;
+    use crate::wire::frame::CAP_CLAUDE_STAGE_V1;
+    use crate::wire::workspace::ClaudeRef;
+
+    const VM: &str = "microvm-claude01";
+
+    fn cref(v: &str, c: char) -> ClaudeRef {
+        ClaudeRef { version: v.into(), sha256: c.to_string().repeat(64) }
+    }
+
+    /// The VM's row: its recorded caps naming `claude_stage_v1` (`cap`), its `claude_bad`.
+    fn row_with(cap: bool, bad: &[&ClaudeRef]) -> VmRow {
+        let mut caps = vec![CAP_WORKSPACE_V1.to_string(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1.to_string()];
+        if cap {
+            caps.push(CAP_CLAUDE_STAGE_V1.to_string());
+        }
+        VmRow { id: VM.into(), caps: Some(caps), claude_bad: bad.iter().map(|r| r.sha256.clone()).collect(), ..VmRow::default() }
+    }
+
+    fn vm_info() -> VmInfo {
+        VmInfo {
+            id: VM.into(),
+            state: VmState::Running,
+            endpoint: "x".into(),
+            image_arn: crate::bridge::api::FAKE_IMAGE_ARN.into(),
+            image_version: "1.0".into(),
+            started_at_unix: None,
+            max_duration_s: 3600,
+            state_reason: None,
+            execution_role_arn: None,
+            idle: None,
+            ingress: Vec::new(),
+            egress: Vec::new(),
+            terminated_at_unix: None,
+        }
+    }
+
+    /// A plan whose records hold 2.1.310 (`b`) and 2.1.309 (`c`) staged and 2.1.308 admitted, V `ext`.
+    fn planned(dir: &Path, ext: Option<&str>) -> SessionPlan {
+        let mut plan = SessionPlan::sample(dir);
+        put(&plan.paths, "2.1.310", 'b', "staged");
+        put(&plan.paths, "2.1.309", 'c', "staged");
+        put(&plan.paths, "2.1.308", 'd', "admitted");
+        plan.claude = crate::bridge::claude::plan_for(&plan.paths, ext);
+        plan
+    }
+
+    /// L2 at P4: V then the other staged versions, newest first, only to a VM whose recorded caps name
+    /// `claude_stage_v1` (none to an S10 image, nor to a row whose caps were never read); generation 1 takes P0's
+    /// plan, a later one reads the records again (a version staged since is named); the spawn frame carries them.
+    #[test]
+    fn p4_names_admitted_staged_versions_only_to_a_shim_with_the_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let plan = planned(d.path(), Some("2.1.310"));
+        let row = row_with(true, &[]);
+        let ask = claude_ask(&plan, 1, &row);
+        assert_eq!((ask.cap, ask.sent.clone(), ask.after_start_failed), (true, vec![cref("2.1.310", 'b'), cref("2.1.309", 'c')], false));
+        assert_eq!(ask.plan, plan.claude);
+        let spec = spawn_spec(&plan, &plan.ctx(), &row, &SpawnId::new_v7(), plan.argv_now(), ask.sent.clone());
+        assert_eq!(spec.claude, ask.sent);
+        for other in [row_with(false, &[]), VmRow { caps: None, ..row_with(true, &[]) }] {
+            let ask = claude_ask(&plan, 1, &other);
+            assert!(!ask.cap && ask.sent.is_empty(), "{:?}", other.caps);
+            assert_eq!(crate::bridge::claude::claude_src_of(&ask, Some("2.1.305"), Some("2.1.305"), None), "image(no_cap)");
+        }
+        put(&plan.paths, "2.1.311", 'e', "staged");
+        assert_eq!(claude_ask(&plan, 1, &row).sent.len(), 2, "generation 1: P0's plan");
+        assert_eq!(claude_ask(&plan, 2, &row).sent, [cref("2.1.310", 'b'), cref("2.1.311", 'e'), cref("2.1.309", 'c')], "a later one reads the records again");
+        let admitted = planned(tempfile::tempdir().unwrap().path(), Some("2.1.308"));
+        let ask = claude_ask(&admitted, 1, &row);
+        assert_eq!((ask.plan.why_not, ask.sent.clone()), (Some("not_staged"), vec![cref("2.1.310", 'b'), cref("2.1.309", 'c')]), "an admitted V is not named");
+    }
+
+    /// A cached claude that died before its init on this VM (`claude_bad`) is never named there again: a
+    /// `ClaudeRetry` writes it into the VM's row, audits `claude_start_failed` with what comes next, and the
+    /// generations after it say `start_failed`.
+    #[test]
+    fn p4_never_names_a_vms_bad_claude() {
+        let d = tempfile::tempdir().unwrap();
+        let plan = planned(d.path(), Some("2.1.310"));
+        let v = cref("2.1.310", 'b');
+        assert_eq!(claude_ask(&plan, 1, &row_with(true, &[&v])).sent, [cref("2.1.309", 'c')]);
+        let row = row_with(true, &[]);
+        vm_registry::write_row(&plan.paths, &row).unwrap();
+        let path = d.path().join("backend.json");
+        std::fs::write(&path, serde_json::to_string(&crate::bridge::api::FakeState::new()).unwrap()).unwrap();
+        let backend = Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap());
+        let current = Current { backend: Rc::new(backend), row, vm: vm_info(), how: "started", seed: "cloned", seeded_head: None, seal: Seal { tag: "0".repeat(16), account: None } };
+        let after = mark_claude_bad(&plan, 2, current, &v.sha256);
+        assert_eq!(after.row.claude_bad, std::slice::from_ref(&v.sha256));
+        assert_eq!(vm_registry::read_row(&plan.paths, VM).unwrap().unwrap().claude_bad, std::slice::from_ref(&v.sha256), "the row goes with the VM");
+        let rows: Vec<serde_json::Value> = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event::CLAUDE_START_FAILED).collect();
+        assert_eq!(rows.len(), 1);
+        let d0 = &rows[0]["detail"];
+        assert_eq!((d0["session"].as_str(), d0["vm"].as_str(), d0["version"].as_str(), d0["sha256"].as_str(), d0["gen"].as_str(), d0["next"].as_str()), (Some("-"), Some(VM), Some("2.1.310"), Some(v.sha256.as_str()), Some("2"), Some("2.1.309")));
+        let ask = claude_ask(&plan, 2, &after.row);
+        assert_eq!((ask.after_start_failed, ask.sent.clone()), (true, vec![cref("2.1.309", 'c')]));
+        assert_eq!(crate::bridge::claude::claude_src_of(&ask, Some("2.1.305"), Some("2.1.309"), Some(&"c".repeat(64))), "older(start_failed)");
+        // Marking it again changes nothing in the row; the last staged one gone too: `next` is the image.
+        let again = mark_claude_bad(&plan, 3, after, &"c".repeat(64));
+        assert_eq!(again.row.claude_bad.len(), 2);
+        let last = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().rfind(|r| r["event"] == event::CLAUDE_START_FAILED).unwrap();
+        assert_eq!(last["detail"]["next"], "image");
+    }
+
+    /// P3 and P4 never wait for claude: P4's choice reads local records only, and V's fetch is a future handed to
+    /// the link unpolled (the API is asked nothing until the link starts it); none at all for a VM without the cap
+    /// or a V that is not staged.
+    #[test]
+    fn p3_and_p4_never_wait_for_claude() {
+        let d = tempfile::tempdir().unwrap();
+        let plan = planned(d.path(), Some("2.1.310"));
+        let api = Arc::new(crate::bridge::api::FakeMicrovmApi::new());
+        let t = std::time::Instant::now();
+        let row = row_with(true, &[]);
+        let _ = claude_ask(&plan, 1, &row);
+        let after = crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row, &vm_info(), None);
+        assert!(after.is_some());
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(api.calls().is_empty(), "nothing asked: {:?}", api.calls());
+        drop(after);
+        assert!(crate::bridge::claude::fetch::after_output(&plan, &plan.ctx(), Arc::clone(&api), &row_with(false, &[]), &vm_info(), None).is_none(), "no cap");
+        let admitted = planned(tempfile::tempdir().unwrap().path(), Some("2.1.308"));
+        assert!(crate::bridge::claude::fetch::after_output(&admitted, &admitted.ctx(), Arc::clone(&api), &row, &vm_info(), None).is_none(), "V not staged");
+        let none = planned(tempfile::tempdir().unwrap().path(), None);
+        assert!(crate::bridge::claude::fetch::after_output(&none, &none.ctx(), api, &row, &vm_info(), None).is_none(), "no V");
+    }
+
+    /// A same-VM respawn restores the transcript only for a resumed chat: a resume miss's session, else the
+    /// `--resume`; a fresh chat's start-up respawn restores nothing.
+    #[test]
+    fn same_vm_restores_only_a_resumed_chat() {
+        let d = tempfile::tempdir().unwrap();
+        let mut plan = SessionPlan::sample(d.path());
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let argv = StartWhy::ArgvRetry { flag: "--x".into(), init_answered: false };
+        let claude = StartWhy::ClaudeRetry { bad_sha256: "b".repeat(64), init_answered: false };
+        let miss = StartWhy::ResumeRetry { session_id: sid.into(), init_answered: false };
+        assert_eq!((same_vm_restore(&plan, &argv), same_vm_restore(&plan, &claude), same_vm_restore(&plan, &miss)), (None, None, Some(sid)));
+        assert_eq!(same_vm_restore(&plan, &StartWhy::First), None);
+        plan.resume = Some(sid.into());
+        assert_eq!((same_vm_restore(&plan, &argv), same_vm_restore(&plan, &claude)), (Some(sid), Some(sid)));
+    }
+
+    /// Every generation after a start-up respawn spawns without the dropped flags (`argv_now`): a retry's, a move's
+    /// (`move_argv` over it), in drop order; a flag no longer there is skipped; P0's argv itself is kept.
+    #[test]
+    fn later_generations_apply_the_dropped_flags() {
+        let d = tempfile::tempdir().unwrap();
+        let mut plan = SessionPlan::sample(d.path());
+        plan.argv.extend(["--thinking", "disabled", "--include-partial-messages", "--from-the-future", "--model=opus"].map(String::from));
+        let p0 = plan.argv.clone();
+        assert_eq!(plan.argv_now(), p0, "nothing dropped yet");
+        plan.dropped.borrow_mut().extend(["--from-the-future".to_string(), "--thinking".to_string(), "--never-there".to_string()]);
+        let now = plan.argv_now();
+        assert_eq!(now, ["claude", "--output-format", "stream-json", "--include-partial-messages", "--model=opus"].map(String::from));
+        assert_eq!(plan.argv, p0, "P0's argv stays");
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let moved = move_argv(&plan.argv_now(), Some(sid), &Cut::None);
+        assert!(!moved.iter().any(|a| a.starts_with("--from-the-future") || a.starts_with("--thinking")), "{moved:?}");
+        assert!(moved.iter().any(|a| a == &format!("--resume={sid}")), "{moved:?}");
+        plan.dropped.borrow_mut().push("--output-format".into());
+        assert_eq!(plan.argv_now(), now, "a session flag is never dropped (`drop_option` refuses it)");
+    }
+
+    /// W2: P0 measures the spawn frame with `CLAUDE_REFS_MAX` refs of the longest version P4 can send, so an argv
+    /// within that margin of `CONTROL_FRAME_MAX` is refused (exit 9) rather than closing the shim's socket at P4.
+    #[test]
+    fn p0_measures_the_spawn_frame_with_the_most_refs_p4_can_send() {
+        let d = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(d.path());
+        let ctx = plan.ctx();
+        let worst = worst_claude_refs();
+        assert!(worst.len() == crate::wire::workspace::CLAUDE_REFS_MAX && worst.iter().all(|r| r.check().is_ok()), "refs P4 could send: {worst:?}");
+        let padded = |pad: usize| -> Vec<String> { plan.argv.iter().cloned().chain(["x".repeat(pad)]).collect() };
+        let size = |pad: usize, refs: Vec<ClaudeRef>| spawn_frame_size(&ctx, &padded(pad), &plan.ws, &plan.env, refs);
+        let (bare, full) = (size(0, Vec::new()), size(0, worst.clone()));
+        assert!(full - bare > CLAUDE_REFS_MAX_BYTES_FLOOR, "the refs' margin: {}", full - bare);
+        // Just inside the cap without refs, past it with them: refused.
+        let pad = CONTROL_FRAME_MAX - bare - (full - bare) / 2;
+        assert!(size(pad, Vec::new()) <= CONTROL_FRAME_MAX && size(pad, worst.clone()) > CONTROL_FRAME_MAX);
+        let f = spawn_frame_fits(&ctx, &padded(pad), &plan.ws, &plan.env).unwrap_err();
+        assert!(matches!(&f, Failure::Refused { what } if what.contains("-byte spawn frame")), "{f:?}");
+        // With room for the refs, it fits to the byte.
+        let pad = CONTROL_FRAME_MAX - full;
+        assert_eq!(size(pad, worst.clone()), CONTROL_FRAME_MAX);
+        assert!(spawn_frame_fits(&ctx, &padded(pad), &plan.ws, &plan.env).is_ok());
+    }
+
+    /// Four refs' JSON is more than their sha256s alone.
+    const CLAUDE_REFS_MAX_BYTES_FLOOR: usize = 4 * 64;
 }

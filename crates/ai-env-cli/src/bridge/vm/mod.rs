@@ -2,7 +2,8 @@
 //! registry and placement locks, run/select with pending rows, endpoint
 //! tokens and `/health`, tag-free gc, the experimental shell, the live
 //! probes, the file-backed fake for process-level tests, and the
-//! `ai-env vm …` commands.
+//! `ai-env vm …` commands; S11: the bodies `vm list`, `vm suspend|resume`
+//! and the one-id `vm terminate` share with the panel (`ops`).
 pub mod client;
 pub mod cmd;
 pub mod fake_file;
@@ -11,6 +12,7 @@ pub mod health;
 pub mod lab;
 pub mod lab_mac;
 pub mod lock;
+pub mod ops;
 pub mod registry;
 pub mod run;
 pub mod shell;

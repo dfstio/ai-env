@@ -1459,7 +1459,7 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
         }
     };
     let keys = if changed.is_empty() { "none".to_string() } else { changed.join(",") };
-    let row = AuditRow::new("infra_status_write", None, audit::detail(&[("keys_changed", keys), ("stack", stack.to_string()), ("bridge_toml", bridge_toml.to_string())]));
+    let row = AuditRow::new(crate::bridge::audit::event::INFRA_STATUS_WRITE, None, audit::detail(&[("keys_changed", keys), ("stack", stack.to_string()), ("bridge_toml", bridge_toml.to_string())]));
     audit::append(&audit_path, &row)?;
     Ok(())
 }
@@ -1483,7 +1483,7 @@ fn base_image_args(identifier: &str) -> [&str; 8] {
 /// pagination token (`nextToken` from the API, `NextToken` from the CLI's
 /// `--max-items`) is only one page, and versions on the others would read
 /// as missing: refused.
-fn version_items(json: &str) -> std::result::Result<Vec<serde_json::Value>, String> {
+pub(crate) fn version_items(json: &str) -> std::result::Result<Vec<serde_json::Value>, String> {
     if json.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1505,7 +1505,7 @@ fn version_items(json: &str) -> std::result::Result<Vec<serde_json::Value>, Stri
 }
 
 /// A field as text: strings as they are, numbers rendered.
-fn text_of(v: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn text_of(v: &serde_json::Value, key: &str) -> Option<String> {
     match v.get(key)? {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),

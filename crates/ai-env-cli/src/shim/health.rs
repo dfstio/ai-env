@@ -16,7 +16,10 @@
 //! once `s3xfer::SERVED` holds; the code port's git routes name
 //! `CAP_GIT_HTTP_V1` once `gitcgi::SERVED` holds. S8's `PUT /transcript`
 //! (the Mac's mirror sent up at a resume) went at the S3 cut-over: a chat's
-//! transcript reaches the VM from S3 (`POST /transcript/pull`).
+//! transcript reaches the VM from S3 (`POST /transcript/pull`). S11's claude
+//! routes (`shim::claudebin`: `POST`/`GET /claude/stage`, `POST
+//! /claude/relay`) are mounted, and `CAP_CLAUDE_STAGE_V1` named, once
+//! `claudebin::SERVED` holds and the cache has a store.
 use crate::shim::agent::AgentRegistry;
 use crate::shim::asagent::{self, AgentCmd, WorkspaceSlot};
 use crate::shim::hooks::HookSource;
@@ -25,8 +28,10 @@ use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
 use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_PARK_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
+use crate::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_VIEW_PARENT_V1};
 use crate::wire::workspace::{budget, refusal, vm_path_check, PathQuery, SettingsCapture, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_ROUTE};
 use crate::wire::workspace::{TRANSCRIPT_PULL_ROUTE, TRANSCRIPT_PUSH_ROUTE, TRANSCRIPT_TAIL_ROUTE, TRANSCRIPT_VIEW_ROUTE};
+use crate::wire::workspace::{CLAUDE_RELAY_ROUTE, CLAUDE_STAGE_ROUTE};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
@@ -45,6 +50,39 @@ pub const CLAUDE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// PATH of the probe child (the environment is otherwise cleared).
 const PROBE_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Why a `--version` probe printed no line ([`ShimState::probe_claude`]):
+/// what the binary did of itself, or what kept it from running. S11's
+/// cache refuses a fetched binary as `version_mismatch` (which fails its
+/// version on the Mac for good) only for the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeError {
+    /// It ran and judged itself: an exit status other than 0, a fault of
+    /// its own ([`ended_of_itself`]), no line on stdout, or no executable
+    /// at all (`ENOEXEC`).
+    Ran(String),
+    /// It never ran, or was stopped from outside: the throwaway HOME or its
+    /// chown, the spawn's errno (but `ENOEXEC`), the timeout, any other
+    /// signal (a kill, an abort). `enospc`: the disk was full.
+    NotRun { why: String, enospc: bool },
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Ran(why) | ProbeError::NotRun { why, .. } => f.write_str(why),
+        }
+    }
+}
+
+/// Whether a probe's end is the binary's own doing: an exit status, or a
+/// fault signal of its own (SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGTRAP,
+/// SIGSYS). A kill, a termination or an abort may come from outside (the
+/// OOM killer, a chat's own `pkill claude`, memory short): not judged.
+pub(crate) fn ended_of_itself(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal().is_none_or(|sig| [libc::SIGSEGV, libc::SIGILL, libc::SIGBUS, libc::SIGFPE, libc::SIGTRAP, libc::SIGSYS].contains(&sig))
+}
 
 /// Who the claude probe runs as. `None` = unchanged (the shim is not root:
 /// native tests on the Mac).
@@ -199,6 +237,11 @@ pub struct ShimState {
     pub transfers: crate::shim::s3xfer::Transfers,
     /// S10: the guest's `MemTotal` in MiB, read once at start (`/health`).
     mem_total_mib: Option<u32>,
+    /// S11: the VM's claude cache (`shim::claudebin`): disabled without a store (no root, no `--fs-root`).
+    pub claude_cache: crate::shim::claudebin::ClaudeCache,
+    /// S11 (LD-24): what first used this VM (a spawn, a credential frame): it is no longer fresh, and relays no
+    /// claude ([`Self::fresh`]).
+    used: Mutex<Option<&'static str>>,
 }
 
 impl ShimState {
@@ -227,6 +270,7 @@ impl ShimState {
         // S10 (W3 #2): the last seed's record survives a shim restart.
         let workspace = WorkspaceSlot::persisted(asagent::RecordStore::for_shim(&opts));
         let mem_total_mib = sys.meminfo().and_then(|text| crate::shim::sys::parse_meminfo(&text).0).map(|kb| u32::try_from(kb / 1024).unwrap_or(u32::MAX));
+        let claude_cache = crate::shim::claudebin::ClaudeCache::for_shim(&opts);
         ShimState {
             started: Instant::now(),
             claude,
@@ -249,6 +293,8 @@ impl ShimState {
             workspace,
             transfers: crate::shim::s3xfer::Transfers::default(),
             mem_total_mib,
+            claude_cache,
+            used: Mutex::new(None),
         }
     }
 
@@ -294,12 +340,19 @@ impl ShimState {
     }
 
     /// What this shim can do beyond wire v1's core: `hello_ok.caps` and
-    /// `/health`'s, in this order: `credential_cache`; then, with a helper,
-    /// `workspace_v1`, `git_http_v1` once the git routes are built
+    /// `/health`'s, in this order, each once: `credential_cache`; then, with
+    /// a helper, `workspace_v1`, `git_http_v1` once the git routes are built
     /// (`gitcgi::SERVED`) and `transcript_s3_v1` once the transfers are
     /// (`s3xfer::SERVED`, S9): a route is mounted exactly when its cap is
     /// named. Then `park_v1` once the park is built (`agent::PARK_SERVED`,
-    /// S10), with or without a helper.
+    /// S10), with or without a helper. Then S11's, each under its served
+    /// flag (each served since wave 1: part C's three since C1, part A's
+    /// since A1): with a helper,
+    /// `codeout_manifest_v1` (`code::MANIFEST_SERVED`), `view_parent_v1` and
+    /// `transcript_gzip_v1` (`s3xfer::SERVED` and `s3xfer::VIEW_PARENT_SERVED`,
+    /// `s3xfer::GZIP_SERVED`); last, with or without a helper,
+    /// `claude_stage_v1` (`claudebin::SERVED` and a cache with a store). An
+    /// S10 shim's list is a prefix of an S11 one's.
     #[must_use]
     pub fn caps(&self) -> Vec<String> {
         let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
@@ -315,7 +368,47 @@ impl ShimState {
         if crate::shim::agent::PARK_SERVED {
             caps.push(CAP_PARK_V1.to_string());
         }
+        if self.serves_workspace() {
+            if crate::shim::code::MANIFEST_SERVED {
+                caps.push(CAP_CODEOUT_MANIFEST_V1.to_string());
+            }
+            if crate::shim::s3xfer::SERVED && crate::shim::s3xfer::VIEW_PARENT_SERVED {
+                caps.push(CAP_VIEW_PARENT_V1.to_string());
+            }
+            if crate::shim::s3xfer::SERVED && crate::shim::s3xfer::GZIP_SERVED {
+                caps.push(CAP_TRANSCRIPT_GZIP_V1.to_string());
+            }
+        }
+        if self.serves_claude() {
+            caps.push(CAP_CLAUDE_STAGE_V1.to_string());
+        }
         caps
+    }
+
+    /// Whether this shim serves S11's claude routes and runs a spawn's refs
+    /// (`claudebin::SERVED` and a cache with a store): it names
+    /// `claude_stage_v1` and mounts the routes exactly then.
+    #[must_use]
+    fn serves_claude(&self) -> bool {
+        crate::shim::claudebin::SERVED && self.claude_cache.enabled()
+    }
+
+    /// S11 (LD-24): `what` used this VM (`spawn`: a spawn frame, before it
+    /// starts; `credential`: a credential frame): from now on it is not
+    /// [`Self::fresh`]. The first use is kept.
+    pub fn mark_used(&self, what: &'static str) {
+        let mut used = self.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if used.is_none() {
+            *used = Some(what);
+        }
+    }
+
+    /// S11 (LD-24): no spawn ran, no credential came, and the workspace
+    /// holds no seed record: only such a VM relays a claude
+    /// (`POST /claude/relay`, `not_fresh` otherwise).
+    #[must_use]
+    pub fn fresh(&self) -> bool {
+        self.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() && self.workspace.record().is_none()
     }
 
     /// `/ready`: the three listeners are bound and one probe succeeded.
@@ -348,22 +441,36 @@ impl ShimState {
         Ok(self.claude_line.get_or_init(|| async { line }).await.clone())
     }
 
-    /// `<claude> --version` now, never cached: a cleared environment (a
-    /// throwaway `HOME`, a fixed `PATH`), as `uid:gid` when root, stdin
+    /// `<claude> --version` now, never cached: [`Self::probe_version`] of
+    /// the image's claude (`--claude`).
+    pub async fn probe_fresh(&self) -> Result<String, String> {
+        self.probe_version(&self.claude).await
+    }
+
+    /// `<path> --version` now (S11: the image's claude, and a fetched one
+    /// before the cache indexes it, `shim::claudebin`): a cleared environment
+    /// (a throwaway `HOME`, a fixed `PATH`), as `uid:gid` when root, stdin
     /// closed, killed after [`CLAUDE_PROBE_TIMEOUT`]. Returns the first
     /// stdout line. An EPERM from the chown or the dropped spawn names the
     /// capabilities the effective set lacks. Counted as a workspace helper
     /// while it runs (`SpawnManager::hold_helper`): the idle sweep a spawn's
     /// end starts never kills the probe, which runs as the agent too.
-    pub async fn probe_fresh(&self) -> Result<String, String> {
+    pub async fn probe_version(&self, path: &Path) -> Result<String, String> {
+        self.probe_claude(path).await.map_err(|e| e.to_string())
+    }
+
+    /// [`Self::probe_version`], its failure classed ([`ProbeError`]): the
+    /// cache judges a fetched binary only by what the binary did itself.
+    pub async fn probe_claude(&self, path: &Path) -> Result<String, ProbeError> {
+        let not_run = |why: String, e: Option<&std::io::Error>| ProbeError::NotRun { why, enospc: e.is_some_and(|e| e.raw_os_error() == Some(libc::ENOSPC)) };
         let _hold = self.spawns.hold_helper(true).await;
-        let home = tempfile::Builder::new().prefix("ai-env-probe-").tempdir().map_err(|e| format!("probe HOME: {e}"))?;
+        let home = tempfile::Builder::new().prefix("ai-env-probe-").tempdir().map_err(|e| not_run(format!("probe HOME: {e}"), Some(&e)))?;
         let dropping = self.probe.uid.is_some() || self.probe.gid.is_some();
         let hint = |e: &std::io::Error| if dropping { crate::shim::sys::eperm_hint(e, self.sys.cap_eff()) } else { String::new() };
         if dropping {
-            std::os::unix::fs::chown(home.path(), self.probe.uid, self.probe.gid).map_err(|e| format!("probe HOME chown: {e}{}", hint(&e)))?;
+            std::os::unix::fs::chown(home.path(), self.probe.uid, self.probe.gid).map_err(|e| not_run(format!("probe HOME chown: {e}{}", hint(&e)), Some(&e)))?;
         }
-        let mut cmd = tokio::process::Command::new(&self.claude);
+        let mut cmd = tokio::process::Command::new(path);
         cmd.arg("--version")
             .env_clear()
             .env("HOME", home.path())
@@ -378,21 +485,26 @@ impl ShimState {
         if let Some(uid) = self.probe.uid {
             cmd.uid(uid);
         }
-        let out = tokio::time::timeout(CLAUDE_PROBE_TIMEOUT, cmd.output())
-            .await
-            .map_err(|_| format!("timed out after {} s", CLAUDE_PROBE_TIMEOUT.as_secs()))?
-            .map_err(|e| format!("cannot run {}: {e}{}", self.claude.display(), hint(&e)))?;
+        let out = match tokio::time::timeout(CLAUDE_PROBE_TIMEOUT, cmd.output()).await {
+            Err(_) => return Err(not_run(format!("timed out after {} s", CLAUDE_PROBE_TIMEOUT.as_secs()), None)),
+            Ok(Err(e)) => {
+                let why = format!("cannot run {}: {e}{}", path.display(), hint(&e));
+                return Err(if e.raw_os_error() == Some(libc::ENOEXEC) { ProbeError::Ran(why) } else { not_run(why, Some(&e)) });
+            }
+            Ok(Ok(out)) => out,
+        };
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let first = err.lines().next().unwrap_or("").chars().take(200).collect::<String>();
-            return Err(format!("{} (stderr: {})", out.status, crate::wire::redact::scrub(&first)));
+            let why = format!("{} (stderr: {})", out.status, crate::wire::redact::scrub(&first));
+            return Err(if ended_of_itself(out.status) { ProbeError::Ran(why) } else { not_run(why, None) });
         }
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .next()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
-            .ok_or_else(|| "empty --version output".into())
+            .ok_or_else(|| ProbeError::Ran("empty --version output".into()))
     }
 
     pub async fn health(&self) -> Health {
@@ -468,6 +580,7 @@ impl ShimState {
             listeners,
             listeners_omitted,
             workspace: self.serves_workspace().then(|| self.workspace.view(self.spawns.helpers())),
+            claude_cache: self.claude_cache.view(),
         }
     }
 }
@@ -514,6 +627,13 @@ pub fn router(state: Arc<ShimState>) -> Router {
             .route(TRANSCRIPT_PULL_ROUTE, post(s3xfer::pull).fallback(method_not_allowed))
             .route(TRANSCRIPT_VIEW_ROUTE, get(s3xfer::view).fallback(method_not_allowed))
             .route(TRANSCRIPT_TAIL_ROUTE, post(s3xfer::tail).fallback(method_not_allowed));
+    }
+    // S11: the claude cache's routes, as their cap is named (`caps`), helper or not.
+    if state.serves_claude() {
+        use crate::shim::claudebin;
+        routes = routes
+            .route(CLAUDE_STAGE_ROUTE, post(claudebin::stage).get(claudebin::stage_state).fallback(method_not_allowed))
+            .route(CLAUDE_RELAY_ROUTE, post(claudebin::relay).fallback(method_not_allowed));
     }
     // The last layer runs first: the guard, then the bearer.
     routes
@@ -755,17 +875,35 @@ mod tests {
         assert!(e.starts_with("cannot run ") && !e.contains("capabilities"), "no drop, no hint: {e}");
     }
 
-    /// S10: `park_v1` comes last, with or without a helper, exactly when the
-    /// park is built (`agent::PARK_SERVED`); the caps before it are S9's.
+    /// S11 (the index §1, C §X.1): S10's caps first (`park_v1` exactly when
+    /// the park is built, helper or not), then, with a helper, part C's three
+    /// in order, each under its served flag, and last `claude_stage_v1` under
+    /// `claudebin::SERVED` and a cache with a store, helper or not. While
+    /// every S11 flag is false (phase 0) the lists are S10's.
     #[test]
-    fn park_v1_is_named_last_once_the_park_is_built() {
-        let park: &[&str] = if crate::shim::agent::PARK_SERVED { &[CAP_PARK_V1] } else { &[] };
+    fn the_s11_caps_follow_park_v1_each_under_its_flag() {
+        use crate::shim::{claudebin, code, s3xfer};
+        let on = |flag: bool, cap: &'static str| if flag { vec![cap] } else { Vec::new() };
+        let park = on(crate::shim::agent::PARK_SERVED, CAP_PARK_V1);
+        let claude = |s: &ShimState| on(claudebin::SERVED && s.claude_cache.enabled(), CAP_CLAUDE_STAGE_V1);
+        let part_c = [on(code::MANIFEST_SERVED, CAP_CODEOUT_MANIFEST_V1), on(s3xfer::SERVED && s3xfer::VIEW_PARENT_SERVED, CAP_VIEW_PARENT_V1), on(s3xfer::SERVED && s3xfer::GZIP_SERVED, CAP_TRANSCRIPT_GZIP_V1)].concat();
         let bare = ShimState::with(PathBuf::from("c"), ShimOpts::default(), ProbeSpec::default(), Arc::new(RealSys));
-        assert_eq!(bare.caps(), [&[CAP_CREDENTIAL_CACHE][..], park].concat());
-        let opts = ShimOpts { helper: Some(PathBuf::from("/nonexistent/helper")), ..ShimOpts::default() };
-        let helper = ShimState::with(PathBuf::from("c"), opts, ProbeSpec::default(), Arc::new(RealSys));
-        let s9 = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1];
-        assert_eq!(helper.caps(), [&s9[..], park].concat());
+        assert_eq!(bare.caps(), [vec![CAP_CREDENTIAL_CACHE], park.clone(), claude(&bare)].concat());
+        let s9 = vec![CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1];
+        let root = tempfile::tempdir().unwrap();
+        for fs_root in [None, Some(root.path().to_path_buf())] {
+            let opts = ShimOpts { helper: Some(PathBuf::from("/nonexistent/helper")), fs_root, ..ShimOpts::default() };
+            let helper = ShimState::with(PathBuf::from("c"), opts, ProbeSpec::default(), Arc::new(RealSys));
+            let caps = helper.caps();
+            assert_eq!(caps, [s9.clone(), park.clone(), part_c.clone(), claude(&helper)].concat());
+            let mut unique = caps.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), caps.len(), "each once: {caps:?}");
+            if [code::MANIFEST_SERVED, s3xfer::VIEW_PARENT_SERVED, s3xfer::GZIP_SERVED, claudebin::SERVED].iter().all(|served| !served) {
+                assert_eq!(caps, [s9.clone(), park.clone()].concat(), "phase 0: S10's list");
+            }
+        }
     }
 
     /// S10: the hidden `--cold-warm` takes off, read or run; off is the

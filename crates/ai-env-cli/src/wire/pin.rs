@@ -11,6 +11,28 @@ pub const RELEASE_BASE: &str = "https://downloads.claude.ai/claude-code-releases
 /// The only platform the image runs on.
 pub const PLATFORM: &str = "linux-arm64";
 
+/// S11 (A.1): the primary-key fingerprint of Anthropic's Claude Code release key (`CLAUDE_GPG_FPR`, Makefile:83;
+/// the vendored `certs/claude-code-release.gpg`): an admitted manifest's VALIDSIG ends in it.
+pub const RELEASE_KEY_FPR: &str = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE";
+
+/// `<RELEASE_BASE>/<version>/manifest.json`.
+#[must_use]
+pub fn manifest_url(version: &str) -> String {
+    format!("{RELEASE_BASE}/{version}/manifest.json")
+}
+
+/// `<RELEASE_BASE>/<version>/manifest.json.sig`.
+#[must_use]
+pub fn sig_url(version: &str) -> String {
+    format!("{RELEASE_BASE}/{version}/manifest.json.sig")
+}
+
+/// `<RELEASE_BASE>/<version>/<PLATFORM>/claude`; [`ClaudePin::download_url`] calls it (S11, LD-18).
+#[must_use]
+pub fn binary_url(version: &str) -> String {
+    format!("{RELEASE_BASE}/{version}/{PLATFORM}/claude")
+}
+
 const KEYS: [&str; 5] = ["CLAUDE_VERSION", "CLAUDE_PLATFORM", "CLAUDE_SHA256", "CLAUDE_SIZE", "CLAUDE_BUILD_DATE"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,10 +47,10 @@ pub struct ClaudePin {
 }
 
 impl ClaudePin {
-    /// `<base>/<version>/<platform>/claude`.
+    /// `<base>/<version>/<platform>/claude` ([`binary_url`]: a valid pin's platform is [`PLATFORM`]).
     #[must_use]
     pub fn download_url(&self) -> String {
-        format!("{RELEASE_BASE}/{}/{}/claude", self.version, self.platform)
+        binary_url(&self.version)
     }
 
     /// What `claude --version` prints for this pin.
@@ -58,7 +80,9 @@ impl ClaudePin {
     }
 }
 
-fn is_version(v: &str) -> bool {
+/// `N.N.N`, each part 1 to 6 digits (S11: `pub`, for `wire::s3`'s claude key and the admission).
+#[must_use]
+pub fn is_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|c| c.is_ascii_digit()))
 }
@@ -192,6 +216,41 @@ mod tests {
     fn comments_and_blank_lines_are_tolerated() {
         let text = render_lock(&pin()).unwrap();
         assert_eq!(parse_lock(&format!("\n# note\n  # indented note\n \t\n{text}\n")).unwrap(), pin());
+    }
+
+    /// The repository's file at `rel` (from the workspace root).
+    fn repo_file(rel: &str) -> String {
+        std::fs::read_to_string(format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+
+    /// S11 (A §1.8): the fingerprint is the Makefile's `CLAUDE_GPG_FPR`
+    /// (which `claude-pin` and P4 name), 40 uppercase hex digits.
+    #[test]
+    fn the_release_key_fingerprint_is_the_makefiles() {
+        let make = repo_file("Makefile");
+        let line = make.lines().find(|l| l.starts_with("CLAUDE_GPG_FPR ")).expect("the Makefile's CLAUDE_GPG_FPR line");
+        let value = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or_default();
+        assert_eq!(value, RELEASE_KEY_FPR, "{line}");
+        assert!(RELEASE_KEY_FPR.len() == 40 && RELEASE_KEY_FPR.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)));
+    }
+
+    /// S11 (A §1.8): `RELEASE_BASE` is the Makefile's `CLAUDE_RELEASES`;
+    /// `binary_url` is the Dockerfile's download URL with its two variables
+    /// filled; the manifest's and its signature's URLs sit beside it; a pin's
+    /// `download_url` delegates.
+    #[test]
+    fn the_release_urls_are_the_makefiles() {
+        let make = repo_file("Makefile");
+        let line = make.lines().find(|l| l.starts_with("CLAUDE_RELEASES ")).expect("the Makefile's CLAUDE_RELEASES line");
+        assert_eq!(line.split_once('=').map(|(_, v)| v.trim()), Some(RELEASE_BASE), "{line}");
+        let docker = repo_file("image/Dockerfile");
+        let url = docker.lines().find_map(|l| l.split('"').find(|part| part.starts_with("https://") && part.ends_with("/claude"))).expect("the Dockerfile's download URL");
+        assert_eq!(url, "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/${CLAUDE_PLATFORM}/claude");
+        assert_eq!(binary_url("2.1.308"), url.replace("${CLAUDE_VERSION}", "2.1.308").replace("${CLAUDE_PLATFORM}", PLATFORM));
+        assert_eq!(manifest_url("2.1.308"), format!("{RELEASE_BASE}/2.1.308/manifest.json"));
+        assert_eq!(sig_url("2.1.308"), format!("{}.sig", manifest_url("2.1.308")));
+        assert_eq!(pin().download_url(), binary_url(&pin().version));
+        assert!(is_version("2.1.308") && !is_version("2.1") && !is_version("2.1.308-beta"));
     }
 
     /// What the shell `.` or the Makefile's anchored sed would read

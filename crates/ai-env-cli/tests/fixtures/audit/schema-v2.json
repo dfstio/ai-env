@@ -1,0 +1,1642 @@
+{
+  "common": {
+    "actors": [
+      "cli",
+      "wrapper",
+      "panel"
+    ],
+    "optional": [
+      "purpose"
+    ],
+    "required": [
+      "actor"
+    ]
+  },
+  "events": [
+    {
+      "effects": [
+        {
+          "effect": "span_open",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_remote_start",
+      "optional": [
+        "account"
+      ],
+      "required": [
+        "id",
+        "spawn",
+        "gen",
+        "why"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "span_close",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_remote_end",
+      "optional": [],
+      "required": [
+        "vm",
+        "spawn",
+        "gen",
+        "exit",
+        "end",
+        "close_ms",
+        "last_acked_seq"
+      ],
+      "session": "envelope",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "session_remote_failed",
+      "optional": [
+        "gen",
+        "id"
+      ],
+      "required": [
+        "step",
+        "code",
+        "why"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        },
+        {
+          "effect": "resume",
+          "when": {
+            "if": "is",
+            "key": "how",
+            "value": "resumed"
+          }
+        }
+      ],
+      "name": "vm_select",
+      "optional": [
+        "how",
+        "ms",
+        "gen",
+        "avoid"
+      ],
+      "required": [
+        "id",
+        "choice"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "seed",
+      "optional": [
+        "mode",
+        "bytes",
+        "ms",
+        "kept",
+        "source"
+      ],
+      "required": [
+        "vm",
+        "outcome",
+        "workspace"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "seed_refused",
+      "optional": [
+        "step",
+        "source",
+        "vm"
+      ],
+      "required": [
+        "code",
+        "workspace"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "codeout_fetch",
+      "optional": [
+        "via",
+        "promoted",
+        "quarantined",
+        "hidden",
+        "bytes",
+        "ms",
+        "why"
+      ],
+      "required": [
+        "vm",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "box_fetch_finding",
+      "optional": [],
+      "required": [
+        "vm",
+        "ref",
+        "rules"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "settings_capture",
+      "optional": [
+        "files",
+        "why"
+      ],
+      "required": [
+        "phase",
+        "outcome",
+        "vm"
+      ],
+      "session": "envelope",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "settings_sync",
+      "optional": [],
+      "required": [
+        "rules",
+        "policy_lines",
+        "outcome"
+      ],
+      "session": "envelope",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "prewarm",
+      "optional": [],
+      "required": [
+        "workspace",
+        "pid",
+        "setting"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "auth_timers_unmeasured",
+      "optional": [],
+      "required": [
+        "claude",
+        "measured"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "box_review",
+      "optional": [
+        "remote"
+      ],
+      "required": [
+        "repo",
+        "mode",
+        "commits",
+        "findings",
+        "whole_history",
+        "verdict",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "hook_install",
+      "optional": [],
+      "required": [
+        "repo",
+        "hook",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "drop_transport",
+      "optional": [],
+      "required": [
+        "session",
+        "wrapper_pid"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "transcript_push",
+      "optional": [
+        "version_id"
+      ],
+      "required": [
+        "session",
+        "vm",
+        "kind",
+        "from",
+        "len",
+        "s3_status",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "transcript_pull",
+      "optional": [],
+      "required": [
+        "session",
+        "vm",
+        "parts",
+        "bytes",
+        "outcome",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "transcript_view",
+      "optional": [],
+      "required": [
+        "session",
+        "vm",
+        "messages",
+        "masked",
+        "bytes",
+        "outcome"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "transcript_stage",
+      "optional": [
+        "rate",
+        "stored"
+      ],
+      "required": [
+        "session",
+        "bytes",
+        "parts",
+        "outcome",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "transcript_gc",
+      "optional": [],
+      "required": [
+        "sessions",
+        "objects",
+        "older_than_days"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "transcript_migrate",
+      "optional": [],
+      "required": [
+        "session",
+        "from",
+        "outcome",
+        "bytes"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_move",
+      "optional": [
+        "cause",
+        "trigger",
+        "request"
+      ],
+      "required": [
+        "session",
+        "gen",
+        "kind",
+        "from_vm",
+        "outstanding",
+        "cancelled"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "from_vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_move_end",
+      "optional": [
+        "step",
+        "code",
+        "request",
+        "account",
+        "account_from"
+      ],
+      "required": [
+        "session",
+        "gen",
+        "kind",
+        "outcome",
+        "from_vm",
+        "to_vm",
+        "how",
+        "seed",
+        "transcript",
+        "cut",
+        "touchid",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "to_vm",
+        "from_vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "session_migrate_request",
+      "optional": [
+        "wrapper_pid"
+      ],
+      "required": [
+        "session",
+        "nonce",
+        "how"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "span_close",
+          "when": {
+            "if": "always"
+          }
+        },
+        {
+          "effect": "suspend",
+          "when": {
+            "if": "is",
+            "key": "why",
+            "value": "suspended"
+          }
+        }
+      ],
+      "name": "session_park",
+      "optional": [],
+      "required": [
+        "vm",
+        "spawn",
+        "why",
+        "quiet_ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "span_open",
+          "when": {
+            "if": "always"
+          }
+        },
+        {
+          "effect": "resume",
+          "when": {
+            "if": "is",
+            "key": "vm_state",
+            "value": "suspended"
+          }
+        }
+      ],
+      "name": "session_unpark",
+      "optional": [],
+      "required": [
+        "vm",
+        "spawn",
+        "by",
+        "vm_state",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_park_refused",
+      "optional": [],
+      "required": [
+        "vm",
+        "spawn",
+        "reason",
+        "procs",
+        "cpu_ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        },
+        {
+          "effect": "span_close",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "session_reap",
+      "optional": [],
+      "required": [
+        "session",
+        "vm",
+        "spawn",
+        "why",
+        "wrapper_pid",
+        "outcome",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "vm_gc_reconcile",
+      "optional": [],
+      "required": [
+        "marked",
+        "removed",
+        "closed",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "session_account",
+      "optional": [],
+      "required": [
+        "session",
+        "gen",
+        "kind",
+        "from",
+        "from_tag",
+        "to",
+        "to_tag"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "usage_limited",
+      "optional": [],
+      "required": [
+        "account",
+        "tag",
+        "kind",
+        "resets_at",
+        "text",
+        "gen",
+        "source"
+      ],
+      "session": "envelope",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "claude_admit",
+      "optional": [
+        "step",
+        "why",
+        "sha256",
+        "signer",
+        "markers",
+        "docker_image",
+        "auto"
+      ],
+      "required": [
+        "version",
+        "outcome",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "claude_stage",
+      "optional": [
+        "vm",
+        "s3_status",
+        "step",
+        "why"
+      ],
+      "required": [
+        "version",
+        "sha256",
+        "outcome",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "claude_fetch",
+      "optional": [
+        "session",
+        "gen",
+        "why",
+        "got_len"
+      ],
+      "required": [
+        "vm",
+        "version",
+        "sha256",
+        "outcome",
+        "ms"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "claude_object_bad",
+      "optional": [
+        "got_len",
+        "bad_stages"
+      ],
+      "required": [
+        "version",
+        "sha256",
+        "vm",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "claude_start_failed",
+      "optional": [
+        "code",
+        "next"
+      ],
+      "required": [
+        "session",
+        "vm",
+        "version",
+        "sha256",
+        "gen"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "argv_dropped",
+      "optional": [
+        "session",
+        "vm",
+        "ext"
+      ],
+      "required": [
+        "flag",
+        "claude",
+        "gen"
+      ],
+      "session": {
+        "detail": "session"
+      },
+      "vm_keys": [
+        "vm"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "creds_account_adopt",
+      "optional": [],
+      "required": [
+        "name",
+        "tag",
+        "combined"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_account_use",
+      "optional": [],
+      "required": [
+        "from",
+        "to",
+        "tag",
+        "combined",
+        "chats_other"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_account_forget",
+      "optional": [],
+      "required": [
+        "name",
+        "files",
+        "holders",
+        "was_active",
+        "failed"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "account_check",
+      "optional": [],
+      "required": [
+        "account",
+        "tag",
+        "outcome",
+        "status",
+        "five_hour",
+        "seven_day",
+        "kind",
+        "resets_at",
+        "model",
+        "claude",
+        "exit",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_account_rename",
+      "optional": [],
+      "required": [
+        "from",
+        "to",
+        "tag"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_account_note",
+      "optional": [],
+      "required": [
+        "name",
+        "set"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "start",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_run",
+      "optional": [
+        "max_duration_s",
+        "max_idle_s",
+        "suspended_s",
+        "memory_mib"
+      ],
+      "required": [
+        "id",
+        "purpose",
+        "image_version",
+        "egress",
+        "shell",
+        "client_token"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        },
+        {
+          "effect": "resume",
+          "when": {
+            "if": "is",
+            "key": "resumed",
+            "value": "true"
+          }
+        }
+      ],
+      "name": "vm_reuse",
+      "optional": [],
+      "required": [
+        "id",
+        "purpose",
+        "resumed"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "start",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_adopt",
+      "optional": [],
+      "required": [
+        "id",
+        "client_token",
+        "egress",
+        "via"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "suspend",
+          "when": {
+            "if": "is_or_absent",
+            "key": "outcome",
+            "value": "fired"
+          }
+        }
+      ],
+      "name": "vm_suspend",
+      "optional": [
+        "by",
+        "outcome",
+        "why",
+        "ms"
+      ],
+      "required": [
+        "id"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "resume",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_resume",
+      "optional": [],
+      "required": [
+        "id"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "terminate",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_terminate",
+      "optional": [],
+      "required": [
+        "id",
+        "by"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "vm_token",
+      "optional": [],
+      "required": [
+        "id",
+        "port",
+        "minutes",
+        "revealed"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "vm_egress_internet",
+      "optional": [],
+      "required": [
+        "client_token",
+        "purpose"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "terminate",
+          "when": {
+            "if": "is",
+            "key": "terminated",
+            "value": "true"
+          }
+        }
+      ],
+      "name": "vm_egress_mismatch",
+      "optional": [],
+      "required": [
+        "id",
+        "expected",
+        "echoed",
+        "via",
+        "purpose",
+        "terminated"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "vm_gc",
+      "optional": [],
+      "required": [
+        "terminated",
+        "adopted",
+        "removed",
+        "marked",
+        "errors",
+        "include_orphans_s"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_exec",
+      "optional": [],
+      "required": [
+        "id",
+        "argv0",
+        "spawn",
+        "status",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_attach",
+      "optional": [],
+      "required": [
+        "id",
+        "argv0",
+        "spawn",
+        "status",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "credential_unseal",
+      "optional": [
+        "id",
+        "tag",
+        "account",
+        "for"
+      ],
+      "required": [
+        "source",
+        "ms",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "credential_gate",
+      "optional": [
+        "condition",
+        "half",
+        "image_version"
+      ],
+      "required": [
+        "id",
+        "result"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "credential_deliver",
+      "optional": [
+        "id",
+        "spawn",
+        "account",
+        "to",
+        "gen",
+        "pid"
+      ],
+      "required": [
+        "name",
+        "tag",
+        "source",
+        "deliver"
+      ],
+      "session": "envelope",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "credential_rejected",
+      "optional": [],
+      "required": [
+        "id",
+        "tag",
+        "how"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "agent_reconnect",
+      "optional": [],
+      "required": [
+        "id",
+        "spawn",
+        "reason",
+        "ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "agent_remint",
+      "optional": [],
+      "required": [
+        "id",
+        "spawn",
+        "reason"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [
+        {
+          "effect": "activity",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "agent_rotate",
+      "optional": [],
+      "required": [
+        "id",
+        "spawn",
+        "mode"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "endpoint_429",
+      "optional": [
+        "spawn"
+      ],
+      "required": [
+        "id",
+        "retry_after",
+        "waited_ms"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "egress_check",
+      "optional": [
+        "reason",
+        "revoked",
+        "ready",
+        "allowlisted",
+        "report_only"
+      ],
+      "required": [
+        "id",
+        "image_version",
+        "verdict"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "egress_reload",
+      "optional": [],
+      "required": [
+        "result"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "egress_allow",
+      "optional": [],
+      "required": [
+        "slug",
+        "host",
+        "action"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "egress_suspend",
+      "optional": [],
+      "required": [
+        "host",
+        "action"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "proxy_start",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "proxy_start",
+      "optional": [],
+      "required": [
+        "instance"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "proxy_stop",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "proxy_stop",
+      "optional": [],
+      "required": [
+        "instance",
+        "vpc_vms"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "proxy_patch",
+      "optional": [],
+      "required": [
+        "instance",
+        "result"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_combined",
+      "optional": [
+        "account"
+      ],
+      "required": [
+        "by",
+        "outcome",
+        "removed"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_setup_token",
+      "optional": [],
+      "required": [
+        "key",
+        "prefix",
+        "chars",
+        "source",
+        "rotated",
+        "combined",
+        "account",
+        "installed"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_forget",
+      "optional": [
+        "accounts",
+        "holders",
+        "holders_unreadable",
+        "ops"
+      ],
+      "required": [
+        "files",
+        "failed"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_aws_set",
+      "optional": [],
+      "required": [
+        "user",
+        "key_id_last4",
+        "key",
+        "rotated",
+        "file"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_aws_verify",
+      "optional": [],
+      "required": [
+        "user",
+        "key_id_last4",
+        "result"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "creds_deployer_key",
+      "optional": [],
+      "required": [
+        "user",
+        "key_id_last4",
+        "result"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "resume_seed_retry",
+      "optional": [
+        "files",
+        "bytes",
+        "kept"
+      ],
+      "required": [
+        "session_id",
+        "source"
+      ],
+      "session": {
+        "detail": "session_id"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "resume_seed_miss",
+      "optional": [],
+      "required": [
+        "session_id",
+        "reason"
+      ],
+      "session": {
+        "detail": "session_id"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "resume_seed_failed",
+      "optional": [],
+      "required": [
+        "session_id",
+        "reason"
+      ],
+      "session": {
+        "detail": "session_id"
+      },
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "replay_timeout",
+      "optional": [],
+      "required": [
+        "failed",
+        "gen"
+      ],
+      "session": "envelope",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "oauth_refresh_answered",
+      "optional": [],
+      "required": [
+        "subtype",
+        "gen"
+      ],
+      "session": "envelope",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "synthetic_oauth",
+      "optional": [],
+      "required": [
+        "class",
+        "ms"
+      ],
+      "session": "envelope",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "lab_probe",
+      "optional": [],
+      "required": [
+        "probe",
+        "verdict",
+        "expected"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "infra_status_write",
+      "optional": [],
+      "required": [
+        "keys_changed",
+        "stack",
+        "bridge_toml"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "as_identity",
+      "optional": [
+        "key_id_last4",
+        "account"
+      ],
+      "required": [
+        "identity",
+        "command"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [
+        {
+          "effect": "observed",
+          "when": {
+            "if": "always"
+          }
+        }
+      ],
+      "name": "vm_observed",
+      "optional": [],
+      "required": [
+        "id",
+        "state",
+        "was",
+        "via"
+      ],
+      "session": "none",
+      "vm_keys": [
+        "id"
+      ]
+    },
+    {
+      "effects": [],
+      "name": "panel_serve",
+      "optional": [],
+      "required": [
+        "port",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    }
+  ],
+  "v": 2
+}

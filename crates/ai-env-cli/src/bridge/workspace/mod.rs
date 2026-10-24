@@ -377,14 +377,10 @@ pub(crate) async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + '
 }
 
 /// One audit row of the data plane (`remote::audit_event`), its actor this
-/// process's voice; one that cannot be written is a warning, never fatal.
+/// process's (`AuditRow::new`'s, S11: the voice unless set); one that cannot
+/// be written is a warning, never fatal.
 pub(crate) fn audit(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
-    let mut detail = crate::bridge::audit::detail(pairs);
-    let actor = match voice::voice() {
-        voice::Voice::Cli => "cli",
-        voice::Voice::Wrapper => "wrapper",
-    };
-    detail.insert("actor".into(), actor.into());
+    let detail = crate::bridge::audit::detail(pairs);
     if let Err(e) = crate::bridge::audit::append(&paths.audit(), &crate::bridge::audit::AuditRow::new(event, None, detail)) {
         voice::warn(&format!("audit row {event} not written: {e}"));
     }
@@ -706,7 +702,8 @@ pub enum CarrySource {
 /// (`WsRow.vm[<vm>].fetched`, ids the code-out promoted into this Mac's
 /// store). No record: this Mac, with a note (the VM's work was never
 /// fetched). A record without WIP whose head is this Mac's HEAD or an
-/// ancestor of it: this Mac (it holds everything). Anything else: the box
+/// ancestor of it, on this Mac's branch (S11, C.1.3: detached where this
+/// Mac is detached): this Mac (it holds everything). Anything else: the box
 /// record, noted when this Mac's HEAD has commits the record lacks. A record
 /// whose commits this Mac's store lacks is this Mac's, noted. Local only
 /// (git on this Mac): run it off the runtime's thread.
@@ -724,7 +721,9 @@ pub fn carry_source(paths: &Paths, ws: &WorkspaceRef, dead_vm: &str) -> CarrySou
     }
     let mac = ws.head.sha();
     let ancestor = |a: &str, b: &str| a == b || git.succeeds(["merge-base", "--is-ancestor", a, b]).unwrap_or(false);
-    if record.wip.is_none() && ancestor(&record.head, mac) {
+    // S11 (C.1.3): a record on another branch (a `checkout -b` with no new object) is the box's, so the moved chat
+    // keeps the VM's branch.
+    if record.wip.is_none() && record.branch.as_deref() == ws.head.branch() && ancestor(&record.head, mac) {
         return CarrySource::Mac { note: None };
     }
     let note = (!ancestor(mac, &record.head)).then(|| format!("this Mac's HEAD has commits {dead_vm}'s last fetch lacks: the moved chat's checkout is that VM's work, without them"));

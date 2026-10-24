@@ -11,6 +11,11 @@
 mod curl;
 #[path = "shim_local/transcript_s3.rs"]
 mod transcript_s3;
+// S11 (wave 1): A1's claude cache, C1's code-out manifest, view parent and gzip pull.
+#[path = "shim_local/claude_stage.rs"]
+mod claude_stage;
+#[path = "shim_local/s11.rs"]
+mod s11;
 
 use ai_env_cli::shim::health::{router, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::hooks::{self, HookPeer, HookSource, PREFIX};
@@ -139,6 +144,10 @@ fn plant_vm_tree(root: &Path) {
     for d in ["agents", "skills", "commands"] {
         std::fs::create_dir_all(root.join("Users/mike/.claude").join(d)).unwrap();
     }
+    // S11: the image's empty claude cache (V4).
+    let cache = root.join("opt/ai-env/claude");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::set_permissions(&cache, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 }
 
 fn opts(root: Option<&Path>, source: HookSource, delay: u64) -> ShimOpts {
@@ -1336,7 +1345,7 @@ async fn agent_spawn_is_answered_by_the_spawn_manager() {
     s.run(true).await;
     let mut w = ws_hello_ok(s.app).await;
     let id = SpawnId::new_v7();
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
     send_frame(&mut w, &spawn).await;
     match next_frame(&mut w).await {
         Ok(Frame::Spawned { spawn_id, pid, .. }) => assert!(spawn_id == id && pid != 0, "{spawn_id} {pid}"),
@@ -1360,7 +1369,7 @@ async fn spawning_stack() -> (Stack, tempfile::TempDir) {
 /// tests run (the agent is this process's own uid, the home a canonical
 /// tempdir), so anything else before its `spawned` fails the test.
 async fn start(w: &mut Ws, id: &SpawnId, argv: &[&str], detach_grace_s: Option<u32>) -> (u32, Vec<Frame>) {
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s, credential: None };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s, credential: None, claude: Vec::new() };
     start_frame(w, &spawn).await
 }
 
@@ -1531,7 +1540,7 @@ async fn hello_view(app: SocketAddr) -> (Ws, bool, Vec<String>, CredentialView) 
 
 /// A `spawn` of `argv` naming `credential` and carrying `secrets` (fd delivery).
 fn spawn_with(id: &SpawnId, argv: &[&str], credential: Option<&str>, secrets: BTreeMap<String, Secret<String>>) -> Frame {
-    Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: None, credential: credential.map(str::to_string) }
+    Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: None, credential: credential.map(str::to_string), claude: Vec::new() }
 }
 
 /// The spawn's answer when it is refused: its code and message.
@@ -2702,8 +2711,13 @@ impl Vm {
 /// The caps of a shim that serves the workspace (S9): `credential_cache`,
 /// `workspace_v1`, then `git_http_v1` and `transcript_s3_v1` once their
 /// routes are served (`shim::gitcgi::SERVED`, `shim::s3xfer::SERVED`); S10:
-/// then `park_v1` once the park is (`shim::agent::PARK_SERVED`).
+/// then `park_v1` once the park is (`shim::agent::PARK_SERVED`). S11, each
+/// under its flag: `codeout_manifest_v1`, `view_parent_v1` and
+/// `transcript_gzip_v1` (the two transfer caps also under
+/// `s3xfer::SERVED`), then `claude_stage_v1` (`shim::claudebin::SERVED`:
+/// these shims run with an fs root, so the claude cache has a store).
 fn shim_caps() -> Vec<&'static str> {
+    use ai_env_cli::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_VIEW_PARENT_V1};
     let mut caps = vec![CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1];
     if ai_env_cli::shim::gitcgi::SERVED {
         caps.push(CAP_GIT_HTTP_V1);
@@ -2714,11 +2728,26 @@ fn shim_caps() -> Vec<&'static str> {
     if ai_env_cli::shim::agent::PARK_SERVED {
         caps.push(ai_env_cli::wire::frame::CAP_PARK_V1);
     }
+    if ai_env_cli::shim::code::MANIFEST_SERVED {
+        caps.push(CAP_CODEOUT_MANIFEST_V1);
+    }
+    if ai_env_cli::shim::s3xfer::SERVED && ai_env_cli::shim::s3xfer::VIEW_PARENT_SERVED {
+        caps.push(CAP_VIEW_PARENT_V1);
+    }
+    if ai_env_cli::shim::s3xfer::SERVED && ai_env_cli::shim::s3xfer::GZIP_SERVED {
+        caps.push(CAP_TRANSCRIPT_GZIP_V1);
+    }
+    if ai_env_cli::shim::claudebin::SERVED {
+        caps.push(CAP_CLAUDE_STAGE_V1);
+    }
     caps
 }
 
 /// The caps of a shim without a helper: `credential_cache`, and S10's
-/// `park_v1` once the park is served (with or without a helper).
+/// `park_v1` once the park is served (with or without a helper). S11: no
+/// helper, so none of part C's caps; and these shims run with no fs root and
+/// not as root, so the claude cache has no store and `claude_stage_v1` is
+/// never named.
 fn bare_caps() -> Vec<&'static str> {
     let mut caps = vec![CAP_CREDENTIAL_CACHE];
     if ai_env_cli::shim::agent::PARK_SERVED {
@@ -4367,7 +4396,10 @@ fn the_cold_warm_read_reads_the_claude_binary_after_run() {
 /// its miss, `wire::claude::CUT_MISS_MARKER`; a fresh chat's flag and its
 /// refusal), each a build failure naming it; after the shim, the seed
 /// record's directory, root's and 0700, and the gate that the image bakes
-/// no record in. The ENTRYPOINT passes no `--cold-warm` (off).
+/// no record in. The ENTRYPOINT passes no `--cold-warm` (off). S11 (A §2.7):
+/// after the record's gate and before the ENTRYPOINT, the claude cache's:
+/// `/opt/ai-env/claude` root's, 0755 and empty (no claude baked into the
+/// cache; its index lives under the record's directory, which stays empty).
 #[test]
 fn the_image_gates_the_claude_strings_and_bakes_no_seed_record() {
     let df = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
@@ -4383,4 +4415,126 @@ fn the_image_gates_the_claude_strings_and_bakes_no_seed_record() {
     assert!(shim < dir && dir < empty && at("ENTRYPOINT ") > empty, "the record's gate after the shim");
     assert!(ai_env_cli::shim::asagent::SEED_RECORD_PATH.starts_with("/var/lib/ai-env/"));
     assert!(!entrypoint().iter().any(|w| w.starts_with("--cold-warm")), "the warm is off in the image");
+    let (cache, owned, baked, said) = (
+        at("install -d -m 0755 -o 0 -g 0 /opt/ai-env /opt/ai-env/claude;"),
+        at("test \"$(stat -c '%u:%g %a' /opt/ai-env/claude)\" = \"0:0 755\""),
+        at("test -z \"$(find /opt/ai-env/claude -mindepth 1 -print -quit)\" || { echo \"a claude is baked into the cache: $(ls -A /opt/ai-env/claude)\"; exit 1; }"),
+        at("echo \"claude-cache gate: /opt/ai-env/claude root 0755, empty\""),
+    );
+    assert!(empty < cache && cache < owned && owned < baked && baked < said && said < at("ENTRYPOINT "), "the cache's gate after the record's, before the ENTRYPOINT");
+    assert!(!df[empty..cache].contains("\nENTRYPOINT ") && !df[cache..said].contains("\nRUN "), "one RUN of its own after the record's");
+    assert_eq!(ai_env_cli::shim::claudebin::CACHE_DIR, "/opt/ai-env/claude");
+    assert!(ai_env_cli::shim::claudebin::INDEX_PATH.starts_with("/var/lib/ai-env/"), "the cache's index under the record's directory, which the image keeps empty");
+}
+
+// ---- S11 phase 0 (part C): curl decodes gzip, the fake curl's encoding, the encoded-part refusal ----
+
+/// S11 (C.3.8): the curl gate in the block that makes `ai-env-net` also
+/// requires libz (a gzip-staged transcript is pulled with curl's
+/// `compressed`): after the 7.84 check, the `Features:` line read and its
+/// `libz` case, then the gate's echo; the fake curl's `--version` lists it.
+#[test]
+fn the_image_gates_curl_on_libz() {
+    let df = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
+    let at = |what: &str| df.find(what).unwrap_or_else(|| panic!("{what} missing from image/Dockerfile"));
+    let user = at("useradd --system --uid 999 --gid 999");
+    let run = df[..user].rfind("\nRUN ").expect("the RUN that makes ai-env-net");
+    let check = at("the transcript transfers need 7.84 or later");
+    let features = at("features=$(curl --version | while IFS= read -r line; do case $line in (Features:*) echo \"${line#Features:}\";; esac; done);");
+    let libz = at("case \" $features \" in *\" libz \"*) ;; *) echo \"curl lists no libz:$features (a gzip-staged transcript is pulled with curl's compressed)\"; exit 1;; esac;");
+    let said = at("echo \"ai-env-net 999:999; curl $2 with https and libz\"");
+    assert!(run < user && user < check && check < features && features < libz && libz < said, "the libz gate after the 7.84 check, before the echo");
+    assert!(!df[run + 1..said].contains("\nRUN "), "in the block that makes ai-env-net");
+    let fake = std::fs::read_to_string(curl::FAKE_CURL).unwrap();
+    assert!(fake.lines().any(|l| l.contains("echo \"Features:") && l.split_whitespace().any(|w| w == "libz")), "the fake curl's --version lists libz");
+}
+
+/// S11 (C.3.9): the fake curl's `S3CURL_ENCODING=gzip` serves its GET bodies
+/// as gzip streams stored with `Content-Encoding: gzip`: a configuration
+/// with a `compressed` line gets them decoded, one without as stored, as
+/// curl does; unset, the bodies go as they are, `compressed` or not.
+#[test]
+fn the_fake_curl_decodes_gzip_only_with_compressed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let (fake, log) = (root.join("curl"), root.join("curl.log"));
+    let plain = b"{\"n\":1}\n{\"n\":2}\n".to_vec();
+    std::fs::write(root.join("plain"), &plain).unwrap();
+    let gz = Command::new("/usr/bin/gzip").args(["-n", "-6", "-c"]).arg(root.join("plain")).output().unwrap();
+    assert!(gz.status.success() && gz.stdout.starts_with(&[0x1f, 0x8b]), "gzip: {}", String::from_utf8_lossy(&gz.stderr));
+    let stored = root.join("stored.gz");
+    std::fs::write(&stored, &gz.stdout).unwrap();
+    // The shim's call: the configuration on fd 3 alone, an environment of PATH and LC_ALL.
+    let run = |compressed: bool| {
+        let config = root.join("config.in");
+        let mut lines = vec!["url = \"https://example.invalid/v1/k\"".to_string(), "request = \"GET\"".to_string()];
+        if compressed {
+            lines.push("compressed".to_string());
+        }
+        lines.extend(["fail".to_string(), "output = \"-\"".to_string()]);
+        std::fs::write(&config, lines.join("\n") + "\n").unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exec \"$0\" -q -K /dev/fd/3 3<\"$1\"").arg(&fake).arg(&config).env_clear().env("PATH", "/usr/bin:/bin").env("LC_ALL", "C").stdin(Stdio::null());
+        curl::without_stray_fds(&mut cmd);
+        let o = cmd.output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+        o.stdout
+    };
+    let body = stored.to_str().unwrap();
+    curl::install_fake_curl(&fake, &log, &[("S3CURL_BODY", body), ("S3CURL_ENCODING", "gzip")]);
+    assert_eq!(run(true), plain, "compressed: decoded");
+    assert_eq!(run(false), gz.stdout, "without compressed: as stored");
+    curl::install_fake_curl(&fake, &log, &[("S3CURL_BODY", body)]);
+    assert_eq!(run(true), gz.stdout, "no encoding: as it is, compressed or not");
+    assert_eq!(run(false), gz.stdout);
+    let calls = curl::curl_calls(&log);
+    assert_eq!(calls.iter().map(|c| c.conf("compressed").len()).collect::<Vec<_>>(), [1, 0, 1, 0], "{calls:?}");
+}
+
+/// S11 (C.3.2): while `shim::s3xfer::GZIP_SERVED` is false, a pull naming an
+/// encoded part (a Mac object with its sha256, which `check()` lets through)
+/// is refused before any curl runs: 400 `bad_request`, nothing written. Once
+/// C1 serves gzip it returns at once (C1's own tests take over), so the flag's
+/// flip needs no edit here.
+#[tokio::test]
+async fn a_shim_that_does_not_decode_refuses_an_encoded_part() {
+    use ai_env_cli::wire::s3::{S3Key, SIGNED_HEADERS_GET};
+    use ai_env_cli::wire::workspace::{PartEncoding, PullPart, TranscriptPull};
+    if ai_env_cli::shim::s3xfer::GZIP_SERVED || !ai_env_cli::shim::s3xfer::SERVED {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("vm/Users/agent")).unwrap();
+    let (fake, log) = (root.join("vm-curl"), root.join("curl-vm.log"));
+    curl::install_fake_curl(&fake, &log, &[]);
+    let o = ShimOpts { fs_root: Some(root.join("vm")), home: root.join("vm/Users/agent"), helper: Some(PathBuf::from(bin())), git: git_real().to_path_buf(), curl: fake.clone(), ..opts(None, HookSource::Log, 0) };
+    let s = stack(o).await;
+    s.run(true).await;
+    let decoded = b"{\"n\":1}\n".to_vec();
+    let digest = |b: &[u8]| {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(b))
+    };
+    let (sha, stored_sha) = (digest(decoded.as_slice()), digest(&b"the stored gzip bytes"[..]));
+    let key = S3Key::Mac { session: S8_ID.into(), sha256: stored_sha.clone() }.render();
+    let query = format!(
+        "versionId=fv3&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261017%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261017T101530Z&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={}",
+        SIGNED_HEADERS_GET.replace(';', "%3B"),
+        digest(key.as_bytes())
+    );
+    // The store's bucket of S9's example account (transcript_s3's).
+    let owner = transcript_s3::OWNER.to_string();
+    let url = ai_env_cli::wire::s3::PresignedUrl::new(format!("https://ai-env-transcripts-{owner}.s3.eu-central-1.amazonaws.com/{key}?{query}")).unwrap();
+    let rel = format!("{S8_SLUG}/{S8_ID}.jsonl");
+    let pull = TranscriptPull { rel: rel.clone(), parts: vec![PullPart { url, len: decoded.len() as u64, sha256: Some(sha), encoding: Some(PartEncoding::Gzip) }], sha256: None, owner, proxy: None, share: 1 };
+    pull.check().unwrap_or_else(|e| panic!("the pull itself is well formed: {e}"));
+    let json = serde_json::to_vec(&pull).unwrap();
+    let (st, _, body) = request(s.app, "POST", "/transcript/pull", "Content-Type: application/json\r\n", Some(&json)).await;
+    assert_eq!(st, 400, "{}", String::from_utf8_lossy(&body));
+    let refusal = refusal_of(&body);
+    assert_eq!(refusal.code, "bad_request", "{refusal:?}");
+    assert!(refusal.message.contains("the pull names an encoded part this shim does not decode"), "{refusal:?}");
+    assert!(curl::curl_calls(&log).is_empty(), "no curl ran");
+    assert!(!root.join("vm/Users/agent/.claude/projects").join(&rel).exists(), "nothing written");
 }

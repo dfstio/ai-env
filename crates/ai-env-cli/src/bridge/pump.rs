@@ -1247,6 +1247,15 @@ struct Pump {
     gen_why: String,
     gen_move: Option<MoveWhy>,
     gen_init: bool,
+    /// S11 (A.5): the current generation's CLI answered the host's `initialize` (it read its stdin: past its start).
+    gen_answered: bool,
+    /// S11 (A.5): the current generation's CLI wrote a stdout frame (forwarded, held or swallowed): past its start,
+    /// so its end is never a start-up respawn's (an unknown option and a binary that dies at its load print none).
+    gen_output: bool,
+    /// S11 (A.5): the start-up respawns this process made: `ArgvRetry`s (at most `remote::ARGV_DROP_MAX`) and
+    /// `ClaudeRetry`s (at most `remote::CLAUDE_RETRY_MAX`).
+    argv_retries: usize,
+    claude_retries: usize,
     /// S10: [`RESUME_MISS_GRACE`] after a moved CLI's first answer (to the
     /// replayed `initialize`): with no miss by then it resumed the session,
     /// as at its first init, whichever comes first.
@@ -1514,6 +1523,10 @@ impl Pump {
             gen_why: String::new(),
             gen_move: None,
             gen_init: false,
+            gen_answered: false,
+            gen_output: false,
+            argv_retries: 0,
+            claude_retries: 0,
             move_resumed_by: None,
             parked: false,
             unparking: false,
@@ -1594,7 +1607,7 @@ impl Pump {
         let class = synthetic_answer_class(line);
         s.class = Some(class.clone());
         tracing::info!(class = %class, ms, "synthetic oauth_token_refresh answered (never forwarded)");
-        self.audit("synthetic_oauth", &[("class", class), ("ms", ms.to_string())]);
+        self.audit(crate::bridge::audit::event::SYNTHETIC_OAUTH, &[("class", class), ("ms", ms.to_string())]);
     }
 
     /// Start the next child generation (`why`: the first, or the resume
@@ -1606,12 +1619,17 @@ impl Pump {
         self.state.begin_gen(self.gen);
         // S10: what the generation is, for its `vms` entry and a moved CLI's miss; a new spawn is parked nowhere.
         self.gen_init = false;
+        self.gen_answered = false;
+        self.gen_output = false;
         self.move_resumed_by = None;
         self.parked = false;
         self.unparking = false;
         (self.gen_why, self.gen_move) = match &why {
             StartWhy::First => ("first".to_string(), None),
             StartWhy::ResumeRetry { .. } => ("retry".to_string(), None),
+            // S11 (LD-25): the start-up respawns' `vms[]` and `session_remote_start` words.
+            StartWhy::ArgvRetry { .. } => ("argv_retry".to_string(), None),
+            StartWhy::ClaudeRetry { .. } => ("claude_retry".to_string(), None),
             StartWhy::Move(m) => (m.vms_why(), Some(m.clone())),
         };
         self.child_exit = None;
@@ -1649,7 +1667,7 @@ impl Pump {
                         ("source", "setup-token".to_string()),
                         ("deliver", c.word().to_string()),
                     ];
-                    self.audit("credential_deliver", &detail);
+                    self.audit(crate::bridge::audit::event::CREDENTIAL_DELIVER, &detail);
                 }
                 self.settle_credential(false, "the child started and no retry can respawn it");
                 true
@@ -2083,14 +2101,24 @@ impl Pump {
             return;
         }
         tracing::warn!(gen = self.gen, how, "Anthropic refused the delivered setup-token: stopping the session");
-        self.final_line = Some(Failure::TokenRefused.line());
         let snap = self.links.snapshot();
         let vm = snap.as_ref().and_then(|s| s.vm.clone());
-        let tag = snap
-            .and_then(|s| s.seal)
-            .map(|s| s.tag)
+        let seal = snap.and_then(|s| s.seal);
+        let installed_tag = crate::bridge::agent::credential::seal_tag(&self.sess.paths.setup_token_env());
+        let tag = seal
+            .as_ref()
+            .map(|s| s.tag.clone())
             .or_else(|| vm.as_deref().and_then(|vm| crate::bridge::vm::registry::read_row(&self.sess.paths, vm).ok().flatten()).and_then(|r| r.credential_tag))
-            .or_else(|| crate::bridge::agent::credential::seal_tag(&self.sess.paths.setup_token_env()));
+            .or_else(|| installed_tag.clone());
+        // A1 joint review (J1): the line names the refused seal's account (the live generation's, else the one
+        // `accounts::label` names now), never `creds setup-token` for it, which seals the active account.
+        let account = match (&seal, &tag) {
+            (Some(s), _) => s.account.clone(),
+            (None, Some(t)) => crate::bridge::accounts::label(&self.sess.paths, t),
+            (None, None) => None,
+        };
+        let installed = tag.is_some() && tag == installed_tag;
+        self.final_line = Some(Failure::TokenRefused { account, installed }.line());
         match (&vm, &tag) {
             (Some(vm), Some(tag)) => crate::bridge::agent::credential::record_rejection(&self.sess.paths, vm, tag, how),
             _ => tracing::warn!("the refusal is not recorded: no VM or no seal known"),
@@ -2116,6 +2144,8 @@ impl Pump {
     }
 
     fn on_child_line(&mut self, line: Bytes) {
+        // S11: whatever becomes of it, the CLI printed: it is past its start.
+        self.gen_output = true;
         // Part B: a move's resent line went out under a fresh uuid; its frames come back under the original.
         let line = self.state.restore_resent(&line).unwrap_or(line);
         let frame = claude::classify_child(&line);
@@ -2142,7 +2172,7 @@ impl Pump {
                     }
                 }
                 self.out.oauth_answered += 1;
-                self.audit("oauth_refresh_answered", &[("subtype", sub.clone()), ("gen", self.gen.to_string())]);
+                self.audit(crate::bridge::audit::event::OAUTH_REFRESH_ANSWERED, &[("subtype", sub.clone()), ("gen", self.gen.to_string())]);
                 tracing::info!(subtype = %sub, "answered locally with a null token (never forwarded)");
                 return;
             }
@@ -2212,6 +2242,7 @@ impl Pump {
             self.tell_quiet(None, matches!(frame, ChildFrame::KeepAlive));
         }
         if initialized {
+            self.gen_answered = true;
             if self.kind == LinkKind::Remote && self.out.init_latency_ms.is_none() {
                 // The first answer the host got, whichever generation gave it (a resume miss's retry
                 // answers the replayed request under a fresh id): from T0, as generation 1's above.
@@ -2339,8 +2370,13 @@ impl Pump {
             return;
         };
         let now = crate::wire::time::unix_now();
-        let others = usage::others(&state, &name, now);
-        let note = usage::note_usage_limit(&name, hit, &others, self.out.session_id.as_deref(), now);
+        // A1 joint review (J4, F1): never an account `creds account use` refuses (a refused seal, or any while the
+        // refusal record cannot be read); `session migrate` only where `on_migrate` would take it.
+        let refused = crate::bridge::agent::credential::rejected_tags(&self.sess.paths).ok();
+        let others = usage::others_usable(&state, &name, now, refused.as_ref());
+        let pinned = self.links.snapshot().and_then(|s| s.pinned).is_some();
+        let session = self.out.session_id.as_deref().filter(|_| !pinned && !self.sess.session.no_session_persistence);
+        let note = usage::note_usage_limit(&name, hit, &others, session, now);
         self.note(&note);
     }
 
@@ -2408,7 +2444,9 @@ impl Pump {
     /// (the transcript restored into the VM from S3), generation 1, no init
     /// forwarded.
     fn retry_possible(&self) -> bool {
-        matches!(self.sess.mode, Mode::LocalScratch | Mode::Remote) && self.gen == 1 && self.retries == 0 && self.plan.resume.is_some() && self.state.inits_forwarded() == 0
+        // S11 (LD-26): generation 1, or a start-up respawn of it (each one generation more).
+        let first = 1 + u32::try_from(self.argv_retries + self.claude_retries).unwrap_or(u32::MAX);
+        matches!(self.sess.mode, Mode::LocalScratch | Mode::Remote) && self.gen == first && self.retries == 0 && self.plan.resume.is_some() && self.state.inits_forwarded() == 0
     }
 
     /// May a `system/init` naming `id` make it this session's (its registry
@@ -2557,6 +2595,8 @@ impl Pump {
         self.in_q.clear();
         self.held_end_at = None;
         let closing = self.close_requested || self.finish.is_some() || self.ladder.is_some();
+        // S11 (A.5): a held miss is the miss's to handle, never a start-up respawn's.
+        let held = self.held_miss.is_some();
         // S10: a moved CLI that ended on its own before it showed it resumed, with no error result held (a start-up
         // refusal on stderr alone: `--session-id`'s `is already in use`), did not resume the session either.
         let unresumed = self.move_unconfirmed()
@@ -2630,6 +2670,9 @@ impl Pump {
                 // A1: a turn's result all the same (a usage limit before the CLI's init, say).
                 self.on_turn_result(&held, is_error);
             }
+        }
+        if !held && self.start_up_respawn(code, closing) {
+            return;
         }
         if unresumed {
             let how = match (code, signal) {
@@ -2746,10 +2789,10 @@ impl Pump {
         if self.kind == LinkKind::Remote {
             if self.links.snapshot().and_then(|s| s.transcript) == Some(TranscriptOutcome::NothingToRestore.word()) {
                 tracing::warn!("resume miss for {resume}: no transcript in S3 or on this Mac to restore");
-                self.audit("resume_seed_miss", &[("session_id", resume.clone()), ("reason", "nothing to restore".to_string())]);
+                self.audit(crate::bridge::audit::event::RESUME_SEED_MISS, &[("session_id", resume.clone()), ("reason", "nothing to restore".to_string())]);
                 return false;
             }
-            self.audit("resume_seed_retry", &[("session_id", resume.clone()), ("source", "s3".to_string())]);
+            self.audit(crate::bridge::audit::event::RESUME_SEED_RETRY, &[("session_id", resume.clone()), ("source", "s3".to_string())]);
             return self.respawn_and_replay(resume);
         }
         let detail: Vec<(&str, String)> = match seed_from_mac(&self.sess, &self.plan, &resume, true) {
@@ -2764,16 +2807,16 @@ impl Pump {
             SeedOutcome::KeptNewer(path) => vec![("session_id", resume.clone()), ("source", path.display().to_string()), ("files", "0".to_string()), ("bytes", "0".to_string()), ("kept", "scratch copy".to_string())],
             SeedOutcome::NoSource => {
                 tracing::warn!("resume miss for {resume}: no local transcript to seed from");
-                self.audit("resume_seed_miss", &[("session_id", resume.clone()), ("reason", "no local transcript".to_string())]);
+                self.audit(crate::bridge::audit::event::RESUME_SEED_MISS, &[("session_id", resume.clone()), ("reason", "no local transcript".to_string())]);
                 return false;
             }
             SeedOutcome::Failed(reason) => {
                 tracing::warn!("resume miss for {resume}: seeding failed: {reason}");
-                self.audit("resume_seed_failed", &[("session_id", resume.clone()), ("reason", reason)]);
+                self.audit(crate::bridge::audit::event::RESUME_SEED_FAILED, &[("session_id", resume.clone()), ("reason", reason)]);
                 return false;
             }
         };
-        self.audit("resume_seed_retry", &detail);
+        self.audit(crate::bridge::audit::event::RESUME_SEED_RETRY, &detail);
         self.respawn_and_replay(resume)
     }
 
@@ -2790,6 +2833,75 @@ impl Pump {
         self.out.respawns += 1;
         self.replay_into_new_gen(false);
         true
+    }
+
+    /// S11 (A.5, L1): a generation that is no move's ended before its start (its CLI wrote nothing on stdout: no
+    /// answer to the host's `initialize`, swallowed or not, no init, no result such as a forwarded resume miss; its
+    /// code not 0) with nothing closing (no host EOF or signal, no loss, no
+    /// start failure, no detach, no finish decided) respawns on the same VM with no Touch ID: (a) its CLI refused an
+    /// option the session may drop (`RemoteSnapshot::start_refusal`), fewer than `ARGV_DROP_MAX` dropped so far:
+    /// `ArgvRetry` (`argv_dropped` audited once per flag and claude version); (b) else, it ran a cached claude
+    /// (`RemoteSnapshot::claude_sha256`) and no claude retry ran: `ClaudeRetry`. Each counts in `respawns`, the host
+    /// state replayed. `true`: respawned (or its start failed, the finish decided).
+    fn start_up_respawn(&mut self, code: Option<i32>, closing: bool) -> bool {
+        let nothing_closing = !closing && !self.host_gone && self.link_loss.is_none() && self.start_failure.is_none() && !self.detached && self.finish_after_child.is_none();
+        if self.kind != LinkKind::Remote || self.gen_move.is_some() || !nothing_closing || self.gen_answered || self.gen_init || self.gen_output || code == Some(0) {
+            return false;
+        }
+        let Some(snap) = self.links.snapshot() else { return false };
+        let init_answered = self.out.init_latency_ms.is_some();
+        let refused = snap.start_refusal.as_ref().map(|crate::bridge::remote::link::StartRefusal::UnknownOption { flag, droppable }| (flag.clone(), *droppable));
+        if let Some((flag, droppable)) = refused {
+            if droppable && self.argv_retries < crate::bridge::remote::ARGV_DROP_MAX {
+                self.argv_retries += 1;
+                self.audit_argv_dropped(&flag, &snap);
+                tracing::warn!(gen = self.gen, flag = %flag, "the CLI refused an option at its start: respawning without it");
+                if self.spawn_next(StartWhy::ArgvRetry { flag, init_answered }) {
+                    self.out.respawns += 1;
+                    self.replay_into_new_gen(false);
+                }
+                return true;
+            }
+            // (b) still holds: a cached claude that refused it gives way to the next best, which may know the flag.
+            tracing::warn!(gen = self.gen, flag = %flag, droppable, dropped = self.argv_retries, "the CLI refused an option this session cannot drop");
+        }
+        let Some(bad) = snap.claude_sha256.clone() else { return false };
+        if self.claude_retries >= crate::bridge::remote::CLAUDE_RETRY_MAX {
+            return false;
+        }
+        self.claude_retries += 1;
+        tracing::warn!(gen = self.gen, claude = snap.claude.as_deref().unwrap_or("unknown"), "a cached claude ended before its init: respawning on the next best");
+        if self.spawn_next(StartWhy::ClaudeRetry { bad_sha256: bad, init_answered }) {
+            self.out.respawns += 1;
+            self.replay_into_new_gen(false);
+        }
+        true
+    }
+
+    /// `argv_dropped`, once per flag and claude version on this Mac (the empty marker
+    /// `state/argv-dropped/<claude>/<flag>`, `audit_auth_timers`' pattern): the refused flag, the claude that
+    /// refused it, the generation, the session, the VM and V.
+    fn audit_argv_dropped(&self, flag: &str, snap: &RemoteSnapshot) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let claude = snap.claude.clone().unwrap_or_else(|| "unknown".to_string());
+        let plain = |s: &str| !s.is_empty() && s.len() <= 64 && !s.starts_with('.') && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'));
+        if plain(&claude) && plain(flag) {
+            let marker = self.sess.paths.argv_dropped_marker(&claude, flag);
+            let made = marker
+                .parent()
+                .map_or(Ok(()), |dir| registry::ensure_private_dir(dir.parent().unwrap_or(dir)).and_then(|()| registry::ensure_private_dir(dir)).map_err(|e| std::io::Error::other(e.to_string())))
+                .and_then(|()| std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&marker));
+            match made {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return,
+                Err(e) => tracing::warn!("{}: no marker for {flag} on claude {claude} ({e}): audited anyway", audit_event::ARGV_DROPPED),
+            }
+        }
+        let mut pairs = vec![("flag", flag.to_string()), ("claude", claude), ("gen", self.gen.to_string())];
+        pairs.extend(self.plan.resume.clone().map(|s| ("session", s)));
+        pairs.extend(snap.vm.clone().map(|v| ("vm", v)));
+        pairs.extend(self.sess.start_row.ext.clone().map(|e| ("ext", e)));
+        self.audit(audit_event::ARGV_DROPPED, &pairs);
     }
 
     /// The host's state into the generation just started (a resume miss's
@@ -3673,7 +3785,7 @@ impl Pump {
             s.class = Some("none".into());
             let wait_ms = s.wait.as_millis() as u64;
             tracing::info!(wait_ms, "synthetic oauth_token_refresh: no answer within the wait");
-            self.audit("synthetic_oauth", &[("class", "none".to_string()), ("ms", wait_ms.to_string())]);
+            self.audit(crate::bridge::audit::event::SYNTHETIC_OAUTH, &[("class", "none".to_string()), ("ms", wait_ms.to_string())]);
         }
         // A1: the usage tap's pending observations, once due.
         self.usage_flush(now, false);
@@ -3682,7 +3794,7 @@ impl Pump {
             if self.state.replaying() {
                 let errors = self.state.replay_expired();
                 tracing::warn!("respawned child did not answer the replay within {:?}", self.replay_deadline_len());
-                self.audit("replay_timeout", &[("failed", errors.len().to_string()), ("gen", self.gen.to_string())]);
+                self.audit(crate::bridge::audit::event::REPLAY_TIMEOUT, &[("failed", errors.len().to_string()), ("gen", self.gen.to_string())]);
                 for e in errors {
                     self.forward(&e);
                 }
@@ -4215,7 +4327,7 @@ pub fn scratch_login(sess: &Session, env: &dyn Fn(&str) -> Option<OsString>, use
         Err(e) => format!("exit {}", e.exit_code()),
     };
     let detail = [("for", "local-scratch".to_string()), ("source", "setup-token".to_string()), ("ms", elapsed.as_millis().to_string()), ("outcome", outcome)];
-    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new("credential_unseal", None, audit::detail(&detail))) {
+    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(crate::bridge::audit::event::CREDENTIAL_UNSEAL, None, audit::detail(&detail))) {
         tracing::warn!("audit credential_unseal: {e}");
     }
     match unsealed {
@@ -6051,6 +6163,328 @@ mod tests {
             });
         }
 
+        /// S11 (A.5): generation 1 refusing an option at its start: what the link's snapshot says of it.
+        fn refuse(hand: &Rc<RefCell<Hand>>, flag: &str, droppable: bool) {
+            let mut h = hand.borrow_mut();
+            h.snap.claude = Some("2.1.310".into());
+            h.snap.start_refusal = Some(crate::bridge::remote::link::StartRefusal::UnknownOption { flag: flag.into(), droppable });
+        }
+
+        /// A new generation's snapshot: what the link resets at its hand-over (its start-up's refusal and claude).
+        fn handed_over(hand: &Rc<RefCell<Hand>>) {
+            let mut h = hand.borrow_mut();
+            h.snap.start_refusal = None;
+            h.snap.claude_sha256 = None;
+        }
+
+        fn argv_retry(flag: &str) -> StartWhy {
+            StartWhy::ArgvRetry { flag: flag.into(), init_answered: false }
+        }
+
+        /// The `argv_dropped` rows of the pump's audit file.
+        fn argv_dropped_rows(pump: &Pump) -> Vec<Value> {
+            let text = std::fs::read_to_string(pump.sess.paths.audit()).unwrap_or_default();
+            text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|r| r["event"] == "argv_dropped").collect()
+        }
+
+        /// S11 (A.5, L1): generation 1 refuses an option before it reads its stdin (the link's `start_refusal`,
+        /// droppable): an `ArgvRetry` on the same VM, the host's state replayed (the `initialize` under a fresh id),
+        /// its answer the host's first; one respawn, `argv_dropped` audited, the session goes on.
+        #[test]
+        fn an_unknown_option_respawns_with_it_dropped() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                refuse(&hand, "--from-the-future", true);
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First, argv_retry("--from-the-future")]);
+                handed_over(&hand);
+                gen2.started().await;
+                let replayed = gen2.next_input().await.expect("the replayed initialize");
+                let v: Value = serde_json::from_str(&replayed).unwrap();
+                assert_eq!(v["request"]["subtype"], "initialize");
+                let fresh = v["request_id"].as_str().unwrap().to_string();
+                assert_ne!(fresh, "i1");
+                gen2.line(&answer(&fresh, r#"{"pid":4242}"#)).await;
+                gen2.line(&init_frame(SID)).await;
+                host.wait_for("the init", |v| v["type"] == "system").await;
+                host.eof().await;
+                assert_eq!(gen2.next_input().await, None);
+                gen2.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                let answers: Vec<Value> = host.json().into_iter().filter(|v| v["type"] == "control_response").collect();
+                assert_eq!(answers.len(), 1, "{answers:?}");
+                assert_eq!(answers[0]["response"]["request_id"], "i1");
+                let rows = argv_dropped_rows(&pump);
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert_eq!((rows[0]["detail"]["flag"].as_str(), rows[0]["detail"]["claude"].as_str(), rows[0]["detail"]["gen"].as_str()), (Some("--from-the-future"), Some("2.1.310"), Some("1")));
+                assert_eq!(pump.conclude(code).respawns, 1);
+            });
+        }
+
+        /// `ARGV_DROP_MAX` (3) flags per wrapper: three refusals respawn, the fourth ends the chat with the CLI's
+        /// exit; one `argv_dropped` row per flag.
+        #[test]
+        fn three_unknown_options_then_the_fourth_fails() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                host.send(INIT).await;
+                let flags = ["--one", "--two", "--three", "--four"];
+                for flag in flags {
+                    let mut gen = far(&hand).await;
+                    handed_over(&hand);
+                    gen.started().await;
+                    assert!(gen.next_input().await.is_some(), "the initialize, or its replay");
+                    refuse(&hand, flag, true);
+                    gen.exit(1).await;
+                }
+                let (code, mut pump) = ended(task).await;
+                assert_eq!((code, pump.finish.map(|f| f.1)), (1, Some(EndReason::ChildExit)));
+                let whys = hand.borrow().whys.clone();
+                assert_eq!(whys, [StartWhy::First, argv_retry("--one"), argv_retry("--two"), argv_retry("--three")]);
+                let flags_audited: Vec<String> = argv_dropped_rows(&pump).iter().map(|r| r["detail"]["flag"].as_str().unwrap().to_string()).collect();
+                assert_eq!(flags_audited, ["--one", "--two", "--three"]);
+                assert_eq!(pump.conclude(code).respawns, 3);
+            });
+        }
+
+        /// A flag the link judged not droppable (a session flag of `argv::NEVER_DROP`, or one no longer in the
+        /// argv) is never dropped: the chat ends with the CLI's exit, no respawn, no row.
+        #[test]
+        fn a_session_flag_is_never_dropped() {
+            for flag in ["--resume", "--permission-mode", "--gone-already"] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let gen1 = far(&hand).await;
+                    gen1.started().await;
+                    host.send(INIT).await;
+                    refuse(&hand, flag, false);
+                    gen1.exit(1).await;
+                    let (code, pump) = ended(task).await;
+                    assert_eq!(code, 1, "{flag}");
+                    assert_eq!(hand.borrow().whys, [StartWhy::First], "{flag}");
+                    assert!(argv_dropped_rows(&pump).is_empty(), "{flag}");
+                });
+            }
+            assert!(crate::wire::argv::drop_option(&["claude".into(), "--resume".into(), "x".into()], "--resume").is_none(), "what the link asks");
+        }
+
+        /// §4.4 (b) after (a): a cached claude refusing what the session cannot drop (a session flag, or a fourth
+        /// flag past `ARGV_DROP_MAX`) gives way once to the next best claude (`ClaudeRetry` naming it bad), which
+        /// may know the flag; nothing more is dropped.
+        #[test]
+        fn a_cached_claude_refusing_what_cannot_be_dropped_respawns_on_the_next_best() {
+            let bad = "b".repeat(64);
+            let claude_retry = StartWhy::ClaudeRetry { bad_sha256: bad.clone(), init_answered: false };
+            for fourth in [false, true] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    host.send(INIT).await;
+                    let flags: &[(&str, bool)] = if fourth { &[("--one", true), ("--two", true), ("--three", true), ("--four", true)] } else { &[("--resume", false)] };
+                    for (i, (flag, droppable)) in flags.iter().enumerate() {
+                        let mut gen = far(&hand).await;
+                        handed_over(&hand);
+                        gen.started().await;
+                        assert!(gen.next_input().await.is_some(), "the initialize, or its replay");
+                        refuse(&hand, flag, *droppable);
+                        if i + 1 == flags.len() {
+                            hand.borrow_mut().snap.claude_sha256 = Some(bad.clone());
+                        }
+                        gen.exit(1).await;
+                    }
+                    let mut next = far(&hand).await;
+                    let mut want = vec![StartWhy::First];
+                    if fourth {
+                        want.extend(["--one", "--two", "--three"].map(argv_retry));
+                    }
+                    want.push(claude_retry.clone());
+                    assert_eq!(hand.borrow().whys, want, "fourth: {fourth}");
+                    handed_over(&hand);
+                    next.started().await;
+                    assert!(next.next_input().await.is_some(), "the replayed initialize");
+                    next.exit(1).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!(code, 1);
+                    assert_eq!(argv_dropped_rows(&pump).len(), if fourth { 3 } else { 0 });
+                    assert_eq!(pump.conclude(code).respawns, if fourth { 4 } else { 1 });
+                });
+            }
+        }
+
+        /// A cached claude (the link's `claude_sha256`) that ended before its init: one `ClaudeRetry` naming it
+        /// bad, on the same VM; a second such end is the chat's (`CLAUDE_RETRY_MAX`).
+        #[test]
+        fn a_cached_claude_dead_before_init_respawns_on_the_next_best() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                let bad = "b".repeat(64);
+                hand.borrow_mut().snap.claude_sha256 = Some(bad.clone());
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::ClaudeRetry { bad_sha256: bad.clone(), init_answered: false }]);
+                gen2.started().await;
+                assert!(gen2.next_input().await.is_some(), "the replayed initialize");
+                // The next best is a cached one too, and dies as well: no second claude retry.
+                gen2.exit(1).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 1);
+                assert_eq!(hand.borrow().whys.len(), 2);
+                assert_eq!(pump.conclude(code).respawns, 1);
+            });
+        }
+
+        /// A-CONT-1: a CLI that printed anything on stdout is past its start, whatever cached claude ran: a resume
+        /// miss forwarded by the miss's retry (its one retry spent), or a retry whose answer to the replayed
+        /// `initialize` was swallowed (the host had its own), ends the chat with the CLI's exit; no `ClaudeRetry`.
+        #[test]
+        fn a_cli_that_printed_is_never_a_start_up_respawn() {
+            for answered in [false, true] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={SID}");
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    host.send(INIT).await;
+                    assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                    if answered {
+                        gen1.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                        host.wait_for("the answer", |v| v["type"] == "control_response").await;
+                    }
+                    let miss = format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#);
+                    gen1.line(&miss).await;
+                    gen1.exit(1).await;
+                    let mut gen2 = far(&hand).await;
+                    assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::ResumeRetry { session_id: SID.to_string(), init_answered: answered }]);
+                    handed_over(&hand);
+                    gen2.started().await;
+                    let replayed = gen2.next_input().await.expect("the replayed initialize");
+                    let fresh = serde_json::from_str::<Value>(&replayed).unwrap()["request_id"].as_str().unwrap().to_string();
+                    // The retry runs a cached claude.
+                    hand.borrow_mut().snap.claude_sha256 = Some("b".repeat(64));
+                    if answered {
+                        gen2.line(&answer(&fresh, r#"{"pid":4242}"#)).await;
+                    } else {
+                        gen2.line(&miss).await;
+                        host.wait_for("the second miss", |v| v["type"] == "result").await;
+                    }
+                    gen2.exit(1).await;
+                    let (code, mut pump) = ended(task).await;
+                    assert_eq!(code, 1, "answered: {answered}");
+                    assert_eq!(hand.borrow().whys.len(), 2, "no ClaudeRetry: {:?}", hand.borrow().whys);
+                    assert_eq!(pump.conclude(code).respawns, 1, "answered: {answered}");
+                });
+            }
+        }
+
+        /// Nothing respawns a CLI the session is closing: the host's EOF (or a signal) before the start-up end
+        /// keeps the CLI's own exit, whatever the snapshot says; a CLI past its start (it answered `initialize`)
+        /// is never a start-up's either.
+        #[test]
+        fn a_closing_session_never_respawns_for_claude() {
+            for eof in [true, false] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    host.send(INIT).await;
+                    assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                    {
+                        let mut h = hand.borrow_mut();
+                        h.snap.claude_sha256 = Some("b".repeat(64));
+                    }
+                    refuse(&hand, "--from-the-future", true);
+                    if eof {
+                        host.eof().await;
+                        assert_eq!(gen1.next_input().await, None);
+                    } else {
+                        host.signal(HostSignal::Term);
+                        assert_eq!(gen1.next_signal().await, Some(Sig::Term));
+                    }
+                    gen1.exit(1).await;
+                    let (_, pump) = ended(task).await;
+                    assert_eq!(hand.borrow().whys, [StartWhy::First], "eof {eof}");
+                    assert!(argv_dropped_rows(&pump).is_empty());
+                });
+            }
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                gen1.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                host.wait_for("the answer", |v| v["type"] == "control_response").await;
+                hand.borrow_mut().snap.claude_sha256 = Some("b".repeat(64));
+                gen1.exit(1).await;
+                let (code, _) = ended(task).await;
+                assert_eq!((code, hand.borrow().whys.clone()), (1, vec![StartWhy::First]), "past its start: the CLI's end");
+            });
+        }
+
+        /// LD-26: a resume miss after a start-up respawn still gets its retry: generation 2 is generation 1's
+        /// respawn, so its miss is held and retried as generation 1's would be.
+        #[test]
+        fn a_resume_miss_after_an_argv_retry_still_retries() {
+            let d = tempfile::tempdir().unwrap();
+            on_local(async {
+                let resume = format!("--resume={SID}");
+                let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                let task = supervise(pump, io);
+                let mut gen1 = far(&hand).await;
+                gen1.started().await;
+                host.send(INIT).await;
+                assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                refuse(&hand, "--from-the-future", true);
+                gen1.exit(1).await;
+                let mut gen2 = far(&hand).await;
+                handed_over(&hand);
+                gen2.started().await;
+                assert!(gen2.next_input().await.is_some(), "the replayed initialize");
+                let miss = format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#);
+                gen2.line(&miss).await;
+                gen2.exit(1).await;
+                let mut gen3 = far(&hand).await;
+                assert_eq!(hand.borrow().whys, [StartWhy::First, argv_retry("--from-the-future"), StartWhy::ResumeRetry { session_id: SID.to_string(), init_answered: false }]);
+                gen3.started().await;
+                let replayed = gen3.next_input().await.expect("the replayed initialize");
+                let fresh = serde_json::from_str::<Value>(&replayed).unwrap()["request_id"].as_str().unwrap().to_string();
+                gen3.line(&answer(&fresh, r#"{"pid":4242}"#)).await;
+                gen3.line(&init_frame(SID)).await;
+                host.wait_for("the init", |v| v["type"] == "system").await;
+                host.eof().await;
+                assert_eq!(gen3.next_input().await, None);
+                gen3.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0);
+                assert!(!host.json().iter().any(|v| v["type"] == "result"), "the miss never reached the host");
+                assert_eq!(pump.conclude(code).respawns, 2);
+            });
+        }
+
         /// S8 phase 4 (TIMING-3): a miss after generation 1 answered the
         /// host's `initialize` (the CLI read a user line first) starts the
         /// retry `init_answered`: Cursor's 60 s window is over, so its start
@@ -6270,12 +6704,12 @@ mod tests {
                 far.send(ChildEvent::Detached).await;
                 let (code, mut pump) = ended(task).await;
                 assert_eq!((code, pump.finish.map(|f| f.1)), (5, Some(EndReason::CredentialRejected)));
-                assert_eq!(pump.final_line.as_deref(), Some(Failure::TokenRefused.line().as_str()));
+                assert_eq!(pump.final_line.as_deref(), Some(Failure::TokenRefused { account: None, installed: true }.line().as_str()), "no account: today's line");
                 let refused = crate::bridge::agent::credential::read_rejection(&paths, &tag).unwrap().expect("the seal is recorded as refused");
                 assert_eq!(refused.vm, "microvm-1");
                 pump.conclude(code);
                 assert!(end_note(&pump).contains("end:credential_rejected"));
-                assert_eq!(REJECTED_STATUS, Failure::TokenRefused.exit_code());
+                assert_eq!(REJECTED_STATUS, Failure::TokenRefused { account: None, installed: true }.exit_code());
             });
         }
 
@@ -6314,6 +6748,11 @@ mod tests {
                 for (tag, refused) in [(live.tag.clone(), true), ("c".repeat(16), false), (crate::bridge::agent::credential::seal_tag(&paths.setup_token_env()).unwrap(), false)] {
                     assert_eq!(crate::bridge::agent::credential::read_rejection(&paths, &tag).unwrap().is_some(), refused, "{tag}");
                 }
+                // A1 joint review (J1): the line names the refused account and its own fix, never `creds setup-token`
+                // (which would seal into the installed account), nor `use OTHER` (another account is installed).
+                let line = pump.final_line.clone().unwrap_or_default();
+                assert_eq!(line, Failure::TokenRefused { account: Some("work".into()), installed: false }.line());
+                assert!(line.contains("Claude account work's token") && line.contains("`ai-env creds account add work`") && !line.contains("creds setup-token") && !line.contains("account use"), "{line}");
                 pump.conclude(code);
                 let row = registry_row(&pump, SID);
                 assert_eq!((row.vms[0]["tag"].as_str(), row.vms[0]["account"].as_str()), (Some(live.tag.as_str()), Some("work")), "{:?}", row.vms);
@@ -6513,6 +6952,47 @@ mod tests {
                 assert!(usage_of(&paths, "default").is_some_and(|r| r.limited.is_some()), "the second answer after the limit wrote nothing");
                 assert!(end_note(&pump).contains("; usage_limited:1"), "{}", end_note(&pump));
             });
+        }
+
+        /// A1 joint review (J4, F1): the note never offers an account `creds
+        /// account use` refuses (`spare`'s seal refused: every other one is
+        /// limited or refused), nor `session migrate` for a chat a migration
+        /// refuses (a pinned one: the reopen alone).
+        #[test]
+        fn a_usage_limit_note_offers_no_refused_account_nor_a_refused_move() {
+            for case in ["refused", "pinned"] {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    accounts_and_seal(&paths, &hand, &"a".repeat(16));
+                    if case == "refused" {
+                        crate::bridge::agent::credential::record_rejection(&paths, "microvm-1", &"b".repeat(16), "text");
+                    } else {
+                        hand.borrow_mut().snap.pinned = Some("microvm-1".into());
+                    }
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    let limit = include_str!("../../tests/fixtures/claude/usage-limit-result-2.1.305.json").trim_end().to_string();
+                    far.line(&limit).await;
+                    let note = host.wait_for("the note", |v| v["subtype"] == "informational").await;
+                    let head = "ai-env: account default hit its weekly limit (it resets 10am (UTC)); ";
+                    let want = if case == "refused" {
+                        format!("{head}every other account is limited or refused, as far as ai-env knows: ai-env creds account check measures them")
+                    } else {
+                        format!("{head}to go on now with account spare (its limits are unknown: ai-env creds account check): ai-env creds account use spare, then reopen this chat")
+                    };
+                    assert_eq!(note["content"].as_str(), Some(want.as_str()), "{case}");
+                    host.eof().await;
+                    far.exit(0).await;
+                    let (code, _) = ended(task).await;
+                    assert_eq!(code, 0, "{case}");
+                });
+            }
         }
 
         /// A remote session's registry row and census end row come from its

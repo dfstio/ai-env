@@ -17,11 +17,12 @@ use super::common::Harness;
 use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_ok, git_out, target, FakeVm, Tokens, World};
 use ai_env_cli::bridge::agent::AgentTarget;
 use ai_env_cli::bridge::api::{AuthToken, Call, TOKEN_HEADER};
-use ai_env_cli::bridge::codeout::{fetch_smart_http, CodeoutCtx, FetchOpts, BOX_REFS};
+use ai_env_cli::bridge::codeout::{fetch, fetch_smart_http, CodeoutCtx, FetchOpts, BOX_REFS};
 use ai_env_cli::bridge::dataplane::{verdict_cap, DpReply, HttpsEndpoint, Verdict};
 use ai_env_cli::bridge::errors::BridgeError;
 use ai_env_cli::bridge::gitsmart::{parse_pkt, GitHttp, Pkt};
 use ai_env_cli::bridge::lab::VmKnobs;
+use ai_env_cli::bridge::workspace::rows;
 use ai_env_cli::bridge::workspace::{ensure_workspace, resolve, SeedProgress, SeedWant};
 use ai_env_cli::errors::CliError;
 use ai_env_cli::wire::frame::CAP_GIT_HTTP_V1;
@@ -492,6 +493,78 @@ async fn a_smart_http_fetch_takes_only_refs_that_name_a_commit() {
     assert!(matches!(&e, BridgeError::WorkspaceRefused { code, message } if *code == refusal::NOT_SEEDED && message.contains("names a tree")), "{e:?}");
     assert_eq!(exit(e), 9);
     assert_eq!(repo.git(&["for-each-ref", "--format=%(refname)", "refs/remotes/"]), format!("{BOX_REFS}main"), "no box/HEAD");
+}
+
+/// S11 (C.1.3): a smart-HTTP fetch whose listed tips the haves all hold asks
+/// for no pack and takes the listing as a manifest without one. The first,
+/// nothing changed since the seed, records the VM's HEAD on `main` (S10 said
+/// nothing new and recorded nothing); after `git checkout -b topic` the
+/// record follows the VM's branch, `box/topic` promoted at the commit the
+/// Mac holds; asked again unchanged, nothing is new. No `fetch` request
+/// goes out, only `ls-refs`; the audit says `promoted`, `promoted`, then
+/// `nothing_new`.
+#[tokio::test]
+async fn a_smart_http_fetch_with_every_tip_had_moves_the_record() {
+    let w = World::new();
+    let repo = w.repo("app");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let vm = FakeVm::new(&w.root.join("vm"), &w.root.join("vm-projects"));
+    let (fake_api, t, c) = (api().await, target(), caps());
+    let progress = |_: SeedProgress| {};
+    ensure_workspace(&ensure_ctx(&fake_api, &vm, &paths, &cfg, &t, &c, &ws, &progress), None, SeedWant::Auto).await.unwrap();
+    let base = repo.head();
+    let transport = Arc::new(UploadPackVm::new(&vm.dir));
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: transport.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
+    let opts = FetchOpts { wip: false, max_bytes: 1 << 20 };
+    let record = || rows::row_of(&paths, &ws).unwrap().and_then(|r| r.vm.get(super::fixture::VM).and_then(|e| e.fetched.clone())).map(|f| (f.head, f.branch));
+    let first = fetch_smart_http(&ctx, opts).await.unwrap();
+    assert!(first.ok && first.bytes == 0, "{first:?}");
+    assert_eq!(first.promoted, BTreeMap::from([(format!("{BOX_REFS}main"), base.clone())]));
+    assert_eq!(record(), Some((base.clone(), Some("main".to_string()))), "the VM's HEAD on main, recorded");
+    git(&vm.dir, &["checkout", "-q", "-b", "topic"]);
+    let second = fetch_smart_http(&ctx, opts).await.unwrap();
+    assert!(second.ok && second.bytes == 0, "{second:?}");
+    assert_eq!(second.promoted.get(&format!("{BOX_REFS}topic")), Some(&base), "{second:?}");
+    assert_eq!(record(), Some((base.clone(), Some("topic".to_string()))), "the record follows the VM's branch");
+    let third = fetch_smart_http(&ctx, opts).await.unwrap();
+    assert!(third.ok && third.promoted.is_empty() && third.bytes == 0, "{third:?}");
+    assert_eq!(record(), Some((base.clone(), Some("topic".to_string()))));
+    let posts = transport.posts();
+    assert_eq!(posts.len(), 3, "ls-refs alone, each time");
+    assert!(posts.iter().all(|p| lines(p).iter().any(|l| l == "command=ls-refs")), "no fetch wants what the Mac holds");
+    assert_eq!(fetch_rows(&paths.audit()), [row("promoted", "0"), row("promoted", "0"), row("nothing_new", "-")]);
+    assert_eq!(repo.git(&["rev-parse", "main"]), base, "the Mac's branch did not move");
+}
+
+/// S11 (C.1.3; the review's C2-R1): a smart-HTTP fetch says nothing of the
+/// VM's worktree (`manifest_only` is handed no snapshot). After a `--wip`
+/// code-out recorded the VM's snapshot, a branch made with the worktree
+/// still dirty moves the record to that branch and keeps the snapshot,
+/// whose first parent is still the HEAD.
+#[tokio::test]
+async fn a_smart_http_fetch_keeps_the_records_snapshot_at_the_same_head() {
+    let w = World::new();
+    let repo = w.repo("app");
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let vm = Arc::new(FakeVm::new(&w.root.join("vm"), &w.root.join("vm-projects")));
+    let (fake_api, t, c) = (api().await, target(), caps());
+    let progress = |_: SeedProgress| {};
+    ensure_workspace(&ensure_ctx(&fake_api, &vm, &paths, &cfg, &t, &c, &ws, &progress), None, SeedWant::Auto).await.unwrap();
+    let base = repo.head();
+    std::fs::write(vm.dir.join("edit.txt"), "the agent's edit\n").unwrap();
+    let codeout = CodeoutCtx { api: Arc::new(api().await), dp: vm.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
+    fetch(&codeout, FetchOpts::per_result(&cfg)).await.unwrap();
+    let record = || rows::row_of(&paths, &ws).unwrap().and_then(|r| r.vm.get(super::fixture::VM).and_then(|e| e.fetched.clone())).map(|f| (f.head, f.branch, f.wip));
+    let snapshot = record().and_then(|r| r.2).expect("the snapshot recorded");
+    git(&vm.dir, &["checkout", "-q", "-b", "topic"]);
+    let transport = Arc::new(UploadPackVm::new(&vm.dir));
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: transport.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
+    let report = fetch_smart_http(&ctx, FetchOpts { wip: false, max_bytes: 1 << 20 }).await.unwrap();
+    assert!(report.ok && report.bytes == 0 && report.promoted.get(&format!("{BOX_REFS}topic")) == Some(&base), "{report:?}");
+    assert_eq!(transport.posts().len(), 1, "ls-refs alone");
+    assert_eq!(record(), Some((base.clone(), Some("topic".to_string()), Some(snapshot))), "the branch recorded, the snapshot kept");
 }
 
 // ---- `ai-env box fetch` through the endpoint and the native shim ----

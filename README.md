@@ -160,6 +160,17 @@ ai-env infra  pin [--manifest FILE | --check-bundle | --bundle-version] [--lock 
 ai-env infra  status [--write] [--stack dev] [--cwd infra]          # Pulumi outputs + a live image read → bridge.toml [aws] + state/infra.toml
 ai-env infra  base-image [--name al2023-1] [--version 1]  # the pinned managed base image is AVAILABLE
 ai-env infra  versions-diff --before F --after F [--record-probe]   # image versions around a deploy (bridge feature)
+ai-env claude status [--json] | admit [VERSION] [--redo] [--json] | stage [VERSION] [--force] [--json] | update [VERSION] [--json]   # the Claude Code
+                                                          #   versions VMs follow (S11): phases, no Touch ID / admit: signature, binary, markers,
+                                                          #   Docker tests, no Touch ID / stage in S3 through a credential-less VM, one Touch ID / both
+ai-env claude forget VERSION [--local] [--force] | gc [--yes] [--json]   # one version's S3 object (one Touch ID), binary and record /
+                                                          #   keep the 3 newest staged, the bundle's and the live windows' (--yes: one Touch ID)
+ai-env audit  tail [-n N] [-f] [--session UUID] [--vm ID] [--event E,…] [--actor cli|wrapper|panel] [--since WHEN] [--where K=V]… [--json] | grep PATTERN [-i] [the same filters] [--json]
+                                                          #   audit.jsonl's rows, followed with -f / holding a fixed string, exit 1 when none (S11; no AWS, no Touch ID)
+ai-env cost   [--since WHEN] [--until WHEN] [--by day] [--json] [--compare FILE]   # the MicroVMs' and the proxy's cost rebuilt from the audit,
+                                                          #   a range; --compare judges it against Cost Explorer's (S11; no AWS, no Touch ID)
+ai-env panel  serve [--port N] [--bind 127.0.0.1]        # the local control panel on 127.0.0.1, its URL holding this run's bearer; one Touch ID
+                                                          #   per action ([panel] enabled = true in bridge.toml; S11)
 ai-env creds  aws-set [--user ai-env-runtime|ai-env-ops] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin:
                                                           #   ai-env-runtime's into credentials/aws.env, ai-env-ops' into credentials/ops.env
 ai-env creds  aws-verify [--user ai-env-runtime|ai-env-ops]   # one Touch ID: the sealed key alone must answer as its user (retried while IAM propagates)
@@ -180,7 +191,8 @@ ai-env vm     suspend ID | resume ID | terminate ID|--all [--yes] | gc [--yes] [
 ai-env vm     shell ID [--auth header|subprotocol]         # experimental: the platform shell (VM started with --shell)
 ai-env vm     smoke [--max-duration 900] [--keep] [--exec [--with-credential]] [--json]   # run → RUNNING → /health (→ exec checks → a credentialed claude -p) → terminate, with timings
 ai-env vm     exec ID [--cwd P] [--env K=V]… [--detach-grace S] [--with-credential | --credential-file P] [--deliver fd|env] -- CMD ARGS…   # run as the agent over /agent; stdio byte-exact, the command's exit status (S6; the credential S7)
-ai-env vm     warm WORKSPACE [--json] [--dry-run]          # start the workspace's VM, seed it (S8) and deliver the sealed setup-token, ahead of time (S7)
+ai-env vm     warm WORKSPACE [--json] [--dry-run]          # start the workspace's VM, seed it (S8) and deliver the sealed setup-token, ahead of time (S7);
+                                                          #   S11: also stages the bundle's admitted Claude Code and fetches it into the VM
 ai-env vm     attach ID --spawn UUID [--from-seq N]       # reattach to a running command (the newest client wins)
 ai-env vm     health ID --detail [--json]                  # /health/detail with the session bearer: guard, sockets, spawns, listeners
 ai-env box    seed [WORKSPACE] [--branch B] [--no-wip] [--replace] [--dry-run] [--max-mib N] [--json]   # the checkout into its VM at the same path (S8)
@@ -318,10 +330,12 @@ URL credentials, plus rules for the baked Claude settings: no `bypassPermissions
 entries, no secret-named `env` keys; exit 9 names file, line and rule, never the matched text), and
 writes a deterministic zip plus `target/image/image.json` (its sha256 and S3 key). The image pins
 Claude Code by version, size and SHA-256 (`image/claude.lock`; `make claude-pin CLAUDE_VERSION=<v>`
-refreshes it from the release manifest, verifying its signature when the release key is in gpg)
-and bakes a fresh, reviewed config subset — never the Mac's own `~/.claude`. The image carries the
-version the Mac's Cursor extension bundles (the deploy's preflight P10 refuses any other), and the
-extension updates itself, often daily: `make claude-update` follows it in one command.
+refreshes it from the release manifest, whose signature gpgv checks against the vendored release
+key in `crates/ai-env-cli/certs/`, fail-closed) and bakes a fresh, reviewed config subset — never
+the Mac's own `~/.claude`. That claude is the image's fallback: the Cursor extension updates itself,
+often daily, and from S11 the VMs follow its Claude Code with no deploy (`ai-env claude update`,
+below); the deploy's preflight P10 notes a bundle that differs from the lock (`[-  ]`) and refuses
+nothing for it.
 
 `ai-env shim` is the image's ENTRYPOINT. As PID 1 it is a small init (child subreaper, signal
 forwarding, orphan reaping) that runs the same binary as its worker; the worker serves the
@@ -351,51 +365,14 @@ make infra-status WRITE=1      # (ops: one Touch ID) stack outputs (+ the image'
 make runtime-key               # (deployer: one paste) seal a key of the ai-env-runtime user under the bridge keystore key,
                                #   rebuild every Claude account's combined.env (one Touch ID each), then verify the key (one
                                #   Touch ID); ROTATE=1 replaces it
-make claude-update             # (at a terminal; asks once: when it deploys the passphrase's Touch ID unless set, then the
-                               #   deployer's key; else ops' Touch ID) follow the Cursor extension's Claude Code: claude-pin,
-                               #   test-docker, deploy, infra-status WRITE=1, proxy-start, egress check --if-needed (only what
-                               #   is not current; rerun resumes)
+make claude-update             # retired (S11): exits 2 naming ai-env claude update; VMs follow Cursor's claude with no deploy
 ```
 
-`make claude-update` reads the version of the installed Cursor bundle (`ai-env infra pin
---bundle-version`: a real directory Cursor has not marked obsolete), the lock and the deployed
-image's (the stack output `claudeVersion`), and shows the release site's `latest` for comparison
-only (and says when the bundle is behind it, ahead of it, or older than the deployed version). When
-all three agree it runs `make infra-status WRITE=1`, checks that new VMs start the deployed image
-version (a rollback with `make image-deactivate`/`image-activate` stops it, and so does an
-`[aws].image_version` that pins another version or is written in a form the script does not read)
-and runs `ai-env egress check --if-needed`, which starts no VM once the version new VMs run has a
-pass bound to its build and to the connector's live facts, at most 7 days old and judged by the
-current DNS and egress rules (a pass recorded before S9's S3 cases never counts: the check runs again
-and says why). It never runs under `make -i`, `-k` or
-`-p`, nor with `BREAKGLASS=1` on its command line (break-glass is `make deploy BREAKGLASS=1`, then
-the steps by hand). Otherwise it checks the preconditions first (a terminal, the stack's Pulumi
-passphrase in the environment or its sealed file to unseal, "The stack's passphrase" under
-Identities, Docker, and a stack that exports its deployer: before the bootstrap there is no
-deployer key, and that deploy is the account root's, "The bootstrap" under Identities), then pins,
-runs `make test-docker` (unless it already passed for the current zip), `make deploy` (the plan
-gate, then Pulumi's own confirmation),
-`make infra-status WRITE=1`, the same active-version check, `make proxy-start` (the check needs
-squid serving) and the egress check for the new image version (its VM costs the runtime key's Touch
-ID). It asks once for the AWS identity the run needs, after the steps that need none (the pin and
-`make test-docker` run without any key or the passphrase) and before the first that does: the
-deployer's key (one paste) when a deploy is due, else ops' Touch ID, announced on stderr as
-`claude-update: this run needs ai-env as deployer (a deploy is due): asking once, …`. A deploy
-needs the stack's passphrase too: when it is not set ("The stack's passphrase" under Identities), it
-unseals the sealed file first, one Touch ID before the paste (`claude-update: a deploy is due: the
-dev stack's passphrase: ai-env run -f … (one Touch ID), then ai-env as deployer: asking once each,
-…`), and stops there, before the paste, when the sealed value is empty; only its `make deploy` gets
-the passphrase, none of its other steps or its own reads. Every later step runs under that
-identity, which must be one of the stack's (`claude-update: identity …`; a refusal there, after the
-pin and `make test-docker` ran, says what they left: the new lock and the stamp stay, and a rerun
-goes on from them), and under `ai-env as deployer -- make claude-update` it asks for nothing more
-but that Touch ID (that runner's identity checked first, before anything runs). The first failure
-stops it naming the step; running it again resumes (once it has started a deploy, a marker in
-`target/image` makes the rerun finish every remaining step, `make proxy-start` included). Near the
-image-version quota it lists old versions to deactivate, never one a VM still runs. It cannot run
-unattended (the paste or Touch ID, Pulumi's confirmation and the check's Touch ID are the point);
-Cursor updates the extension on its own unless its Auto Update is off. The new `image/claude.lock`
-is left for review and commit.
+**Claude Code versions.** `make claude-update` is retired (S11): it prints `claude-update: retired
+(S11): …` and exits 2. A new Claude Code version needs no deploy: a chat's VM runs the version of the
+Cursor extension that started the chat once ai-env has admitted and staged it, and the image's own
+claude (the lock) until then (`ai-env claude status`; stage S11, below). `make claude-pin` still
+moves the image's fallback, which takes a deploy; no daily update needs one.
 
 Pulumi state stays in a local backend on the deploying Mac; `infra/Pulumi.dev.yaml` and
 `infra/config/dev.env` (budget email and limit) are not committed — copy the `.example` files. No
@@ -827,10 +804,15 @@ instead): the command reminds you.
   during the check, leaves the last output at most 3 s, as a stop does; a stderr nobody reads gets no
   line), audits `credential_rejected`, and never starts the command again; `vm smoke --with-credential`
   records a refused `claude -p` the same way. The rejection is recorded against the sealed container:
-  credentialed commands then refuse at once (exit 5, no Touch ID) until `creds setup-token` seals a new
-  token for that account, or `creds account use` makes another one active (a refused account is never
-  made active). That record is `state/creds.toml`: one that cannot be read refuses them too (exit 5, naming
-  it, since which tokens were refused is then unknown), the wrapper's `local-scratch` child then runs
+  credentialed commands then refuse at once (exit 5, no Touch ID) until a new token is sealed for that
+  account, or `creds account use` makes another one active (a refused account is never made active).
+  With accounts, the refusal's line names the account and its fix: `claude setup-token` logged in to
+  claude.ai as that account, then `ai-env creds account add NAME`. Not `creds setup-token`, which
+  seals the active account anew: after a `creds account use` that is another account, whose seal it
+  would replace with this one's token. With no account at all, `creds setup-token` is the fix (a chat
+  that ran as a refused account says the same in its last line). That record is `state/creds.toml`:
+  one that cannot be read refuses them too (exit 5, naming it, since which tokens were refused is
+  then unknown), the wrapper's `local-scratch` child then runs
   logged out, and `creds status` and doctor show it as a warning. A refused `--credential-file`
   container with a seal of its own blocks only itself; the sealed setup-token is not affected. A byte
   copy of `setup-token.env` has the sealed token's seal, so its refusal is the sealed token's.
@@ -1458,7 +1440,8 @@ rule, and nothing is sent), sent to S3 by the Mac (`transcript:staged`), then mo
 `state/transcripts/UUID/origin/` and replaced by the view. A reopen carries up to 64 MiB inline; a larger
 chat is refused before any Touch ID, exit 9:
 `the chat's transcript is SIZE (over the 64 MiB a reopen carries inline): run ai-env session stage UUID --warm in a terminal, then reopen the chat`.
-`ai-env session stage UUID` stages a chat of up to 4 GiB (what a restore pulls) from a terminal (one
+`ai-env session stage UUID` stages a chat of up to 4 GiB (what a restore pulls; since S11 4 GiB a
+file and 16 GiB in all, each file gzipped: stage S11) from a terminal (one
 Touch ID): scanned first, then a multipart upload (64 MiB parts, 8 at a time, a sha256 each; since
 S10 a part is held to its progress, not to a timeout of the whole (stage S10), and a part that gets no
 answer, or S3's 500 or 503, goes again, 3 tries at most) that resumes where a cut left it, never
@@ -1599,7 +1582,8 @@ interrupted turn's partial work (it runs again), background tasks, MCP servers a
 history (no rewind across a move). It also misses a branch switch or a HEAD move that made no new
 object (`git checkout -b topic`, a reset to a commit this Mac already has): the turn's fetch finds
 nothing new, so this Mac keeps the record of the fetch before, and the new VM gets that fetch's branch
-and HEAD (no commit is lost; the fix is deferred past S10). What was fetched stays under
+and HEAD (no commit is lost). Since S11 a VM of image 13.0 answers such a fetch with its manifest
+alone, and the record follows the switch (F1, stage S11); an older VM still misses it. What was fetched stays under
 `refs/remotes/box/*`, as before.
 
 `[vm] max_readdress` (3; 0 to 10) bounds the moves after a lost link in one wrapper process, to a new
@@ -1777,13 +1761,16 @@ says so, right after the note that it goes on:
 
 A turn refused for the account's usage limit reaches the chat as claude printed it
 (`You've hit your weekly limit · resets …`), and a note follows it, naming another account to go on
-with (the one with the lowest weekly use ai-env saw, else one it saw with no weekly use known, else one
-it never saw, which the note says) and how:
+with (the one with the lowest weekly use ai-env saw, a week whose reset has passed counting as 0 %, else
+one it saw with no weekly use known, else one it never saw, which the note says; never one whose token
+Anthropic refused, which `creds account use` would refuse) and how:
 
 `ai-env: account NAME hit its weekly limit (it resets 10am (UTC)); to go on now with account OTHER: ai-env creds account use OTHER, then reopen this chat or run ai-env session migrate UUID`
 
-When every other account is limited too, as far as ai-env knows, the note says so and names
-`ai-env creds account check`; with no other account, it names `ai-env creds account add NAME`. What a
+A pinned chat, or one started with `--no-session-persistence`, cannot move, so its note offers only
+the reopen. When every other account is limited or refused, as far as ai-env knows (or when which
+tokens were refused cannot be read), the note says so and names `ai-env creds account check`; with no
+other account, it names `ai-env creds account add NAME`. What a
 turn's `rate_limit_event` says of the account's 5-hour and weekly windows, and a limit, go into
 `[usage.NAME]` in `state/accounts.toml` (written at once for the first, a limit, a change of status or
 the first answer after a limit, else at most once a minute, and never waiting for the file's lock). A
@@ -1861,8 +1848,9 @@ ai-env doctor                     # the [vm] row: the memory baseline and the gu
 - The census keeps a `--max-thinking-tokens=` of 1 to 7 digits as written (anything else is still
   masked), and `make proxy-patch` names squid's version after the patch even when the document's
   output is cut.
-- claude 2.1.303 is pinned, and the image build fails when the claude binary lacks a string a move
-  relies on (`--resume-session-at`, `--session-id` and their errors).
+- The image build fails when its claude binary lacks a string a move relies on
+  (`--resume-session-at`, `--session-id` and their errors); since S11 an admission checks every new
+  version for the same strings, its markers (stage S11).
 
 **What the first S10 measurements found** (taken before S10's image was built, on image 11.0 and
 claude 2.1.302; `plans/s10-measurements.md`). At rest claude used at most 50 ms of CPU in any 10 s
@@ -1889,6 +1877,238 @@ make test-cursor STEP=t10_3 SINCE=TIME   # one S10 Cursor step's evidence (t10_2
 Debug builds also honour `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS=<n>`: the park's quiet in n ms (1 to
 3600000) in place of `[vm].park_after_s`, with or without the fake API. The live Makefile targets drop
 it, and release builds compile it out.
+
+### Claude always fresh, the panel, the audit and the cost (stage S11)
+
+**What changes.** Cursor's auto-update stays on, and ai-env follows it: a new Claude Code version in
+the Cursor extension reaches remote chats with no deploy. ai-env checks the new version first (its
+release signature against a vendored key, then the Docker tests), stages its Linux binary in S3
+through a VM that holds no credential, and the VMs fetch it from there. Until a version has passed
+both checks and is staged, chats run the newest version that has, or the image's own claude
+(`image/claude.lock`, 2.1.305), as before. Leave Cursor's Auto Update on: no ai-env row or line
+advises turning it off, and a version skew blocks nothing (the deploy's preflight P10 shows it as a
+note, `[-  ]`, and `ai-env infra pin --check-bundle` exits 3 with the note). S11 also brings a local
+control panel, a reader for the audit, a cost estimate rebuilt from the audit, new doctor rows, and a
+compressed `session stage`. Its image is 13.0: an older VM keeps running chats on the image's claude.
+
+**When Cursor updates the extension.** Nothing to do. What happens:
+
+1. Cursor installs the new extension (the bundle `anthropic.claude-code-V-darwin-arm64`, V the
+   version); a window runs it once reloaded. `ai-env claude status` names V `seen`, and doctor shows
+   a `[!! ]` row naming the next step, never a `[NO ]`.
+2. In remote mode the first wrapper that sees V (Cursor's `auth status --json` when a window opens, or
+   a remote chat's start) starts `ai-env claude admit V --auto` detached, with no Touch ID and nothing
+   in Cursor's way, when `[claude].auto_admit` is on (the default), this Mac's record of V is missing
+   or not past `signed`, the last try for V ended more than 15 minutes ago (`state/claude/V.lock` holds its
+   outcome) and an `ai-env` sits next to the wrapper. The admission then needs Docker answering,
+   cargo on its PATH (Cursor's), this checkout and the local image `ai-env-agent:local` (`make
+   image-build-local`); without one it records nothing, and the lock says which (`skipped(no_docker)`,
+   `skipped(no_cargo)`, `skipped(no_checkout)`, `skipped(no_image)`). In passthrough nothing starts
+   it: run `ai-env claude admit`.
+3. The admission (no Touch ID, no AWS call): the release's `manifest.json` and its signature, checked
+   by `gpgv` against the vendored key alone; the Linux arm64 binary, downloaded and checked against the
+   signed size and SHA-256; its markers (texts the code relies on, the strings a move needs among
+   them); then `make claude-admit-docker`, this checkout's claude-facing Docker tests run on that
+   binary in `target/claude-admit` (the first build takes several GB and many minutes, a later one 2 to
+   5 minutes), with no key in its environment. The verdict goes into `state/claude/V.toml`: admitted,
+   or `failed(STEP)`, which stands until `ai-env claude admit V --redo`; a step that may pass again
+   (the network, gpgv missing) records nothing. The tests run on the working tree: no edit in the
+   checkout while an admission runs, or it fails (`failed(docker)`, then `--redo`).
+4. The stage (one Touch ID, the runtime key's): a stager VM (`--egress internet`, no credential, 900 s,
+   purpose `claude-stage`) streams V's release from downloads.claude.ai into an S3 PUT the Mac presigned
+   with the signed length, the SHA-256 and a new-only condition, so S3 takes no other bytes; the Mac
+   never uploads the binary. The object is `v1/_claude/mac/V/SHA256` in the transcripts bucket. `ai-env
+   claude stage` or `update` stages by hand; `vm warm` (the installed bundle's version) and, in remote
+   mode, the wrapper's prewarm (its window's, once per version) stage an admitted version not staged
+   yet inside their own Touch ID. The stager counts against `[vm] max_concurrent`.
+5. The fetch: a VM of image 13.0 fetches V from S3 into its cache (`/opt/ai-env/claude/SHA256/claude`,
+   root's, run as the agent, 2 binaries kept) after a chat's first output (or 20 s after its start), at
+   most 32 MB/s, and keeps it only when its size, its SHA-256 and its `--version` match. Nothing waits
+   inside Cursor's 60 s window: a chat that starts on a VM lacking V runs what that VM holds, and the
+   next start there runs V. `vm warm` (waiting up to 120 s), the prewarm, `session stage --warm` and a
+   migration's preparation fetch ahead. A VM that finds the object's bytes wrong has the Mac delete it
+   and mark V `stale` (the next stage restages it); a second bad stage in a row is `failed(stage)`.
+
+**Which claude a chat runs.** A remote chat's start names V when it is staged, then the other staged
+versions, newest first, at most 4 in all; the VM runs the first one its cache holds, else the
+image's claude. The census end row says what ran (`claude:VERSION`) and where it came from:
+`claude_src:cached` (V from the VM's cache), `image` (the image's claude, which is V), `older(WHY)`
+(another cached version, a newer one for an older window too) or `image(WHY)` (the image's claude,
+which is not V), WHY the first reason V did not run: `no_ext` (no version in the extension's path),
+`seen`, `failed`, `not_staged`, `not_cached` (staged, not on that VM yet), `no_cap` (an image older than
+13.0), `bad` (V failed to start on that VM before) or `start_failed` (it just did). `ai-env wrapper
+status` shows the newest remote chat's. Two restarts ask no Touch ID: a claude that refuses an option
+the extension passed (`error: unknown option …` before it answered `initialize`) starts again on the
+same VM without it (at most 3 options a chat, never one a session needs; census `argv_dropped:FLAG`,
+audit `argv_dropped`), and a cached claude that dies before it printed anything starts once more with the
+next claude (audit `claude_start_failed`; the VM's row keeps it as bad); neither restarts a claude
+that printed anything. A chat reopened on a VM that lacks the version its transcript was written by is
+resumed by another claude, which `claude_src` shows. When a reconnect cannot learn which claude a
+start ran (its `spawned` answer lost with the socket), the end row has neither part.
+
+**The commands.** These two ask nothing of AWS and no Touch ID:
+
+```sh doc-test
+ai-env claude status   # each version's phase (seen, signed, admitted, failed, staged, stale), who runs it, the image's fallback
+ai-env claude gc       # what gc would delete, from the records (without --yes nothing is deleted)
+```
+
+`ai-env claude admit [VERSION] [--redo]` admits (the installed bundle's version by default; no Touch
+ID; exit 9 when the signature, the binary or a marker refuses it, 1 when the Docker tests fail or a
+step may pass again). `ai-env claude stage [VERSION] [--force]` stages an admitted version (one Touch
+ID; exit 9 before it for a version not admitted, or at `[vm] max_concurrent`; an object S3 already
+holds, its `412`, counts as staged). `ai-env claude update [VERSION]` admits when needed, then stages
+(one Touch ID). `ai-env claude forget VERSION` deletes its S3 object (one Touch ID; none with
+`--local`, which leaves S3 as it is), its binary on this Mac and its record, and refuses a version a
+live Cursor window runs unless `--force`. `ai-env claude gc --yes` keeps in S3 the 3 newest staged
+versions, the bundle's and every live window's, deletes the others' objects (one Touch ID), and keeps
+the 2 newest binaries on this Mac. Their audit rows are `claude_admit` (with `auto` for the wrapper's)
+and `claude_stage`; the VMs' fetches write `claude_fetch` and `claude_object_bad`.
+
+**Doctor, wrapper status and the pin.** One row per version the installed bundle or a live window
+runs, newest first, never `[NO ]`: `[ok ]` when chats run it (staged, or the image's own claude),
+else `[!! ]` naming the claude chats run meanwhile and the next command (`ai-env claude admit`,
+`stage`, or `admit --redo` after a failure); then
+`[-  ] the image's claude 2.1.305 runs where no staged version can`. S10's image
+claude row and its Auto Update advice are gone. `ai-env infra pin --check-bundle` says
+`pin: lock 2.1.305 is the image's fallback; Cursor bundle V: VMs follow it (ai-env claude status)`
+with exit 3 (equal: exit 0; no bundle or no readable lock: exit 1), and the deploy's P10 shows that
+note as `[-  ]`. `make claude-pin CLAUDE_VERSION=V` moves the fallback (`ai-env claude manifest`
+fetches and verifies the manifest first, fail-closed), which then needs a deploy; the image stays on
+2.1.305 until a reason to move it.
+
+**The vendored key.** `crates/ai-env-cli/certs/claude-code-release.asc`, fetched once from
+`https://downloads.claude.ai/keys/claude-code.asc`, and its dearmored `claude-code-release.gpg`, which
+is compiled into ai-env: `gpgv` (Homebrew's, never one found on PATH) gets a copy of it as its only
+keyring. `certs/README.md` records both files' SHA-256s and how the key was checked, and tests tie
+the compiled keyring to that record and the fingerprint, `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`,
+to the Makefile's `CLAUDE_GPG_FPR`. Only a good signature whose valid signer is that fingerprint
+passes; a bad, expired, revoked, unknown or missing signature, or any other answer, fails the
+admission closed. gpgv comes with GnuPG (`brew install gnupg`; the preflight's P4 names it). If
+Anthropic rotates the key, every admission fails until the key is vendored again (after checking the
+new one out of band, as `certs/README.md` says), and chats keep the newest admitted version.
+
+**The panel.** `ai-env panel serve` serves a control panel in the foreground until Ctrl-C (or SIGTERM,
+SIGHUP; exit 0). It is off until `[panel] enabled = true` in bridge.toml (else exit 9), listens on
+127.0.0.1 only, at `[panel] port` (7391; `--port N`, 0 for any free port; a port in use is exit 1),
+refuses any other `--bind` (exit 2) and any bound address that is not loopback (exit 9), and costs no
+Touch ID to start. It prints its URL once on stdout, `http://127.0.0.1:7391/BEARER/`, BEARER a fresh
+value per run (32 random bytes, 43 characters), never written to disk, never in an argv or a log, and
+known to the scrubber, so no line ai-env writes holds it. Open the URL in a private browser window (its
+history would keep the bearer), and never paste it into a chat, a file or a screen share. Every
+request must carry it as the path's first segment (compared in constant time, else 401), with `Host`
+exactly `127.0.0.1:PORT` (else 403: no DNS rebinding); only GET, HEAD and POST pass, a GET's
+`Sec-Fetch-Site` (when sent) must be `same-origin` or `none`, and a POST's `Origin` must be the panel's
+own and its `Sec-Fetch-Site` `same-origin` (else 403), its body a small form (else 413 or 415). Every
+answer carries a strict Content-Security-Policy, `no-referrer`, `X-Frame-Options: DENY`, `nosniff` and
+`no-store`, and never a cookie or a CORS header. The pages, rendered on the Mac with every value
+escaped (each also as JSON with `?json=1`): Sessions (VM, moves, cost), a session (its generations,
+moves, timeline and cost), VMs (with RUN and COST), Audit (live, at most 8 streams), a session's
+settings diff (read-only) and Cost. The actions: suspend, resume and terminate a VM, refresh the list,
+and migrate a chat. Each goes through a confirm page that names its CLI twin (`ai-env vm suspend ID`,
+…) and issues a nonce bound to it, single use for 5 minutes; one action runs at a time (another gets
+409), each asks its own Touch ID from the panel's process, and its rows say `actor=panel`. A live
+chat's migrate is its wrapper's move, with that move's Touch ID. The Run button posts through the
+page's script (a plain form post under `no-referrer` would carry no usable `Origin`, and gets 403).
+The panel's start and stop are audited (`panel_serve`).
+
+**The audit.** `audit.jsonl` is at schema v2: every row's `detail.actor` says who wrote it (`cli`,
+`wrapper` or `panel`; the wrapper's detached `vm warm` says `wrapper`, `claude admit --auto` `cli`), and
+a registry of every event (87, with their keys, the key that names a VM, where the session comes from
+and what each means for the cost) is frozen in `tests/fixtures/audit/schema-v2.json`: names and keys
+are never renamed. S11's events: `claude_admit`, `claude_stage`, `claude_fetch`, `claude_object_bad`,
+`claude_start_failed`, `argv_dropped`, `vm_observed` (a VM seen in a new state) and `panel_serve`;
+`vm_run` gains `max_duration_s`, `max_idle_s`, `suspended_s` and `memory_mib`, `transcript_stage`
+gains `stored`. `ai-env audit tail` prints the last rows (20, `-n N`) one per line, `TS ACTOR EVENT
+SESSION8 VM K=V…`, every cell scrubbed again and its control characters escaped (`--json`: the rows
+as stored); `-f` then follows the file (Ctrl-C ends it, exit 0), across a truncation too. The filters
+(all must hold): `--session UUID` (its rows, and its VMs' rows while it ran on them), `--vm ID`,
+`--event E,…`, `--actor cli|wrapper|panel`, `--since WHEN` and `--where K=V` (repeatable); a malformed
+one is exit 2. `ai-env audit grep PATTERN [-i]` prints the rows whose line holds PATTERN, a fixed string
+(not a regex; a session's full id matches its rows too, though the line shows its first 8 characters),
+and exits 1 when none does. Neither asks AWS anything or a Touch ID; an S10 row (v1, no
+actor) is read as well as it can be.
+
+```sh doc-test
+ai-env audit tail --session UUID   # one chat's rows, and its VMs' while it ran on them
+ai-env audit grep ID               # every row naming that VM; exit 1 when none does
+```
+
+**The cost.** `ai-env cost` estimates what the MicroVMs and the egress proxy cost over a window
+(`--since WHEN`, default 24 h before now; `--until WHEN`; `--by day` splits it at UTC midnights;
+`--json`), rebuilt from this Mac's audit alone: no AWS call, no Touch ID. WHEN is `90s`, `30m`, `1h`,
+`2d` before now, an RFC 3339 UTC time or a UTC date. Each VM's running and suspended stretches come
+from its run, resume, suspend and terminate rows and its chats' keep-alive spans; an idle suspend no
+row records is inferred `max_idle_s` after the last activity, which makes the estimate a range. They
+are priced at S10's measured Lambda rates (per vCPU-second of the 1 vCPU baseline, per GB-second of
+the image's memory, per GB of snapshot written, read and stored), plus the proxy's EC2 lines, each
+line under its Cost Explorer usage type. Not counted: S3, CloudWatch, data transfer, image builds,
+and the VMs of another bridge root (the live tests'); the output says so beside its caveats.
+`ai-env cost --compare FILE` judges the estimate against a Cost Explorer answer over the file's own
+days (`aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE`, which an identity
+that reads billing runs: none of ai-env's may; the output prints the exact line): the MicroVM total
+passes within ±30 % (T11.1), and exits 1 outside it. The views carry it too: `vm list` gains RUN and
+COST, `session list` the VM, MOVES and COST, and `session show` the generations, the moves (each
+paired with its end), the timeline and the cost.
+
+```sh doc-test
+ai-env cost --since 7d   # the last week's estimate and its range: no AWS call, no Touch ID
+```
+
+**The doctor matrix.** Every broken precondition of the wrapper path is a `[NO ]` row naming its fix
+(a sibling `ai-env-claude` missing or of another version: the install; Cursor's wrapper setting on a
+path that does not exist or does not run: `ai-env wrapper install --write`, after the install when the
+sibling is missing). S11 adds: `ai-env = ai-env-claude = image shim` (the deployed image's shim, from
+`state/infra.toml`, of another version is `[NO ]` naming the deploy, or the install when the image's
+is newer; a live VM on an older shim is `[!! ]` naming that chat's migrate, or the VM's terminate);
+the `image/` scan of the checkout doctor runs in (a finding is `[NO ]`; a deployed zip that is not the
+one the scan passed is `[!! ]`); the stack's budget, its limit and what was spent, `[!! ]` once the spend
+reaches the limit (under `ai-env as ops --`: ops reads it with `budgets:ViewBudget`, which S11's deploy
+grants); newer versions of the managed
+base image; and `[!! ]` rows for a workspace root that does not exist, an `initialPermissionMode` of
+`bypassPermissions` (every chat would start with no permission prompt) and an `[aws].image_version`
+pinned to another version than the active one. The claude rows (above) replace S10's image claude row.
+
+**The drift rows.** Doctor reads the census's chat rows of each running Cursor window's extension,
+offline, names and flags only, never a value: `[!! ]` for env names it starts chats with that
+`[wrapper] env_forward` and `env_extra` do not forward and no review has classified (`ENV_REVIEWED`,
+`src/bridge/drift.rs`), `[-  ]` for a forwarded name it no longer sets and for a name a remote session
+never carries (one `vm exec` refuses, such as a TOKEN name), `[!! ]` for flags the router
+does not classify (add them to `VALUE_FLAGS` or `BOOL_FLAGS` in `src/wire/argv.rs`, then
+`make argv-fixtures EXT=V`), and per extension newer than 2.1.302 whether its reader still names the
+view's fields (`[ok ]`, else `[!! ]`: the view format changed). They replace S10's fixture-drift row.
+
+**The compressed stage.** `ai-env session stage` now stores each file as `/usr/bin/gzip -n -6` of its
+scanned bytes (`Content-Encoding: gzip`), keyed by the stored bytes' SHA-256; the manifest keeps the
+decoded length and SHA-256 beside the encoding and the stored ones. Subtree files go up 8 at a time,
+and the caps are 4 GiB a file (what one pull restores) and 16 GiB in all, decoded (S9's was 4 GiB the
+chat). The VM's pull decodes (curl's `compressed`) and checks the decoded bytes. A gzip-staged chat
+reopens only on a VM whose image decodes it (`transcript_gzip_v1`, image 13.0): a reopen takes no
+older VM for it, and an S10 build cannot read its manifest. A reopen's inline stage gzips only for a
+13.0 VM. `transcript_stage` records the stored bytes (`stored`) beside the decoded ones (`bytes`). A
+chat that goes on here while it is being staged is refused once its manifest is written (exit 1): its
+files stay where they are, and `ai-env session forget UUID --purge`, then `ai-env session stage UUID`,
+stages it with every turn.
+
+**S3's other prefixes.** Beside the chats' `v1/UUID/`, the transcripts bucket holds
+`v1/_claude/mac/V/SHA256` (the staged claudes: `ai-env claude gc` and `forget` delete them) and S9's
+`v1/_egress-check/` (it expires by itself). A sweep of `v1/` by hand for chats no session owns skips
+both prefixes; `session gc --remote` and `session forget --purge` never touch them.
+
+**Also in S11.**
+
+- F1: a branch switch or a HEAD move that brings no new object (`git checkout -b topic`) now moves the
+  chat's fetch record on a 13.0 VM (`codeout_manifest_v1`), so a move carries the new branch.
+- C-4: a move during the first turn after a `/compact` resumes cut at the compaction (`view_parent_v1`,
+  a 13.0 VM) instead of sending that turn again after its partial answer; on an older VM it still does.
+- `make test-aws S11=1` runs S11's live tests (`live_s11_*`) alone, and `make test-aws S10=1 WALL=1`
+  S10's three wall tests alone.
+
+```sh
+make test-aws S11=1            # S11's live tests (live_s11_*): the stager, claude_src after a fetch, an unknown option,
+                               #   F1 after git checkout -b, C-4 after /compact, a fork's first write
+make test-aws S10=1 WALL=1     # S10's three wall tests alone (about 45 minutes)
+```
 
 ### Identities: the deployer, ops and the runtime key
 
@@ -1997,9 +2217,9 @@ user.
   resolves its identity itself, as `ai-env egress …` and `ai-env proxy …` typed by hand do; none
   asks again under `ai-env as ops --` or `ai-env as deployer --`;
 - `ai-env egress allow` needs the deployer (`ai-env as deployer -- ai-env egress allow SLUG HOST`),
-  `ai-env egress check` costs the ops key's Touch ID and then the runtime key's for its VM, and
-  `make claude-update` asks once for the identity the run needs (S3, above), and when it deploys
-  unseals the stack's passphrase first (its Touch ID before the paste);
+  and `ai-env egress check` costs the ops key's Touch ID and then the runtime key's for its VM;
+  `ai-env claude update` and `ai-env claude stage` cost the runtime key's Touch ID, and
+  `ai-env claude admit` none (stage S11, above; `make claude-update` is retired);
 - `ai-env doctor` asks for nothing, and its one AWS call is a plain sts call that warns when the
   shell's own credentials are the account root's; `ai-env as ops -- ai-env doctor` (one Touch ID)
   adds the rows that call AWS: the operator identity (checked with sts), the deployer's key count
@@ -2011,7 +2231,7 @@ user.
   the runner it would call, then the recipe. Every tiered target refuses `make -i` (a refused
   identity would be ignored) and `make -p` (`-n` beside it or not: make prints every variable when it
   ends, and the make under the runner would print the key, and the passphrase once unsealed), before
-  its build, its unseal or its runner; `make claude-update` refuses both too. A make typed under
+  its build, its unseal or its runner. A make typed under
   `ai-env as` (or `ai-env run -f` with the passphrase) holds the key (or the passphrase) itself and
   prints it under `-p` whatever the target, so never `-p` there. `make -j` is not for tiered targets
   (two runners would ask at once);
@@ -2038,15 +2258,12 @@ Touch ID) when it is not set as Pulumi takes it (`PULUMI_CONFIG_PASSPHRASE` firs
 an empty one counts as none; else `PULUMI_CONFIG_PASSPHRASE_FILE`): `make preview`, `make deploy`,
 `make deploy-policies` and `make destroy` after their build and before their runner asks (the
 deployer's paste; `ai-env as root` asks for nothing), saying so first
-(`deploy: the dev stack's passphrase: ai-env run -f … (one Touch ID)`), and `make claude-update`
-when it deploys. Only that run holds it: nothing compiles with it, no test or Docker step sees it,
-and of `make claude-update` only its `make deploy` gets it, none of its other steps or its own
-reads. `PULUMI_SEALED=FILE` (on the make command line, or exported) names another file, a leading
-`~/` the home directory's (zsh passes `PULUMI_SEALED=~/…` on to make as it is). An exported
+(`deploy: the dev stack's passphrase: ai-env run -f … (one Touch ID)`). Only that run holds it:
+nothing compiles with it, and no test or Docker step sees it. `PULUMI_SEALED=FILE` (on the make
+command line, or exported) names another file, a leading `~/` the home directory's (zsh passes `PULUMI_SEALED=~/…` on to make as it is). An exported
 `PULUMI_CONFIG_PASSPHRASE_FILE` works as before, and with the passphrase set nothing is unsealed
-(nor in a make nested in such a run). Without the file, `make deploy`, `make deploy-policies` and
-`make claude-update` (when it deploys) refuse before anything runs, naming the two lines above:
-their plan check runs Pulumi's preview `--non-interactive`, which cannot prompt; `make preview`
+(nor in a make nested in such a run). Without the file, `make deploy` and `make deploy-policies`
+refuse before anything runs, naming the two lines above: their plan check runs Pulumi's preview `--non-interactive`, which cannot prompt; `make preview`
 and `make destroy` keep Pulumi's own prompt. A sealed value left empty (the first line without
 `ai-env edit`) stops the run right after the Touch ID, before the runner; a wrong one fails at the
 plan check with Pulumi's `incorrect passphrase`, nothing deployed: set it again with `ai-env edit`.
@@ -2057,10 +2274,6 @@ lines could reach the deployer's key prompts.
 
 ```sh
 make deploy
-```
-
-```sh
-make claude-update
 ```
 
 ```sh
@@ -2271,6 +2484,11 @@ the diffs annoy you.
 - A wrapper still running from before an `ai-env` with Claude accounts was installed (a chat left
   open across `make install`) fails its moves after a `creds account use` (the token was sealed anew
   under it: exit 5). Reopen such a chat.
+- `ai-env cost` is an estimate from this Mac's audit: idle suspends are inferred, the GB a snapshot
+  writes or reads and the proxy's rates are calibrated against Cost Explorer (T11.1), and bursts above
+  the baseline go unseen.
+- The panel's URL holds its bearer: a browser's history or a screen share can show it, and whoever
+  has it on this Mac can start the panel's actions (each still asks its Touch ID) until the panel stops.
 
 ## Security invariants (enforced by tests)
 
@@ -2301,6 +2519,13 @@ the diffs annoy you.
   and the VM's `git http-backend` runs as the agent with an allowlisted CGI environment and no
   receive-pack. The pre-push hook refuses a push of `refs/remotes/*` or `refs/ai-env/*` and fails
   closed without its binary (S9).
+- A claude binary reaches a VM only as S3's object under the length and SHA-256 its signed release
+  manifest names, once the release signature (the vendored key, gpgv, fail-closed) and the Docker
+  tests admitted it; a fresh VM holding no credential puts it there, the Mac never uploads it, and a
+  VM runs it only once its size, SHA-256 and version match (S11).
+- The panel listens on 127.0.0.1 only, behind a fresh bearer per run that is never written anywhere;
+  it checks `Host`, `Origin` and `Sec-Fetch-Site`, sets no cookie, and every action asks its own
+  Touch ID (S11).
 
 ## Workspace
 

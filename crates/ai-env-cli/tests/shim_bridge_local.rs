@@ -159,7 +159,7 @@ impl Rig {
             }
             (out, err, pid, exit)
         });
-        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None };
+        let spec = SpawnSpec { argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None, claude: Vec::new() };
         let env = self.env();
         let outcome = tokio::time::timeout(LIMIT, run_spawn(&env, Start::New(spec), io)).await.expect("the spawn ends in time").unwrap_or_else(|e| panic!("run_spawn: {e}"));
         drop(env);

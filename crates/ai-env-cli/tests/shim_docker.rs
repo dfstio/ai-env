@@ -55,13 +55,20 @@
 //! `setsid` escaper through `/agent`; (S10) such an escaper makes a park
 //! `busy` while it spins and nothing once it sleeps (V-6), and
 //! `/var/lib/ai-env` is root's, 0700 and empty.
-//! The only claude ever executed is the pinned Linux binary inside L2.
+//! S11 L2 (wave 2, K): the claude cache `/opt/ai-env/claude` root's, 0755,
+//! empty and not the agent's to write (`claude_stage_v1` named, and
+//! `/health/detail`'s `claude_cache` empty), `/validate`'s V4 line naming
+//! it, and the image's curl decoding a gzip object (a stand-in for S3 on the
+//! container's loopback serves it). Every L2 container runs the claude under
+//! test when `make claude-admit-docker` names one (`claude_under_test`).
+//! The only claude ever executed is the pinned Linux binary inside L2 (or
+//! the claude under test there).
 #[path = "common/curl.rs"]
 mod curl;
 
 use ai_env_cli::wire::chunk::{decode, Chunker};
 use ai_env_cli::wire::frame::{ClientInfo, CredentialErrCode, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
-use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_PARK_V1};
+use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_CLAUDE_STAGE_V1, CAP_PARK_V1};
 use ai_env_cli::wire::redact::Secret;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
@@ -152,6 +159,47 @@ fn shim_binary() -> PathBuf {
 fn lock_version() -> String {
     let lock = std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).unwrap();
     ai_env_cli::wire::pin::parse_lock(&lock).unwrap().version
+}
+
+/// S11 (D2): the claude under test when `AI_ENV_CLAUDE_UNDER_TEST` names a file (`make claude-admit-docker`, which
+/// `ai-env claude admit` runs): its path and version (`AI_ENV_CLAUDE_UNDER_TEST_VERSION`), the file hashed once and
+/// required to equal `AI_ENV_CLAUDE_UNDER_TEST_SHA256` (a panic otherwise); `None` without it.
+fn claude_under_test() -> Option<(PathBuf, String)> {
+    static UNDER_TEST: std::sync::OnceLock<Option<(PathBuf, String)>> = std::sync::OnceLock::new();
+    UNDER_TEST
+        .get_or_init(|| {
+            use sha2::Digest as _;
+            use std::io::Read as _;
+            let path = std::env::var_os("AI_ENV_CLAUDE_UNDER_TEST").filter(|p| !p.is_empty()).map(PathBuf::from)?;
+            assert!(path.is_absolute() && path.is_file(), "AI_ENV_CLAUDE_UNDER_TEST={}: not an absolute path to a file", path.display());
+            let version = std::env::var("AI_ENV_CLAUDE_UNDER_TEST_VERSION").unwrap_or_default();
+            assert!(ai_env_cli::wire::pin::is_version(&version), "AI_ENV_CLAUDE_UNDER_TEST_VERSION={version:?}: not N.N.N");
+            let want = std::env::var("AI_ENV_CLAUDE_UNDER_TEST_SHA256").unwrap_or_default();
+            let mut f = std::fs::File::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut h = sha2::Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = f.read(&mut buf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            let got = hex::encode(h.finalize());
+            assert_eq!(got, want, "the claude under test ({}) is not AI_ENV_CLAUDE_UNDER_TEST_SHA256's bytes", path.display());
+            Some((path, version))
+        })
+        .clone()
+}
+
+/// The version the L2 tests expect: the claude under test's, else the lock's (`lock_version`).
+fn expected_claude() -> String {
+    claude_under_test().map_or_else(lock_version, |(_, v)| v)
+}
+
+/// `docker run`'s mount of the claude under test over the image's, read-only (none without one).
+fn claude_mount() -> Vec<String> {
+    claude_under_test().map(|(p, _)| vec!["-v".to_string(), format!("{}:/usr/local/bin/claude:ro", p.display())]).unwrap_or_default()
 }
 
 fn ok_stdout(args: &[&str]) -> String {
@@ -668,9 +716,11 @@ fn l1_missing_drop_caps_are_named() {
 /// What the Dockerfile bakes for the agent, from the repo's image/ (mounted
 /// at /opt/image): the lock, the managed settings, `/Users/mike` 0700 with
 /// the claude config subset, all owned by 1000:1000 — and, as in the image, a
-/// root-owned `/usr/local/bin/claude` (here a copy of the fake).
+/// root-owned `/usr/local/bin/claude` (here a copy of the fake) and S11's
+/// empty claude cache `/opt/ai-env/claude` (root 0755: `/validate`'s V4).
 const SEED: &str = "set -eu; \
     mkdir -p /etc/ai-env /etc/claude-code /Users/mike/.claude/agents /Users/mike/.claude/skills /Users/mike/.claude/commands; \
+    install -d -m 0755 -o 0 -g 0 /opt/ai-env /opt/ai-env/claude; \
     cp /opt/image/claude.lock /etc/ai-env/claude.lock; \
     cp /opt/image/managed-settings.json /etc/claude-code/managed-settings.json; \
     cp /opt/image/claude/settings.json /opt/image/claude/CLAUDE.md /Users/mike/.claude/; \
@@ -858,7 +908,7 @@ impl Agent {
     fn spawn(&mut self, spec: &Spec) -> Result<(SpawnId, u32), (SpawnErrCode, String)> {
         let id = SpawnId::new_v7();
         let secrets = spec.secret.iter().map(|(k, v)| (k.clone(), Secret::new(v.clone()))).collect();
-        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone() });
+        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone(), claude: Vec::new() });
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             assert!(Instant::now() < deadline, "no answer to spawn {id} within {SPAWN_WAIT:?}");
@@ -2529,7 +2579,9 @@ fn l2() -> Container {
     let image = local_image();
     let out = docker(&["image", "inspect", &image]);
     assert!(out.status.success(), "{image} is missing: run make image-build-local");
-    Container::start(&[], &image, &[])
+    // S11 (D2): the claude under test over the image's, when `make claude-admit-docker` names one.
+    let mount = claude_mount();
+    Container::start(&mount.iter().map(String::as_str).collect::<Vec<_>>(), &image, &[])
 }
 
 #[test]
@@ -2542,13 +2594,14 @@ fn l2_claude_version_matches_the_lock() {
     let line = probe.lines().find(|l| l.contains("claude probe ok")).unwrap().to_string();
     let (_, h) = http(c.port(8080), "GET", "/health", "");
     let h: Health = serde_json::from_str(&h).unwrap();
-    assert_eq!(h.claude_version, Some(lock_version()));
+    assert_eq!(h.claude_version, Some(expected_claude()));
     eprintln!("L2 ready after {:?}; {line}", started.elapsed());
 }
 
 /// `/validate` passes from the host (outside the VM: admitted without a
 /// lookup, noted) and from inside as root (a live root socket); both V6
-/// lines name the self-test's two refused hook lines.
+/// lines name the self-test's two refused hook lines. S11: V4's line names
+/// the image's empty claude cache (`/opt/ai-env/claude`, A §2.6).
 #[test]
 #[ignore = "Docker: make test-docker"]
 fn l2_validate_200() {
@@ -2561,6 +2614,10 @@ fn l2_validate_200() {
         assert!(logs.contains(&format!("ai-env: validate {v}")), "{v}:\n{logs}");
     }
     assert!(logs.contains("ai-env: validate V3 ok 2 settings files parse and are readable by 1000:1000;"), "the agent is 1000:1000 (the --gid default):\n{logs}");
+    assert!(
+        logs.lines().any(|l| l == "ai-env: validate V4 ok no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache"),
+        "V4 holds the image's empty claude cache:\n{logs}"
+    );
     let ip = c.ip();
     assert_v6_named(&logs, &ip, "the platform's /validate request came from outside this VM (admitted without a lookup); ");
     let (s, body) = c.curl("0", &["-X", "POST", &format!("http://127.0.0.1:9000{PREFIX}/validate")]);
@@ -2634,14 +2691,15 @@ fn l2_no_defunct() {
 }
 
 /// T6.7 offline: the real, pinned claude through `/agent` (as uid 1000, HOME
-/// and the config dir the image's) prints exactly the lock's version line.
+/// and the config dir the image's) prints exactly the lock's version line
+/// (S11: the claude under test's, which [`l2`] mounts when one is named).
 #[test]
 #[ignore = "Docker: make test-docker"]
 fn l2_claude_version_through_the_agent() {
     let vm = Vm::started(l2(), None, 120);
     let (out, err, exit) = vm.run(&["claude", "--version"], b"");
     assert_eq!(exit, ExitInfo { code: Some(0), signal: None }, "{}", String::from_utf8_lossy(&err));
-    assert_eq!(String::from_utf8_lossy(&out), format!("{} (Claude Code)\n", lock_version()));
+    assert_eq!(String::from_utf8_lossy(&out), format!("{} (Claude Code)\n", expected_claude()));
     assert!(!vm.c.logs().contains(&vm.token), "the session token reached the log");
 }
 
@@ -2720,4 +2778,159 @@ fn l2_the_seed_record_dir_is_roots_0700_and_empty() {
     assert!(!diff.lines().any(|l| l.contains("/var/lib")), "the running shim changed /var/lib: {diff}");
     let out = c.exec_as("1000", &["ls", "-A", "/var/lib/ai-env"]);
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent listed it: {}", String::from_utf8_lossy(&out.stdout));
+}
+
+// ---- S11 L2 (wave 2, K): the claude cache, the image's curl and gzip ---------------------------
+
+/// S11 (A §2.6, the Dockerfile's cache gate) in the real image: the claude
+/// cache `/opt/ai-env/claude` and its parent `/opt/ai-env` are root's, 0755
+/// and directories; the cache is empty and its index
+/// `/var/lib/ai-env/claude-index.json` absent, as every VM starts from the
+/// image (a claude baked in would be every VM's). A shim that started and
+/// took `/run` (no fetch came) wrote nothing there: the container's diff
+/// names nothing under /opt and no index. The shim has its store (root):
+/// `hello_ok` names `claude_stage_v1`, and `/health/detail`'s `claude_cache`
+/// holds no entry, no fetch and no refusal, its image ref the lock's version
+/// and sha256. The agent lists the cache (0755) and can write neither it nor
+/// `/opt/ai-env`.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_claude_cache_is_root_0755_empty_and_not_the_agents() {
+    let vm = Vm::started(l2(), None, 120);
+    let c = &vm.c;
+    assert_eq!(c.sh("stat -c '%a %u:%g %F %n' /opt/ai-env /opt/ai-env/claude"), "755 0:0 directory /opt/ai-env\n755 0:0 directory /opt/ai-env/claude");
+    assert_eq!(c.sh("ls -A /opt/ai-env/claude"), "", "no claude in the image's cache, none fetched since");
+    assert_eq!(c.sh("test -e /var/lib/ai-env/claude-index.json && echo there || echo absent"), "absent", "no cache index");
+    let a = vm.agent();
+    assert!(a.caps.iter().any(|cap| cap == CAP_CLAUDE_STAGE_V1), "the image's shim names {CAP_CLAUDE_STAGE_V1}: {:?}", a.caps);
+    let cache = vm.detail().claude_cache.expect("/health/detail names the claude cache");
+    assert!(cache.entries.is_empty() && cache.fetching.is_none() && cache.failed.is_empty(), "an empty cache: {cache:?}");
+    let lock = ai_env_cli::wire::pin::parse_lock(&std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).unwrap()).unwrap();
+    assert_eq!(cache.image.map(|r| (r.version, r.sha256)), Some((lock.version, lock.sha256)), "the image's own claude, the lock's");
+    assert_eq!(c.sh_as("1000", "ls -A /opt/ai-env/claude"), "", "the agent lists the cache");
+    for script in ["mkdir /opt/ai-env/claude/x", "touch /opt/ai-env/claude/claude", "mkdir /opt/ai-env/x"] {
+        let out = c.exec_as("1000", &["sh", "-c", script]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent wrote: {script}");
+    }
+    assert_eq!(c.sh("ls -A /opt/ai-env/claude"), "", "still empty");
+    let diff = ok_stdout(&["diff", &c.id]);
+    assert!(!diff.lines().any(|l| l.contains("/opt") || l.contains("claude-index")), "the running shim changed the cache: {diff}");
+}
+
+/// The stand-in for S3 of [`l2_the_images_curl_decodes_a_gzip_object`]
+/// (gawk as root with bytes as bytes, `-v port= -v file= -v out=`): `file`
+/// read whole, then one connection on `port`: its request line and its
+/// `Accept-Encoding` header (`-`: none) logged to `out` once its head is
+/// read, tab-separated, then the answer S3 gives a GET of an object stored
+/// gzip: 200, `Content-Encoding: gzip`, the stored bytes' `Content-Length`,
+/// a version id and an ETag, then those bytes.
+const GZIP_STAND_IN: &str = r#"BEGIN {
+  RS = "^$"
+  if ((getline body < file) <= 0) exit 1
+  close(file)
+  RS = "\n"
+  srv = "/inet4/tcp/" port "/0/0"
+  if ((srv |& getline first) > 0) {
+    sub(/\r$/, "", first); enc = "-"
+    while ((srv |& getline h) > 0) { sub(/\r$/, "", h); if (h == "") break; if (tolower(h) ~ /^accept-encoding:/) enc = h }
+    print first "\t" enc >> out; fflush(out)
+    printf "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\nx-amz-version-id: fv1\r\nETag: \"stand-in\"\r\nConnection: close\r\n\r\n", length(body) |& srv
+    printf "%s", body |& srv
+  }
+  close(srv)
+}"#;
+
+/// curl's write-out line (`shim::s3xfer`'s `WRITE_OUT`, crate-private): its status, version id, checksum and ETag on stderr.
+const CURL_WRITE_OUT: &str = r#"write-out = "%{stderr}ai-env-curl status=%{http_code} version=%header{x-amz-version-id} checksum=%header{x-amz-checksum-sha256} etag=%header{etag}\n""#;
+
+/// S11 (C.3.12, L5's compressed stage) on the real image: its curl decodes a
+/// gzip object. Docker L2 has no S3, and the image's shim (a release build)
+/// takes https URLs only, so the test runs curl as the shim runs it: as
+/// `ai-env-net` (999), `-q -K /dev/fd/3`, its configuration on fd 3 alone,
+/// the shim's GET of a pull part (`s3xfer::curl_config`, line by line as
+/// `the_curl_config_is_the_contracts` pins it) in its lab form (a lab URL of
+/// the store, `proto =http`), against a stand-in on the container's loopback
+/// ([`GZIP_STAND_IN`]) answering as S3 answers a GET of an object stored
+/// gzip (`Content-Encoding: gzip`). The object is transcript lines, gzipped
+/// by the image's gzip. With `compressed` (a gzip part's line) curl asks for
+/// gzip and writes the decoded bytes, byte for byte the object's (what the
+/// shim's checks then read); without it (an identity part's configuration)
+/// it asks for no encoding and writes the stored gzip stream as it came.
+/// Each reports 200 and the version id on its write-out line. One more
+/// answer of the image's curl that S11 reads (A §2.4, the claude stage's
+/// GET; the lens F1 on the fakes): with `max-filesize` below the answer's
+/// `Content-Length` it writes nothing and exits 63 (`curl: (63) Maximum file
+/// size exceeded`, claudebin's `over`), its write-out still saying 200.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_images_curl_decodes_a_gzip_object() {
+    use ai_env_cli::shim::s3xfer::{SPEED_LIMIT, SPEED_TIME_S};
+    use ai_env_cli::wire::s3::{PresignedUrl, S3Key, SIGNED_HEADERS_GET};
+    use sha2::Digest as _;
+    let c = l2();
+    wait_ready(&c, 120);
+    // The object: transcript lines, gzipped by the image's gzip.
+    let decoded: String = (0..2000).map(|n| format!("{{\"type\":\"assistant\",\"n\":{n},\"text\":\"line {n} of a chat staged gzip\"}}\n")).collect();
+    let (raw, gz) = ("/tmp/ai-env-s11-object", "/tmp/ai-env-s11-object.gz");
+    let put = c.exec_input("0", &["sh", "-c", &format!("cat > {raw} && gzip -n -c {raw} > {gz}")], decoded.as_bytes());
+    assert!(put.status.success(), "the object: {}", String::from_utf8_lossy(&put.stderr));
+    let stored = c.exec(&["cat", gz]).stdout;
+    assert!(stored.starts_with(&[0x1f, 0x8b]) && stored.len() * 4 < decoded.len(), "a gzip stream, much smaller: {} of {} bytes", stored.len(), decoded.len());
+    let (session, owner) = ("0199d2a0-0000-7000-8000-00000000000c", "123456789012");
+    let signature = hex::encode(sha2::Sha256::digest(SpawnId::new_v7().to_string().as_bytes()));
+    let key = S3Key::Segment { session: session.into(), gen: 1, offset: 0 }.render();
+    // One GET through a stand-in of its own on `port` (`max-filesize` when given): curl's output, the stand-in's
+    // line, the request target.
+    let get = |port: u16, compressed: bool, max_filesize: Option<usize>| -> (Output, String, String) {
+        let log = format!("/tmp/ai-env-s11-stand-in-{port}.log");
+        let started = docker(&["exec", "-d", "-u", "0", "-e", "LC_ALL=C", &c.id, "gawk", "-b", "-v", &format!("port={port}"), "-v", &format!("file={gz}"), "-v", &format!("out={log}"), GZIP_STAND_IN]);
+        assert!(started.status.success(), "the stand-in: {}", String::from_utf8_lossy(&started.stderr));
+        let row = format!(":{port:04X} 00000000:0000 0A");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !c.sh("cat /proc/net/tcp").contains(&row) {
+            assert!(Instant::now() < deadline, "the stand-in is not listening on {port}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let base = format!("http://127.0.0.1:{port}");
+        let query = format!(
+            "versionId=fv1&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261023%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261023T080000Z&X-Amz-Expires=300&X-Amz-SignedHeaders={}&X-Amz-Signature={signature}",
+            SIGNED_HEADERS_GET.replace(';', "%3B")
+        );
+        let url = PresignedUrl::new(format!("{base}/ai-env-transcripts-{owner}/{key}?{query}")).expect("a lab URL of the store");
+        assert!(url.is_lab(), "plain http to the stand-in");
+        let mut lines = vec![format!("url = \"{}\"", url.expose()), "silent".into(), "show-error".into(), "proto = \"=http\"".into(), "connect-timeout = 20".into(), "max-time = 60".into()];
+        lines.extend([format!("speed-limit = {SPEED_LIMIT}"), format!("speed-time = {SPEED_TIME_S}"), CURL_WRITE_OUT.to_string(), "request = \"GET\"".into(), format!("header = \"x-amz-expected-bucket-owner: {owner}\"")]);
+        if compressed {
+            lines.push("compressed".into());
+        }
+        lines.extend(["fail".to_string(), "output = \"-\"".to_string()]);
+        lines.extend(max_filesize.map(|n| format!("max-filesize = {n}")));
+        let config = lines.join("\n") + "\n";
+        let out = c.exec_input("999:999", &["sh", "-c", "exec 3<&0 0</dev/null; exec /usr/bin/curl -q -K /dev/fd/3"], config.as_bytes());
+        let target = url.expose().strip_prefix(&base).expect("the URL's path and query").to_string();
+        (out, c.sh(&format!("cat {log}")), target)
+    };
+    let status_line = "ai-env-curl status=200 version=fv1 checksum= etag=\"stand-in\"";
+    // Past max-filesize (one byte under the stored length): refused before a byte is written, exit 63, still 200.
+    let (out, seen, target) = get(18_313, false, Some(stored.len() - 1));
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(63), "max-filesize: curl's exit, stderr {said:?}");
+    assert!(out.stdout.is_empty(), "max-filesize: curl wrote {} bytes", out.stdout.len());
+    assert!(said.lines().any(|l| l == "curl: (63) Maximum file size exceeded") && said.lines().any(|l| l == status_line), "max-filesize: curl's error and its write-out (200): {said:?}");
+    assert_eq!(seen.split_once('\t').map(|(l, _)| l.to_string()), Some(format!("GET {target} HTTP/1.1")), "the stand-in took the GET: {seen:?}");
+    for (port, compressed) in [(18_311, true), (18_312, false)] {
+        let (out, seen, target) = get(port, compressed, None);
+        let said = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(out.status.success() && said.lines().any(|l| l == status_line), "curl (compressed: {compressed}): {:?}, stderr {said:?}", out.status);
+        let (line, encoding) = seen.split_once('\t').unwrap_or_else(|| panic!("the stand-in's line: {seen:?}"));
+        assert_eq!(line, format!("GET {target} HTTP/1.1"), "the part's GET, its key and version");
+        if compressed {
+            assert!(encoding.to_ascii_lowercase().starts_with("accept-encoding:") && encoding.contains("gzip"), "compressed asks for gzip: {encoding:?}");
+            assert!(out.stdout == decoded.as_bytes(), "compressed: curl wrote the decoded object ({} bytes, sha256 {}), not its {} bytes", out.stdout.len(), hex::encode(sha2::Sha256::digest(&out.stdout)), decoded.len());
+        } else {
+            assert_eq!(encoding, "-", "an identity part's GET asks for no encoding");
+            assert!(out.stdout == stored, "without compressed: curl wrote the stored gzip stream as it came ({} bytes, not {})", out.stdout.len(), stored.len());
+        }
+    }
+    eprintln!("L2 gzip: the image's curl decoded {} stored bytes to {} with compressed, wrote them as stored without it, and refused them past max-filesize (exit 63, nothing written, status 200)", stored.len(), decoded.len());
 }

@@ -4,12 +4,18 @@
 //! Declared in S10 phase 0; S10 wave 1b (C) writes the tests. The record is
 //! written here as the code-out leaves it (C2 writes it there): the dead VM's
 //! commits and its `refs/wip/*` snapshot promoted into the user's store, ids
-//! only, no ref.
-use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_out, target, FakeVm, Repo, World};
+//! only, no ref. S11 (C.1): a re-address after `git checkout -b` in the dead
+//! VM keeps its branch, the record written by a real code-out.
+use super::fixture::{api, caps, ensure_ctx, git, git_cmd, git_out, target, FakeVm, Repo, Tokens, World, VM};
+use ai_env_cli::bridge::agent::AgentTarget;
+use ai_env_cli::bridge::codeout::{fetch, CodeoutCtx, FetchOpts};
 use ai_env_cli::bridge::config::Paths;
+use ai_env_cli::bridge::vm::registry::{write_row, RowStatus, VmRow};
 use ai_env_cli::bridge::workspace::rows::{self, VmFetchRow};
 use ai_env_cli::bridge::workspace::{carry_source, ensure_workspace, prepare, prepare_from_box, resolve, CarrySource, EnsureOutcome, SeedLimits, SeedProgress, SeedWant, WorkspaceRef};
 use ai_env_cli::errors::CliError;
+use ai_env_cli::wire::frame::{CAP_CODEOUT_MANIFEST_V1, CAP_WORKSPACE_V1};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The dead VM, whose last fetch the record keeps.
@@ -181,7 +187,9 @@ async fn a_carry_seed_past_its_cap_or_window_is_refused_naming_session_migrate()
 /// this Mac's HEAD or an ancestor of it is this Mac's, with no note (it holds
 /// everything); any other is the box's: a commit ahead of this Mac's HEAD, a
 /// WIP, with no note, and noted once this Mac's HEAD has commits the record
-/// lacks.
+/// lacks. S11 (C.1.3): this Mac's only on the record's branch: one at this
+/// Mac's HEAD on another branch (a clean `git checkout -b topic`, F1's
+/// record), or detached where this Mac is on one, is the box's, with no note.
 #[test]
 fn carry_source_rules() {
     let w = World::new();
@@ -199,6 +207,11 @@ fn carry_source_rules() {
     assert!(never(mac_note(carry_source(&paths, &ws, DEAD))), "a record with no head");
     record(&paths, &ws, DEAD, Some(fetched(&base, None)));
     assert_eq!(mac_note(carry_source(&paths, &ws, DEAD)), None, "this Mac's HEAD, no WIP: this Mac holds it all");
+    for (branch, what) in [(Some("topic"), "this Mac's HEAD on branch topic"), (None, "this Mac's HEAD, detached")] {
+        let other = VmFetchRow { branch: branch.map(str::to_string), ..fetched(&base, None) };
+        record(&paths, &ws, DEAD, Some(other.clone()));
+        assert_eq!(box_of(carry_source(&paths, &ws, DEAD)), (other, None), "{what}, this Mac on main: the box's, no note");
+    }
     record(&paths, &ws, DEAD, Some(fetched(&head, None)));
     let (rec, note) = box_of(carry_source(&paths, &ws, DEAD));
     assert_eq!((rec, note), (fetched(&head, None), None), "a commit ahead of this Mac's HEAD");
@@ -221,4 +234,41 @@ fn carry_source_rules() {
     let (rec, note) = box_of(carry_source(&paths, &ws, DEAD));
     assert_eq!(rec, fetched(&head, Some(&wip)));
     assert!(note.as_deref().is_some_and(|n| n.contains("this Mac's HEAD has commits") && n.contains(DEAD)), "{note:?}");
+}
+
+/// S11 (C.1.3, F1): a re-address after `git checkout -b topic` in the dead
+/// VM (no new object, its worktree clean, so no snapshot) seeds the new VM
+/// on `topic`. The dead VM's caps name `codeout_manifest_v1`, so its
+/// code-out answered the manifest alone and the fetch record names `topic`
+/// at this Mac's HEAD; `carry_source` takes it as the box's (this Mac is on
+/// `main`), with no note, and the carry seed checks `topic` out at that
+/// commit in a never-seeded VM.
+#[tokio::test]
+async fn a_readdress_after_checkout_b_seeds_box_with_branch_topic() {
+    let w = World::new();
+    let repo = w.repo("app");
+    let base = repo.head();
+    let (paths, cfg) = (w.paths(), w.cfg(""));
+    let ws = resolve(&cfg, &repo.dir, None).unwrap();
+    let dead = Arc::new(FakeVm::new(&w.root.join("vm"), &w.root.join("vm-projects")));
+    let (fake_api, t, c) = (api().await, target(), caps());
+    let progress = |_: SeedProgress| {};
+    ensure_workspace(&ensure_ctx(&fake_api, &dead, &paths, &cfg, &t, &c, &ws, &progress), None, SeedWant::Auto).await.unwrap();
+    write_row(&paths, &VmRow { id: VM.into(), status: RowStatus::Running, caps: Some(vec![CAP_WORKSPACE_V1.into(), CAP_CODEOUT_MANIFEST_V1.into()]), ..VmRow::default() }).unwrap();
+    git(&dead.dir, &["checkout", "-q", "-b", "topic"]);
+    let ctx = CodeoutCtx { api: Arc::new(api().await), dp: dead.clone(), tokens: Arc::new(Tokens), paths: paths.clone(), cfg: Arc::new(cfg.clone()), target: target(), ws: ws.clone(), capture_settings: false, transcript: None };
+    let report = fetch(&ctx, FetchOpts::per_result(&cfg)).await.unwrap();
+    assert!(report.ok && report.bytes == 0 && report.wip_ref.is_none(), "{report:?}");
+    // The VM is gone; its chat is re-addressed to a new one.
+    let (rec, note) = box_of(carry_source(&paths, &ws, VM));
+    assert_eq!((rec.head.as_str(), rec.branch.as_deref(), rec.wip.as_deref(), note), (base.as_str(), Some("topic"), None, None), "the box's: this Mac's HEAD, on topic");
+    let prepared = prepare_from_box(&paths, &cfg, &ws, &SeedLimits::wrapper(&cfg), &rec).unwrap();
+    assert_eq!(prepared.source(), "box");
+    let fresh = FakeVm::new(&w.root.join("vm2"), &w.root.join("vm2-projects"));
+    let t2 = AgentTarget { vm_id: "microvm-00000000-0000-4000-8000-0000000000f2".into(), ..target() };
+    let outcome = ensure_workspace(&ensure_ctx(&fake_api, &fresh, &paths, &cfg, &t2, &c, &ws, &progress), Some(prepared), SeedWant::Carry).await.unwrap();
+    assert!(matches!(&outcome, EnsureOutcome::Seeded { head: h, wip: None, .. } if *h == base), "{outcome:?}");
+    assert_eq!((git(&fresh.dir, &["rev-parse", "HEAD"]), git(&fresh.dir, &["symbolic-ref", "--short", "HEAD"])), (base.clone(), "topic".to_string()), "the new VM is on topic");
+    assert_eq!(fresh.record().and_then(|r| r.branch).as_deref(), Some("topic"));
+    assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "main", "this Mac's checkout untouched");
 }

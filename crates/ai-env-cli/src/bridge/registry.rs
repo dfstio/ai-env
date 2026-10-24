@@ -342,13 +342,25 @@ fn row_file_id(name: &std::ffi::OsStr) -> Option<&str> {
 /// other names are ignored); a row that fails to read or parse is skipped
 /// with a `warn!`.
 pub fn list(paths: &Paths) -> Result<Vec<SessionRow>, BridgeError> {
+    let (rows, skipped) = list_reporting(paths)?;
+    for s in &skipped {
+        tracing::warn!("session registry: skipping {s}");
+    }
+    Ok(rows)
+}
+
+/// [`list`], and the rows it skipped (`<id>: <error>`, one each, B3's
+/// review): a reader that decides from a row's absence (doctor's live-shim
+/// fix, whose session-less fix is a terminate) treats a skipped row as it
+/// treats a registry that cannot be read.
+pub fn list_reporting(paths: &Paths) -> Result<(Vec<SessionRow>, Vec<String>), BridgeError> {
     let dir = paths.sessions();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(io_at("cannot list", &dir)(e)),
     };
-    let mut rows = Vec::new();
+    let (mut rows, mut skipped) = (Vec::new(), Vec::new());
     for entry in entries {
         let entry = entry.map_err(io_at("cannot list", &dir))?;
         let name = entry.file_name();
@@ -360,11 +372,12 @@ pub fn list(paths: &Paths) -> Result<Vec<SessionRow>, BridgeError> {
         match read(paths, id) {
             Ok(Some(row)) => rows.push(row),
             Ok(None) => {}
-            Err(e) => tracing::warn!("session registry: skipping {id}: {e}"),
+            Err(e) => skipped.push(format!("{id}: {e}")),
         }
     }
     sort_rows(&mut rows);
-    Ok(rows)
+    skipped.sort();
+    Ok((rows, skipped))
 }
 
 /// `last_seen` descending (RFC 3339 UTC sorts lexically), then `session_id` ascending.
@@ -533,11 +546,286 @@ pub fn now_rfc3339() -> String {
     time::rfc3339_utc(time::unix_now())
 }
 
+// ---- S11 (B.3): `session list`'s extras and `session show`'s view ------------------------
+// Phase 0 declared them; S11 wave 1's B2 built them.
+
+/// What `session list` shows past the row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ListExtra {
+    /// The row's `microvm_id` (`-` for a chat on this Mac).
+    pub vm: String,
+    /// The `vms[]` entries whose `why` starts `readdress:`, `respawn:` or `migrate:`.
+    pub moves: u32,
+    /// The session's cost (`cost` over its generations' spans), `None` for a chat on this Mac.
+    pub usd: Option<f64>,
+}
+
+/// One move: a `session_move` paired with its `session_move_end` (by session, `gen` and `kind`, else by `request`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MoveView {
+    /// The `session_move` row's time; `-` when only the end was found.
+    pub at: String,
+    pub gen: u32,
+    pub kind: String,
+    /// Its `cause`, else its `trigger`.
+    pub why: String,
+    pub from_vm: String,
+    pub to_vm: String,
+    /// The end's `outcome`; `-` while open.
+    pub outcome: String,
+    pub ms: Option<u64>,
+    pub touchid: String,
+    pub request: Option<String>,
+    /// The `session_move` row's actor (`-` for a v1 row).
+    pub actor: String,
+}
+
+/// One stretch of the session's VMs, inside its generations' spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpanView {
+    pub vm: String,
+    /// `running` or `suspended`.
+    pub phase: String,
+    /// RFC 3339 UTC.
+    pub from: String,
+    pub to: String,
+    pub inferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionCost {
+    pub usd: f64,
+    pub low_usd: f64,
+    pub high_usd: f64,
+    pub running_s: u64,
+    pub suspended_s: u64,
+    pub vms: Vec<String>,
+}
+
+/// `session show <sid> --json`: the row's own keys, then the S11 ones.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionView {
+    #[serde(flatten)]
+    pub row: SessionRow,
+    pub generations: Vec<VmEntry>,
+    pub moves: Vec<MoveView>,
+    pub timeline: Vec<SpanView>,
+    /// `None` for a chat on this Mac.
+    pub cost: Option<SessionCost>,
+    /// A live wrapper serves it (`confirm_wrapper`).
+    pub wrapper_live: bool,
+    /// Settings captures held for it.
+    pub settings_captures: u32,
+}
+
+/// A chat on this Mac (no VM): `session list`'s `-` cells, `session show`'s `cost` `None`.
+fn on_this_mac(row: &SessionRow) -> bool {
+    row.mode != "remote" && row.microvm_id.is_none()
+}
+
+/// The row's generations (`vms[]`, the entries that read).
+fn generations(row: &SessionRow) -> Vec<VmEntry> {
+    row.vms.iter().filter_map(VmEntry::from_value).collect()
+}
+
+/// Each generation's `(vm, from, to)` (unix seconds): `to` `None` while it runs; a closed row's open entry
+/// ends at its `last_seen`. An entry without a VM or a readable `from` is left out.
+#[must_use]
+pub fn generation_spans(row: &SessionRow) -> Vec<(String, u64, Option<u64>)> {
+    let closed_at = (row.status == "closed").then(|| time::parse_rfc3339_utc(&row.last_seen)).flatten();
+    generations(row)
+        .into_iter()
+        .filter(|e| !e.vm.is_empty() && e.vm != "-")
+        .filter_map(|e| {
+            let from = time::parse_rfc3339_utc(&e.from)?;
+            let to = e.to.as_deref().and_then(time::parse_rfc3339_utc).or(closed_at);
+            Some((e.vm, from, to))
+        })
+        .collect()
+}
+
+/// The moves among `vms[]`: entries whose `why` starts `readdress:`, `respawn:` or `migrate:`.
+fn moves_of(row: &SessionRow) -> u32 {
+    let n = generations(row).iter().filter(|e| ["readdress:", "respawn:", "migrate:"].iter().any(|p| e.why.starts_with(p))).count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The spans a session's cost covers, open ones ended at `now`.
+fn closed_spans(row: &SessionRow, now: u64) -> Vec<(String, u64, u64)> {
+    generation_spans(row).into_iter().map(|(vm, from, to)| (vm, from, to.unwrap_or(now).min(now))).filter(|(_, from, to)| to > from).collect()
+}
+
+/// The timeline of every VM from the audit's start to `now` (the views' one reading).
+fn life_timeline(paths: &Paths, now: u64) -> crate::errors::Result<crate::bridge::timeline::Timeline> {
+    Ok(crate::bridge::cost::timeline_for(paths, 0, now)?)
+}
+
+/// `session list`'s cells past the row, one per row in order.
+pub fn list_extras(paths: &Paths, rows: &[SessionRow], now: u64) -> crate::errors::Result<Vec<ListExtra>> {
+    let remote = rows.iter().any(|r| !on_this_mac(r));
+    let t = if remote { Some(life_timeline(paths, now)?) } else { None };
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let usd = t.as_ref().filter(|_| !on_this_mac(r)).map(|t| crate::bridge::cost::spans_cost(t, &closed_spans(r, now)).0);
+            ListExtra { vm: r.microvm_id.clone().unwrap_or_else(|| "-".into()), moves: moves_of(r), usd }
+        })
+        .collect())
+}
+
+/// The moves of `uuid` in `rows`: each `session_move` paired with its `session_move_end` (by `gen` and `kind`,
+/// else by `request`); an end with no move of its own stands alone.
+fn moves_view(rows: &[crate::bridge::audit::read::Read], uuid: &str) -> Vec<MoveView> {
+    use crate::bridge::remote::audit_event::{SESSION_MOVE, SESSION_MOVE_END};
+    let word = |r: &crate::bridge::audit::read::Read, k: &str| r.detail.get(k).filter(|v| !v.is_empty() && v.as_str() != "-").cloned();
+    let mut moves: Vec<(MoveView, bool)> = Vec::new();
+    for r in rows.iter().filter(|r| r.known && r.session.as_deref() == Some(uuid)) {
+        let gen = word(r, "gen").and_then(|g| g.parse().ok()).unwrap_or(0);
+        let kind = word(r, "kind").unwrap_or_else(|| "-".into());
+        if r.event == SESSION_MOVE {
+            moves.push((
+                MoveView {
+                    at: r.ts.clone(),
+                    gen,
+                    kind,
+                    why: word(r, "cause").or_else(|| word(r, "trigger")).unwrap_or_else(|| "-".into()),
+                    from_vm: word(r, "from_vm").unwrap_or_else(|| "-".into()),
+                    to_vm: "-".into(),
+                    outcome: "-".into(),
+                    ms: None,
+                    touchid: "-".into(),
+                    request: word(r, "request"),
+                    actor: r.actor.clone().unwrap_or_else(|| "-".into()),
+                },
+                false,
+            ));
+        } else if r.event == SESSION_MOVE_END {
+            let request = word(r, "request");
+            let open = moves.iter().rposition(|(m, ended)| !ended && m.gen == gen && m.kind == kind).or_else(|| request.as_ref().and_then(|q| moves.iter().rposition(|(m, ended)| !ended && m.request.as_ref() == Some(q))));
+            let idx = open.unwrap_or_else(|| {
+                let alone = MoveView { at: "-".into(), gen, kind: kind.clone(), why: "-".into(), from_vm: word(r, "from_vm").unwrap_or_else(|| "-".into()), to_vm: "-".into(), outcome: "-".into(), ms: None, touchid: "-".into(), request: None, actor: "-".into() };
+                moves.push((alone, false));
+                moves.len() - 1
+            });
+            let (m, ended) = &mut moves[idx];
+            *ended = true;
+            m.to_vm = word(r, "to_vm").unwrap_or_else(|| "-".into());
+            m.outcome = word(r, "outcome").unwrap_or_else(|| "-".into());
+            m.ms = word(r, "ms").and_then(|v| v.parse().ok());
+            m.touchid = word(r, "touchid").unwrap_or_else(|| "-".into());
+            if m.from_vm == "-" {
+                m.from_vm = word(r, "from_vm").unwrap_or_else(|| "-".into());
+            }
+            if m.request.is_none() {
+                m.request = request;
+            }
+        }
+    }
+    moves.into_iter().map(|(m, _)| m).collect()
+}
+
+/// The settings captures held for `uuid`: `start.json`, `latest.json` and `latest-<vm>.json` (regular files).
+fn captures_of(paths: &Paths, uuid: &str) -> u32 {
+    let dir = paths.quarantine_session(uuid).join("settings");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
+    let n = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n == "start.json" || n == "latest.json" || (n.starts_with("latest-") && n.ends_with(".json"))))
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// `session show`'s view of `uuid`: `Ok(None)` without a row.
+pub fn session_view(paths: &Paths, uuid: &str, now: u64) -> crate::errors::Result<Option<SessionView>> {
+    let Some(row) = read(paths, uuid)? else {
+        return Ok(None);
+    };
+    let rows = crate::bridge::audit::read::read_all(&paths.audit())?;
+    let moves = moves_view(&rows, uuid);
+    let (timeline, cost) = if on_this_mac(&row) {
+        (Vec::new(), None)
+    } else {
+        let vm_rows = crate::bridge::vm::registry::list_rows(paths)?;
+        let defaults = crate::bridge::timeline::VmDefaults::from_cfg(&crate::bridge::config::BridgeConfig::load(paths)?.map(|c| c.vm).unwrap_or_default());
+        let t = crate::bridge::timeline::build(&rows, &vm_rows, defaults, 0, now);
+        let spans = closed_spans(&row, now);
+        let mut views = Vec::new();
+        for (vm, from, to) in &spans {
+            for iv in t.vms.iter().filter(|v| &v.vm == vm).flat_map(|v| v.intervals.iter()) {
+                let (a, b) = (iv.from.max(*from), iv.to.min(*to));
+                if a < b {
+                    let phase = match iv.phase {
+                        crate::bridge::timeline::Phase::Running => "running",
+                        crate::bridge::timeline::Phase::Suspended => "suspended",
+                    };
+                    views.push(SpanView { vm: vm.clone(), phase: phase.into(), from: time::rfc3339_utc(a), to: time::rfc3339_utc(b), inferred: iv.inferred && iv.to <= *to });
+                }
+            }
+        }
+        let (usd, low_usd, high_usd, running_s, suspended_s) = crate::bridge::cost::spans_cost(&t, &spans);
+        let mut vms: Vec<String> = Vec::new();
+        for (vm, _, _) in &spans {
+            if !vms.contains(vm) {
+                vms.push(vm.clone());
+            }
+        }
+        (views, Some(SessionCost { usd, low_usd, high_usd, running_s, suspended_s, vms }))
+    };
+    let wrapper_live = row.status != "closed" && row.pid != 0 && confirm_wrapper(&row, row.pid).is_ok();
+    let settings_captures = captures_of(paths, uuid);
+    let generations = generations(&row);
+    Ok(Some(SessionView { row, generations, moves, timeline, cost, wrapper_live, settings_captures }))
+}
+
+/// `session show`'s text (frozen by `tests/control.rs`' snapshot): the header, the generations, the moves, the
+/// timeline, the cost and the settings captures' count; every line's control characters escaped
+/// (`audit::read::terminal_safe`), as the TOML dump it replaced escaped them.
+fn show_lines(v: &SessionView) -> Vec<String> {
+    let r = &v.row;
+    let dash = |s: Option<&str>| s.filter(|s| !s.is_empty()).unwrap_or("-").to_string();
+    let mut out = vec![
+        format!("session {}", r.session_id),
+        format!("  status     {}  mode {}  route {}", dash(Some(&r.status)), dash(Some(&r.mode)), dash(Some(&r.route))),
+        format!("  cwd        {}", dash(r.cwd.as_deref())),
+        format!("  extension  {}", dash(r.ext.as_deref())),
+        format!("  vm         {}", dash(r.microvm_id.as_deref())),
+        format!("  wrapper    {}", if v.wrapper_live { format!("live (pid {})", r.pid) } else { "not live".to_string() }),
+        format!("  seen       created {}  last {}", dash(Some(&r.created)), dash(Some(&r.last_seen))),
+        format!("generations ({})", v.generations.len()),
+    ];
+    for g in &v.generations {
+        out.push(format!("  {}/{}  {}  {} .. {}  {}  {}", g.pid, g.gen, dash(Some(&g.vm)), dash(Some(&g.from)), dash(g.to.as_deref()), dash(Some(&g.why)), dash(g.end.as_deref())));
+    }
+    out.push(format!("moves ({})", v.moves.len()));
+    for m in &v.moves {
+        let ms = m.ms.map_or_else(|| "-".to_string(), |ms| format!("{ms} ms"));
+        let request = m.request.as_deref().map(|q| format!("  request {q}")).unwrap_or_default();
+        out.push(format!("  {}  gen {} {}  {}  {} -> {}  {}  {}  touchid {}  by {}{request}", m.at, m.gen, m.kind, m.why, m.from_vm, m.to_vm, m.outcome, ms, m.touchid, m.actor));
+    }
+    out.push(format!("timeline ({})", v.timeline.len()));
+    for s in &v.timeline {
+        out.push(format!("  {}  {:<9}  {} .. {}{}", s.vm, s.phase, s.from, s.to, if s.inferred { "  inferred" } else { "" }));
+    }
+    match &v.cost {
+        Some(c) => {
+            let secs = |s: u64| crate::bridge::vm::cmd::fmt_secs(i64::try_from(s).unwrap_or(i64::MAX));
+            out.push(format!("cost       ${:.3} (range ${:.3}–{:.3})  running {}  suspended {}", c.usd, c.low_usd, c.high_usd, secs(c.running_s), secs(c.suspended_s)));
+        }
+        None => out.push("cost       - (a chat on this Mac)".to_string()),
+    }
+    out.push(format!("settings captures  {}", v.settings_captures));
+    out.iter().map(|l| crate::bridge::audit::read::terminal_safe(l).into_owned()).collect()
+}
+
 // ---- `ai-env session …` ------------------------------------------------------------------
 
-/// One text line of `session list`: id, status, mode, last_seen, slug (`-` when unset).
-fn list_line(row: &SessionRow) -> String {
-    format!("{}  {:<6}  {:<13}  {}  {}", row.session_id, row.status, row.mode, row.last_seen, row.slug.as_deref().unwrap_or("-"))
+/// One text line of `session list`: id, status, mode, last_seen, slug (`-` when unset); S11: then the VM, the
+/// moves and the cost (`$<usd>` at 3 decimals, `-` for a chat on this Mac).
+fn list_line(row: &SessionRow, extra: &ListExtra) -> String {
+    let cost = extra.usd.map_or_else(|| "-".to_string(), |u| format!("${u:.3}"));
+    let line = format!("{}  {:<6}  {:<13}  {}  {}  {}  {}  {cost}", row.session_id, row.status, row.mode, row.last_seen, row.slug.as_deref().unwrap_or("-"), extra.vm, extra.moves);
+    crate::bridge::audit::read::terminal_safe(&line).into_owned()
 }
 
 /// The suffix of `forgot <uuid>…`, or `None` when nothing was removed.
@@ -552,8 +840,8 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> crate::errors::Result<String> {
 }
 
 /// `ai-env session list [--json]`: every registered session, newest first.
-/// Text: one line per row (`<id>  <status>  <mode>  <last_seen>  <slug>`), or
-/// `no sessions yet`; JSON: a pretty array (`[]` when empty).
+/// Text: one line per row (`<id>  <status>  <mode>  <last_seen>  <slug>  <vm>  <moves>  <cost>`, S11), or
+/// `no sessions yet`; JSON: a pretty array (`[]` when empty), the rows alone.
 pub fn cmd_list(json: bool) -> crate::errors::Result<()> {
     let paths = Paths::resolve()?;
     let rows = list(&paths)?;
@@ -562,28 +850,36 @@ pub fn cmd_list(json: bool) -> crate::errors::Result<()> {
     } else if rows.is_empty() {
         outln!("no sessions yet");
     } else {
-        for row in &rows {
-            outln!("{}", list_line(row));
+        // The rows print whatever the audit, the VM rows or bridge.toml say: without them, no cost cells (`-`),
+        // as `vm list` stands without its own.
+        let extras = list_extras(&paths, &rows, crate::bridge::lab::now()).unwrap_or_else(|e| {
+            crate::bridge::voice::warn(&format!("session list: no cost cells: {e}"));
+            rows.iter().map(|r| ListExtra { vm: r.microvm_id.clone().unwrap_or_else(|| "-".into()), moves: moves_of(r), usd: None }).collect()
+        });
+        for (row, extra) in rows.iter().zip(&extras) {
+            outln!("{}", list_line(row, extra));
         }
     }
     Ok(())
 }
 
-/// `ai-env session show UUID [--json]`: the row as TOML (or pretty JSON).
-/// A non-uuid is a usage error (exit 2); an unknown session exits 1.
+/// `ai-env session show UUID [--json]`: S11's view of the session (`session_view`): its header, generations,
+/// moves, timeline, cost and settings captures (`--json`: the row's keys, then those). A non-uuid is a usage
+/// error (exit 2); an unknown session exits 1.
 pub fn cmd_show(uuid: &str, json: bool) -> crate::errors::Result<()> {
     if !is_uuid(uuid) {
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
     }
     let paths = Paths::resolve()?;
-    let Some(row) = read(&paths, uuid)? else {
+    let Some(view) = session_view(&paths, uuid, crate::bridge::lab::now())? else {
         bail!("no session {uuid}");
     };
     if json {
-        outln!("{}", to_json(&row)?);
+        outln!("{}", to_json(&view)?);
     } else {
-        let text = toml::to_string_pretty(&row).map_err(|e| CliError::Msg(format!("cannot render TOML: {e}")))?;
-        outln!("{}", text.trim_end_matches('\n'));
+        for line in show_lines(&view) {
+            outln!("{line}");
+        }
     }
     Ok(())
 }
@@ -799,7 +1095,9 @@ mod drop_transport_tests {
         let rows = crate::bridge::audit::read_rows(&paths.audit(), None).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!((rows[0]["event"].as_str(), rows[0]["session_id"].as_str()), (Some(crate::bridge::remote::audit_event::DROP_TRANSPORT), Some(sid)));
-        assert_eq!(rows[0]["detail"], serde_json::json!({"session": sid, "wrapper_pid": "4242"}));
+        let mut detail = rows[0]["detail"].clone();
+        assert!(detail.as_object_mut().and_then(|d| d.remove("actor")).is_some(), "S11: every row names its actor");
+        assert_eq!(detail, serde_json::json!({"session": sid, "wrapper_pid": "4242"}));
         assert_eq!(rows[0]["pid"], std::process::id(), "the writing process: the command's, not the wrapper's");
     }
 }
@@ -1421,11 +1719,14 @@ mod tests {
     #[test]
     fn list_line_and_forget_suffix() {
         let mut r = row(1, "2026-09-25T10:00:00Z");
-        assert_eq!(list_line(&r), format!("{}  closed  local-child    2026-09-25T10:00:00Z  -", id(1)));
+        let mac = ListExtra { vm: "-".into(), moves: 0, usd: None };
+        assert_eq!(list_line(&r, &mac), format!("{}  closed  local-child    2026-09-25T10:00:00Z  -  -  0  -", id(1)));
         r.slug = Some("-tmp-x".into());
         r.status = "active".into();
         r.mode = "local-scratch".into();
-        assert_eq!(list_line(&r), format!("{}  active  local-scratch  2026-09-25T10:00:00Z  -tmp-x", id(1)));
+        assert_eq!(list_line(&r, &mac), format!("{}  active  local-scratch  2026-09-25T10:00:00Z  -tmp-x  -  0  -", id(1)));
+        let remote = ListExtra { vm: "microvm-a1".into(), moves: 2, usd: Some(0.1234) };
+        assert!(list_line(&r, &remote).ends_with("-tmp-x  microvm-a1  2  $0.123"), "{}", list_line(&r, &remote));
         assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false }).as_deref(), Some(" (row)"));
         assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (row, scratch dir)"));
         assert_eq!(forget_suffix(ForgetReport { removed_row: false, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (scratch dir)"));

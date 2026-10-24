@@ -5,7 +5,7 @@
 //! it, and without a config. Nothing here touches the process environment.
 use ai_env_cli::bridge::config::BridgeConfig;
 use ai_env_cli::bridge::route::{cwd_under_roots, decide};
-use ai_env_cli::wire::argv::{LocalReason, Route, FIXTURE_EXT_VERSION, FIXTURE_NAMES, KEPT_FIXTURES};
+use ai_env_cli::wire::argv::{flag_class, takes_value, FlagClass, LocalReason, Route, FIXTURE_EXT_VERSION, FIXTURE_NAMES, KEPT_FIXTURES};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -111,6 +111,64 @@ fn every_fixture_is_tagged_with_the_captured_extension_version() {
     for (name, tag) in [("session", "99.0.0"), ("version", "99.0.0"), ("version", "2.1"), ("version", "2.1.x"), ("version", "2.1.278.1"), ("version", "")] {
         assert!(!tag_holds(name, tag), "{name} tagged {tag:?}");
     }
+}
+
+/// The `--flag` names `args` passes before a bare `--`, as doctor's drift row reads a census row's: `--name=value`
+/// split at its first `=`, the spaced value of a flag that takes one skipped.
+fn passed_flags(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = args.iter().map(String::as_str);
+    while let Some(tok) = rest.next() {
+        if tok == "--" {
+            break;
+        }
+        if tok.len() <= 2 || !tok.starts_with("--") {
+            continue;
+        }
+        let name = tok.split_once('=').map_or(tok, |(name, _)| name);
+        if name == tok && takes_value(tok) {
+            rest.next();
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// S11 (C.4): every flag a session-shaped fixture (`route` `remote`) passes is one the router classifies
+/// (`wire::argv::flag_class`: a `Value`, `Stripped` or `Bool` flag, never `Unknown`), so a re-capture that brings a
+/// new flag fails here until it is reviewed, as doctor's drift row (`bridge::drift::unknown_flags`) names it on the
+/// census row. A subcommand's flags (`--json`, `--scope`, `--transport`, `--env`, `--status`) are its own: its rows
+/// are never a session's, so they are never judged.
+#[test]
+fn every_flag_of_a_session_shaped_fixture_is_classified() {
+    use ai_env_cli::bridge::drift::unknown_flags;
+    let all = load_fixtures();
+    // A census row of the fixture's argv (argv[0] the wrapper, argv[1] the real binary) at a stand-in version.
+    let row = |f: &Fixture, reason: &str| {
+        let argv: Vec<String> = ["/w/ai-env-claude".to_string(), "/b/claude".to_string()].into_iter().chain(f.argv.iter().cloned()).collect();
+        serde_json::json!({"reason": reason, "ext": "9.9.9", "argv": argv, "env_names": []})
+    };
+    let sessions: Vec<&Fixture> = all.iter().filter(|f| f.route == "remote").collect();
+    let names: BTreeSet<&str> = sessions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, BTreeSet::from(["config_probe", "session", "session_chrome_mcp", "session_multiroot", "session_resume"]), "the session-shaped fixtures");
+    for f in &sessions {
+        let flags = passed_flags(&f.argv);
+        assert!(flags.len() >= 10, "{}: {flags:?}", f.name);
+        for flag in &flags {
+            assert_ne!(flag_class(flag), FlagClass::Unknown, "{}: {flag} is not classified: VALUE_FLAGS or BOOL_FLAGS (src/wire/argv.rs), once reviewed", f.name);
+        }
+        assert_eq!(unknown_flags(&[row(f, "session")], "9.9.9"), Vec::<String>::new(), "{}: doctor's drift row reads it alike", f.name);
+    }
+    // Every class occurs among them.
+    let classes: BTreeSet<String> = sessions.iter().flat_map(|f| passed_flags(&f.argv)).map(|flag| format!("{:?}", flag_class(flag))).collect();
+    assert_eq!(classes, BTreeSet::from(["Bool".to_string(), "Stripped".to_string(), "Value".to_string()]));
+    // A subcommand's own flags: unknown to the router, and never judged, a subcommand's row being no session's.
+    let mut own = BTreeSet::new();
+    for f in all.iter().filter(|f| f.reason.as_deref().is_some_and(|r| r.starts_with("subcommand:"))) {
+        own.extend(passed_flags(&f.argv).into_iter().filter(|flag| flag_class(flag) == FlagClass::Unknown).map(str::to_string));
+        assert!(unknown_flags(&[row(f, f.reason.as_deref().unwrap_or_default())], "9.9.9").is_empty(), "{}: a subcommand's row is never judged", f.name);
+    }
+    assert_eq!(own, ["--env", "--json", "--scope", "--status", "--transport"].into_iter().map(str::to_string).collect::<BTreeSet<_>>());
 }
 
 #[test]

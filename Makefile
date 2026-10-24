@@ -1,19 +1,19 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
 .PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-egress-run test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance acceptance-run clean \
-        claude-pin image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures
+        claude-pin claude-admit-docker image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate, widen a live run or pick an identity (YES, KEEP,
 # VERSION, ROTATE, WRITE, CONFIRM, RECORD_PROBE, FOLLOW, EXPECT_BUILD_FAILURE, SLOW, PROBES, SYSTEMD, CRED, S3, S10,
-# CHAT, REFRESH, BREAKGLASS) count only when given on the make command line (`make image-prune YES=1`; a sub-make
+# S11, WALL, CHAT, REFRESH, BREAKGLASS) count only when given on the make command line (`make image-prune YES=1`; a sub-make
 # inherits them, one under `ai-env as` too): the same name exported in the environment is ignored. $(call cmdline,NAME)
 # is the value, or empty.
 cmdline       = $(if $(filter command line,$(origin $(1))),$($(1)))
 # The single-letter switches of this make run: MAKEFLAGS' first word and its -x words, as GNU make 3.81 and 4.x write
 # them (a variable assignment, a long option, and an option with an argument (-j -l -O -I) hold none). acceptance, and
 # every tiered target and its X-run (NOT_UNDER_I_OR_P, infra/infra.mk), refuse -i and -p on them; TIER leaves its
-# runner out in a dry run (-n, -q, -t: MAKE_DRY). ops.sh's make_switch reads claude-update's the same way.
+# runner out in a dry run (-n, -q, -t: MAKE_DRY).
 MAKE_SWITCHES = $(foreach w,$(firstword $(MAKEFLAGS)),$(if $(or $(findstring =,$(w)),$(filter --% -j% -l% -O% -I%,$(w))),,$(w))) $(filter-out --% -j% -l% -O% -I%,$(filter -%,$(MAKEFLAGS)))
 MAKE_DRY      = $(strip $(findstring n,$(MAKE_SWITCHES))$(findstring q,$(MAKE_SWITCHES))$(findstring t,$(MAKE_SWITCHES)))
 STACK        ?= dev
@@ -33,7 +33,8 @@ LLVM_BIN     ?= /opt/homebrew/opt/llvm/bin
 # The image's base container: the FROM line of image/Dockerfile is the single source (digest-pinned).
 BASE_IMAGE   := $(shell sed -n 's/^FROM[[:space:]]*//p' image/Dockerfile | head -1)
 CARGO        := cargo +$(TOOLCHAIN)
-# A make started under `cargo run` (claude-update's passes re-exec through $(AI_ENV), `cargo run` by default) inherits
+# A make started under `cargo run` (S11: `ai-env claude admit` run through $(AI_ENV), `cargo run` by default, starts make
+# claude-admit-docker) inherits
 # CARGO, the path cargo gives its children, and make exports a variable that came from the environment with this
 # file's value: every recipe would get CARGO=`cargo +1.98.1`, which cargo-lambda runs as a program for its `cargo
 # metadata` (cargo_metadata reads CARGO first), and none is called that (vm-build: "failed to start `cargo metadata`:
@@ -78,8 +79,9 @@ LOCAL_IMAGE  ?= ai-env-agent:local
 # s3-preflight P3: free disk inside the Docker VM (KiB) for the image build (the ~240 MB claude download, the layers,
 # the build cache).
 DOCKER_FREE_MIN_KB ?= 4194304
-# Claude Code release signing key (gpg). With gpg and this key in its keyring, claude-pin requires manifest.json.sig
-# and a valid signature whose primary key is this fingerprint; without either it pins with a NOT verified warning.
+# The Claude Code release key's primary fingerprint (S11): the vendored crates/ai-env-cli/certs/claude-code-release.gpg,
+# which wire::pin::RELEASE_KEY_FPR and certs/README.md equal (a test ties the three). claude-pin and ai-env claude admit
+# verify every release manifest with gpgv against that key alone, fail-closed.
 CLAUDE_GPG_FPR ?= 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
 CLAUDE_RELEASES := https://downloads.claude.ai/claude-code-releases
 
@@ -115,25 +117,27 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
 	@echo "check-bins: ok"
 
-test: ## Unit + integration tests in all four feature sets
-	$(CARGO) test --workspace
-	$(CARGO) test -p $(PKG) --no-default-features
-	$(CARGO) test -p $(PKG) --no-default-features --features shim
-	$(CARGO) test -p $(PKG) --no-default-features --features bridge
+test: ## Unit + integration tests in all four feature sets; S11: the audit is strict (AI_ENV_AUDIT_STRICT=1: an unregistered event or key fails its write)
+	AI_ENV_AUDIT_STRICT=1 $(CARGO) test --workspace
+	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features
+	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features shim
+	AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features bridge
 
 # Live targets never run against a fake: every lab knob of the developer's shell is dropped (S5:
 # AI_ENV_BRIDGE_LAB_FAKE_SHELL, the scripted shell of `ai-env egress check` under the fake backend; S7: the
 # wrapper's synthetic oauth_token_refresh, and the unseal budget of its local-scratch and of every credentialed
 # vm and lab command; S8: the remote session's transcript knob, a resume that uploads no transcript, and S2's pump
 # knobs, which S8's live wrapper runs meet: s8-smoke, test-aws CRED=1, acceptance; S9: the fake S3's address and the
-# code token's minutes). tests/infra/image.rs holds the list to every AI_ENV_BRIDGE_LAB_* name the code and
+# code token's minutes; S10: the park's quiet; S11: the release's curl, gpgv and make of `ai-env claude admit`, and the
+# S11 views' clock, last). tests/infra/image.rs holds the list to every AI_ENV_BRIDGE_LAB_* name the code and
 # infra/scripts read. test-aws SLOW=1 then sets the code token's minutes again, for its test process: the re-mint
 # test mints its tokens in that process, and the vm, box and session commands and the chats it runs drop every
 # lab knob.
-LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_SHELL AI_ENV_BRIDGE_LAB_ASSUME_TTY \
+LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_ENV_BRIDGE_LAB_BACKOFF_MS AI_ENV_BRIDGE_LAB_FAKE_SHELL \
                 AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS AI_ENV_BRIDGE_LAB_TRANSCRIPT AI_ENV_BRIDGE_LAB_EXIT \
                 AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS AI_ENV_BRIDGE_LAB_OSASCRIPT \
-                AI_ENV_BRIDGE_LAB_S3_ADDR AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES AI_ENV_BRIDGE_LAB_PARK_AFTER_MS
+                AI_ENV_BRIDGE_LAB_S3_ADDR AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES AI_ENV_BRIDGE_LAB_PARK_AFTER_MS \
+                AI_ENV_BRIDGE_LAB_RELEASE_CURL AI_ENV_BRIDGE_LAB_GPGV AI_ENV_BRIDGE_LAB_ADMIT_MAKE AI_ENV_BRIDGE_LAB_NOW
 LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 
 # S10 (F12): `make test-aws S3=1 CHAT=dev` runs the S3 store's gib test alone (live_s3_gib_round_trip_timing) on a
@@ -149,6 +153,10 @@ TEST_AWS_CHAT = chat='$(call cmdline,CHAT)'; shape='$(S3_CHAT_DEV)'; case "$$cha
   test '$(call cmdline,S3)' = 1 || { echo "test-aws: CHAT=dev needs S3=1: make test-aws S3=1 CHAT=dev"; exit 2; }; \
   test -n "$$shape" || { echo "test-aws: S3_CHAT_DEV is empty: set it at part B's P0 to main=<MiB>,subtree=<MiB>,files=<n>, from the development chat's file names and sizes only (never its content), in this Makefile or on the command line"; exit 2; }; \
   printf '%s\n' "$$shape" | grep -Eqx 'main=[0-9]+,subtree=[0-9]+,files=[0-9]+' || { echo "test-aws: S3_CHAT_DEV=$$shape is not main=<MiB>,subtree=<MiB>,files=<n>"; exit 2; }
+# S11 (C.5.4): `make test-aws S10=1 WALL=1` runs S10's three wall tests alone (AI_ENV_AWS_SLOW=1, no code token minutes);
+# WALL other than 1, or WALL=1 without S10=1, stops after the keyless compile and before the tests (exit 2).
+TEST_AWS_WALL = test '$(call cmdline,WALL)' = 1 || { echo "test-aws: WALL=$(call cmdline,WALL) is not 1: make test-aws S10=1 WALL=1 runs S10's three wall tests alone"; exit 2; }; \
+  test '$(call cmdline,S10)' = 1 || { echo "test-aws: WALL=1 needs S10=1: make test-aws S10=1 WALL=1 runs S10's three wall tests alone"; exit 2; }
 
 # --nocapture: the live tests are measurements (statuses, x-aws-proxy-error, timings) printed to stderr, which
 # cargo hides for passing tests; one thread keeps each test's lines together. test-aws may run under a runner (its
@@ -156,11 +164,14 @@ TEST_AWS_CHAT = chat='$(call cmdline,CHAT)'; shape='$(S3_CHAT_DEV)'; case "$$cha
 # built first without any key in their environment (D18: a dependency's build script or proc macro never sees it), as
 # test-egress's are, and so is the probes' operator CLI; the run then finds them built and keeps the key. S10: S10=1
 # runs the live_s10_* tests alone (AI_ENV_S10_TESTS=1); with SLOW=1 it sets AI_ENV_AWS_SLOW=1 alone, for its three
-# wall tests: the code token's minutes are S9's re-mint test's, which S10=1 leaves out.
-test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command, and one per test for its chats' S3 objects, purged at its end by one session forget --purge of them all: 13 beside the test process's one (the planted secret's test has nothing to purge), 14 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension test, four more: its chat, its purge, and the ops key's for the suspension and for its restore (one per egress suspend; two in all when the run is under ai-env as ops or as deployer); live_wrapper_smoke is skipped: make s8-smoke runs it). S9: the smart-HTTP tests run in the plain form (live_box_fetch_smart_http_matches_codeout, live_smart_http_wrong_port_token_403_twice, live_review_loop_and_tag_leak, live_vm_has_no_push_path: vpc VMs of fixtures under target/s8, one Touch ID per ai-env command); SLOW=1 adds the code token's re-mint after its expiry (live_smart_http_remints_after_expiry: SLOW=1 also sets AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2 for the test process, whose own MintingTokens mint its 9418 tokens: the vm, box and session commands and the chats it runs drop every lab knob); S3=1 runs the S3 store's live tests alone (live_s3_*: chats in remote mode after S9's cut-over, the setup-token sealed, each test's chats' objects purged from S3 at its end with one Touch ID more, one session forget --purge of them all; the 1 GiB round trip takes tens of minutes); S3=1 CHAT=dev runs that round trip alone (live_s3_gib_round_trip_timing, about 1.5 h) on a synthetic chat of the development chat's shape, AI_ENV_S3_CHAT=S3_CHAT_DEV (main=<MiB>,subtree=<MiB>,files=<n>, set at part B's P0 from the development chat's file names and sizes only, never its content); another CHAT, or one without S3=1 or a well-formed S3_CHAT_DEV, stops before the tests run. S10=1 runs S10's live tests alone (live_s10_*, AI_ENV_S10_TESTS=1: chats of the real ai-env-claude in remote mode on target/s8 fixtures, the setup-token sealed: a close and a reopen with the wrapper stopped as a closed lid, a VM terminated mid-turn and after an edit, a park at a permission prompt, then subagents and a move, and a live chat moved by session migrate; one Touch ID per chat and per vm or session command, one more per move to a new VM, and one per test for its chats' S3 objects: about 21 in all, the test process's own included); with SLOW=1 the three wall tests too (a wall migration between turns, a reopen near the wall, a reopen after it with the platform's wall recorded; about 45 minutes and 9 Touch IDs more, 3 each, about 30 in all: the others run too), AI_ENV_AWS_SLOW=1 alone
+# wall tests: the code token's minutes are S9's re-mint test's, which S10=1 leaves out. S10=1 WALL=1 runs those three
+# alone, by their full names. S11: S11=1 runs the live_s11_* tests alone (AI_ENV_S11_TESTS=1), parts A's and C's under
+# one filter, and sets no code token minutes (with SLOW=1 only the slow switch).
+test-aws: ## Live AWS/TLS tests (#[ignore]d; AI_ENV_AWS_TESTS=1; needs credentials; region is pinned in code), measurements shown. SLOW=1 adds the 6-minute token-expiry test and the S6 65-minute rotation hold (live_agent_rotation); PROBES=1 re-records the live S4 probes; CRED=1 adds the S7 credential tests (live_credential_*: the setup-token delivered and answering OK, a garbage token refused with exit 5, no credential into an internet VM; Touch IDs: the test process's one, then one per credentialed command with a current combined.env, two for the garbage token's --credential-file: the runtime key, then the file) and S8's live wrapper tests (live_wrapper_*: chats of the real ai-env-claude in remote mode on target/s8 fixtures under [workspaces].roots, one Touch ID per chat and per vm or box command, and one per test for its chats' S3 objects, purged at its end by one session forget --purge of them all: 13 beside the test process's one (the planted secret's test has nothing to purge), 14 when the planted secret's dialog is answered before the seed's refusal closes it; SLOW=1 adds the API host's suspension test, four more: its chat, its purge, and the ops key's for the suspension and for its restore (one per egress suspend; two in all when the run is under ai-env as ops or as deployer); live_wrapper_smoke is skipped: make s8-smoke runs it). S9: the smart-HTTP tests run in the plain form (live_box_fetch_smart_http_matches_codeout, live_smart_http_wrong_port_token_403_twice, live_review_loop_and_tag_leak, live_vm_has_no_push_path: vpc VMs of fixtures under target/s8, one Touch ID per ai-env command); SLOW=1 adds the code token's re-mint after its expiry (live_smart_http_remints_after_expiry: SLOW=1 also sets AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2 for the test process, whose own MintingTokens mint its 9418 tokens: the vm, box and session commands and the chats it runs drop every lab knob); S3=1 runs the S3 store's live tests alone (live_s3_*: chats in remote mode after S9's cut-over, the setup-token sealed, each test's chats' objects purged from S3 at its end with one Touch ID more, one session forget --purge of them all; the 1 GiB round trip takes tens of minutes); S3=1 CHAT=dev runs that round trip alone (live_s3_gib_round_trip_timing, about 1.5 h) on a synthetic chat of the development chat's shape, AI_ENV_S3_CHAT=S3_CHAT_DEV (main=<MiB>,subtree=<MiB>,files=<n>, set at part B's P0 from the development chat's file names and sizes only, never its content); another CHAT, or one without S3=1 or a well-formed S3_CHAT_DEV, stops before the tests run. S10=1 runs S10's live tests alone (live_s10_*, AI_ENV_S10_TESTS=1: chats of the real ai-env-claude in remote mode on target/s8 fixtures, the setup-token sealed: a close and a reopen with the wrapper stopped as a closed lid, a VM terminated mid-turn and after an edit, a park at a permission prompt, then subagents and a move, and a live chat moved by session migrate; one Touch ID per chat and per vm or session command, one more per move to a new VM, and one per test for its chats' S3 objects: about 21 in all, the test process's own included); with SLOW=1 the three wall tests too (a wall migration between turns, a reopen near the wall, a reopen after it with the platform's wall recorded; about 45 minutes and 9 Touch IDs more, 3 each, about 30 in all: the others run too), AI_ENV_AWS_SLOW=1 alone. S11=1 runs S11's live tests alone (live_s11_*, AI_ENV_S11_TESTS=1: chats of the real ai-env-claude in remote mode on target/s8 fixtures, the setup-token sealed; part C's three about 14 Touch IDs, the test process's one included, and part A's unknown option, stager and claude_src tests theirs); S10=1 WALL=1 runs S10's three wall tests alone (AI_ENV_AWS_SLOW=1; about 10 Touch IDs and 45 minutes); WALL=1 without S10=1 stops before the tests run
 	$(NO_KEY) $(LAB_UNSET) $(CARGO) test -p $(PKG) --features bridge --test aws --no-run
 	@$(if $(call cmdline,CHAT),$(TEST_AWS_CHAT))
-	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW)),AI_ENV_AWS_SLOW=1$(if $(filter 1,$(call cmdline,S10)),, AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2)) $(if $(filter 1,$(call cmdline,S3)),AI_ENV_S3_TESTS=1 $(if $(filter dev,$(call cmdline,CHAT)),AI_ENV_S3_CHAT='$(S3_CHAT_DEV)' ))$(if $(filter 1,$(call cmdline,S10)),AI_ENV_S10_TESTS=1 )$(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)$(if $(filter 1,$(call cmdline,S3)), $(if $(filter dev,$(call cmdline,CHAT)),live_s3_gib_round_trip_timing,live_s3_))$(if $(filter 1,$(call cmdline,S10)), live_s10_)
+	@$(if $(call cmdline,WALL),$(TEST_AWS_WALL))
+	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 $(if $(filter 1,$(call cmdline,SLOW) $(call cmdline,WALL)),AI_ENV_AWS_SLOW=1$(if $(filter 1,$(call cmdline,S10) $(call cmdline,S11)),, AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES=2)) $(if $(filter 1,$(call cmdline,S3)),AI_ENV_S3_TESTS=1 $(if $(filter dev,$(call cmdline,CHAT)),AI_ENV_S3_CHAT='$(S3_CHAT_DEV)' ))$(if $(filter 1,$(call cmdline,S10)),AI_ENV_S10_TESTS=1 )$(if $(filter 1,$(call cmdline,S11)),AI_ENV_S11_TESTS=1 )$(if $(filter 1,$(call cmdline,CRED)),AI_ENV_CREDENTIAL_TESTS=1) $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --test-threads=1 --nocapture$(if $(filter 1,$(call cmdline,CRED)), --skip live_wrapper_smoke)$(if $(filter 1,$(call cmdline,S3)), $(if $(filter dev,$(call cmdline,CHAT)),live_s3_gib_round_trip_timing,live_s3_))$(if $(filter 1,$(call cmdline,S10)), $(if $(filter 1,$(call cmdline,WALL)),live_s10_wall_migration live_s10_reopen_near_wall live_s10_reopen_after_wall,live_s10_))$(if $(filter 1,$(call cmdline,S11)), live_s11_)
 	@$(if $(filter 1,$(call cmdline,PROBES)),$(AI_ENV_BUILD) || exit $$?; rc=0; for p in payload-size no-traffic-before-run snapshot-uniqueness idle-policy-limits; do \
 	  $(LAB_UNSET) $(AI_ENV) lab run $$p || { echo "test-aws: probe $$p did not record its expected verdict"; rc=1; }; done; exit $$rc,true)
 
@@ -179,12 +190,13 @@ test-claude: ## T7.2 (live, this Mac): the sealed setup-token drives the real cl
 s8-smoke: ## T8.2 gate: tests/aws.rs live_wrapper_smoke, three passes, each a chat of the real ai-env-claude in remote mode on the fixture target/s8/live-wrapper-smoke (made anew; [workspaces].roots must hold target/s8): the seed, one turn, its code-out fetched before the close, exit 0 within 1.5 s; one Touch ID each, plus the test process's own (its runtime key) and one for the three chats' S3 objects, purged at its end by one session forget --purge of them all: 5 in all; the test's VM terminated at its end; each pass's record appended to target/s8/smoke.jsonl once its close passed
 	$(LAB_UNSET) AI_ENV_AWS_TESTS=1 AI_ENV_CREDENTIAL_TESTS=1 $(CARGO) test -p $(PKG) --features bridge --test aws -- --ignored --exact live_wrapper_smoke --nocapture --test-threads=1
 
-test-cursor: ## S8 part B: one Cursor step's evidence (tests/cursor_live.rs; no VM, no Touch ID, no AWS: the census, the registry, the audit, the lab rows, the git refs): STEP=t8_3|t8_4|t8_5|t8_6|t8_7|t9_s3|t10_2|t10_3|t10_4|t10_5|t10_p (S9: the S3 store's chats; S10, in a target/s8 fixture window, never the development chat: t10_2 a close, a reopen and a lid's sleep, t10_3 a VM terminated mid-turn, t10_4 a wall migration or a reopen that moved first, t10_5 a park at a permission prompt, subagents and a move, t10_p the placeholder's picker reopen), SINCE=TIME (required, RFC 3339 UTC: only rows from then on, the step's start taken with date -u +%Y-%m-%dT%H:%M:%SZ before the step; SINCE=all reads every row) and WORKSPACE=PATH (optional: the chats' workspace; default this checkout)
+test-cursor: ## S8 part B: one Cursor step's evidence (tests/cursor_live.rs; no VM, no Touch ID, no AWS: the census, the registry, the audit, the lab rows, the git refs): STEP=t8_3|t8_4|t8_5|t8_6|t8_7|t9_s3|t10_2|t10_3|t10_4|t10_5|t10_p|t11_3|t11_fresh (S9: the S3 store's chats; S10, in a target/s8 fixture window, never the development chat: t10_2 a close, a reopen and a lid's sleep, t10_3 a VM terminated mid-turn, t10_4 a wall migration or a reopen that moved first, t10_5 a park at a permission prompt, subagents and a move, t10_p the placeholder's picker reopen; S11, in a target/s8 fixture window: t11_3 the panel's suspend, resume and live migrate of the chat, actor=panel, the move's request the panel's nonce, the CLI's twins with the same keys, t11_fresh a chat on the window's own claude from the VM's cache, claude_src:cached, its claude: the row's ext), SINCE=TIME (required, RFC 3339 UTC: only rows from then on, the step's start taken with date -u +%Y-%m-%dT%H:%M:%SZ before the step; SINCE=all reads every row) and WORKSPACE=PATH (optional: the chats' workspace; default this checkout)
 	@step='$(call cmdline,STEP)'; case "$$step" in t8_3|t8_4|t8_5|t8_6|t8_7) ;; \
 	  t9_s3) ;; \
 	  t10_2|t10_3|t10_4|t10_5|t10_p) ;; \
-	  '') echo "test-cursor: STEP is missing: make test-cursor STEP=t8_3 (or t8_4, t8_5, t8_6, t8_7) after that step in Cursor, or STEP=t9_s3 after S9's, or STEP=t10_2 (or t10_3, t10_4, t10_5, t10_p) after S10's"; exit 2 ;; \
-	  *) echo "test-cursor: STEP=$$step names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7, t9_s3, t10_2, t10_3, t10_4, t10_5, t10_p"; exit 2 ;; esac
+	  t11_3|t11_fresh) ;; \
+	  '') echo "test-cursor: STEP is missing: make test-cursor STEP=t8_3 (or t8_4, t8_5, t8_6, t8_7) after that step in Cursor, or STEP=t9_s3 after S9's, or STEP=t10_2 (or t10_3, t10_4, t10_5, t10_p) after S10's, or STEP=t11_3 (or t11_fresh) after S11's"; exit 2 ;; \
+	  *) echo "test-cursor: STEP=$$step names no step: one of t8_3, t8_4, t8_5, t8_6, t8_7, t9_s3, t10_2, t10_3, t10_4, t10_5, t10_p, t11_3, t11_fresh"; exit 2 ;; esac
 	@test -n '$(call cmdline,SINCE)' || { echo "test-cursor: SINCE is missing: take the step's start (date -u +%Y-%m-%dT%H:%M:%SZ) before the step in Cursor, or pass SINCE=all to read every row"; exit 2; }
 	$(LAB_UNSET) AI_ENV_CURSOR_TESTS=1 AI_ENV_CURSOR_STEP=$(call cmdline,STEP) $(if $(call cmdline,SINCE),AI_ENV_CURSOR_SINCE='$(call cmdline,SINCE)' )$(if $(call cmdline,WORKSPACE),AI_ENV_CURSOR_WORKSPACE='$(call cmdline,WORKSPACE)' )$(CARGO) test -p $(PKG) --features bridge --test cursor_live -- --ignored --nocapture --test-threads=1
 
@@ -341,7 +353,7 @@ check-msrv: ## T0.2: ai-env-age builds on $(MSRV_OLD); ai-env-cli refuses (requi
 	cargo +$(MSRV_OLD) build -p ai-env-age
 	@out=$$(cargo +$(MSRV_OLD) build -p $(PKG) 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-cli unexpectedly builds on $(MSRV_OLD)"; exit 1; }; \
-	  grep -q 'ai-env-cli@0.1.0 requires rustc 1.94.1' <<<"$$out" || { echo "$$out"; echo "expected the MSRV refusal"; exit 1; }; \
+	  grep -q 'ai-env-cli@0.11.0 requires rustc 1.94.1' <<<"$$out" || { echo "$$out"; echo "expected the MSRV refusal"; exit 1; }; \
 	  echo "check-msrv: ai-env-cli correctly refused on $(MSRV_OLD)"
 	$(CARGO) build --workspace --all-targets
 	@head -3 Cargo.lock | grep -q '^version = 4$$' || { echo "Cargo.lock version changed; cargo $(MSRV_OLD) may not read it"; exit 1; }
@@ -365,11 +377,14 @@ clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-o
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features -- -D warnings
 	$(CARGO) clippy -p ai-env-age --all-targets -- -D warnings
 
-lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; no raw `ai-env:` line on the remote path, which speaks through bridge::voice; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); every tests/*.rs declared)
+lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; no raw `ai-env:` line on the remote path, which speaks through bridge::voice; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); a listener only in src/shim and src/bridge/panel; every tests/*.rs declared)
 	@bad=$$(grep -rn 'Connector::Plain' crates/$(PKG)/src || true); test -z "$$bad" || { echo "$$bad"; echo "lint: Connector::Plain is forbidden"; exit 1; }
 	@bad=$$(grep -nE '(eprintln!|eprint!|say|writeln!|write!)\(.*"ai-env: ' crates/$(PKG)/src/bridge/vm/run.rs crates/$(PKG)/src/bridge/vm/lock.rs crates/$(PKG)/src/bridge/agent/credential.rs crates/$(PKG)/src/bridge/creds.rs crates/$(PKG)/src/bridge/remote/*.rs || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the remote path speaks through bridge::voice (no raw ai-env: line in vm/run.rs, vm/lock.rs, agent/credential.rs, creds.rs, remote/)"; exit 1; }
 	@bad=$$(grep -rlE 'connect_async|client_async|Connector::Rustls|use_preconfigured_tls|ClientConfig::builder|aws_smithy_http_client' crates/$(PKG)/src | grep -vE '$(TLS_ALLOW)' || true); \
 	  test -z "$$bad" || { echo "$$bad"; echo "lint: TLS/WS/SDK-HTTP dialing must live in $(TLS_ALLOW)"; exit 1; }
+	@bad=$$(for f in $$(grep -rlE 'TcpListener::bind|axum::serve' crates/$(PKG)/src | grep -vE '^crates/$(PKG)/src/(shim/|bridge/panel/)'); do \
+	  awk -v f="$$f" '/^#\[cfg\((all\()?test/{t=1} t&&/^}/{t=0;next} !t&&/TcpListener::bind|axum::serve/{print f":"FNR": "$$0}' "$$f"; done); \
+	  test -z "$$bad" || { echo "$$bad"; echo "lint: a listener (TcpListener::bind, axum::serve) lives only in src/shim and src/bridge/panel (test modules aside)"; exit 1; }
 	@for f in crates/$(PKG)/tests/*.rs; do n=$$(basename "$$f" .rs); \
 	  grep -qE "^name *= *\"$$n\"" crates/$(PKG)/Cargo.toml || { echo "lint: $$f has no [[test]] name = \"$$n\" entry (autotests = false: it would silently never run)"; exit 1; }; done
 	@echo "lint: ok"
@@ -387,23 +402,27 @@ lint-negative: ## T0.5: clippy must REJECT examples/tls_lint_negative.rs with on
 
 # ---- S3 image: pin, stage, scan, zip, local build, Docker tests ---------------------
 
-# Fails closed once gpg holds the release key: the .sig is then required, and gpg's machine-readable status (captured,
-# never piped into an early-exiting grep under pipefail) must carry GOODSIG and a VALIDSIG whose last field, the
-# primary-key fingerprint (a subkey signature names its subkey in the first), is CLAUDE_GPG_FPR: a good signature
-# by any other key in the keyring does not count. `infra pin --expect-version` refuses a manifest of another version.
-claude-pin: ## Pin Claude Code CLAUDE_VERSION=<v> into image/claude.lock from its release manifest (gpg-verified, fail-closed, when the release key is in the keyring)
-	@test -n "$(CLAUDE_VERSION)" || { echo "usage: make claude-pin CLAUDE_VERSION=<version>   (ai-env infra pin --bundle-version prints the installed Cursor bundle; make claude-update follows it)"; exit 2; }
+# Fails closed (S11): `ai-env claude manifest` fetches the version's manifest.json and its signature (curl with a
+# cleared environment) and writes them only when gpgv verifies the signature against the vendored release key alone
+# (GOODSIG and a VALIDSIG whose last field, the primary key's fingerprint, is CLAUDE_GPG_FPR); no gpg branch, no
+# unverified pin. `infra pin --expect-version` refuses a manifest of another version. VMs follow the Cursor bundle's
+# claude with no deploy (ai-env claude status): the lock is the image's fallback.
+claude-pin: ## Pin Claude Code CLAUDE_VERSION=<v> into image/claude.lock, the image's fallback claude, from its release manifest (gpgv against the vendored release key, fail-closed)
+	@test -n "$(CLAUDE_VERSION)" || { echo "usage: make claude-pin CLAUDE_VERSION=<version>   (ai-env infra pin --bundle-version prints the installed Cursor bundle; VMs follow it with no deploy: ai-env claude status)"; exit 2; }
 	@set -euo pipefail; d="$(IMAGE_OUT)/claude-pin/$(CLAUDE_VERSION)"; mkdir -p "$$d"; rm -f "$$d/manifest.json" "$$d/manifest.json.sig"; \
-	  curl --proto '=https' --tlsv1.2 -fsSL -o "$$d/manifest.json" "$(CLAUDE_RELEASES)/$(CLAUDE_VERSION)/manifest.json"; \
-	  if command -v gpg >/dev/null && gpg --list-keys "$(CLAUDE_GPG_FPR)" >/dev/null 2>&1; then \
-	    curl --proto '=https' --tlsv1.2 -fsSL -o "$$d/manifest.json.sig" "$(CLAUDE_RELEASES)/$(CLAUDE_VERSION)/manifest.json.sig" \
-	      || { echo "claude-pin: cannot download manifest.json.sig, required with the release key in the keyring; lock not written"; exit 1; }; \
-	    st=$$(gpg --status-fd 1 --verify "$$d/manifest.json.sig" "$$d/manifest.json" || true); \
-	    awk -v f="$(CLAUDE_GPG_FPR)" '$$1 == "[GNUPG:]" && $$2 == "NEWSIG" { g = 0 } $$1 == "[GNUPG:]" && $$2 == "GOODSIG" { g = 1 } $$1 == "[GNUPG:]" && $$2 == "VALIDSIG" && g && toupper($$NF) == toupper(f) { ok = 1 } END { exit !ok }' <<<"$$st" \
-	      || { echo "claude-pin: manifest.json.sig is not a good signature by the release key $(CLAUDE_GPG_FPR) (gpg above); lock not written"; exit 1; }; \
-	    echo "claude-pin: manifest signature verified ($(CLAUDE_GPG_FPR))"; \
-	  else echo "claude-pin: signature NOT verified (gpg missing or the release key $(CLAUDE_GPG_FPR) not in its keyring: import it to verify)"; fi; \
+	  $(AI_ENV) claude manifest $(CLAUDE_VERSION) --out "$$d"; \
 	  $(AI_ENV) infra pin --manifest "$$d/manifest.json" --lock "$(IMAGE_DIR)/claude.lock" --expect-version "$(CLAUDE_VERSION)"
+
+# S11 (D2): the claude-facing Docker L2 tests on a claude under test, bind-mounted read-only over the local image's
+# /usr/local/bin/claude (tests/docker_exec.rs and tests/shim_docker.rs: claude_under_test, expected_claude). ai-env
+# claude admit runs it on a version's Linux build. No AWS, no Touch ID, no key (NO_KEY); its own target dir
+# (target/claude-admit: LD-12), never target/debug's matrix.
+claude-admit-docker: ## (no AWS, no Touch ID) S11: the claude-facing Docker L2 tests on CLAUDE_BIN, the Linux build of CLAUDE_VERSION (its SHA-256 CLAUDE_SHA256), bind-mounted over the local image's claude: ai-env claude admit runs it
+	@test -n "$(CLAUDE_BIN)" && test -n "$(CLAUDE_VERSION)" && test -n "$(CLAUDE_SHA256)" || { echo "usage: make claude-admit-docker CLAUDE_BIN=<absolute path> CLAUDE_VERSION=<version> CLAUDE_SHA256=<sha256>   (ai-env claude admit runs it)"; exit 2; }
+	@docker image inspect $(LOCAL_IMAGE) >/dev/null 2>&1 || { echo "claude-admit-docker: $(LOCAL_IMAGE) is missing: make image-build-local"; exit 2; }
+	$(NO_KEY) CARGO_TARGET_DIR='$(CURDIR)/target/claude-admit' AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
+	  AI_ENV_CLAUDE_UNDER_TEST='$(CLAUDE_BIN)' AI_ENV_CLAUDE_UNDER_TEST_VERSION='$(CLAUDE_VERSION)' AI_ENV_CLAUDE_UNDER_TEST_SHA256='$(CLAUDE_SHA256)' \
+	  $(CARGO) test -p $(PKG) --features bridge --test docker_exec --test shim_docker -- --ignored --exact --test-threads=1 l2_wrapper_remote_session_initializes_the_pinned_claude l2_claude_auth_status_json_is_logged_out_with_no_network l2_claude_version_matches_the_lock
 
 # The tree is staged into $(STAGE).tmp and becomes $(STAGE) only after a clean scan: any failure leaves no $(STAGE)
 # (image-build-local refuses) and removes the unscanned copy. A symlink anywhere under $(IMAGE_DIR) stops it before
@@ -506,7 +525,7 @@ s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; 
 	    *) row "[NO ]" "P3 docker $$v: the server is not arm64 (the image build would be emulated)";; \
 	    esac; \
 	  else row "[NO ]" "P3 docker is not running"; fi; \
-	  if node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' 2>/dev/null && command -v npm >/dev/null && command -v zip >/dev/null; then row "[ok ]" "P4 node $$(node --version), npm, zip$$(command -v gpg >/dev/null && echo ', gpg' || echo ' (no gpg: claude-pin cannot verify signatures)')"; else row "[NO ]" "P4 node >= 20, npm and zip are required"; fi; \
+	  if node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' 2>/dev/null && command -v npm >/dev/null && command -v zip >/dev/null; then row "[ok ]" "P4 node $$(node --version), npm, zip$$(test -f /opt/homebrew/bin/gpgv || test -f /usr/local/bin/gpgv && echo ', gpgv' || echo ' (no gpgv: make claude-pin and ai-env claude admit fail closed: brew install gnupg)')"; else row "[NO ]" "P4 node >= 20, npm and zip are required"; fi; \
 	  claude=$$(sed -n 's/^CLAUDE_VERSION=//p' image/claude.lock); \
 	  for u in "$(CLAUDE_RELEASES)/$$claude/manifest.json" https://public.ecr.aws/v2/ https://cdn.amazonlinux.com/al2023/core/mirrors/latest/aarch64/mirror.list; do \
 	    code=$$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$$u" 2>/dev/null || echo 000); \
@@ -521,7 +540,8 @@ s3-preflight: ## S3/S5 preconditions P1-P16 (PHASE=a: build + read-only checks; 
 	  else row "[NO ]" "P8 no AWS credentials (PHASE=a: this shell's own, the agent's; on this Mac: ai-env as ops -- make s3-preflight)"; fi; \
 	  if [ "$$phase" = b ]; then \
 	    if out=$$($(AI_ENV) creds aws-set --check 2>&1); then row "[ok ]" "P9 runtime-key preconditions"; else row "[-  ]" "P9 runtime-key preconditions not met yet (needed by make runtime-key, not by deploy)"; fi; fi; \
-	  if out=$$($(AI_ENV) infra pin --check-bundle --lock image/claude.lock 2>&1); then row "[ok ]" "P10 $$(echo "$$out" | tail -1)"; else row "[NO ]" "P10 $$(echo "$$out" | tail -1)"; fi; \
+	  if out=$$($(AI_ENV) infra pin --check-bundle --lock image/claude.lock 2>&1); then row "[ok ]" "P10 $$(echo "$$out" | tail -1)"; \
+	  else rc=$$?; if [ $$rc -eq 3 ]; then row "[-  ]" "P10 $$(echo "$$out" | tail -1)"; else row "[NO ]" "P10 $$(echo "$$out" | tail -1)"; fi; fi; \
 	  if ! $(BASE_CHECK); then row "[NO ]" "P11 $(BASE_MISSING)"; \
 	  elif out=$$($(AI_ENV) infra base-image --name $(BASE_NAME) --version $(BASE_VERSION) 2>&1); then row "[ok ]" "P11 $$(echo "$$out" | tail -1)"; else row "[NO ]" "P11 $$(echo "$$out" | tail -1)"; fi; \
 	  if [ "$$phase" = b ]; then \

@@ -375,7 +375,7 @@ async fn fetch_dry_run<A: MicrovmApi>(ctx: &Ctx, api: &A, dp: &HttpsEndpoint, to
 /// line (`HttpsEndpoint::codeout_refs`: no snapshot, the pack never read);
 /// `None` when the VM has nothing to fetch (204).
 async fn codeout_manifest<A: MicrovmApi>(api: &A, dp: &HttpsEndpoint, tokens: &MintingTokens<Arc<A>>, target: &AgentTarget, ws: &WorkspaceRef) -> Result<Option<crate::wire::workspace::CodeoutManifest>> {
-    let req = CodeoutRequest { path: ws.vm_root.clone(), haves: Vec::new(), wip: false, max_bytes: SEED_BODY_MAX };
+    let req = CodeoutRequest { path: ws.vm_root.clone(), haves: Vec::new(), wip: false, max_bytes: SEED_BODY_MAX, manifest_when_empty: false };
     let x = Exchange { api, tokens, vm_id: &target.vm_id, port: CODE_PORT, cap: crate::wire::frame::CAP_WORKSPACE_V1, route: "POST /codeout", deadline: None, idempotent: true };
     let (reply, verdict): (DpReply<crate::wire::workspace::CodeoutManifest>, Verdict) = exchange(&x, |t| {
         let req = &req;

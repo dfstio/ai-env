@@ -100,7 +100,8 @@ pub struct VmSeedRow {
 pub struct VmFetchRow {
     /// When it ended (unix seconds); a 204 refreshes only this.
     pub at: u64,
-    /// The VM's HEAD, recorded only when the fetch promoted it.
+    /// The VM's HEAD, recorded only when the fetch promoted it, or held it back because its box tip holds that
+    /// commit already (S11 F1-1).
     pub head: String,
     /// The branch checked out then; `None`: detached.
     pub branch: Option<String>,
@@ -356,6 +357,18 @@ pub fn refresh_fetch(paths: &Paths, ws: &WorkspaceRef, vm: &str, at: u64) -> Res
     Ok(())
 }
 
+/// S11 (C.1.3): whether a code-out that answered its manifest without a
+/// pack changes nothing `row` keeps, so it is nothing new (only the
+/// record's `at`, no git run): every ref the import would take (`taken`:
+/// box name to commit) already sits at its commit in the row's `fetched`
+/// (the box tips), and `vm`'s fetch record holds `head` on `branch`
+/// (`None`: detached). Pure.
+#[must_use]
+pub fn fetch_unchanged(row: &WsRow, vm: &str, taken: &BTreeMap<String, String>, head: &str, branch: Option<&str>) -> bool {
+    let tips = taken.iter().all(|(name, id)| row.fetched.get(name) == Some(id));
+    tips && row.vm.get(vm).and_then(|e| e.fetched.as_ref()).is_some_and(|f| f.head == head && f.branch.as_deref() == branch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +543,29 @@ mod c2_tests {
         let clean = VmFetchRow { at: 50, head: id(4), branch: Some("dev".into()), wip: None, wip_ref: None };
         update(&paths, &ws, |r| note_fetch(r, &vm(1), Some(clean.clone()), 50, true)).unwrap();
         assert_eq!(record(), Some(clean), "replaced whole: a snapshot asked, the worktree clean");
+    }
+
+    /// S11 (C.1.3): a manifest without a pack is nothing new only when every
+    /// ref the import would take sits at its commit among the row's box tips
+    /// and the VM's record holds the manifest's HEAD on its branch (detached
+    /// as `None`); another VM's record, a moved tip, a new box name, another
+    /// branch or HEAD, or no record at all is not.
+    #[test]
+    fn fetch_unchanged_needs_every_taken_tip_and_the_records_head_and_branch() {
+        let tip = |n: &str| format!("refs/remotes/box/{n}");
+        let mut row = WsRow { fetched: BTreeMap::from([(tip("main"), id(1)), (tip("topic"), id(1)), (tip("old"), id(7))]), ..WsRow::default() };
+        let taken = BTreeMap::from([(tip("main"), id(1)), (tip("topic"), id(1))]);
+        assert!(!fetch_unchanged(&row, &vm(1), &taken, &id(1), Some("topic")), "no record");
+        note_fetch(&mut row, &vm(1), Some(VmFetchRow { at: 1, head: id(1), branch: Some("topic".into()), wip: None, wip_ref: None }), 1, true);
+        assert!(fetch_unchanged(&row, &vm(1), &taken, &id(1), Some("topic")), "every tip in place, the record's HEAD and branch");
+        assert!(fetch_unchanged(&row, &vm(1), &BTreeMap::new(), &id(1), Some("topic")), "nothing taken (every ref kept out)");
+        assert!(!fetch_unchanged(&row, &vm(2), &taken, &id(1), Some("topic")), "another VM's record");
+        assert!(!fetch_unchanged(&row, &vm(1), &taken, &id(1), Some("main")), "another branch");
+        assert!(!fetch_unchanged(&row, &vm(1), &taken, &id(1), None), "detached");
+        assert!(!fetch_unchanged(&row, &vm(1), &taken, &id(2), Some("topic")), "another HEAD");
+        let moved = BTreeMap::from([(tip("main"), id(1)), (tip("topic"), id(2))]);
+        assert!(!fetch_unchanged(&row, &vm(1), &moved, &id(1), Some("topic")), "a moved tip");
+        let new = BTreeMap::from([(tip("main"), id(1)), (tip("fresh"), id(1))]);
+        assert!(!fetch_unchanged(&row, &vm(1), &new, &id(1), Some("topic")), "a box name the row lacks");
     }
 }

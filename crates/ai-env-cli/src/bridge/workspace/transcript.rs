@@ -202,7 +202,10 @@ pub fn digest_stream(rules: &crate::bridge::scan::Rules, input: &mut dyn Read, p
 /// P3's restore of a `--resume`'s transcript from S3 (S9; `remote::pipeline`
 /// calls it, the resume miss's retry again, and `session stage --warm` into
 /// the VM it warmed): nothing goes
-/// to a VM without `transcript_s3_v1` (exit 7). A chat S3 does not hold yet
+/// to a VM without `transcript_s3_v1` (exit 7), and S11 (L5) nothing of a
+/// chat stored encoded to one without `transcript_gzip_v1` (exit 7, before
+/// the stat and any presign); P3's inline upload stores gzip only on a VM
+/// naming it. A chat S3 does not hold yet
 /// (no manifest) whose copy is on this Mac goes up first, inline (at most
 /// `wire::s3::INLINE_MAX`: P0 refused a larger one), scanned through the
 /// session's tripwires (a finding refuses before any request, audited
@@ -281,7 +284,9 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
             };
             let client = crate::bridge::s3::client::S3Client::new(ctx.api, &sync.target)?;
             let at = crate::wire::time::rfc3339_utc_ms(crate::wire::time::unix_now_ms());
-            let mut up = stage::upload_chat(&client, ctx.paths, sid, &chat, &digests, crate::wire::s3::MULTIPART_PART, &at).await?;
+            // S11 (L5, C.3.7): stored gzip only on a VM that decodes it.
+            let encoding = ctx.caps.iter().any(|c| c == crate::wire::frame::CAP_TRANSCRIPT_GZIP_V1).then_some(crate::wire::workspace::PartEncoding::Gzip);
+            let mut up = stage::upload_chat(&client, ctx.paths, sid, &chat, &digests, crate::wire::s3::MULTIPART_PART, &at, encoding).await?;
             if s8 {
                 // S8's mirror is the remote chat's transcript: the chat began on a VM, whatever copy this Mac sent up.
                 up.manifest.origin = manifest::ORIGIN_VM.to_string();
@@ -295,11 +300,17 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
                 stage::replace_mirror(ctx.paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, &rules, build, &ctx.target.vm_id)?;
                 audit(ctx.paths, audit_event::TRANSCRIPT_MIGRATE, &[("session", sid.to_string()), ("from", "gone_vm".to_string()), ("outcome", "migrated".to_string()), ("bytes", up.bytes.to_string())]);
             } else {
+                // GZ-1: a chat that went on while it went up keeps its original (S3 holds the scanned bytes).
+                stage::unchanged_since_scan(&chat, &digests, sid)?;
                 stage::leave_view(ctx.paths, sid, &chat, projects, &sync.mac_cwd, sync.view_messages, &rules, build)?;
                 // `rate` only when something went up, as `session stage` writes it (S10 F5).
                 let mut pairs = vec![("session", sid.to_string()), ("bytes", up.bytes.to_string()), ("parts", up.parts.to_string()), ("outcome", "staged".to_string()), ("ms", ms.to_string())];
                 if up.sent > 0 {
                     pairs.push(("rate", up.rate().to_string()));
+                }
+                // S11 (C.3.7): the stored bytes, when the upload encoded.
+                if up.encoding.is_some() {
+                    pairs.push(("stored", up.stored.to_string()));
                 }
                 audit(ctx.paths, audit_event::TRANSCRIPT_STAGE, &pairs);
             }
@@ -308,6 +319,11 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
     }
     let _held = manifest::lock(ctx.paths, sid).await?;
     let Some(mut m) = manifest::read(ctx.paths, sid)? else { return Ok(TranscriptOutcome::NothingToRestore) };
+    // S11 (L5, C.3.6): the backstop. A chat stored encoded restores only on a VM that decodes it, before the stat,
+    // the kept-on-VM answer and any presign (an unknown-caps row, a pinned older image; `restore_subtree` after it).
+    if m.encoded() {
+        super::require_cap(ctx.caps, &ctx.target.vm_id, crate::wire::frame::CAP_TRANSCRIPT_GZIP_V1)?;
+    }
     if m.parts.is_empty() {
         tracing::info!(session = sid, "transcript: the manifest commits nothing: nothing to restore");
         return Ok(TranscriptOutcome::NothingToRestore);
@@ -328,8 +344,8 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
     let listed = client.list(&crate::bridge::s3::sync::tail_prefix(sid, tail_gen)).await?;
     let chain = crate::bridge::s3::sync::tail_chain(&listed, sid, tail_gen, m.committed, room);
     left_out(sid, &chain);
-    let mut pieces: Vec<(String, String, u64, Option<String>)> = m.parts.iter().map(|p| (p.key.clone(), p.version_id.clone(), p.len, Some(p.sha256.clone()))).collect();
-    pieces.extend(chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None)));
+    let mut pieces: Vec<Piece> = m.parts.iter().map(|p| (p.key.clone(), p.version_id.clone(), p.len, Some(p.sha256.clone()), p.encoding)).collect();
+    pieces.extend(chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None, None)));
     let whole = (m.parts.len() == 1 && chain.links.is_empty()).then(|| m.parts[0].sha256.clone());
     let (parts, bytes) = pull_one(&sctx, sid, &rel, &pieces, whole, 1).await?;
     let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -373,7 +389,7 @@ async fn restore_unsynced<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
         tracing::info!(session = sid, "transcript: a VM-begun chat that never reached S3: nothing to restore");
         return Ok(TranscriptOutcome::NothingToRestore);
     }
-    let pieces: Vec<(String, String, u64, Option<String>)> = chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None)).collect();
+    let pieces: Vec<Piece> = chain.links.iter().map(|(key, size)| (key.clone(), String::new(), *size, None, None)).collect();
     let (parts, bytes) = pull_one(sctx, sid, rel, &pieces, None, 1).await?;
     tracing::info!(session = sid, bytes, tails = parts, "transcript restored from its tails (closed before its first sync)");
     Ok(TranscriptOutcome::Restored { parts, bytes })
@@ -478,7 +494,7 @@ async fn pull_file<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: T
     share: u32,
 ) -> Result<(u32, u64), BridgeError> {
     let sha = Some(f.sha256.clone());
-    pull_one(sctx, sid, &frel, &[(f.key, f.version_id.unwrap_or_default(), f.len, sha.clone())], sha, share).await
+    pull_one(sctx, sid, &frel, &[(f.key, f.version_id.unwrap_or_default(), f.len, sha.clone(), f.encoding)], sha, share).await
 }
 
 /// A stage cut after its manifest and before its view (`session stage`,
@@ -521,9 +537,16 @@ fn finish_cut_stage(
     Ok(())
 }
 
-/// One `POST /transcript/pull` of `rel` from `pieces` (key, version or
-/// empty, length, sha256 or none: a tail), presigned GETs expiring after the
-/// pull's budget, `whole` the file's sha256 when known; audited
+/// One piece of a pull ([`pull_one`]): its key, its version (empty: the
+/// current one), its decoded length, its decoded sha256 (none: a tail), and
+/// S11 (L5) how its object is stored (none: identity; the tails' always).
+type Piece = (String, String, u64, Option<String>, Option<crate::wire::workspace::PartEncoding>);
+
+/// One `POST /transcript/pull` of `rel` from `pieces` ([`Piece`]: key,
+/// version or empty, length, sha256 or none, encoding), presigned GETs
+/// expiring after the pull's budget, `whole` the file's sha256 when known;
+/// each part's `encoding` its piece's (only to a VM naming
+/// `transcript_gzip_v1`: [`restore`]'s backstop); audited
 /// `transcript_pull`. Parts and bytes written; not written is `S3` (exit 7)
 /// naming the first part that failed its status, length or sha256. Under a
 /// deadline (a reopen's P3, inside Cursor's window: at the proxy's 4 to 16
@@ -533,7 +556,7 @@ async fn pull_one<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: To
     sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
     sid: &str,
     rel: &str,
-    pieces: &[(String, String, u64, Option<String>)],
+    pieces: &[Piece],
     whole: Option<String>,
     share: u32,
 ) -> Result<(u32, u64), BridgeError> {
@@ -546,10 +569,10 @@ async fn pull_one<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: To
     // One pull alone (S10: C sends the share of the pulls that run at once).
     let expires = presign::pull_expiry(bytes, share);
     let mut parts = Vec::with_capacity(pieces.len());
-    for (key, version, len, sha) in pieces {
+    for (key, version, len, sha, encoding) in pieces {
         let query = if version.is_empty() { Vec::new() } else { vec![("versionId".to_string(), version.clone())] };
         let url = sctx.api.presign(&presign::request(S3Method::Get, &sctx.sync.target, Some(key.clone()), query, Vec::new(), expires)).await?;
-        parts.push(crate::wire::workspace::PullPart { url, len: *len, sha256: sha.clone() });
+        parts.push(crate::wire::workspace::PullPart { url, len: *len, sha256: sha.clone(), encoding: *encoding });
     }
     let req = crate::wire::workspace::TranscriptPull { rel: rel.to_string(), parts, sha256: whole, owner: sctx.sync.target.owner.clone(), proxy: sctx.sync.proxy.clone(), share };
     let x = Exchange { api: sctx.api, tokens: sctx.tokens, vm_id: &sctx.target.vm_id, port: APP_PORT, cap: crate::wire::frame::CAP_TRANSCRIPT_S3_V1, route: "POST /transcript/pull", deadline: sctx.deadline, idempotent: false };
@@ -732,5 +755,51 @@ mod tests {
         assert!(rows.iter().all(|r| r["detail"]["step"] == "transcript" && r["detail"].get("vm").is_none()), "{rows:?}");
         assert!(!w.paths.tmp().exists(), "P1 copies nothing");
         assert!(!std::fs::read_to_string(w.paths.audit()).unwrap().contains(&key()), "no value in the audit");
+    }
+
+    /// S11 (L5, C.3.6): the restore's backstop. A manifest stored encoded (its
+    /// main object gzip) restores only on a VM naming `transcript_gzip_v1`:
+    /// without it, `NoCapability` (exit 7) naming the cap and the VM, before
+    /// any stat of the VM, kept-on-VM answer or presign (the data plane is
+    /// never reached, the API never called). With the cap the restore goes
+    /// on to its stat (here the unreached data plane's error). An identity
+    /// manifest needs no such cap.
+    #[tokio::test]
+    async fn restore_refuses_an_encoded_manifest_on_a_vm_without_the_cap() {
+        use crate::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_MAC};
+        use crate::wire::frame::CAP_TRANSCRIPT_GZIP_V1;
+        let w = World::new();
+        let lab = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Lab(([127, 0, 0, 1], 9).into()) };
+        let sync = crate::bridge::s3::TranscriptSync { target: lab.clone(), slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: w.projects.clone(), proxy: None, view_messages: 10 };
+        let mut m = Manifest::new(ID, &lab, ORIGIN_MAC, &format!("-w/{ID}.jsonl"), "2026-10-23T10:00:00.000Z");
+        let key = crate::wire::s3::S3Key::Mac { session: ID.into(), sha256: "d".repeat(64) }.render();
+        m.parts.push(ManifestPart { key, version_id: "fv1".into(), from: 0, len: 500, sha256: "b".repeat(64), encoding: Some(crate::wire::workspace::PartEncoding::Gzip), stored_len: Some(120), stored_sha256: Some("d".repeat(64)) });
+        (m.committed, m.fp) = (500, "f".repeat(64));
+        manifest::write(&w.paths, &m).unwrap();
+        let (api, target) = (FakeMicrovmApi::new(), target());
+        let restore_on = |caps: Vec<String>| {
+            let (w, sync, api, target) = (&w, &sync, &api, &target);
+            async move {
+                let ctx = EnsureCtx { api, dp: &Unreached, tokens: &Unreached, paths: &w.paths, cfg: &w.cfg, target, caps: &caps, ws: &w.ws, lim: SeedLimits::wrapper(&w.cfg), deadline: None, progress: &|_: SeedProgress| {} };
+                restore(&ctx, sync, Some(&w.projects), &["-mac"], ID, &crate::wire::view::build_view).await
+            }
+        };
+        let e = restore_on(vec![CAP_WORKSPACE_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]).await.unwrap_err();
+        match &e {
+            BridgeError::NoCapability { cap, message } => assert!(*cap == CAP_TRANSCRIPT_GZIP_V1 && message.contains("microvm-1"), "{e:?}"),
+            other => panic!("not the backstop: {other:?}"),
+        }
+        assert_eq!(crate::errors::CliError::from(e).exit_code(), 7);
+        assert!(api.calls().is_empty(), "no presign, no AWS call: {:?}", api.calls());
+        assert_eq!(manifest::read(&w.paths, ID).unwrap().as_ref(), Some(&m), "the manifest as it was");
+        // The cap named: past the backstop, to the stat (the data plane this test never reaches).
+        let e = restore_on(vec![CAP_WORKSPACE_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string(), CAP_TRANSCRIPT_GZIP_V1.to_string()]).await.unwrap_err();
+        assert!(!matches!(e, BridgeError::NoCapability { .. }), "{e:?}");
+        // An identity manifest: no such cap asked.
+        let mut plain = m.clone();
+        (plain.parts[0].encoding, plain.parts[0].stored_len, plain.parts[0].stored_sha256) = (None, None, None);
+        manifest::write(&w.paths, &plain).unwrap();
+        let e = restore_on(vec![CAP_WORKSPACE_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()]).await.unwrap_err();
+        assert!(!matches!(e, BridgeError::NoCapability { .. }), "{e:?}");
     }
 }

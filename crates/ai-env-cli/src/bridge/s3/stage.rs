@@ -16,7 +16,14 @@
 //! knows, is done once S3 lists the key at its length; an upload below
 //! `dataplane::MIN_RATE` warns once, and `transcript_stage` records its
 //! `rate`. S10 (F3a): `--warm` with `[vm].reuse_per_workspace` off is
-//! refused before any Touch ID.
+//! refused before any Touch ID. S11 (L5, the compressed stage): `session
+//! stage` stores each file as `/usr/bin/gzip -n -6` of its scanned bytes
+//! (a spool under `state/transcripts/<sid>/spool/`, made again on a resume:
+//! the same bytes, the same key), `Content-Encoding: gzip`, keyed by the
+//! stored bytes' sha256; the manifest keeps the decoded `len` and `sha256`
+//! beside `encoding`, `stored_len` and `stored_sha256`. The subtree's files
+//! go up [`SUBTREE_PARALLEL`] at a time (identity ones too); a file that
+//! needs multipart goes alone.
 use super::client::{Body, S3Client, Written};
 use super::manifest::{self, Manifest, ManifestFile, ManifestPart};
 use super::{S3Sign, S3Target};
@@ -29,9 +36,16 @@ use crate::bridge::workspace::transcript::FileDigest;
 use crate::errors::CliError;
 use crate::store::Keystore;
 use crate::wire::s3::{S3Key, MULTIPART_PARALLEL, MULTIPART_PART};
+use crate::wire::workspace::PartEncoding;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+/// S11 (L5, C.3.4): the compressor of a gzip stage, run by its absolute path.
+pub const GZIP: &str = "/usr/bin/gzip";
+
+/// The chunk a file is fed to gzip in, and a spool digested in.
+const FEED_CHUNK: usize = 1 << 20;
 
 /// The stage file's version.
 pub const STAGE_V: u32 = 1;
@@ -68,9 +82,18 @@ pub struct StagePart {
 
 // ---- the stage (G4) ---------------------------------------------------------------------------
 
-/// The largest chat `session stage` takes: what one PUT from the VM can
-/// restore (a pull's parts are summed to at most `PULL_MAX`).
-pub const STAGE_MAX: u64 = crate::wire::workspace::PULL_MAX;
+/// The largest chat `session stage` takes, in all and decoded (S11, C.3.5:
+/// was `PULL_MAX`; each file is held to [`STAGE_FILE_MAX`]).
+pub const STAGE_MAX: u64 = 16 << 30;
+
+/// S11 (C.3.5): the largest file of a chat `session stage` takes, decoded:
+/// what one pull from the VM can restore (`PULL_MAX`).
+pub const STAGE_FILE_MAX: u64 = crate::wire::workspace::PULL_MAX;
+
+/// S11 (L5, C.3.4): how many subtree files go up at once (the main goes
+/// alone, first; a file that needs multipart goes alone too). Equal to
+/// `wire::s3::MULTIPART_PARALLEL`.
+pub const SUBTREE_PARALLEL: usize = 8;
 
 /// A chat of this Mac as the stage finds it: its project directory, the
 /// directory's name (the session's slug on the Mac and in the VM), and its
@@ -100,11 +123,16 @@ impl MacChat {
 /// `sid`'s chat under `projects`: the first of `seed::candidates` (`slugs`
 /// first, then every project directory) holding `<sid>.jsonl`, its files
 /// listed by the seeder's rules up to `cap` bytes in all (more:
-/// `TranscriptTooLarge`, exit 9). `Ok(None)`: no such chat on this Mac.
+/// `TranscriptTooLarge`, exit 9); S11: a file over [`STAGE_FILE_MAX`],
+/// whatever `cap`, is `TranscriptTooLarge` with that file's bytes.
+/// `Ok(None)`: no such chat on this Mac.
 pub fn locate(projects: &Path, slugs: &[&str], sid: &str, cap: u64) -> Result<Option<MacChat>, BridgeError> {
     let Some(dir) = crate::bridge::seed::candidates(projects, slugs, sid).into_iter().next() else { return Ok(None) };
     let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let files = crate::bridge::seed::transcript_files_capped(&dir, sid, cap)?;
+    if let Some((_, bytes)) = files.iter().find(|(_, len)| *len > STAGE_FILE_MAX) {
+        return Err(BridgeError::TranscriptTooLarge { session: sid.to_string(), bytes: *bytes });
+    }
     let main = format!("{sid}.jsonl");
     if files.first().is_none_or(|(rel, _)| *rel != main) {
         return Ok(None);
@@ -260,22 +288,27 @@ fn shown_rate(bytes_per_s: u64) -> String {
 /// lists the key at its length, its Complete's answer lost, else it starts
 /// over), completed new-only, `stage.toml` removed after. A part, the
 /// PutObject or the Complete that gets no answer (or S3's 500 or 503, or a
-/// transient 409) goes again, `client::PART_TRIES` tries in all.
+/// transient 409) goes again, `client::PART_TRIES` tries in all. A part that
+/// fails for good starts no other: the parts in flight finish, those that
+/// went through are kept in `stage.toml` (a resume does not send them
+/// again), then the first failure is the error.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_file<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64) -> Result<Uploaded, BridgeError> {
-    upload_paced(client, paths, sid, key, path, d, part_len, &Pace::new(sid)).await
+    upload_paced(client, paths, sid, key, path, d, part_len, &Pace::new(sid), None).await
 }
 
 /// [`upload_file`], its bytes counted into `pace` as the connections take
-/// them and as S3 answers them.
+/// them and as S3 answers them. S11 (L5): `encoding` is how `path`'s bytes
+/// are stored (the PutObject's or the CreateMultipartUpload's
+/// `content-encoding`); `d` is always their own digest (a spool's).
 #[allow(clippy::too_many_arguments)]
-async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64, pace: &Pace<'_>) -> Result<Uploaded, BridgeError> {
+async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, key: &str, path: &Path, d: &FileDigest, part_len: u64, pace: &Pace<'_>, encoding: Option<PartEncoding>) -> Result<Uploaded, BridgeError> {
     use futures_util::StreamExt as _;
     let counted = client.counting(&pace.handed);
     let client = &counted;
     let part_len = part_len.max(1);
     if d.parts.len() <= 1 {
-        let w = client.put_object(key, Body::File { path: path.to_path_buf(), offset: 0, len: d.len }, d.len, &d.sha256).await?;
+        let w = client.put_object(key, Body::File { path: path.to_path_buf(), offset: 0, len: d.len }, d.len, &d.sha256, encoding).await?;
         pace.add(d.len);
         return Ok(match w {
             Written::Stored(v) => Uploaded { version_id: v, parts: 1, resumed: false, existed: false, sent: d.len },
@@ -293,7 +326,7 @@ async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &
                 // Another upload of this session (other bytes): S3's lifecycle aborts it after a day anyway.
                 let _ = client.abort_multipart(&old.key, &old.upload_id).await;
             }
-            let upload_id = client.create_multipart(key).await?;
+            let upload_id = client.create_multipart(key, encoding).await?;
             let s = Stage { v: STAGE_V, session: sid.to_string(), key: key.to_string(), upload_id, len: d.len, sha256: d.sha256.clone(), part_len, started: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), parts: Vec::new() };
             write_stage(paths, &s)?;
             s
@@ -310,7 +343,7 @@ async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &
                     return Ok(Uploaded { version_id: String::new(), parts: count, resumed: true, existed: true, sent: 0 });
                 }
                 resumed = false;
-                stage.upload_id = client.create_multipart(key).await?;
+                stage.upload_id = client.create_multipart(key, encoding).await?;
                 stage.parts.clear();
             }
             Some(listed) => {
@@ -331,8 +364,11 @@ async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &
     let done: std::collections::BTreeSet<u32> = stage.parts.iter().map(|p| p.number).collect();
     let upload_id = stage.upload_id.clone();
     let missing: Vec<u32> = (1..=count).filter(|n| !done.contains(n)).collect();
+    // Once a part failed no other starts; the parts in flight then finish (each held to its own progress) and the
+    // ones that went through stay in `stage.toml`, so a resume sends only what S3 lacks.
+    let failed = std::cell::Cell::new(false);
     // The parts in flight share the uplink; each is held to its own progress (`client::Waits`), never to a budget.
-    let sends = missing.into_iter().map(|n| {
+    let sends = missing.into_iter().take_while(|_| !failed.get()).map(|n| {
         let (upload_id, sha) = (upload_id.clone(), d.parts[n as usize - 1].clone());
         let offset = u64::from(n - 1) * part_len;
         let len = part_len.min(d.len - offset);
@@ -342,9 +378,16 @@ async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &
         }
     });
     let mut running = futures_util::stream::iter(sends).buffer_unordered(MULTIPART_PARALLEL);
-    let mut sent = 0u64;
+    let (mut sent, mut first_error) = (0u64, None);
     while let Some(part) = running.next().await {
-        let part = part?;
+        let part = match part {
+            Ok(part) => part,
+            Err(e) => {
+                failed.set(true);
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
         sent += part.len;
         pace.add(part.len);
         stage.parts.push(part);
@@ -352,6 +395,9 @@ async fn upload_paced<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &
         write_stage(paths, &stage)?;
     }
     drop(running);
+    if let Some(e) = first_error {
+        return Err(e);
+    }
     let list: Vec<(u32, String, String)> = stage.parts.iter().map(|p| (p.number, p.etag.clone(), p.sha256.clone())).collect();
     let w = client.complete_multipart(key, &upload_id, &list, d.len).await?;
     crate::bridge::registry::remove_if_present(&paths.transcript_stage(sid))?;
@@ -377,6 +423,11 @@ pub struct ChatUpload {
     pub sent: u64,
     pub ms: u64,
     pub slow: bool,
+    /// S11 (C.3.7): every file's stored bytes, summed, whether sent now or held by S3 already (the raw bytes when
+    /// identity).
+    pub stored: u64,
+    /// S11: how the files are stored (`None`: identity).
+    pub encoding: Option<PartEncoding>,
 }
 
 impl ChatUpload {
@@ -387,20 +438,277 @@ impl ChatUpload {
     }
 }
 
-/// Upload every file of `chat` (`digests` in its order) as
+/// S11 (L5): a spool of the stage (`state/transcripts/<sid>/spool/<n>.gz`):
+/// the file gzip wrote there, held open (its inode, and so its identity
+/// `dev`, `ino`, is never reused while the spool lives); removed once dropped
+/// (when its object is complete, stored or held by S3 already, on any error,
+/// and when its upload is cut short), and only while its path still names
+/// that file: another upload of the session (one cut short whose gzip still
+/// runs on its blocking thread) may have made its own there. A spool is
+/// never trusted as a run left it: a resume makes it again.
+struct Spool {
+    path: PathBuf,
+    file: std::fs::File,
+    id: (u64, u64),
+}
+
+impl Spool {
+    /// Whether its path still names the file this spool made.
+    fn intact(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id)
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        if self.intact() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// S11: the lock one upload of a session holds for its whole run
+/// (`state/transcripts/<sid>/upload.lock`, [`upload_chat`]): its spools and
+/// its `stage.toml` are the session's, so a second upload is refused while
+/// it is held, never run beside it.
+#[must_use]
+pub fn upload_lock(paths: &Paths, sid: &str) -> PathBuf {
+    paths.transcript_dir(sid).join("upload.lock")
+}
+
+/// One file of a chat ready to go up ([`upload_chat`]): its key
+/// (`v1/<sid>/mac/<the stored bytes' sha256>`), the path whose bytes go (the
+/// file itself, or its spool), the stored bytes' digest (the scan's when
+/// identity), and its spool.
+struct Ready {
+    key: String,
+    path: PathBuf,
+    stored: FileDigest,
+    spool: Option<Spool>,
+}
+
+/// One file of a chat once it went up (or S3 held it): its key, its stored
+/// bytes' length and sha256, what the upload did.
+struct Sent {
+    key: String,
+    stored_len: u64,
+    stored_sha256: String,
+    up: Uploaded,
+}
+
+/// S11 (L5, C.3.4): `chat`'s file `rel` (at `file`; `len` bytes of sha256
+/// `sha256`, as the scan read them) through `/usr/bin/gzip -n -6 -c` into its
+/// spool, `state/transcripts/<sid>/spool/<n>.gz` (`n` the file's index in
+/// the chat, 0 the main; the directory a real 0700 one; a leftover of that
+/// name removed; created 0600 with `O_EXCL | O_NOFOLLOW`). The file is read
+/// without following a symlink, never blocking, exactly `len` bytes of it fed
+/// to gzip's stdin and hashed on the way; gzip runs by its absolute path, its
+/// environment cleared but `LC_ALL=C`, its stdout the spool, its stderr kept.
+/// Fed bytes that are not the scan's are `WorkspaceFailed { changed }` (exit
+/// 1); a gzip that fails, `Io` naming it, its exit and its stderr's last line,
+/// scrubbed (exit 1); either way the spool goes. The spool and its digest:
+/// its sha256 and its `part_len` parts' (no tripwires: its raw bytes were
+/// scanned), read through the handle gzip's stdout was made from, never
+/// through the path (which another run may have taken over: the bytes this
+/// digest signs are then the only ones S3 accepts).
+#[allow(clippy::too_many_arguments)]
+fn spool_file(paths: &Paths, sid: &str, n: usize, file: &Path, rel: &str, len: u64, sha256: &str, part_len: u64) -> Result<(Spool, FileDigest), BridgeError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    let io = |what: &str, p: &Path, e: std::io::Error| BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot {what} {}: {e}", p.display())));
+    // gzip's own failures are never a broken pipe of ours (that exit is 0): `Other`.
+    let gzip_failed = |text: String| BridgeError::Io(std::io::Error::other(text));
+    let dir = paths.transcript_spool(sid);
+    crate::bridge::registry::ensure_private_dir(&dir)?;
+    let at = dir.join(format!("{n}.gz"));
+    crate::bridge::registry::remove_if_present(&at)?;
+    let out = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&at).map_err(|e| io("create", &at, e))?;
+    let id = match out.metadata() {
+        Ok(m) => (m.dev(), m.ino()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&at);
+            return Err(io("stat", &at, e));
+        }
+    };
+    let mut spool = Spool { path: at, file: out, id };
+    let to_gzip = spool.file.try_clone().map_err(|e| io("open", &spool.path, e))?;
+    let src = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(file).map_err(|e| io("open", file, e))?;
+    if !src.metadata().map_err(|e| io("stat", file, e))?.is_file() {
+        return Err(BridgeError::Io(std::io::Error::other(format!("{} is not a regular file", file.display()))));
+    }
+    let mut child = std::process::Command::new(GZIP)
+        .args(["-n", "-6", "-c"])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(to_gzip))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| gzip_failed(format!("cannot run {GZIP}: {e}")))?;
+    let stderr = child.stderr.take();
+    let said = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_end(&mut text);
+        }
+        text
+    });
+    let mut stdin = child.stdin.take();
+    let (mut hasher, mut fed, mut buf) = (Sha256::new(), 0u64, vec![0u8; FEED_CHUNK]);
+    let (mut reader, mut unread, mut stopped) = (src.take(len), None, false);
+    loop {
+        let k = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                unread = Some(e);
+                break;
+            }
+        };
+        hasher.update(&buf[..k]);
+        fed += k as u64;
+        if stdin.as_mut().is_some_and(|pipe| pipe.write_all(&buf[..k]).is_err()) {
+            stopped = true;
+            break;
+        }
+    }
+    drop(stdin);
+    let status = child.wait().map_err(|e| gzip_failed(format!("cannot wait for {GZIP}: {e}")))?;
+    let stderr = said.join().unwrap_or_default();
+    if let Some(e) = unread {
+        return Err(io("read", file, e));
+    }
+    if stopped || !status.success() {
+        let how = match (status.code(), status.signal()) {
+            _ if status.success() => "stopped reading its input".to_string(),
+            (Some(code), _) => format!("exited {code}"),
+            (None, Some(signal)) => format!("was ended by signal {signal}"),
+            (None, None) => "failed".to_string(),
+        };
+        let last = String::from_utf8_lossy(&stderr).lines().map(str::trim).rfind(|l| !l.is_empty()).map(|l| format!(": {}", crate::wire::redact::scrub(l))).unwrap_or_default();
+        return Err(gzip_failed(format!("{GZIP} {how} while it compressed {rel}{last}")));
+    }
+    // A file that grew while it was fed (a turn appended: GZ-1) is no longer the scan's either.
+    let grew = !reader.get_ref().metadata().is_ok_and(|m| m.len() == len);
+    if fed != len || hex::encode(hasher.finalize()) != sha256 || grew {
+        return Err(BridgeError::WorkspaceFailed {
+            code: crate::wire::workspace::refusal::CHANGED,
+            message: format!("the chat changed while it was staged: {rel} is not the bytes the scan read; nothing of it was sent (ai-env session stage {sid} again once the chat is closed)"),
+        });
+    }
+    let stored = digest_spool(&mut spool.file, &spool.path, part_len)?;
+    Ok((spool, stored))
+}
+
+/// The digest of the spool `file` (at `path`, for messages), read from its
+/// start: its length, its sha256 and the sha256 of each `part_len` part (a
+/// multipart upload's), no fingerprint, no hits.
+fn digest_spool(file: &mut std::fs::File, path: &Path, part_len: u64) -> Result<FileDigest, BridgeError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read as _, Seek as _};
+    let at = |what: &str, e: std::io::Error| BridgeError::Io(std::io::Error::new(e.kind(), format!("cannot {what} {}: {e}", path.display())));
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|e| at("read", e))?;
+    let part_len = part_len.max(1);
+    let (mut whole, mut part, mut in_part, mut parts, mut len) = (Sha256::new(), Sha256::new(), 0u64, Vec::new(), 0u64);
+    let mut buf = vec![0u8; FEED_CHUNK];
+    loop {
+        let k = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(at("read", e)),
+        };
+        whole.update(&buf[..k]);
+        let mut rest = &buf[..k];
+        while !rest.is_empty() {
+            let take = usize::try_from((part_len - in_part).min(rest.len() as u64)).unwrap_or(rest.len());
+            part.update(&rest[..take]);
+            in_part += take as u64;
+            rest = &rest[take..];
+            if in_part == part_len {
+                parts.push(hex::encode(std::mem::replace(&mut part, Sha256::new()).finalize()));
+                in_part = 0;
+            }
+        }
+        len += k as u64;
+    }
+    if in_part > 0 {
+        parts.push(hex::encode(part.finalize()));
+    }
+    Ok(FileDigest { len, sha256: hex::encode(whole.finalize()), fp: String::new(), parts, hits: Vec::new(), peak: 0 })
+}
+
+/// `chat.files[n]` (its digest `d`) ready to go up: with no encoding the
+/// file itself, keyed by its own sha256; gzip, its spool ([`spool_file`], on
+/// a blocking thread), keyed by the spool's.
+async fn ready(paths: &Paths, sid: &str, chat: &MacChat, n: usize, d: &FileDigest, part_len: u64, encoding: Option<PartEncoding>) -> Result<Ready, BridgeError> {
+    let rel = chat.files[n].0.clone();
+    let file = chat.dir.join(&rel);
+    let key = |sha: &str| S3Key::Mac { session: sid.to_string(), sha256: sha.to_string() }.render();
+    match encoding {
+        None => Ok(Ready { key: key(&d.sha256), path: file, stored: d.clone(), spool: None }),
+        Some(PartEncoding::Gzip) => {
+            let (paths, owned, len, sha) = (paths.clone(), sid.to_string(), d.len, d.sha256.clone());
+            let (spool, stored) = crate::bridge::workspace::blocking(move || spool_file(&paths, &owned, n, &file, &rel, len, &sha, part_len)).await??;
+            Ok(Ready { key: key(&stored.sha256), path: spool.path.clone(), stored, spool: Some(spool) })
+        }
+    }
+}
+
+/// `r` sent as [`upload_paced`] sends a file (`encoding` its
+/// `content-encoding`), unless `held` (the session's listing) holds its key at
+/// its stored length already: not sent again, its version unknown, as after
+/// a 412. A spool whose path no longer names it (another run made its own
+/// there) is refused before any request. Its spool goes after, whatever came
+/// of it.
+#[allow(clippy::too_many_arguments)]
+async fn put_ready<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, r: Ready, held: &[super::client::Listed], part_len: u64, pace: &Pace<'_>, encoding: Option<PartEncoding>) -> Result<Sent, BridgeError> {
+    let up = if held.iter().any(|o| o.key == r.key && o.size == r.stored.len) {
+        tracing::info!(session = sid, "{}: S3 holds it already: not sent again", r.key);
+        Uploaded { version_id: String::new(), parts: u32::try_from(r.stored.parts.len().max(1)).unwrap_or(u32::MAX), resumed: false, existed: true, sent: 0 }
+    } else {
+        if r.spool.as_ref().is_some_and(|s| !s.intact()) {
+            return Err(BridgeError::Busy(format!("{}: another upload of {sid} replaced this spool; nothing of it was sent", r.path.display())));
+        }
+        upload_paced(client, paths, sid, &r.key, &r.path, &r.stored, part_len, pace, encoding).await?
+    };
+    Ok(Sent { key: r.key, stored_len: r.stored.len, stored_sha256: r.stored.sha256, up })
+}
+
+/// Upload every file of `chat` (`digests` in its order, the scan's) as
 /// `v1/<sid>/mac/<sha256>` objects (the main transcript as [`upload_file`]
-/// does; each subtree file likewise, by its own bytes' sha256), and build
-/// the manifest: one part (the main object), gen 0, its files by rel under
-/// the chat's slug. `state/transcripts/<sid>/` is made before the first
-/// request, so an upload cut before its manifest leaves a trace that
+/// does; each subtree file likewise, by its own stored bytes' sha256), and
+/// build the manifest: one part (the main object), gen 0, its files by rel
+/// under the chat's slug. `state/transcripts/<sid>/` is made before the
+/// first request, so an upload cut before its manifest leaves a trace that
 /// `forget --purge` and `gc --remote` find. One ListObjectsV2 of
 /// `v1/<sid>/mac/` first: an object S3 holds already at its key with its
-/// length (the key is its bytes' sha256, and only this Mac writes there) is
-/// not sent again, its version unknown, as after a 412. S10 (F5): its pace
-/// is judged as its files and parts land, on the bytes the connections took
-/// (the parts in flight too), and an upload below `dataplane::MIN_RATE`
-/// warns once (`ChatUpload::slow`).
-pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, chat: &MacChat, digests: &[FileDigest], part_len: u64, at: &str) -> Result<ChatUpload, BridgeError> {
+/// stored length (the key is its stored bytes' sha256, and only this Mac
+/// writes there) is not sent again, its version unknown, as after a 412.
+/// S10 (F5): its pace is judged as its files and parts land, on the bytes
+/// the connections took (the parts in flight too), and an upload below
+/// `dataplane::MIN_RATE` warns once (`ChatUpload::slow`). S11 (L5, C.3.4):
+/// `encoding` is how the files are stored. With `Some(Gzip)` each file is
+/// spooled ([`spool_file`]: its scanned bytes, a chat that changed since
+/// refused) and its spool goes up with `Content-Encoding: gzip`, keyed by the
+/// spool's sha256 (a resume makes the same spool: the same key, the parts S3
+/// lists not sent again); the manifest's entries keep the decoded `len` and
+/// `sha256` beside `encoding`, `stored_len` and `stored_sha256`. With `None`
+/// the upload is S10's. Either way the main goes alone, first; then the
+/// subtree's files go up to [`SUBTREE_PARALLEL`] at a time, and one whose
+/// stored bytes need more than one `part_len` part (multipart: one
+/// `stage.toml` per session) goes alone once the others are done; one whose
+/// raw bytes exceed a part is spooled only on its turn (at most one such
+/// spool on disk at once). The whole upload holds the session's
+/// [`upload_lock`]: while another holds it the upload is refused (`Busy`,
+/// exit 1) before any request.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid: &str, chat: &MacChat, digests: &[FileDigest], part_len: u64, at: &str, encoding: Option<PartEncoding>) -> Result<ChatUpload, BridgeError> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
     let (Some((main_rel, _)), Some(main)) = (chat.files.first(), digests.first()) else {
         return Err(BridgeError::Config(format!("{sid}: no transcript to stage")));
     };
@@ -408,37 +716,57 @@ pub async fn upload_chat<S: S3Sign>(client: &S3Client<'_, S>, paths: &Paths, sid
         return Err(BridgeError::Config(format!("{}: the transcript is empty: nothing to stage", chat.dir.join(main_rel).display())));
     }
     crate::bridge::registry::ensure_private_dir(&paths.transcript_dir(sid))?;
+    let lock = upload_lock(paths, sid);
+    let Some(_upload) = crate::bridge::vm::lock::try_lock_exclusive(&lock)? else {
+        return Err(BridgeError::Busy(format!("another upload of {sid} is under way (it holds {}); nothing was sent", lock.display())));
+    };
     let pace = Pace::new(sid);
     let held: Vec<super::client::Listed> = client.list(&format!("{}{sid}/mac/", crate::wire::s3::KEY_PREFIX)).await?;
-    let upload = |key: String, path: PathBuf, d: FileDigest| {
-        let there = held.iter().any(|o| o.key == key && o.size == d.len);
-        let pace = &pace;
-        async move {
-            if there {
-                tracing::info!(session = sid, "{key}: S3 holds it already: not sent again");
-                return Ok(Uploaded { version_id: String::new(), parts: u32::try_from(d.parts.len().max(1)).unwrap_or(u32::MAX), resumed: false, existed: true, sent: 0 });
-            }
-            upload_paced(client, paths, sid, &key, &path, &d, part_len, pace).await
+    let (held, pace) = (held.as_slice(), &pace);
+    let put = |r: Ready| put_ready(client, paths, sid, r, held, part_len, pace, encoding);
+    // The main alone, first.
+    let first = put(ready(paths, sid, chat, 0, main, part_len, encoding).await?).await?;
+    // The subtree: SUBTREE_PARALLEL files at once; one that needs multipart (or may: its raw bytes exceed a part)
+    // waits, then is made ready and goes alone, so no spool of it waits on disk (a spool found to need multipart goes
+    // and is made again on its turn: the same bytes). S3 holds no empty part.
+    let steps = chat.files.iter().zip(digests).enumerate().skip(1).filter(|(_, (_, d))| d.len > 0).map(|(n, (_, d))| async move {
+        if d.len > part_len.max(1) {
+            return Ok::<(usize, Option<Sent>), BridgeError>((n, None));
         }
-    };
-    let key = S3Key::Mac { session: sid.to_string(), sha256: main.sha256.clone() }.render();
-    let up = upload(key.clone(), chat.dir.join(main_rel), main.clone()).await?;
+        let r = ready(paths, sid, chat, n, d, part_len, encoding).await?;
+        Ok((n, if r.stored.parts.len() > 1 { None } else { Some(put(r).await?) }))
+    });
+    let mut steps: Vec<(usize, Option<Sent>)> = futures_util::stream::iter(steps).buffer_unordered(SUBTREE_PARALLEL).try_collect().await?;
+    steps.sort_by_key(|(n, _)| *n);
+    let mut sent: Vec<(usize, Sent)> = Vec::with_capacity(steps.len());
+    for (n, step) in steps {
+        let s = match step {
+            Some(s) => s,
+            None => put(ready(paths, sid, chat, n, &digests[n], part_len, encoding).await?).await?,
+        };
+        sent.push((n, s));
+    }
+    let stored_of = |s: &Sent| (encoding.map(|_| s.stored_len), encoding.map(|_| s.stored_sha256.clone()));
     let mut m = Manifest::new(sid, client.target(), manifest::ORIGIN_MAC, &format!("{}/{sid}.jsonl", chat.slug), at);
-    m.parts.push(ManifestPart { key: key.clone(), version_id: up.version_id.clone(), from: 0, len: main.len, sha256: main.sha256.clone() });
+    let (stored_len, stored_sha256) = stored_of(&first);
+    m.parts.push(ManifestPart { key: first.key.clone(), version_id: first.up.version_id.clone(), from: 0, len: main.len, sha256: main.sha256.clone(), encoding, stored_len, stored_sha256 });
     m.committed = main.len;
     m.fp = main.fp.clone();
-    for ((rel, _), d) in chat.files.iter().zip(digests).skip(1) {
-        if d.len == 0 {
-            continue;
-        }
-        let fkey = S3Key::Mac { session: sid.to_string(), sha256: d.sha256.clone() }.render();
-        // The part length the digests were computed with: a file over it goes up in those very parts, each with its sha256.
-        let f = upload(fkey.clone(), chat.dir.join(rel), d.clone()).await?;
-        let version = Some(f.version_id).filter(|v| !v.is_empty()).or_else(|| m.file_version(&fkey));
-        m.files.push(ManifestFile { rel: format!("{}/{rel}", chat.slug), key: fkey, version_id: version, len: d.len, sha256: d.sha256.clone() });
+    for (n, s) in &sent {
+        let ((rel, _), d) = (&chat.files[*n], &digests[*n]);
+        // A key S3 held already (a 412, or listed) takes the version another file of the chat stored it with (two
+        // identical files, side by side), else none.
+        let version = Some(s.up.version_id.clone()).filter(|v| !v.is_empty()).or_else(|| sent.iter().map(|(_, o)| o).find(|o| o.key == s.key && !o.up.version_id.is_empty()).map(|o| o.up.version_id.clone()));
+        let (stored_len, stored_sha256) = stored_of(s);
+        m.files.push(ManifestFile { rel: format!("{}/{rel}", chat.slug), key: s.key.clone(), version_id: version, len: d.len, sha256: d.sha256.clone(), encoding, stored_len, stored_sha256 });
     }
+    if encoding.is_some() {
+        // Every spool went with its file: the directory too (a leftover of a cut run stays, and is removed by name).
+        let _ = std::fs::remove_dir(paths.transcript_spool(sid));
+    }
+    let stored = sent.iter().map(|(_, s)| s.stored_len).fold(first.stored_len, u64::saturating_add);
     let slow = pace.warned.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(ChatUpload { manifest: m, key, bytes: chat.bytes(), parts: up.parts, resumed: up.resumed, existed: up.existed, sent: pace.sent(), ms: pace.ms(), slow })
+    Ok(ChatUpload { manifest: m, key: first.key, bytes: chat.bytes(), parts: first.up.parts, resumed: first.up.resumed, existed: first.up.existed, sent: pace.sent(), ms: pace.ms(), slow, stored, encoding })
 }
 
 /// Move `chat`'s files (`<sid>.jsonl`, the `<sid>/` subtree) into
@@ -626,6 +954,8 @@ pub struct StageReport {
     pub origin: Option<PathBuf>,
     /// S10 (F5): the upload's bytes sent per second (`None`: nothing went up, `already`).
     pub rate: Option<u64>,
+    /// S11 (C.3.7): the stored bytes when the stage wrote, or found (`already`), an encoded manifest; `None` else.
+    pub stored: Option<u64>,
 }
 
 /// The stage of `sid` (`cmd_stage` without the printing): refusals first,
@@ -675,7 +1005,8 @@ where
             }
             _ => (row.as_ref().and_then(|r| r.view.clone()), Some(paths.transcript_origin(sid)).filter(|p| p.exists())),
         };
-        let report = StageReport { session: sid.to_string(), bytes: m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), parts: 1, key: m.parts.first().map(|p| p.key.clone()).unwrap_or_default(), outcome: "already", view, origin, rate: None };
+        let stored = m.encoded().then(|| m.stored_bytes());
+        let report = StageReport { session: sid.to_string(), bytes: m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), parts: 1, key: m.parts.first().map(|p| p.key.clone()).unwrap_or_default(), outcome: "already", view, origin, rate: None, stored };
         audit_stage(paths, &report, t0);
         return Ok(report);
     }
@@ -692,15 +1023,18 @@ where
     let signer = unseal().await?;
     let client = S3Client::new(&signer, target)?;
     let at = crate::wire::time::rfc3339_utc_ms(crate::wire::time::unix_now_ms());
-    let up = upload_chat(&client, paths, sid, &chat, &digests, part_len, &at).await?;
+    // S11 (L5, C.3.7): `session stage` always asks for gzip.
+    let up = upload_chat(&client, paths, sid, &chat, &digests, part_len, &at, Some(PartEncoding::Gzip)).await?;
     {
         let _held = manifest::lock(paths, sid).await?;
         manifest::write(paths, &up.manifest)?;
     }
+    unchanged_since_scan(&chat, &digests, sid)?;
     let (view, origin) = leave_view(paths, sid, &chat, projects, &mac_cwd, n, &rules, build)?;
     let outcome = if up.resumed { "resumed" } else { "staged" };
     let rate = (up.sent > 0).then(|| up.rate());
-    let report = StageReport { session: sid.to_string(), bytes: up.bytes, parts: up.parts, key: up.key, outcome, view, origin, rate };
+    let stored = up.encoding.map(|_| up.stored);
+    let report = StageReport { session: sid.to_string(), bytes: up.bytes, parts: up.parts, key: up.key, outcome, view, origin, rate, stored };
     audit_stage(paths, &report, t0);
     Ok(report)
 }
@@ -730,6 +1064,31 @@ fn staged_copy(m: &Manifest, chat: &MacChat, sid: &str) -> Result<(), BridgeErro
     }
     Err(BridgeError::Config(format!(
         "{} is not the copy S3 holds of {sid}: the chat went on remotely too, and the two copies diverged; it stays where it is (a purge would lose the remote turns)",
+        main.display()
+    )))
+}
+
+/// GZ-1: once `chat` went up as the scan read it (`digests`), and before its
+/// view replaces it, it must still be those bytes: the same files, each of
+/// its scanned length, the main of its sha256 too (`staged_copy`'s rule).
+/// Else the chat went on here while it was staged, and a view built from its
+/// newer tail would show turns S3 never received: refused (`Config`, exit
+/// 1), its files left in place and the manifest kept (S3 holds the scanned
+/// bytes), naming the way out `staged_copy` names.
+pub fn unchanged_since_scan(chat: &MacChat, digests: &[FileDigest], sid: &str) -> Result<(), BridgeError> {
+    let main = chat.main_path(sid);
+    let scanned: std::collections::BTreeMap<&str, u64> = chat.files.iter().zip(digests).map(|((rel, _), d)| (rel.as_str(), d.len)).collect();
+    let now = crate::bridge::seed::transcript_files_capped(&chat.dir, sid, u64::MAX)?;
+    let same_files = now.len() == scanned.len() && now.iter().all(|(rel, len)| scanned.get(rel.as_str()) == Some(len));
+    if same_files {
+        if let Some(d) = digests.first() {
+            if sha256_if_len(&main, d.len)?.as_deref() == Some(d.sha256.as_str()) {
+                return Ok(());
+            }
+        }
+    }
+    Err(BridgeError::Config(format!(
+        "{} is not the copy S3 holds of {sid} (the chat went on here while it was staged): it stays where it is; ai-env session forget {sid} --purge, then ai-env session stage {sid}, stages it with every local turn",
         main.display()
     )))
 }
@@ -879,7 +1238,9 @@ fn held_report(paths: &Paths, sid: &str) -> Result<StageReport, BridgeError> {
         Some(m) => (m.committed + m.files.iter().map(|f| f.len).sum::<u64>(), u32::try_from(m.parts.len()).unwrap_or(u32::MAX), m.parts.first().map(|p| p.key.clone()).unwrap_or_default()),
         None => (0, 0, String::new()),
     };
-    Ok(StageReport { session: sid.to_string(), bytes, parts, key, outcome: "already", view, origin: None, rate: None })
+    // S11 (C.3.7): an S8 mirror P3 sent up gzip-encoded is such a chat's manifest too.
+    let stored = m.as_ref().filter(|m| m.encoded()).map(Manifest::stored_bytes);
+    Ok(StageReport { session: sid.to_string(), bytes, parts, key, outcome: "already", view, origin: None, rate: None, stored })
 }
 
 /// While held, this process's stdout (fd 1) is a copy of another
@@ -1018,7 +1379,9 @@ fn report_and_warm<W: FnOnce() -> crate::errors::Result<Option<WarmRestore>>>(re
     if !json {
         let view = report.view.as_deref().map_or_else(String::new, |v| format!("; its view is {v}"));
         let origin = report.origin.as_ref().map_or_else(String::new, |p| format!("; the original is kept in {}", p.display()));
-        writeln!(out, "{} {}: {} bytes, {} part(s), {}{view}{origin}", report.outcome, report.session, report.bytes, report.parts, report.key)?;
+        // S11 (C.3.7): an encoded stage names its stored bytes; an identity one prints S10's line.
+        let stored = report.stored.map_or_else(String::new, |n| format!(" ({n} stored, {})", PartEncoding::Gzip.word()));
+        writeln!(out, "{} {}: {} bytes{stored}, {} part(s), {}{view}{origin}", report.outcome, report.session, report.bytes, report.parts, report.key)?;
         out.flush()?;
     }
     let warmed = match warm {
@@ -1032,7 +1395,7 @@ fn report_and_warm<W: FnOnce() -> crate::errors::Result<Option<WarmRestore>>>(re
     if json {
         let restore = restored.map(|r| serde_json::json!({ "vm": r.vm, "outcome": r.outcome.word(), "bytes": r.bytes(), "ms": r.ms }));
         let doc = serde_json::json!({
-            "session": report.session, "bytes": report.bytes, "parts": report.parts, "key": report.key, "outcome": report.outcome,
+            "session": report.session, "bytes": report.bytes, "stored": report.stored, "parts": report.parts, "key": report.key, "outcome": report.outcome,
             "view": report.view, "origin": report.origin.as_ref().map(|p| p.display().to_string()), "restore": restore,
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&doc).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?)?;
@@ -1044,12 +1407,17 @@ fn report_and_warm<W: FnOnce() -> crate::errors::Result<Option<WarmRestore>>>(re
 }
 
 /// The `transcript_stage` audit row of `r`; S10 (F5) with its `rate` (bytes
-/// per second) when it uploaded.
+/// per second) when it uploaded; S11 (C.3.7) with its `stored` bytes when the
+/// chat is stored encoded (`bytes` stays the raw bytes, `rate` is the stored
+/// bytes').
 fn audit_stage(paths: &Paths, r: &StageReport, t0: std::time::Instant) {
     let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut pairs = vec![("session", r.session.clone()), ("bytes", r.bytes.to_string()), ("parts", r.parts.to_string()), ("outcome", r.outcome.to_string()), ("ms", ms.to_string())];
     if let Some(rate) = r.rate {
         pairs.push(("rate", rate.to_string()));
+    }
+    if let Some(stored) = r.stored {
+        pairs.push(("stored", stored.to_string()));
     }
     crate::bridge::workspace::audit(paths, crate::bridge::remote::audit_event::TRANSCRIPT_STAGE, &pairs);
 }
@@ -1109,7 +1477,7 @@ pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate:
     };
     let slugs = crate::bridge::registry::read(&ctx.paths, uuid).ok().flatten().and_then(|r| r.slug).into_iter().collect();
     let chat = ChatRestore { session: uuid.to_string(), projects, slugs };
-    let warm = workspace.map(|workspace| move || crate::bridge::vm::cmd::main_with(store, crate::cli::VmCmd::Warm { workspace, json: false, dry_run: false, prewarm: false }, Some(chat)));
+    let warm = workspace.map(|workspace| move || crate::bridge::vm::cmd::main_with(store, crate::cli::VmCmd::Warm { workspace, json: false, dry_run: false, prewarm: false, claude_version: None }, Some(chat)));
     report_and_warm(&report, json, &mut std::io::stdout(), std::io::stderr().as_fd(), warm)
 }
 
@@ -1225,7 +1593,7 @@ mod g4_tests {
             (m.dev(), m.ino())
         };
         let before = fd1();
-        let report = StageReport { session: SID.into(), bytes: 600, parts: 1, key: format!("v1/{SID}/mac/{}", "a".repeat(64)), outcome: "staged", view: Some(format!("-w/{SID}.jsonl")), origin: Some(PathBuf::from("/s/origin")), rate: Some(1_000_000) };
+        let report = StageReport { session: SID.into(), bytes: 600, parts: 1, key: format!("v1/{SID}/mac/{}", "a".repeat(64)), outcome: "staged", view: Some(format!("-w/{SID}.jsonl")), origin: Some(PathBuf::from("/s/origin")), rate: Some(1_000_000), stored: None };
         let mut err = tempfile::tempfile().unwrap();
         let mut out = Vec::new();
         let restored = WarmRestore { vm: "microvm-1".into(), outcome: TranscriptOutcome::Restored { parts: 1, bytes: 600 }, ms: 42 };
@@ -1348,6 +1716,179 @@ mod g4_tests {
         refused(&format!("session {SID} began on a VM and its row records no cwd"));
         crate::bridge::registry::write(&paths, &crate::bridge::registry::SessionRow { transcript_home: None, ..row }).unwrap();
         refused("ai-env session migrate-s9 moves it to S3");
+    }
+}
+
+#[cfg(test)]
+mod s11_tests {
+    use super::*;
+
+    /// S11 (C.3.5): `session stage` takes at most 16 GiB in all and 4 GiB a file, both decoded: a sparse file of
+    /// 4 GiB + 1 is refused whatever the cap (naming its own bytes), as is a sum past 16 GiB; both caps exactly
+    /// pass. The subtree goes `MULTIPART_PARALLEL` at a time.
+    #[test]
+    fn the_stage_caps_each_file_and_the_sum() {
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        assert_eq!((STAGE_MAX, STAGE_FILE_MAX, SUBTREE_PARALLEL), (16 << 30, 4 << 30, MULTIPART_PARALLEL));
+        assert_eq!(STAGE_FILE_MAX, crate::wire::workspace::PULL_MAX);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("-w");
+        std::fs::create_dir_all(dir.join(SID)).unwrap();
+        let sparse = |path: &Path, len: u64| std::fs::File::create(path).unwrap().set_len(len).unwrap();
+        let main = dir.join(format!("{SID}.jsonl"));
+        sparse(&main, STAGE_FILE_MAX + 1);
+        let too_large = |r: Result<Option<MacChat>, BridgeError>| match r {
+            Err(BridgeError::TranscriptTooLarge { session, bytes }) => (session, bytes),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(too_large(locate(tmp.path(), &["-w"], SID, STAGE_MAX)), (SID.to_string(), STAGE_FILE_MAX + 1), "a file over 4 GiB");
+        assert_eq!(too_large(locate(tmp.path(), &["-w"], SID, u64::MAX)), (SID.to_string(), STAGE_FILE_MAX + 1), "whatever the cap");
+        sparse(&main, STAGE_FILE_MAX);
+        for i in 0..3 {
+            sparse(&dir.join(SID).join(format!("agent-{i}.jsonl")), STAGE_FILE_MAX);
+        }
+        let chat = locate(tmp.path(), &["-w"], SID, STAGE_MAX).unwrap().expect("both caps exactly");
+        assert_eq!((chat.files.len(), chat.bytes()), (4, STAGE_MAX));
+        sparse(&dir.join(SID).join("agent-3.jsonl"), 1);
+        assert_eq!(too_large(locate(tmp.path(), &["-w"], SID, STAGE_MAX)), (SID.to_string(), STAGE_MAX + 1), "over 16 GiB in all");
+    }
+
+    /// S11 (C.3.4): a file's spool is `/usr/bin/gzip -n -6` of exactly the
+    /// bytes the scan read (`gzip -dc` gives them back), 0600 in a 0700
+    /// directory, named by the file's index; its digest is its own (its
+    /// sha256, its parts'). Made again it is the same bytes (the same key),
+    /// a leftover of its name replaced; it goes once dropped. Bytes that are
+    /// not the scan's (another byte, or fewer) are `changed` (exit 1), the
+    /// spool gone.
+    #[test]
+    fn a_spool_is_gzip_of_the_scanned_bytes_and_made_again_alike() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        let file = tmp.path().join("agent-a1.jsonl");
+        let bytes: Vec<u8> = (0..20_000u32).flat_map(|i| format!("{{\"n\":{i},\"text\":\"line {}\"}}\n", i * 7919 % 10_007).into_bytes()).collect();
+        std::fs::write(&file, &bytes).unwrap();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let len = bytes.len() as u64;
+        let (spool, d) = spool_file(&paths, SID, 3, &file, "agent-a1.jsonl", len, &sha, 1000).unwrap();
+        assert_eq!(spool.path, paths.transcript_spool(SID).join("3.gz"));
+        let stored = std::fs::read(&spool.path).unwrap();
+        assert_eq!((d.len, d.sha256.clone(), d.parts.len()), (stored.len() as u64, hex::encode(Sha256::digest(&stored)), stored.len().div_ceil(1000)));
+        assert_eq!(d.parts[0], hex::encode(Sha256::digest(&stored[..1000])));
+        assert!(d.len < len / 2, "a JSONL file compresses: {} of {len}", d.len);
+        assert_eq!(std::fs::metadata(&spool.path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(paths.transcript_spool(SID)).unwrap().permissions().mode() & 0o777, 0o700);
+        let mut gunzip = std::process::Command::new(GZIP).arg("-dc").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        gunzip.stdin.take().unwrap().write_all(&stored).unwrap();
+        assert_eq!(gunzip.wait_with_output().unwrap().stdout, bytes, "gzip -dc gives the scanned bytes back");
+        let at = spool.path.clone();
+        drop(spool);
+        assert!(!at.exists(), "dropped, the spool goes");
+        // A leftover of its name (a cut run's) is never trusted: replaced by the same bytes.
+        std::fs::write(&at, b"a cut run's spool").unwrap();
+        let (again, d2) = spool_file(&paths, SID, 3, &file, "agent-a1.jsonl", len, &sha, 1000).unwrap();
+        assert_eq!((d2.sha256.as_str(), std::fs::read(&again.path).unwrap()), (d.sha256.as_str(), stored), "deterministic: the same key");
+        drop(again);
+        // A spool whose path another run took over: its drop leaves that run's file, and its digest is its own.
+        let (third, d3) = spool_file(&paths, SID, 3, &file, "agent-a1.jsonl", len, &sha, 1000).unwrap();
+        assert!(third.intact());
+        std::fs::remove_file(&at).unwrap();
+        std::fs::write(&at, b"another run's spool").unwrap();
+        assert!(!third.intact());
+        drop(third);
+        assert_eq!((std::fs::read(&at).unwrap(), d3.sha256), (b"another run's spool".to_vec(), d.sha256.clone()), "left to its run");
+        std::fs::remove_file(&at).unwrap();
+        // The file changed since the scan: one byte, then a shorter file, then a longer one (a turn appended: its
+        // first `len` bytes are still the scan's, GZ-1).
+        let mut other = bytes.clone();
+        other[10] ^= 1;
+        let appended = [bytes.as_slice(), b"{\"n\":\"a turn appended\"}\n"].concat();
+        for changed in [other, bytes[..bytes.len() - 1].to_vec(), appended] {
+            std::fs::write(&file, &changed).unwrap();
+            let e = spool_file(&paths, SID, 3, &file, "agent-a1.jsonl", len, &sha, 1000).map(|(_, d)| d).unwrap_err();
+            assert_eq!(e.to_string(), format!("workspace failed (changed): the chat changed while it was staged: agent-a1.jsonl is not the bytes the scan read; nothing of it was sent (ai-env session stage {SID} again once the chat is closed)"));
+            assert_eq!(crate::errors::CliError::from(e).exit_code(), 1);
+            assert!(!at.exists(), "no spool left");
+        }
+    }
+
+    /// GZ-1: before a view replaces a chat that went up, the chat must still be
+    /// the bytes the scan read. A turn appended to the main or to a subtree
+    /// file, a new subtree file, or a main of its length with other bytes is
+    /// refused (exit 1) naming the purge and the stage again; the files stay.
+    #[test]
+    fn a_chat_that_went_on_while_it_was_staged_is_refused_before_its_view() {
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("-w");
+        std::fs::create_dir_all(dir.join(SID).join("subagents")).unwrap();
+        let main = dir.join(format!("{SID}.jsonl"));
+        let sub = dir.join(SID).join("subagents").join("agent-a1.jsonl");
+        let (main_bytes, sub_bytes) = (b"{\"turn\":0}\n{\"turn\":1}\n".to_vec(), b"{\"sub\":0}\n".to_vec());
+        let reset = || {
+            std::fs::write(&main, &main_bytes).unwrap();
+            std::fs::write(&sub, &sub_bytes).unwrap();
+            let _ = std::fs::remove_file(dir.join(SID).join("subagents").join("agent-a2.jsonl"));
+        };
+        reset();
+        let chat = locate(tmp.path(), &["-w"], SID, STAGE_MAX).unwrap().unwrap();
+        let digests = scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
+        unchanged_since_scan(&chat, &digests, SID).unwrap();
+        let refused = format!(
+            "{} is not the copy S3 holds of {SID} (the chat went on here while it was staged): it stays where it is; ai-env session forget {SID} --purge, then ai-env session stage {SID}, stages it with every local turn",
+            main.display()
+        );
+        let append = |p: &Path, line: &[u8]| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new().append(true).open(p).unwrap().write_all(line).unwrap();
+        };
+        let cases: [(&str, &dyn Fn()); 4] = [
+            ("a turn appended to the main", &|| append(&main, b"{\"turn\":2}\n")),
+            ("a subtree file appended to", &|| append(&sub, b"{\"sub\":1}\n")),
+            ("a new subtree file", &|| std::fs::write(dir.join(SID).join("subagents").join("agent-a2.jsonl"), b"{}\n").unwrap()),
+            ("the main's length, other bytes", &|| std::fs::write(&main, b"{\"turn\":0}\n{\"turn\":9}\n").unwrap()),
+        ];
+        for (what, change) in cases {
+            reset();
+            change();
+            let e = unchanged_since_scan(&chat, &digests, SID).expect_err(what);
+            assert_eq!(e.to_string(), format!("config: {refused}"), "{what}");
+            assert_eq!(crate::errors::CliError::from(e).exit_code(), 1, "{what}");
+            assert!(main.exists() && sub.exists(), "{what}: the files stay");
+        }
+        reset();
+        unchanged_since_scan(&chat, &digests, SID).unwrap();
+    }
+
+    /// S11 (C.3.7): an encoded stage's line names its stored bytes after its
+    /// bytes (`(<stored> stored, gzip)`) and its `--json` document `stored`;
+    /// an identity one prints S10's line, `stored` null.
+    #[test]
+    fn the_report_names_its_stored_bytes() {
+        const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        use std::os::fd::AsFd as _;
+        let key = format!("v1/{SID}/mac/{}", "a".repeat(64));
+        let report = StageReport { session: SID.into(), bytes: 600, parts: 1, key: key.clone(), outcome: "staged", view: None, origin: None, rate: Some(1_000_000), stored: Some(123) };
+        let err = tempfile::tempfile().unwrap();
+        let none = None::<fn() -> crate::errors::Result<Option<WarmRestore>>>;
+        let mut out = Vec::new();
+        report_and_warm(&report, false, &mut out, err.as_fd(), none).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("staged {SID}: 600 bytes (123 stored, gzip), 1 part(s), {key}\n"));
+        let mut out = Vec::new();
+        report_and_warm(&report, true, &mut out, err.as_fd(), none).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!((doc["bytes"].as_u64(), doc["stored"].as_u64()), (Some(600), Some(123)), "{doc}");
+        let identity = StageReport { stored: None, ..report };
+        let mut out = Vec::new();
+        report_and_warm(&identity, false, &mut out, err.as_fd(), none).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("staged {SID}: 600 bytes, 1 part(s), {key}\n"), "S10's line");
+        let mut out = Vec::new();
+        report_and_warm(&identity, true, &mut out, err.as_fd(), none).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc["stored"].is_null() && doc.get("stored").is_some(), "{doc}");
     }
 }
 

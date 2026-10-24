@@ -54,6 +54,7 @@
 //!   `park_refused` are the VM's kinds, a `bad_frame` from the Mac.
 //!
 //! Logging is lifecycle only: never a frame body, a token or an argument.
+use crate::shim::claudebin::PickedClaude;
 use crate::shim::health::ShimState;
 use crate::shim::peer::{drain, Peer, PeerFacts};
 pub use crate::shim::spawn::ConnGen;
@@ -655,11 +656,18 @@ impl Session {
             Frame::Spawn { .. } => match SpawnRequest::from_frame(frame) {
                 Some(mut req) => {
                     let id = req.spawn_id.clone();
+                    // S11 (LD-24): a VM that was asked to spawn is no longer fresh (no claude relay from now on).
+                    state.mark_used("spawn");
                     // Before the manager knows the spawn: its frames wait for this answer.
                     self.unannounced.add(&id);
                     // S7: a named credential comes from the cache, as the spawn's one-shot secret.
                     let reply = match self.resolve_credential(&mut req) {
-                        Ok(()) => spawns.spawn(gen, req).await,
+                        Ok(()) => {
+                            // S11: which claude a `claude` argv[0] runs, from the VM's cache (never refuses); the
+                            // pick's hold keeps that binary from eviction until the manager holds the spawn.
+                            let _hold = self.resolve_claude(&mut req);
+                            spawns.spawn(gen, req).await
+                        }
                         Err((code, message)) => Frame::SpawnErr { spawn_id: id.clone(), code, message },
                     };
                     self.queue(Cmd::Answer(id, reply)).await
@@ -667,6 +675,8 @@ impl Session {
                 None => self.violation(ErrorCode::BadFrame, None).await,
             },
             Frame::Credential { name, secret, tag } => {
+                // S11 (LD-24): a VM that was handed a credential is no longer fresh.
+                state.mark_used("credential");
                 let reply = if state.is_draining() {
                     Frame::CredentialErr { name, code: CredentialErrCode::Draining, message: "the shim is stopping".into() }
                 } else {
@@ -768,6 +778,26 @@ impl Session {
             }
             None => Err((SpawnErrCode::NoCredential, format!("no credential {name} is cached on this VM (none was delivered since it last ran)"))),
         }
+    }
+
+    /// S11 (A.4): what a `claude` argv[0] runs, before the manager sees the
+    /// spawn: the first of `spawn.claude` the VM's cache holds
+    /// (`ClaudeCache::pick`), else the image's claude with the probe's
+    /// version. Any other argv[0] picks nothing. It never refuses: a ref is
+    /// only compared here, and the manager's `check_request` refuses a
+    /// malformed one. A cached pick comes with its hold, for the caller to
+    /// keep until the manager answered the spawn.
+    fn resolve_claude(&self, req: &mut SpawnRequest) -> Option<crate::shim::claudebin::PickHold> {
+        if req.argv.first().is_none_or(|a| a != "claude") {
+            req.picked = None;
+            return None;
+        }
+        let (picked, hold) = match self.state.claude_cache.pick(&req.claude) {
+            Some((picked, hold)) => (picked, Some(hold)),
+            None => (PickedClaude { path: None, version: self.state.claude_version(), sha256: None }, None),
+        };
+        req.picked = Some(picked);
+        hold
     }
 
     /// A stream error: what to tell the client, and how the reader ends.
@@ -1245,7 +1275,7 @@ mod tests {
         let s = state(true);
         let mut c = hello_ok(&s, FAST).await;
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
         send(&mut c, &spawn).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::SpawnErr { spawn_id, .. }) if spawn_id == id));
         let unknown = SpawnId::new_v7();
@@ -1342,7 +1372,7 @@ mod tests {
         let (held, mut queued) = mpsc::channel(CONTROL_QUEUE);
         let mut reader = Session { state: s.clone(), gen, tx: held, unannounced, authenticated: true, idle: Duration::from_secs(60), idle_unit: FAST.idle_unit, deadline: Instant::now() + Duration::from_secs(60), summary: String::new() };
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
         assert!(matches!(reader.on_frame(spawn).await, Flow::Continue));
         let until = Instant::now() + Duration::from_secs(5);
         while s.spawns.status(None).iter().all(|st| st.exit.is_none()) {
@@ -1422,7 +1452,7 @@ mod tests {
         send(&mut c, &hello_frame(&token(), vec![], Some(IDLE_MIN_S))).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::HelloOk { caps, .. }) if caps.iter().any(|c| c == CAP_PARK_V1)));
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: Some(60), credential: None };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() };
         send(&mut c, &spawn).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::Spawned { spawn_id, .. }) if spawn_id == id));
         let owner = ParkOwner { pid: 51_234, started: 1_792_483_200 };

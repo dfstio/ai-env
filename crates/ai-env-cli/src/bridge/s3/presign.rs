@@ -15,8 +15,9 @@ use std::time::{Duration, SystemTime};
 /// The header every request signs, its value the bucket's owner (a bucket of
 /// our name in another account answers 403, never takes a transcript).
 pub const OWNER_HEADER: &str = "x-amz-expected-bucket-owner";
-/// The headers a request may sign besides `host`, lowercase (plans/s9-contracts.md §2.2).
-pub const SIGNABLE_HEADERS: [&str; 5] = ["content-length", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "if-none-match", OWNER_HEADER];
+/// The headers a request may sign besides `host`, lowercase (plans/s9-contracts.md §2.2); S11 (L5, C.3.4):
+/// `content-encoding`, which an encoded object's PUT or CreateMultipartUpload signs.
+pub const SIGNABLE_HEADERS: [&str; 6] = ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "if-none-match", OWNER_HEADER];
 /// The query parameters a request may sign besides the X-Amz ones, in the
 /// order they must come.
 pub const SIGNABLE_QUERY: [&str; 8] = ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys"];
@@ -254,6 +255,22 @@ mod tests {
         let g = sign(lab_credentials(), &get, at()).unwrap();
         assert_eq!((g.signed_headers(), g.param_names()[0]), (SIGNED_HEADERS_GET, "versionId"));
         assert!(!format!("{url:?}{g:?}").contains("X-Amz-Signature"), "Debug shows the host and key only");
+    }
+
+    /// S11 (C.3.4): an encoded object's PUT signs `content-encoding: gzip`; an unsigned extra header is still refused.
+    #[test]
+    fn content_encoding_is_a_signable_header() {
+        assert_eq!(SIGNABLE_HEADERS, ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "if-none-match", OWNER_HEADER]);
+        let key = Some(format!("v1/{S}/mac/{SHA}"));
+        let mut headers = write_headers(3787, SHA, true).unwrap();
+        headers.push(("content-encoding".into(), "gzip".into()));
+        let req = request(S3Method::Put, &aws(), key.clone(), Vec::new(), headers, PRESIGN_EXPIRY);
+        assert!(check(&req).is_ok(), "{:?}", check(&req));
+        let url = sign(lab_credentials(), &req, at()).unwrap();
+        assert!(url.signed_headers().split(';').any(|h| h == "content-encoding"), "{}", url.signed_headers());
+        let mut other = req.clone();
+        other.headers.push(("x-amz-meta-what".into(), "x".into()));
+        assert!(matches!(check(&other), Err(BridgeError::Config(m)) if m.contains("x-amz-meta-what")));
     }
 
     /// Every method and the bucket itself sign `x-amz-expected-bucket-owner`

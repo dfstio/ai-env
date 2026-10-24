@@ -1,0 +1,33 @@
+v = 2
+session_id = "11111111-1111-4111-8111-111111111111"
+slug = "-w-project"
+cwd = "/w/project"
+transcript_rel = "-w-project/11111111-1111-4111-8111-111111111111.jsonl"
+created = "2026-10-22T09:00:00Z"
+last_seen = "2026-10-22T11:00:00Z"
+status = "parked"
+mode = "remote"
+route = "remote"
+ext = "anthropic.claude-code-2.1.305"
+pid = 1
+argv_hash = "fixture"
+respawns = 0
+microvm_id = "microvm-0be03000-0000-4000-8000-00000000000b"
+
+[[vms]]
+gen = 1
+vm = "microvm-0a5fc800-0000-4000-8000-00000000000a"
+spawn = "spawn-s2"
+from = "2026-10-22T09:00:00Z"
+to = "2026-10-22T10:21:08Z"
+why = "first"
+end = "moved"
+pid = 4200
+
+[[vms]]
+gen = 2
+vm = "microvm-0be03000-0000-4000-8000-00000000000b"
+spawn = "spawn-s4"
+from = "2026-10-22T10:21:05Z"
+why = "migrate:command"
+pid = 4200

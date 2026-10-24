@@ -1925,7 +1925,7 @@ fn egress_check_never_claims_a_pass_whose_record_a_newer_revocation_refused() {
     no_vm_left(&w);
 }
 
-/// `egress check --if-needed` (what `make claude-update` runs after a deploy): no VM when the image version a new VM
+/// `egress check --if-needed` (S10's `make claude-update` ran it after a deploy; retired in S11): no VM when the image version a new VM
 /// runs — read live as the operator — already has a pass bound to that very build and to the connector's live facts;
 /// the full check when the build, the connector or the version differ, or the live read fails. A DNS verdict the gate
 /// does not accept is said, and starts nothing (another check would see the same).

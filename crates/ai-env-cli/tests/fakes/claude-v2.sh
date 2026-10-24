@@ -233,18 +233,47 @@
 # keeps the history): the first one's parent is the cut (--resume-session-at, found), else the
 # --resume transcript's last user or assistant entry that is no sidechain's (none there: null).
 # The shim answers park and unpark (S10), never the fake.
+# S11 (part A: the claude a VM runs, its start-up respawns; plans/s11-contracts-A.md §9.1):
+#   FAKE_REJECT_OPTION        <flag>[ <flag>]: after the argv is logged and the generation counted,
+#                             the first argument (in argv order, --x or --x=...) that is a listed
+#                             flag gets "error: unknown option '<flag>'" on stderr and exit 1,
+#                             before stdin is read, as the CLI refuses an option it lacks;
+#                             FAKE_ENV_LOG gets "gen <n> rejected=<flag>"
+#   FAKE_DIE_BEFORE_INIT=1    at the same point: "fake claude: died before init" on stderr, exit 1;
+#                             FAKE_ENV_LOG gets "gen <n> died_before_init"
+#   FAKE_KNOBS_FILE           an embedded default only (a staged copy's, tests/common/curl.rs'
+#                             fake_claude_bytes): this file is sourced in place of <this path>.knobs
+#   FAKE_VERSION_PINNED       an embedded default only: --version prints "<v> (Claude Code)" whatever
+#                             FAKE_VERSION says
+# S11 (part C: the cut after a compaction; plans/s11-contracts-C.md §C.2.5):
+#   FAKE_COMPACT_BEFORE_TURN  n: with FAKE_WRITE_TRANSCRIPT=1, at the start of this process's turn n
+#                             (each process counts its own turns, as FAKE_ASK_TURN), before the
+#                             turn's user entry is written, two entries are appended to the
+#                             session's transcript as claude 2.1.302 writes a compaction: a
+#                             compact_boundary (parentUuid null, logicalParentUuid the last entry
+#                             written or null; uuid kind 7000) and its summary (isCompactSummary,
+#                             parentUuid the boundary; uuid kind 6000); the turn's user entry then
+#                             chains to the summary; with --session-mirror one transcript_mirror
+#                             frame carries the two; FAKE_ENV_LOG gets "gen <g> turn <t> compacted
+#                             summary=<summary>". Without FAKE_WRITE_TRANSCRIPT=1 it does nothing
 
-# The remote link's knobs (see above), before anything reads one.
-case $0 in
-  */*)
-    if [ -f "$0.knobs" ]; then
-      . "$0.knobs"
-    fi
-    ;;
-esac
+# The remote link's knobs (see above), before anything reads one. S11: a
+# staged copy's embedded FAKE_KNOBS_FILE names the file in place of
+# <this path>.knobs.
+knobs_file=""
+if [ -n "${FAKE_KNOBS_FILE:-}" ]; then
+  knobs_file=$FAKE_KNOBS_FILE
+else
+  case $0 in
+    */*) knobs_file="$0.knobs" ;;
+  esac
+fi
+if [ -n "$knobs_file" ] && [ -f "$knobs_file" ]; then
+  . "$knobs_file"
+fi
 
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-  printf '%s (Claude Code)\n' "${FAKE_VERSION:-2.1.305}"
+  printf '%s (Claude Code)\n' "${FAKE_VERSION_PINNED:-${FAKE_VERSION:-2.1.305}}"
   exit 0
 fi
 
@@ -314,15 +343,40 @@ for a in "$@"; do
   esac
 done
 
+# S11: an option this claude lacks (FAKE_REJECT_OPTION), as the CLI refuses
+# one, and a claude that dies before its init (FAKE_DIE_BEFORE_INIT): both
+# before stdin is read.
+if [ -n "${FAKE_REJECT_OPTION:-}" ]; then
+  for a in "$@"; do
+    rejected=${a%%=*}
+    case "$rejected" in
+      --?*) ;;
+      *) continue ;;
+    esac
+    for listed in $FAKE_REJECT_OPTION; do
+      if [ "$listed" = "$rejected" ]; then
+        if [ -n "${FAKE_ENV_LOG:-}" ]; then
+          printf 'gen %s rejected=%s\n' "$gen" "$rejected" >> "$FAKE_ENV_LOG"
+        fi
+        printf "error: unknown option '%s'\n" "$rejected" >&2
+        exit 1
+      fi
+    done
+  done
+fi
+if [ "${FAKE_DIE_BEFORE_INIT:-0}" = "1" ]; then
+  if [ -n "${FAKE_ENV_LOG:-}" ]; then
+    printf 'gen %s died_before_init\n' "$gen" >> "$FAKE_ENV_LOG"
+  fi
+  printf 'fake claude: died before init\n' >&2
+  exit 1
+fi
+
 if [ -n "${FAKE_ENV_DUMP:-}" ]; then
   knob_names=""
-  case $0 in
-    */*)
-      if [ -f "$0.knobs" ]; then
-        knob_names=$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$0.knobs")
-      fi
-      ;;
-  esac
+  if [ -n "$knobs_file" ] && [ -f "$knobs_file" ]; then
+    knob_names=$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$knobs_file")
+  fi
   printf -- '--- gen %s\n' "$gen" >> "$FAKE_ENV_DUMP"
   env | LC_ALL=C sort | while IFS= read -r kv; do
     name=${kv%%=*}
@@ -961,6 +1015,26 @@ own_uuid() {
   done
 }
 
+# S11: FAKE_COMPACT_BEFORE_TURN, a compaction at the start of this turn: its
+# boundary and its summary appended (with --session-mirror in one frame), the
+# turn's user entry then chained to the summary.
+compact_before_turn() {
+  bnd=$(own_uuid 7000)
+  sum=$(own_uuid 6000)
+  if [ -n "$last_entry" ]; then
+    logical="\"$last_entry\""
+  else
+    logical=null
+  fi
+  be=$(printf '{"parentUuid":null,"logicalParentUuid":%s,"isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"uuid":"%s","sessionId":"%s","cwd":"%s","compactMetadata":{"trigger":"manual","preTokens":1000}}' "$logical" "$bnd" "$sid" "$cwd")
+  se=$(printf '{"parentUuid":"%s","isSidechain":false,"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued from a previous conversation."},"uuid":"%s","sessionId":"%s","cwd":"%s"}' "$bnd" "$sum" "$sid" "$cwd")
+  write_entries "$be" "$se" 0
+  last_entry=$sum
+  if [ -n "${FAKE_ENV_LOG:-}" ]; then
+    printf 'gen %s turn %s compacted summary=%s\n' "$gen" "$turns" "$sum" >> "$FAKE_ENV_LOG"
+  fi
+}
+
 turns=0
 # S10: whether a turn may ask (FAKE_ASK): not one a held turn queued.
 asking=1
@@ -1013,6 +1087,10 @@ on_user() {
     outcome=allow
     usage_limit
     return
+  fi
+  # S11: a compaction before this turn's user entry (FAKE_COMPACT_BEFORE_TURN).
+  if [ -n "${FAKE_COMPACT_BEFORE_TURN:-}" ] && [ "${FAKE_WRITE_TRANSCRIPT:-0}" = "1" ] && [ "$turns" -eq "$FAKE_COMPACT_BEFORE_TURN" ]; then
+    compact_before_turn
   fi
   # S10: the turn's tool, FAKE_ASK's in its turn, else FAKE_TURN_MS's long Bash run.
   tool=""

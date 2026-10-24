@@ -1,6 +1,7 @@
 //! S8 §13: the doc-test. The fenced `sh doc-test` blocks of the README's
 //! "Cursor in a MicroVM (stage S8)" section, of its S9 section ([`S9_SECTION`]),
-//! of its S10 section ([`S10_SECTION`]) and of `skills/ai-env/SKILL.md`
+//! of its S10 section ([`S10_SECTION`]), of its S11 section ([`S11_SECTION`])
+//! and of `skills/ai-env/SKILL.md`
 //! run in their dry forms ([`DRY_FORMS`] is the specification) against a
 //! planted HOME: S7's green world (the sealed runtime key and setup-token,
 //! the egress record, the fake age), the file-backed fake API with one VM
@@ -26,12 +27,15 @@
 //! files are unchanged (no pre-push hook written either). Beside it: the
 //! Commands block parses (`--help`), the VM's CLAUDE.md in the README is
 //! `image/claude/CLAUDE.md` byte for byte, every JSON block parses, every
-//! `ai-env` command of the two S8 sections and of the S9 and S10 sections
-//! is doc-tested, the S10 section quotes the wrapper's notes and lines as
-//! the code writes them and shows `[vm]`'s S10 keys at their defaults, and
-//! the engine refuses what it must. In `make test` (the default and bridge
-//! worlds) and `make doc-test`. Built in S8 wave 2 (W9); the S9 section and
-//! its rows in S9 wave 2 (G9); the S10 section in S10 wave 2 (D).
+//! `ai-env` command of the two S8 sections and of the S9, S10 and S11
+//! sections is doc-tested, the S10 section quotes the wrapper's notes and
+//! lines as the code writes them and shows `[vm]`'s S10 keys at their
+//! defaults, the S11 section states the code's numbers, words and lines
+//! ([`the_s11_section_states_what_the_code_does`]), and the engine refuses
+//! what it must. In `make test` (the default and bridge worlds) and
+//! `make doc-test`. Built in S8 wave 2 (W9); the S9 section and its rows in
+//! S9 wave 2 (G9); the S10 section in S10 wave 2 (D); the S11 section in S11
+//! wave 2 (D).
 //!
 //! A doc-test line is one `ai-env` command, optionally followed by two
 //! spaces and a `#` comment. Words split on whitespace, single and double
@@ -76,6 +80,8 @@ const SECTION: &str = "### Cursor in a MicroVM (stage S8)";
 const S9_SECTION: &str = "### Pushes reviewed, transcripts in S3 (stage S9)";
 /// The README's S10 section, by its heading.
 const S10_SECTION: &str = "### Chats move to a new VM, idle chats park (stage S10)";
+/// The README's S11 section, by its heading.
+const S11_SECTION: &str = "### Claude always fresh, the panel, the audit and the cost (stage S11)";
 /// The bridge's audit log, relative to the planted HOME: a documented command
 /// may only append to it, and only the rows its [`DryForm::audits`] names.
 const AUDIT_LOG: &str = "bridge/audit.jsonl";
@@ -154,16 +160,24 @@ struct DryForm {
     tools: bool,
     /// The audit rows it may append to [`AUDIT_LOG`], by event (none unless [`DryForm::audited`] names them).
     audits: &'static [&'static str],
+    /// Whether it may rewrite VM rows (`bridge/state/vms/<id>.toml`, [`is_vm_row`]): S11's survey records the state
+    /// it saw (B §B1.1, §B3.6). Only a row's contents may change; a row created or removed is still flagged.
+    vm_rows: bool,
 }
 
 impl DryForm {
     const fn new(cmd: &'static [&'static str], dry: Dry, codes: &'static [i32], says: &'static [&'static str], unseals: u8, api: Api, tools: bool) -> DryForm {
-        DryForm { cmd, dry, codes, says, unseals, api, tools, audits: &[] }
+        DryForm { cmd, dry, codes, says, unseals, api, tools, audits: &[], vm_rows: false }
     }
 
     /// The row, allowed to append these audit events (a read-only command that audits itself: `box review`).
     const fn audited(self, events: &'static [&'static str]) -> DryForm {
         DryForm { audits: events, ..self }
+    }
+
+    /// The row, allowed to rewrite existing VM rows (`vm list`: S11's survey stamps `state_seen` and `state_seen_at`).
+    const fn writes_vm_rows(self) -> DryForm {
+        DryForm { vm_rows: true, ..self }
     }
 }
 
@@ -185,8 +199,14 @@ impl DryForm {
 /// `session sync`, `session forget` and S10's `session migrate` (no dry
 /// form: it moves the chat, and with no wrapper unseals and starts a VM).
 /// `box fetch --smart-http` stays out of the blocks: the stand-in endpoint
-/// answers a code-out's manifest and speaks no git smart-HTTP.
-const DRY_FORMS: [DryForm; 20] = [
+/// answers a code-out's manifest and speaks no git smart-HTTP. S11's read
+/// this Mac's files only (no AWS, no Touch ID): `claude status`, `claude gc`
+/// without `--yes` (the records' plan, nothing deleted), `audit tail`,
+/// `audit grep` (exit 1 when nothing matched: a documented pattern must
+/// match in the planted world) and `cost`; `claude admit` (Docker),
+/// `claude stage`, `update` and `forget`, and `panel serve` (a server in
+/// the foreground) have no dry form.
+const DRY_FORMS: [DryForm; 25] = [
     DryForm::new(&["wrapper", "install"], Dry::Drop("--write"), &[0], &["dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "uninstall"], Dry::Drop("--write"), &[0], &["nothing to remove", "dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "status"], Dry::AsIs, &[0], &["claudeCode.claudeProcessWrapper"], 0, Api::None, false),
@@ -201,12 +221,17 @@ const DRY_FORMS: [DryForm; 20] = [
     DryForm::new(&["session", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["session", "show"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["wrapper", "census"], Dry::AsIs, &[0], &[], 0, Api::None, false),
-    DryForm::new(&["vm", "list"], Dry::AsIs, &[0], &[], 1, Api::Reads, false).audited(&["vm_gc_reconcile"]),
+    DryForm::new(&["vm", "list"], Dry::AsIs, &[0], &[], 1, Api::Reads, false).audited(&["vm_gc_reconcile"]).writes_vm_rows(),
     DryForm::new(&["lab", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["box", "review"], Dry::AsIs, &[0], &["box review: pass", "\"verdict\": \"pass\""], 0, Api::None, false).audited(&["box_review"]),
     DryForm::new(&["box", "hook-install"], Dry::Add("--dry-run"), &[0], &["nothing was written", "\"would_install\""], 0, Api::None, false),
     DryForm::new(&["session", "gc"], Dry::Drop("--yes"), &[0], &["nothing removed", "no S3 transcript", "\"dry_run\": true"], 0, Api::None, false),
     DryForm::new(&["session", "migrate-s9"], Dry::Drop("--yes"), &[0], &["nothing migrated", "no S8 mirror", "\"dry_run\": true"], 0, Api::None, false),
+    DryForm::new(&["claude", "status"], Dry::AsIs, &[0], &["automatic admission ([claude].auto_admit)", "\"auto_admit\""], 0, Api::None, false),
+    DryForm::new(&["claude", "gc"], Dry::Drop("--yes"), &[0], &["claude gc: ", "\"dry_run\""], 0, Api::None, false),
+    DryForm::new(&["audit", "tail"], Dry::AsIs, &[0], &[], 0, Api::None, false),
+    DryForm::new(&["audit", "grep"], Dry::AsIs, &[0], &[], 0, Api::None, false),
+    DryForm::new(&["cost"], Dry::AsIs, &[0], &["estimate"], 0, Api::None, false),
 ];
 
 /// Flags that make a listed command act (a Touch ID, a probe row): refused on any line.
@@ -433,11 +458,11 @@ fn docs() -> (String, String) {
     (read("README.md"), read("skills/ai-env/SKILL.md"))
 }
 
-/// The doc-test lines of the README's S8 section, then of its S9 and S10 sections, then of SKILL.md.
+/// The doc-test lines of the README's S8 section, then of its S9, S10 and S11 sections, then of SKILL.md.
 fn documented_lines() -> Vec<DocLine> {
     let (readme, skill) = docs();
     let mut lines = Vec::new();
-    for heading in [SECTION, S9_SECTION, S10_SECTION] {
+    for heading in [SECTION, S9_SECTION, S10_SECTION, S11_SECTION] {
         let (first, text) = section(&readme, heading).unwrap_or_else(|| panic!("README.md has no {heading:?} section"));
         lines.extend(doc_lines(text, "README.md", first));
     }
@@ -724,6 +749,12 @@ fn tree(dir: &Path, skip: &dyn Fn(&str) -> bool) -> BTreeMap<String, String> {
 fn allowed_change(rel: &str) -> bool {
     let under = |dir: &str| rel == dir || rel.starts_with(&format!("{dir}/"));
     under("bridge/logs") || under("bridge/state/scan-cache") || rel == "bridge/state/tmp" || (rel.starts_with("bridge/quarantine/") && rel.ends_with("/settings/diff.json")) || rel == "bridge/state/gc.stamp" || rel == "bridge/state/gc.lock"
+}
+
+/// A VM row, `bridge/state/vms/<id>.toml` (never a hidden scratch file beside it): the rows
+/// [`DryForm::writes_vm_rows`] lets a command rewrite.
+fn is_vm_row(rel: &str) -> bool {
+    rel.starts_with("bridge/state/vms/") && rel.ends_with(".toml") && !rel.contains("/.")
 }
 
 /// What a command did to the audit log, `before` and `after` its run, that
@@ -1052,7 +1083,9 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
             problems.push(format!("{}: `{ran}` {why}", line.at));
         }
         let after = w.home_tree();
-        for (path, change) in changes(&home, &after).into_iter().filter(|(path, _)| !allowed_change(path) && path != AUDIT_LOG) {
+        // S11 (B2): `vm list` may rewrite a VM row it listed (its contents only: a row added or removed still counts).
+        let rewrote_vm_row = |path: &str| form.vm_rows && is_vm_row(path) && home.contains_key(path) && after.contains_key(path);
+        for (path, change) in changes(&home, &after).into_iter().filter(|(path, _)| !allowed_change(path) && path != AUDIT_LOG && !rewrote_vm_row(path)) {
             problems.push(format!("{}: `{ran}` changed HOME: {path}: {change}", line.at));
         }
         home = after;
@@ -1083,17 +1116,17 @@ fn readme_doc_test_blocks_run_in_their_dry_forms() {
     assert!(problems.is_empty(), "{} problem(s) in the doc-test of {} documented commands:\n\n{}", problems.len(), lines.len(), problems.join("\n\n"));
 }
 
-/// Both S8 sections and the README's S9 and S10 sections exist and doc-test
+/// Both S8 sections and the README's S9, S10 and S11 sections exist and doc-test
 /// their commands: each holds `sh doc-test` lines, and no plain `sh` block
 /// there holds an `ai-env` command, which would escape the doc-test (git and
 /// make commands sit in plain blocks; the commands without a dry form, such
-/// as S9's `session stage` and S10's `session migrate`, are named in the
-/// prose).
+/// as S9's `session stage`, S10's `session migrate` and S11's `claude stage`
+/// and `panel serve`, are named in the prose).
 #[test]
 fn the_s8_sections_doc_test_every_ai_env_command() {
     let (readme, skill) = docs();
     let mut escaped = Vec::new();
-    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("README.md", &readme, S9_SECTION, 4), ("README.md", &readme, S10_SECTION, 4), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 5)] {
+    for (file, md, heading, at_least) in [("README.md", &readme, SECTION, 12), ("README.md", &readme, S9_SECTION, 4), ("README.md", &readme, S10_SECTION, 4), ("README.md", &readme, S11_SECTION, 5), ("skills/ai-env/SKILL.md", &skill, SKILL_SECTION, 5)] {
         let (first, text) = section(md, heading).unwrap_or_else(|| panic!("{file} has no {heading:?} section"));
         let n = doc_lines(text, file, first).len();
         assert!(n >= at_least, "{file}'s {heading:?} holds {n} doc-test lines (at least {at_least})");
@@ -1289,6 +1322,82 @@ fn the_s10_sections_vm_keys_are_bridge_toml_at_their_defaults() {
     let set_after = parsed(&uncommented).vm;
     set_after.validate().unwrap_or_else(|e| panic!("README.md:{at}: park_after_s uncommented: {e}"));
     assert!(set_after.park_after_s.is_some() && set_after.park_after() == VmCfg::default().park_after(), "README.md:{at}: park_after_s's shown value is what the unset key means ([vm].max_idle_s)");
+}
+
+/// The README's S11 section states what the code does, whitespace aside (a
+/// statement may wrap): the release key's fingerprint; `infra pin
+/// --check-bundle`'s skew line and doctor's fallback row for the lock's own
+/// version (`image/claude.lock`, the image's claude); the numbers of the
+/// automatic admission, the stager, the fetch, the preferences, the respawns
+/// and gc; the panel's default port and URL, its bearer, its streams and its
+/// nonce's life, off by default; the compressed stage's compressor and caps;
+/// the cost's band and what it leaves out; the census's new parts and every
+/// `claude_src` reason; the registry's count and S11's eight events, each a
+/// backticked word. The Commands block names S11's four commands, and no
+/// line of the README advises turning Cursor's Auto Update off. A value the
+/// code changes fails here before the docs drift from it.
+#[test]
+fn the_s11_section_states_what_the_code_does() {
+    use ai_env_cli::bridge::claude::{ADMIT_COOLDOWN, CLAUDE_GC_KEEP_LOCAL, CLAUDE_GC_KEEP_STAGED, STAGER_MAX_DURATION_S};
+    use ai_env_cli::bridge::remote::{audit_event, census_part, AFTER_OUTPUT_FALLBACK, ARGV_DROP_MAX, CLAUDE_SRC_WHYS, WARM_CLAUDE_WAIT};
+    use ai_env_cli::bridge::{audit, cost, panel, s3::stage};
+    use ai_env_cli::commands::DoctorLine;
+    let (readme, _) = docs();
+    let (_, s11) = section(&readme, S11_SECTION).unwrap_or_else(|| panic!("README.md has no {S11_SECTION:?} section"));
+    let text = flat(s11);
+    let lock_text = std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).expect("image/claude.lock");
+    let lock = ai_env_cli::wire::pin::parse_lock(&lock_text).expect("the lock parses");
+    let skew = ai_env_cli::bridge::imagepin::bundle_check(&lock, Path::new("image/claude.lock"), "V", &[]).0.expect_err("a bundle other than the lock is a skew");
+    let fallback = match ai_env_cli::bridge::claude::rows::rows_claude(&[], Some(&lock.version), Some("2.1.999"), &[]).pop() {
+        Some(DoctorLine::Row { tag, text }) => format!("{} {text}", tag.bracket()),
+        other => panic!("rows_claude ends with no row: {other:?}"),
+    };
+    let cfg = ai_env_cli::bridge::config::BridgeConfig::default();
+    assert!(!cfg.panel.enabled && cfg.claude.auto_admit, "the defaults the section states: the panel off, the automatic admission on");
+    let gib = |n: u64| format!("{} GiB", n >> 30);
+    let mut stated: Vec<String> = vec![
+        format!("`{}`", ai_env_cli::wire::pin::RELEASE_KEY_FPR),
+        format!("`{skew}`"),
+        format!("`{fallback}`"),
+        "`[claude].auto_admit` is on (the default)".into(),
+        format!("more than {} minutes ago", ADMIT_COOLDOWN.as_secs() / 60),
+        format!("no credential, {STAGER_MAX_DURATION_S} s"),
+        format!("{} s after its start", AFTER_OUTPUT_FALLBACK.as_secs()),
+        format!("waiting up to {} s", WARM_CLAUDE_WAIT.as_secs()),
+        format!("at most {} in all", ai_env_cli::wire::workspace::CLAUDE_REFS_MAX),
+        format!("at most {ARGV_DROP_MAX} options a chat"),
+        format!("the {CLAUDE_GC_KEEP_STAGED} newest staged versions"),
+        format!("the {CLAUDE_GC_KEEP_LOCAL} newest binaries on this Mac"),
+        "off until `[panel] enabled = true`".into(),
+        format!("`[panel] port` ({}; `--port N`, 0 for any free port", cfg.panel.port),
+        format!("`http://{}:{}/BEARER/`", panel::BIND_TEXT, cfg.panel.port),
+        format!("({} random bytes, {} characters)", panel::BEARER_BYTES, panel::BEARER_LEN),
+        format!("at most {} streams", panel::SSE_MAX),
+        format!("single use for {} minutes", panel::NONCE_TTL.as_secs() / 60),
+        format!("`{} -n -6`", stage::GZIP),
+        format!("up {} at a time", stage::SUBTREE_PARALLEL),
+        format!("{} a file", gib(stage::STAGE_FILE_MAX)),
+        format!("{} in all, decoded", gib(stage::STAGE_MAX)),
+        format!("within ±{} %", (cost::COMPARE_BAND * 100.0).round()),
+        format!("Not counted: {}", cost::NOT_ESTIMATED.join(", ")),
+        format!("newer than {}", ai_env_cli::wire::view::VIEW_EXT_VERSION),
+        format!("`{}:cached`", census_part::CLAUDE_SRC),
+        format!("`{}:FLAG`", census_part::ARGV_DROPPED),
+        format!("every event ({},", audit::schema::EVENTS.len()),
+    ];
+    stated.extend(CLAUDE_SRC_WHYS.iter().map(|w| format!("`{w}`")));
+    let events = [audit_event::CLAUDE_ADMIT, audit_event::CLAUDE_STAGE, audit_event::CLAUDE_FETCH, audit_event::CLAUDE_OBJECT_BAD, audit_event::CLAUDE_START_FAILED, audit_event::ARGV_DROPPED, audit::event::VM_OBSERVED, audit::event::PANEL_SERVE];
+    stated.extend(events.iter().map(|e| format!("`{e}`")));
+    let missing: Vec<&String> = stated.iter().filter(|s| !text.contains(&flat(s))).collect();
+    assert!(missing.is_empty(), "README.md's S11 section does not state these as the code has them:\n{}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"));
+    let (_, commands) = section(&readme, "## Commands").expect("README.md has a Commands section");
+    for cmd in ["ai-env claude status", "ai-env claude forget", "ai-env audit  tail", "ai-env cost ", "ai-env panel  serve"] {
+        assert!(commands.contains(cmd), "the Commands block names `{cmd}`");
+    }
+    let lower = flat(&readme).to_ascii_lowercase();
+    for advice in ["turn off auto update", "turn off auto-update", "auto update off", "auto update is off", "disable auto-update", "disable auto update"] {
+        assert!(!lower.contains(advice), "README.md advises turning Cursor's Auto Update off ({advice:?}): VMs follow the extension's claude with no deploy");
+    }
 }
 
 /// The engine on a synthetic page: the dry forms of the table, comments and

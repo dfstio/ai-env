@@ -121,9 +121,10 @@ pub fn pump_knobs() -> PumpKnobs {
 // ---- S4: `ai-env vm` / `lab` knobs ---------------------------------------------------
 
 /// The S4 knob names (and S6's agent address, S7's unseal budget, S9's
-/// loopback S3 and code-token minutes, S10's park quiet), for the banner and
-/// the test harnesses' scrub lists.
-pub const VM_KNOBS: [&str; 8] = [
+/// loopback S3 and code-token minutes, S10's park quiet, S11's release curl,
+/// gpgv and admission make), for the banner and the test harnesses' scrub
+/// lists. S11's clock ([`NOW_KNOB`]) is none of them: it prints no banner.
+pub const VM_KNOBS: [&str; 11] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API",
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
@@ -132,6 +133,9 @@ pub const VM_KNOBS: [&str; 8] = [
     "AI_ENV_BRIDGE_LAB_S3_ADDR",
     "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
     "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS",
+    "AI_ENV_BRIDGE_LAB_RELEASE_CURL",
+    "AI_ENV_BRIDGE_LAB_GPGV",
+    "AI_ENV_BRIDGE_LAB_ADMIT_MAKE",
 ];
 
 /// `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`'s range (S10 §9): 1 ms to an hour.
@@ -176,6 +180,16 @@ pub struct VmKnobs {
     /// (`park::ParkPolicy::from_cfg`), 1 to 3 600 000 ms; honoured without
     /// the fake API.
     pub park_after: Option<Duration>,
+    /// `AI_ENV_BRIDGE_LAB_RELEASE_CURL=<path>` (S11): the program
+    /// `claude::release` and `claude::admit` run in place of `/usr/bin/curl`
+    /// (the same argv, the same cleared environment). Honoured only with the
+    /// fake API; see [`VmKnobs::release_curl`].
+    pub release_curl: Option<std::path::PathBuf>,
+    /// `AI_ENV_BRIDGE_LAB_GPGV=<path>` (S11): gpgv, as the release curl.
+    pub gpgv: Option<std::path::PathBuf>,
+    /// `AI_ENV_BRIDGE_LAB_ADMIT_MAKE=<path>` (S11): make, for the admission's
+    /// Docker tests, as the release curl.
+    pub admit_make: Option<std::path::PathBuf>,
 }
 
 impl VmKnobs {
@@ -209,7 +223,51 @@ impl VmKnobs {
         if self.park_after.is_some() {
             out.push(VM_KNOBS[7]);
         }
+        if self.release_curl.is_some() {
+            out.push(VM_KNOBS[8]);
+        }
+        if self.gpgv.is_some() {
+            out.push(VM_KNOBS[9]);
+        }
+        if self.admit_make.is_some() {
+            out.push(VM_KNOBS[10]);
+        }
         out
+    }
+
+    /// The validated release curl (S11): `Ok(None)` when unset; an error when
+    /// set without the fake API (naming both) or when not an absolute path to
+    /// an executable file.
+    pub fn release_curl(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.program(self.release_curl.as_deref(), VM_KNOBS[8])
+    }
+
+    /// The validated gpgv (S11), as [`VmKnobs::release_curl`].
+    pub fn gpgv(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.program(self.gpgv.as_deref(), VM_KNOBS[9])
+    }
+
+    /// The validated admission make (S11), as [`VmKnobs::release_curl`].
+    pub fn admit_make(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.program(self.admit_make.as_deref(), VM_KNOBS[10])
+    }
+
+    /// One S11 program knob: the fake API set, an absolute path, an executable regular file.
+    fn program(&self, path: Option<&std::path::Path>, knob: &str) -> Result<Option<std::path::PathBuf>, String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        if self.fake_api.is_none() {
+            return Err(format!("{knob} needs {} (it never applies to the real service)", VM_KNOBS[0]));
+        }
+        if !path.is_absolute() {
+            return Err(format!("{knob}={}: expected an absolute path", path.display()));
+        }
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => Ok(Some(path.to_path_buf())),
+            _ => Err(format!("{knob}={}: expected an executable file", path.display())),
+        }
     }
 
     /// The validated agent address: `Ok(None)` when unset; an error when set
@@ -276,6 +334,9 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
         s3_addr: None,
         code_token_minutes: None,
         park_after: None,
+        release_curl: None,
+        gpgv: None,
+        admit_make: None,
     }
 }
 
@@ -297,6 +358,9 @@ pub fn vm_knobs() -> VmKnobs {
         s3_addr: get(VM_KNOBS[5]).filter(|v| !v.trim().is_empty()),
         code_token_minutes: get(VM_KNOBS[6]).and_then(|v| v.trim().parse::<u16>().ok()),
         park_after: parse_park_after(get(VM_KNOBS[7]).as_deref()),
+        release_curl: get(VM_KNOBS[8]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
+        gpgv: get(VM_KNOBS[9]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
+        admit_make: get(VM_KNOBS[10]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
         ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
     }
 }
@@ -306,6 +370,48 @@ pub fn vm_knobs() -> VmKnobs {
 #[must_use]
 pub fn vm_knobs() -> VmKnobs {
     VmKnobs::default()
+}
+
+// ---- S11: the views' clock -------------------------------------------------------------
+
+/// `AI_ENV_BRIDGE_LAB_NOW=<unix seconds>` (S11, debug builds only): the clock of the S11 views.
+pub const NOW_KNOB: &str = "AI_ENV_BRIDGE_LAB_NOW";
+
+/// [`parse_now`]'s last second: 2100-01-01T00:00:00Z.
+const NOW_MAX: u64 = 4_102_444_800;
+
+/// The knob's value: 1 to 4 102 444 800 (2100-01-01), digits only; anything else `None`.
+#[must_use]
+pub fn parse_now(value: Option<&str>) -> Option<u64> {
+    let v = value?;
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u64>().ok().filter(|s| (1..=NOW_MAX).contains(s))
+}
+
+/// The knob, read once (debug builds); `None` in release builds.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn lab_now() -> Option<u64> {
+    static NOW: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *NOW.get_or_init(|| parse_now(std::env::var(NOW_KNOB).ok().as_deref()))
+}
+
+/// Release builds: no test clock, whatever the environment says.
+#[cfg(not(debug_assertions))]
+#[must_use]
+pub fn lab_now() -> Option<u64> {
+    None
+}
+
+/// `lab_now()`, else `wire::time::unix_now()`: what every S11 view (`vm::ops`,
+/// `audit::read`, `timeline`, `cost`, `registry`'s `session list` and `session
+/// show`, the panel) takes for now. It never reaches state: written times keep
+/// `unix_now()`.
+#[must_use]
+pub fn now() -> u64 {
+    lab_now().unwrap_or_else(crate::wire::time::unix_now)
 }
 
 #[cfg(test)]
@@ -435,6 +541,53 @@ mod tests {
         let k = VmKnobs { park_after: Some(Duration::from_millis(250)), ..VmKnobs::default() };
         assert_eq!(k.active(), vec![VM_KNOBS[7]], "announced, without the fake API");
         assert_eq!(parse_vm_knobs(None, None, None).park_after, None, "set by vm_knobs alone");
+    }
+
+    /// S11 (A §6.3): the release curl, gpgv and the admission make need the
+    /// fake API and an absolute path to an executable file; each is
+    /// announced; none is set by `parse_vm_knobs`.
+    #[test]
+    fn the_s11_knobs_need_the_fake_api() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(VM_KNOBS[8..], ["AI_ENV_BRIDGE_LAB_RELEASE_CURL", "AI_ENV_BRIDGE_LAB_GPGV", "AI_ENV_BRIDGE_LAB_ADMIT_MAKE"]);
+        assert!(!VM_KNOBS.contains(&NOW_KNOB), "the clock prints no banner");
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("fake-curl");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = d.path().join("plain");
+        std::fs::write(&plain, "").unwrap();
+        let with = |fake: bool, p: &std::path::Path| VmKnobs { fake_api: fake.then(|| std::path::PathBuf::from("/f.json")), release_curl: Some(p.to_path_buf()), gpgv: Some(p.to_path_buf()), admit_make: Some(p.to_path_buf()), ..VmKnobs::default() };
+        let ok = with(true, &exe);
+        assert_eq!((ok.release_curl(), ok.gpgv(), ok.admit_make()), (Ok(Some(exe.clone())), Ok(Some(exe.clone())), Ok(Some(exe.clone()))));
+        assert_eq!(ok.active(), vec![VM_KNOBS[0], VM_KNOBS[8], VM_KNOBS[9], VM_KNOBS[10]]);
+        let alone = with(false, &exe);
+        for e in [alone.release_curl().unwrap_err(), alone.gpgv().unwrap_err(), alone.admit_make().unwrap_err()] {
+            assert!(e.contains("needs AI_ENV_BRIDGE_LAB_FAKE_API") && e.starts_with("AI_ENV_BRIDGE_LAB_"), "{e}");
+        }
+        assert!(with(true, &plain).gpgv().unwrap_err().contains("expected an executable file"));
+        assert!(with(true, &d.path().join("missing")).admit_make().is_err());
+        assert!(with(true, std::path::Path::new("fake-curl")).release_curl().unwrap_err().contains("expected an absolute path"));
+        assert_eq!((VmKnobs::default().release_curl(), VmKnobs::default().gpgv(), VmKnobs::default().admit_make()), (Ok(None), Ok(None), Ok(None)));
+        let parsed = parse_vm_knobs(Some("/f.json"), None, None);
+        assert_eq!((parsed.release_curl, parsed.gpgv, parsed.admit_make), (None, None, None), "set by vm_knobs alone");
+    }
+
+    /// S11 (B §B1.4): the views' clock takes 1 to 2100-01-01 in digits only.
+    #[test]
+    fn the_lab_clock_parses_digits_in_range_only() {
+        assert_eq!(NOW_KNOB, "AI_ENV_BRIDGE_LAB_NOW");
+        assert_eq!(parse_now(Some("1")), Some(1));
+        assert_eq!(parse_now(Some("1792713600")), Some(1_792_713_600));
+        assert_eq!(parse_now(Some("4102444800")), Some(4_102_444_800));
+        for off in [None, Some(""), Some("0"), Some("4102444801"), Some("-5"), Some("+5"), Some(" 5"), Some("5 "), Some("1e9"), Some("5s"), Some("99999999999999999999999")] {
+            assert_eq!(parse_now(off), None, "{off:?}");
+        }
+        if std::env::var_os(NOW_KNOB).is_none() {
+            assert_eq!(lab_now(), None);
+            let (before, now, after) = (crate::wire::time::unix_now(), now(), crate::wire::time::unix_now());
+            assert!(before <= now && now <= after, "without the knob, now is the wall clock");
+        }
     }
 
     #[cfg(debug_assertions)]

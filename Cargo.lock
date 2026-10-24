@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "ai-env-age"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "base64",
  "hex",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "ai-env-cli"
-version = "0.1.0"
+version = "0.11.0"
 dependencies = [
  "ai-env-age",
  "aws-config",

@@ -187,22 +187,21 @@ fn pin_expect_version_refuses_a_manifest_of_another_version() {
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
 }
 
+/// S11 (A.7): VMs follow the Cursor bundle's claude with no deploy, so a lock that differs from the bundle is the
+/// image's fallback, no error: the note on stdout (P10 shows its last line as `[-  ]`) and exit 3, stderr silent.
 #[test]
-fn pin_check_bundle_mismatch_exits_1() {
+fn pin_check_bundle_skew_exits_3_with_a_note() {
     let tmp = tempfile::tempdir().unwrap();
     let t = tmp.path();
     let lock = lock_with(t, VERSION);
     extensions(t, &["anthropic.claude-code-2.1.283-darwin-arm64", "anthropic.claude-code-2.1.290-darwin-arm64", "anthropic.claude-code-2.1.299-linux-x64", "other.extension-9.9.9"]);
     let o = run(&mut ai_env(t, &["infra", "pin", "--check-bundle", "--lock", lock.to_str().unwrap()]));
-    assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
-    let err = stderr(&o);
-    assert!(err.contains("lock 2.1.283") && err.contains("Cursor bundle 2.1.290"), "the highest darwin-arm64 bundle wins: {err}");
-    // The route that always works leads (make claude-update refuses before the bootstrap: no deployer key yet).
-    assert!(
-        err.contains("differs from the Cursor bundle 2.1.290  <- make claude-pin CLAUDE_VERSION=2.1.290 && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)"),
-        "{err}"
-    );
-    // --bundle-version prints that version and nothing else (make claude-update reads it), the lock untouched.
+    assert_eq!(o.status.code(), Some(3), "{}{}", stdout(&o), stderr(&o));
+    // The highest darwin-arm64 bundle wins; the note names what VMs run and where to look.
+    assert_eq!(stdout(&o).lines().last(), Some("pin: lock 2.1.283 is the image's fallback; Cursor bundle 2.1.290: VMs follow it (ai-env claude status)"), "{}", stdout(&o));
+    assert_eq!(stderr(&o), "", "a skew is no error: nothing on stderr");
+    assert!(!stdout(&o).contains("claude-update"), "the retired update is never named: {}", stdout(&o));
+    // --bundle-version prints that version and nothing else, the lock untouched.
     let before = std::fs::read(&lock).unwrap();
     let o = run(&mut ai_env(t, &["infra", "pin", "--bundle-version"]));
     assert!(o.status.success(), "{}", stderr(&o));

@@ -106,6 +106,30 @@ pub fn move_hold_ping(max_idle_s: u32) -> Duration {
     Duration::from_secs(u64::from(max_idle_s / 3))
 }
 
+// ---- S11: claude always fresh (plans/s11-contracts-A.md §10) ---------------------------------
+
+/// The most of a generation's stderr before its first stdout line the link keeps, for the
+/// start-up respawns (`RemoteSnapshot.start_refusal`).
+pub const START_STDERR_MAX: usize = 4 * 1024;
+/// A generation's fetch for the next one starts at its CLI's first stdout line, or this long after
+/// its `Started` when none came.
+pub const AFTER_OUTPUT_FALLBACK: Duration = Duration::from_secs(20);
+/// How often a fetch polls `GET /claude/stage`.
+pub const CLAUDE_POLL_EVERY: Duration = Duration::from_secs(10);
+/// How long a background fetch (`after_output`, phase A) polls before it leaves the VM to go on alone.
+pub const CLAUDE_POLL_FOR: Duration = Duration::from_secs(300);
+/// How long `vm warm`'s claude step waits for its fetch (the only fetch anything waits for).
+pub const WARM_CLAUDE_WAIT: Duration = Duration::from_secs(120);
+/// The unknown-option flags one wrapper process drops (each an `ArgvRetry`); the next fails the chat.
+pub const ARGV_DROP_MAX: usize = 3;
+/// The `ClaudeRetry`s one wrapper process makes (a cached claude dead before its init).
+pub const CLAUDE_RETRY_MAX: usize = 1;
+/// `claude_src`'s `<why>` words (`older(<why>)`, `image(<why>)`): no V; V not admitted yet; V's
+/// admission failed; admitted but its object not present; named but the VM's cache lacked it; the
+/// VM's image lacks `claude_stage_v1`; V in the VM row's `claude_bad`; this chat's cached claude died
+/// before its init.
+pub const CLAUDE_SRC_WHYS: [&str; 8] = ["no_ext", "seen", "failed", "not_staged", "not_cached", "no_cap", "bad", "start_failed"];
+
 // ---- C6: census and audit names (W1 and W2 write the values) -----------------------------
 
 /// The parts a remote session adds to the census rows (`name:value`, joined
@@ -120,8 +144,15 @@ pub mod census_part {
     pub const SPAWN: &str = "spawn";
     /// `vm_pid:<pid>`: the CLI's pid in the VM (Cursor sees the wrapper's own).
     pub const VM_PID: &str = "vm_pid";
-    /// `claude:<version>`: the VM's claude.
+    /// `claude:<version>`: the VM's claude (S11: from `Spawned.claude_version`, always filled).
     pub const CLAUDE: &str = "claude";
+    /// S11: `claude_src:cached`, `claude_src:image`, `claude_src:older(<why>)` or `claude_src:image(<why>)`:
+    /// where the latest generation's claude came from (the link: `RemoteSnapshot.claude_src`, from
+    /// `claude::claude_src_of` at `Started`); `<why>` one of [`CLAUDE_SRC_WHYS`](super::CLAUDE_SRC_WHYS).
+    pub const CLAUDE_SRC: &str = "claude_src";
+    /// S11: `argv_dropped:<flag>[,<flag>]`, once a flag was dropped, in drop order (the link:
+    /// `RemoteSnapshot.argv_dropped`, from `SessionPlan.dropped`).
+    pub const ARGV_DROPPED: &str = "argv_dropped";
     /// `legs:<leg>=<ms>,…` over [`LEG_NAMES`](super::LEG_NAMES).
     pub const LEGS: &str = "legs";
     /// `seed:<word>`: what the workspace step did.
@@ -177,13 +208,16 @@ pub mod census_part {
     pub const RATE_LIMIT: &str = "rate_limit";
     /// A1: `usage_limited:<n>` when n > 0: the usage-limit results the chat got (the pump).
     pub const USAGE_LIMITED: &str = "usage_limited";
-    /// Every part: the end row's, then the start row's, then S10's (all the end row's), then A1's.
-    pub const ALL: [&str; 30] = [
+    /// Every part: the end row's, then the start row's, then S10's (all the end row's), then A1's; S11's two
+    /// follow `claude`, so the claude facts read together.
+    pub const ALL: [&str; 32] = [
         VM,
         VM_HOW,
         SPAWN,
         VM_PID,
         CLAUDE,
+        CLAUDE_SRC,
+        ARGV_DROPPED,
         LEGS,
         SEED,
         TRANSCRIPT,
@@ -298,8 +332,29 @@ pub mod audit_event {
     /// A1: a chat's turn got its account's usage-limit result: `account`, `tag`, `kind`, `resets_at` (`-`
     /// unknown), `text` (the CLI's, cut), `gen`, `source` (`chat`).
     pub const USAGE_LIMITED: &str = "usage_limited";
+    /// S11 (A2): an admission's end (`ai-env claude admit`, its `--auto` child, `update`): `version`,
+    /// `outcome` (`admitted`, `failed`, `error`, `skipped`), `ms`; then `step`, `why`, `sha256`, `signer`,
+    /// `markers`, `docker_image`, `auto`.
+    pub const CLAUDE_ADMIT: &str = "claude_admit";
+    /// S11 (A2): a stage's end, and every delete of a version's object: `version`, `sha256`, `outcome`
+    /// (`staged`, `exists`, `failed`, `deleted`), `ms`; then `vm`, `s3_status`, `step`, `why` (`gc`, `forget`,
+    /// `bad`, `force`).
+    pub const CLAUDE_STAGE: &str = "claude_stage";
+    /// S11 (A3): a fetch's end as the Mac saw it (never for `cached` or `image`): `vm`, `version`, `sha256`,
+    /// `outcome` (`FetchOutcome`'s words), `ms`; then `session`, `gen`, `why` (`after_output`, `warm`,
+    /// `prewarm`, `phase_a`), `got_len`.
+    pub const CLAUDE_FETCH: &str = "claude_fetch";
+    /// S11 (A3): a VM's 422 `checksum_mismatch`, and the delete: `version`, `sha256`, `vm`, `outcome`
+    /// (`deleted`, `delete_failed`); then `got_len`, `bad_stages`.
+    pub const CLAUDE_OBJECT_BAD: &str = "claude_object_bad";
+    /// S11 (A3): a `ClaudeRetry`: `session`, `vm`, `version`, `sha256`, `gen`; then `code`, `next` (a version,
+    /// or `image`).
+    pub const CLAUDE_START_FAILED: &str = "claude_start_failed";
+    /// S11 (A3): an `ArgvRetry`, once per flag and claude version on this Mac: `flag`, `claude`, `gen`; then
+    /// `session`, `vm`, `ext`.
+    pub const ARGV_DROPPED: &str = "argv_dropped";
     /// Every event above (never a URL, a query, a credential or a transcript byte in any detail).
-    pub const ALL: [&str; 31] = [
+    pub const ALL: [&str; 37] = [
         SESSION_REMOTE_START,
         SESSION_REMOTE_END,
         SESSION_REMOTE_FAILED,
@@ -331,6 +386,12 @@ pub mod audit_event {
         VM_GC_RECONCILE,
         SESSION_ACCOUNT,
         USAGE_LIMITED,
+        CLAUDE_ADMIT,
+        CLAUDE_STAGE,
+        CLAUDE_FETCH,
+        CLAUDE_OBJECT_BAD,
+        CLAUDE_START_FAILED,
+        ARGV_DROPPED,
     ];
 }
 
@@ -449,7 +510,14 @@ pub enum Failure {
     /// Pending, exit 143: a signal before the session started.
     Stopped,
     /// Running, exit 5: Anthropic refused the delivered setup-token (S7 D6).
-    TokenRefused,
+    /// A1 joint review (J1): `account`, the Claude account the refused seal
+    /// is (`accounts::label`: `None` in a tree with no account,
+    /// `accounts::UNKNOWN` for a seal it cannot name); `installed`, whether
+    /// that seal is still the installed one (`setup-token.env`'s). After a
+    /// `creds account use`, `creds setup-token` would seal into the active
+    /// account, not the refused one, so a named account's line says
+    /// `creds account add NAME`, as `credential::refuse_rejected` does.
+    TokenRefused { account: Option<String>, installed: bool },
     /// Running, exit 8: the link stayed lost past its budget.
     LinkLost { vm: String },
     /// S10, exit the inner failure's: a move of the chat off `from_vm` (a
@@ -524,7 +592,7 @@ impl Failure {
             Failure::HelloRefused { .. } => "hello_refused",
             Failure::Deadline { .. } => "deadline",
             Failure::Stopped => "stopped",
-            Failure::TokenRefused => "token_refused",
+            Failure::TokenRefused { .. } => "token_refused",
             Failure::LinkLost { .. } => "link_lost",
             Failure::Move { .. } => "move",
             Failure::MovesExhausted { .. } => "moves_exhausted",
@@ -539,7 +607,7 @@ impl Failure {
             Failure::Config { .. } => 1,
             Failure::PinInvalid => 2,
             Failure::TouchIdCancelled => 3,
-            Failure::NoToken { .. } | Failure::NoAccount { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused => 5,
+            Failure::NoToken { .. } | Failure::NoAccount { .. } | Failure::NoRuntimeKey { .. } | Failure::TouchIdTimeout { .. } | Failure::TokenRefused { .. } => 5,
             Failure::OldImage { .. } => 7,
             Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } | Failure::MovesExhausted { .. } => 8,
             Failure::Move { inner, .. } => inner.exit_code(),
@@ -677,7 +745,13 @@ impl Failure {
             Failure::HelloRefused { code } => format!("the VM refused the session ({}): ai-env vm list, ai-env vm terminate it, then reopen the chat", part(code, SHORT_MAX)),
             Failure::Deadline { step, .. } => format!("did not start within Cursor's 60 s window (stuck at {}): ai-env vm warm prepares the VM ahead", part(step, SHORT_MAX)),
             Failure::Stopped => "stopped before the session started: nothing was started; reopen the chat to start it".to_string(),
-            Failure::TokenRefused => "Anthropic refused the delivered setup-token (HTTP 401): the session was stopped and is not started again; seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`".to_string(),
+            Failure::TokenRefused { account: None, .. } => "Anthropic refused the delivered setup-token (HTTP 401): the session was stopped and is not started again; seal a fresh one with `claude setup-token`, then `ai-env creds setup-token`".to_string(),
+            Failure::TokenRefused { account: Some(name), .. } if name == crate::bridge::accounts::UNKNOWN => "Anthropic refused the delivered token (HTTP 401), whose Claude account cannot be told: the session was stopped and is not started again; ai-env creds status names the refused seal, and `ai-env creds account use NAME` installs an account (`ai-env creds account list` names them)".to_string(),
+            Failure::TokenRefused { account: Some(name), installed } => {
+                let name = part(name, crate::bridge::accounts::MAX_NAME);
+                let other = if *installed { ", or `ai-env creds account use OTHER`" } else { "" };
+                format!("Anthropic refused Claude account {name}'s token (HTTP 401), so the session ended: seal a fresh one with `claude setup-token` (logged in as that account), then `ai-env creds account add {name}`{other}")
+            }
             Failure::LinkLost { vm } => format!("lost the VM {}: reopen the chat from the picker", part(vm, SHORT_MAX)),
             Failure::Move { kind, from_vm, cause, inner } => {
                 let (vm, inner) = (part(from_vm, SHORT_MAX), part(&inner.line(), MOVE_INNER_MAX));
@@ -924,9 +998,13 @@ mod tests {
         for e in audit_event::ALL {
             assert!(snake(e) && !earlier.contains(&e), "{e}");
         }
-        for w in VM_HOW_WORDS.iter().chain(LEG_NAMES.iter()).chain(PURPOSES.iter()) {
+        for w in VM_HOW_WORDS.iter().chain(LEG_NAMES.iter()).chain(PURPOSES.iter()).chain(CLAUDE_SRC_WHYS.iter()) {
             assert!(snake(w), "{w}");
         }
+        // S11: claude_src and argv_dropped right after claude; part A's six events appended.
+        assert_eq!((census_part::ALL.len(), audit_event::ALL.len()), (32, 37));
+        assert_eq!(census_part::ALL[4..7], [census_part::CLAUDE, census_part::CLAUDE_SRC, census_part::ARGV_DROPPED]);
+        assert!(!PURPOSES.contains(&"claude-stage"), "a run purpose, no wrapper purpose (LD-3)");
         assert!(MODE_NOTES.iter().all(|n| n.starts_with("mode:remote")));
     }
 
@@ -957,7 +1035,10 @@ mod tests {
             Failure::SpawnLimit { .. } => "--detail",
             Failure::HelloRefused { .. } => "ai-env vm terminate",
             Failure::Stopped => "reopen the chat",
-            Failure::TokenRefused => "ai-env creds setup-token",
+            Failure::TokenRefused { account: None, .. } => "ai-env creds setup-token",
+            Failure::TokenRefused { account: Some(name), .. } if name == crate::bridge::accounts::UNKNOWN => "`ai-env creds account use NAME` installs an account",
+            Failure::TokenRefused { installed: true, .. } => "or `ai-env creds account use OTHER`",
+            Failure::TokenRefused { .. } => "(logged in as that account), then `ai-env creds account add ",
             Failure::LinkLost { .. } | Failure::Move { .. } | Failure::MovesExhausted { .. } => "reopen the chat from the picker",
             Failure::Other { .. } => "ai-env doctor checks the setup",
         }
@@ -1012,7 +1093,11 @@ mod tests {
             (Failure::Deadline { code: 8, step: "spawn" }, 8),
             (Failure::Deadline { code: 3, step: "select" }, 7),
             (Failure::Stopped, 143),
-            (Failure::TokenRefused, 5),
+            (Failure::TokenRefused { account: None, installed: true }, 5),
+            // A1 joint review (J1): a refused account's own fix (never `creds setup-token`, which seals the active one).
+            (Failure::TokenRefused { account: Some("a".repeat(crate::bridge::accounts::MAX_NAME)), installed: true }, 5),
+            (Failure::TokenRefused { account: Some("work".into()), installed: false }, 5),
+            (Failure::TokenRefused { account: Some(crate::bridge::accounts::UNKNOWN.into()), installed: true }, 5),
             (Failure::LinkLost { vm: vm.clone() }, 8),
             // S10: a failed move exits as what failed inside it; past max_readdress, 8.
             (Failure::Move { kind: MoveKind::Readdress, from_vm: vm.clone(), cause: Some(LossCause::VmGone), inner: Box::new(Failure::TouchIdCancelled) }, 3),

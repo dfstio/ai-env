@@ -10,7 +10,7 @@
 //   ... --arn image|execution-role|build-role|egress|connector|connector-by-name|other-connector|proxy-parameter|squid-log-group|image-log-group|
 //             dns-log-group|runtime-user|ops-user|deployer-user|proxy-role|operator-role|ssm-instance-policy|operator-policy|deploy-policy|
 //             deploy-egress-policy|deploy-dns-policy|deployer-policy|ops-policy|transcripts-bucket|transcripts-vm-object|transcripts-mac-object|
-//             transcripts-egress-check|transcripts-outside-prefix|other-bucket-object|al2023-object|s3-endpoint
+//             transcripts-egress-check|transcripts-outside-prefix|transcripts-claude-object|other-bucket-object|al2023-object|s3-endpoint
 //       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach); `s3-endpoint`
 //       prints the endpoint id the bucket policy names (an id, the simulations' aws:SourceVpce)
 //
@@ -128,6 +128,8 @@ if (name !== undefined) {
         ["transcripts-mac-object", `arn:aws:s3:::${names.transcriptsBucket}/${TRANSCRIPTS_KEY_PREFIX}0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b/mac/${"0".repeat(64)}`],
         ["transcripts-egress-check", `arn:aws:s3:::${names.transcriptsBucket}/${EGRESS_CHECK_PREFIX}0123abcd`],
         ["transcripts-outside-prefix", `arn:aws:s3:::${names.transcriptsBucket}/x/_egress-check/0123abcd`],
+        // S11 (part A): a claude object, v1/_claude/mac/<version>/<sha256> (wire::s3::CLAUDE_PREFIX).
+        ["transcripts-claude-object", `arn:aws:s3:::${names.transcriptsBucket}/${TRANSCRIPTS_KEY_PREFIX}_claude/mac/2.1.308/${"0".repeat(64)}`],
         ["other-bucket-object", "arn:aws:s3:::not-ai-env-transcripts/v1/x"],
         ["al2023-object", `arn:aws:s3:::${AL2023_REPO_BUCKET}/core/mirrors/latest/aarch64/mirror.list`],
         ["s3-endpoint", names.s3EndpointId as string],

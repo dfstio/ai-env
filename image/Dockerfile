@@ -47,8 +47,8 @@ RUN mkdir -p /Users /etc/claude-code /etc/ai-env \
 # made at gid 999 (openssh's ssh_keys, a dynamic system group) first moves to
 # the highest free system gid below it, its files with it (their modes kept:
 # a chgrp clears setgid), so 999 is ai-env-net's alone. The gate: curl speaks
-# https and is 7.84 or later (the shim's write-out reads headers with
-# %header{}).
+# https, decodes gzip (libz: S11's compressed stage) and is 7.84 or later (the
+# shim's write-out reads headers with %header{}).
 RUN set -eu; \
     if held=$(getent group 999); then \
       name=${held%%:*}; gid=998; \
@@ -66,7 +66,9 @@ RUN set -eu; \
     set -- $(curl --version | head -n 1); \
     major=${2%%.*}; minor=${2#*.}; minor=${minor%%.*}; \
     { [ "$major" -gt 7 ] || { [ "$major" -eq 7 ] && [ "$minor" -ge 84 ]; }; } || { echo "curl $2: the transcript transfers need 7.84 or later"; exit 1; }; \
-    echo "ai-env-net 999:999; curl $2 with https"
+    features=$(curl --version | while IFS= read -r line; do case $line in (Features:*) echo "${line#Features:}";; esac; done); \
+    case " $features " in *" libz "*) ;; *) echo "curl lists no libz:$features (a gzip-staged transcript is pulled with curl's compressed)"; exit 1;; esac; \
+    echo "ai-env-net 999:999; curl $2 with https and libz"
 
 # Claude Code, pinned by version, size and SHA-256 (image/claude.lock, written
 # by `make claude-pin`). HTTPS only; the gate runs --version with a cleared
@@ -127,6 +129,17 @@ RUN set -eu; \
     test "$(stat -c '%u:%g %a' /var/lib/ai-env)" = "0:0 700" || { echo "/var/lib/ai-env is $(stat -c '%u:%g %a' /var/lib/ai-env), not root's 0700"; exit 1; }; \
     test -z "$(find /var/lib/ai-env -mindepth 1 -print -quit)" || { echo "a seed record is baked into the image: $(ls -A /var/lib/ai-env)"; exit 1; }; \
     echo "seed-record gate: /var/lib/ai-env root 0700, empty"
+
+# S11's claude-cache gate: the shim fetches staged claudes into
+# /opt/ai-env/claude/<sha256>/claude (root's: the directories 0755, the files
+# 0555) and keeps their index in /var/lib/ai-env, which the seed-record gate
+# keeps empty. The cache is root's, 0755 and empty in the image, which every
+# VM shares: a claude baked in would be every VM's.
+RUN set -eu; \
+    install -d -m 0755 -o 0 -g 0 /opt/ai-env /opt/ai-env/claude; \
+    test "$(stat -c '%u:%g %a' /opt/ai-env/claude)" = "0:0 755" || { echo "/opt/ai-env/claude is $(stat -c '%u:%g %a' /opt/ai-env/claude), not root's 0755"; exit 1; }; \
+    test -z "$(find /opt/ai-env/claude -mindepth 1 -print -quit)" || { echo "a claude is baked into the cache: $(ls -A /opt/ai-env/claude)"; exit 1; }; \
+    echo "claude-cache gate: /opt/ai-env/claude root 0755, empty"
 
 EXPOSE 8080 9000 9418
 ENTRYPOINT ["/usr/local/bin/ai-env","shim","--app-port","8080","--hooks-port","9000","--code-port","9418","--claude","/usr/local/bin/claude","--home","/Users/mike","--uid","1000","--hook-source","peer"]

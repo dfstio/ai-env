@@ -22,7 +22,6 @@ use crate::bridge::sibling::{exists_exec, find_sibling, Sibling, INSTALL_HINT};
 use crate::bridge::vm::registry::{list_rows, RowStatus, VmRow, PENDING_STALE_S};
 use crate::commands::{DoctorLine, Tag};
 use crate::store::Keystore;
-use crate::wire::argv::FIXTURE_EXT_VERSION;
 use crate::wire::time::{parse_rfc3339_utc, unix_now};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -522,27 +521,30 @@ pub fn bundle_version(dir_name: &str) -> Option<String> {
 
 /// doctor's Cursor rows from the extensions directory `ext_dir` ([`bundle_rows`]), with the live Cursor windows read
 /// from the census tail ([`running_windows`]); and what the bundled claude's `--version` printed (`version_of` runs
-/// it), which the PATH row compares with.
+/// it), which the PATH row compares with. `auto`: automatic admission can happen (`[claude].auto_admit` on, remote
+/// mode configured), so the seen row may promise it.
 #[must_use]
-pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>) -> (Vec<DoctorLine>, Option<String>) {
-    bundle_rows(ext_dir, image_claude, version_of, &running_windows())
+pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, auto: bool) -> (Vec<DoctorLine>, Option<String>) {
+    // S11 (LD-35): this Mac's claude records, read here only (the tests hand `bundle_rows` their own).
+    let claude = Paths::resolve().map(|p| crate::bridge::claude::load_all(&p)).unwrap_or_default();
+    bundle_rows(ext_dir, image_claude, version_of, &running_windows(), &claude, auto)
 }
 
-/// [`cursor_bundle_rows`] on the live windows `running` (no census read: `ext_dir` and what `version_of` runs are its
-/// other inputs): the installed bundle (the selection P10, gate G4 and `make claude-update` share), a `[!! ]` per live
-/// Cursor window on another extension than that bundle ([`rows_running_windows`]: a window keeps the extension it
-/// loaded until it is reloaded), the fixture drift of the installed and the running versions, and the image's claude
-/// against that bundle.
+/// [`cursor_bundle_rows`] on the live windows `running` and the claude records `claude` (no census or state read:
+/// `ext_dir` and what `version_of` runs are its other inputs): the installed bundle (the selection P10, gate G4 and
+/// `ai-env claude` share), a `[!! ]` per live Cursor window on another extension than that bundle
+/// ([`rows_running_windows`]: a window keeps the extension it loaded until it is reloaded), then (S11) a row per
+/// Claude Code version the bundle or a live window runs and the image's fallback (`claude::rows::rows_claude_auto`,
+/// the seen row's automatic admission named only with `auto`).
 #[must_use]
-pub fn bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, running: &[crate::bridge::census::RunningExtension]) -> (Vec<DoctorLine>, Option<String>) {
+pub fn bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, running: &[crate::bridge::census::RunningExtension], claude: &[crate::bridge::claude::Record], auto: bool) -> (Vec<DoctorLine>, Option<String>) {
     let dirs = installed_extension_names(ext_dir);
     let bundle = pick_bundle(&dirs);
     let bundled_out = bundle.as_ref().and_then(|(_, dir)| version_of(&ext_dir.join(dir).join("resources").join("native-binary").join("claude")));
     let ver = bundle.as_ref().map(|(v, _)| v.as_str());
     let mut lines = vec![row_cursor_bundle(&dirs, bundled_out.as_deref())];
     lines.extend(rows_running_windows(ver, running));
-    lines.extend(row_fixture_drift(ver, running));
-    lines.extend(row_image_claude(image_claude, ver));
+    lines.extend(crate::bridge::claude::rows::rows_claude_auto(claude, image_claude, ver, running, auto));
     (lines, bundled_out)
 }
 
@@ -592,30 +594,6 @@ pub fn row_cursor_bundle(dirs: &[String], bundled_version: Option<&str>) -> Doct
     }
 }
 
-/// `Some(Warn)` when the installed bundle (the directory version that
-/// `row_cursor_bundle` reports) differs from the version the argv fixtures
-/// were captured from, or (S9) a live Cursor window (`running`) runs
-/// another version than both: the argv the wrapper sees now is that
-/// window's. The installed bundle's drift is re-captured (the other
-/// windows' versions named beside it); a window's alone, when the installed
-/// bundle matches the fixtures (or none is installed), is reloaded. `None`
-/// when they all agree, or there is nothing to compare.
-#[must_use]
-pub fn row_fixture_drift(bundle_version: Option<&str>, running: &[crate::bridge::census::RunningExtension]) -> Option<DoctorLine> {
-    let recapture = "re-capture tests/fixtures/argv from `ai-env wrapper census`";
-    let others: std::collections::BTreeSet<&str> = running.iter().map(|w| w.ext.as_str()).filter(|v| *v != FIXTURE_EXT_VERSION && Some(*v) != bundle_version).collect();
-    let others = others.into_iter().collect::<Vec<_>>().join(", ");
-    match bundle_version {
-        Some(v) if v != FIXTURE_EXT_VERSION => {
-            let windows = if others.is_empty() { String::new() } else { format!("; a Cursor window runs {others}") };
-            Some(DoctorLine::row(Tag::Warn, format!("cursor extension {v} ≠ fixtures tagged {FIXTURE_EXT_VERSION}{windows}  <- {recapture}")))
-        }
-        _ if others.is_empty() => None,
-        Some(_) => Some(DoctorLine::row(Tag::Warn, format!("a Cursor window runs extension {others} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- reload that window (the installed bundle matches the fixtures)"))),
-        None => Some(DoctorLine::row(Tag::Warn, format!("a Cursor window runs extension {others} ≠ fixtures tagged {FIXTURE_EXT_VERSION}  <- {recapture}"))),
-    }
-}
-
 #[must_use]
 pub fn row_path_claude(path_claude: Option<(&Path, &str)>, bundled_version: Option<&str>) -> DoctorLine {
     let bundled = bundled_version.and_then(version_token);
@@ -649,22 +627,34 @@ pub fn row_same_version(sibling_version_out: Option<&str>, mine: &str) -> Doctor
     }
 }
 
+/// The fix of a wrapper setting doctor refuses (S11 B.4).
+const WRAPPER_FIX: &str = "ai-env wrapper install --write";
+/// The one `initialPermissionMode` that is a warning: every chat starts with no permission prompt.
+const BYPASS_MODE: &str = "bypassPermissions";
+
 /// Rows for Cursor's wrapper setting; `exists_exec(path) -> (exists, executable)`.
 /// A wrapper under a `target/` component is a debug build that `cargo clean`
 /// removes (T1.4 installs one on purpose), so it is warned about, not refused.
+/// S11 (B.4): a path that is missing or not executable names its fix (the
+/// install first when `sibling` is missing too), and `bypassPermissions` is a
+/// warning naming the mode to write instead.
 #[must_use]
 pub fn row_wrapper_setting(settings: Option<&serde_json::Value>, exists_exec: &dyn Fn(&Path) -> (bool, bool), sibling: &Sibling) -> Vec<DoctorLine> {
     let mut rows = Vec::new();
     let wrapper = settings.and_then(|s| s.get(WRAPPER_SETTING)).and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let fix = match sibling {
+        Sibling::Missing => format!("cargo install --path crates/ai-env-cli --locked, then {WRAPPER_FIX}"),
+        Sibling::Next(_) | Sibling::PathOnly(_) => WRAPPER_FIX.to_string(),
+    };
     match wrapper {
         None => rows.push(DoctorLine::row(Tag::Skip, format!("{WRAPPER_SETTING} not set  <- ai-env wrapper install --write"))),
         Some(p) => {
             let path = Path::new(p);
             let (exists, exec) = exists_exec(path);
             if !exists {
-                rows.push(DoctorLine::row(Tag::No, format!("{WRAPPER_SETTING} = {p} does not exist")));
+                rows.push(DoctorLine::row(Tag::No, format!("{WRAPPER_SETTING} = {p} does not exist  <- {fix}")));
             } else if !exec {
-                rows.push(DoctorLine::row(Tag::No, format!("{WRAPPER_SETTING} = {p} is not executable")));
+                rows.push(DoctorLine::row(Tag::No, format!("{WRAPPER_SETTING} = {p} is not executable  <- {fix}")));
             } else {
                 rows.push(DoctorLine::row(Tag::Ok, format!("{WRAPPER_SETTING} = {p}")));
             }
@@ -682,6 +672,7 @@ pub fn row_wrapper_setting(settings: Option<&serde_json::Value>, exists_exec: &d
         }
     }
     match settings.and_then(|s| s.get(PERMISSION_SETTING)).and_then(|v| v.as_str()) {
+        Some(BYPASS_MODE) => rows.push(DoctorLine::row(Tag::Warn, format!("{PERMISSION_SETTING} = {BYPASS_MODE}: every chat starts with no permission prompt  <- {WRAPPER_FIX} --permission-mode default"))),
         Some(mode) => rows.push(DoctorLine::row(Tag::Ok, format!("{PERMISSION_SETTING} = {mode}"))),
         None => rows.push(DoctorLine::row(Tag::Skip, format!("{PERMISSION_SETTING} unset (sessions start in Manual mode)  <- ai-env wrapper install --write"))),
     }
@@ -756,18 +747,6 @@ pub fn row_infra_state(state: &Result<Option<InfraState>, BridgeError>, path: &P
         Ok(None) => DoctorLine::row(Tag::Skip, format!("no infra state yet ({})  <- make deploy, then make infra-status WRITE=1", path.display())),
         Err(e) => DoctorLine::row(Tag::Warn, format!("infra state unreadable: {e}")),
     }
-}
-
-/// The deployed image's claude against the Cursor bundle: the pin follows the
-/// bundle (plan D2). `None` when either side is unknown.
-#[must_use]
-pub fn row_image_claude(image_claude: Option<&str>, bundle: Option<&str>) -> Option<DoctorLine> {
-    let (img, bun) = (image_claude?, bundle?);
-    Some(if img == bun {
-        DoctorLine::row(Tag::Ok, format!("image claude {img} = Cursor bundle"))
-    } else {
-        DoctorLine::row(Tag::Warn, format!("image claude {img} != Cursor bundle {bun}  <- make claude-update (pins {bun}, make test-docker, make deploy, egress check; or turn off Auto Update for the Claude Code extension in Cursor to update on your own schedule)"))
-    })
 }
 
 /// The two operator scan lists; absent files mean built-in defaults only.
@@ -1599,6 +1578,289 @@ pub fn parse_settings(text: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&strip_jsonc(text)).map_err(|e| e.to_string())
 }
 
+// ---- S11 (B.4): the doctor matrix ---------------------------------------------------
+
+/// The newest live VM row (not terminated, by `created`) whose `/health` named its shim, and the session on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveShim {
+    pub vm: String,
+    pub shim: String,
+    pub session: Option<String>,
+}
+
+/// [`LiveShim`] of the VM rows `vms` and the session rows `sessions`: the session on the VM is the one, not closed,
+/// whose current VM it is (the latest seen); a row id that is not a VM id or a session id is never named.
+#[must_use]
+pub fn live_shim(vms: &[VmRow], sessions: &[crate::bridge::registry::SessionRow]) -> Option<LiveShim> {
+    let row = vms
+        .iter()
+        .filter(|r| r.status != RowStatus::Terminated && crate::bridge::vm::registry::is_vm_id(&r.id) && r.shim_version.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        .max_by(|a, b| a.created.cmp(&b.created))?;
+    let session = sessions
+        .iter()
+        .filter(|s| s.status != "closed" && s.microvm_id.as_deref() == Some(row.id.as_str()) && crate::bridge::registry::is_uuid(&s.session_id))
+        .max_by(|a, b| a.last_seen.cmp(&b.last_seen))
+        .map(|s| s.session_id.clone());
+    Some(LiveShim { vm: row.id.clone(), shim: row.shim_version.as_deref()?.trim().to_string(), session })
+}
+
+/// [`live_shim`] of the VM rows `vms` and the session registry, else, when that registry cannot be read, or one of
+/// its rows cannot (B3's review: `registry::list` would skip it), nothing and a warning saying so: a VM would look
+/// session-less, and [`row_shim_version`]'s fix would turn from the session's migrate into the VM's terminate.
+fn live_shim_of(paths: &Paths, vms: &[VmRow]) -> (Option<LiveShim>, Option<DoctorLine>) {
+    let unread = |why: String| (None, Some(DoctorLine::row(Tag::Warn, format!("live VM shim not checked: session registry unreadable: {why}"))));
+    match crate::bridge::registry::list_reporting(paths) {
+        Ok((sessions, skipped)) if skipped.is_empty() => (live_shim(vms, &sessions), None),
+        Ok((_, skipped)) => unread(format!("{} row(s) cannot be read ({})", skipped.len(), skipped[0])),
+        Err(e) => unread(e.to_string()),
+    }
+}
+
+/// The version check's third leg (L7): `ai-env` (`mine`) against the image's shim (`state/infra.toml`'s
+/// `shim_version`), compared for equality, the sibling's version named when it is the same (a newer image shim's
+/// fix is the install, any other's the deploy); then a warning when the
+/// newest live VM's shim is older than `mine` (an unparseable version is never judged).
+#[must_use]
+pub fn row_shim_version(mine: &str, sibling: Option<&str>, image_shim: Option<&str>, live: Option<&LiveShim>) -> Vec<DoctorLine> {
+    let mut rows = Vec::new();
+    match image_shim.map(str::trim).filter(|s| !s.is_empty()) {
+        None => rows.push(DoctorLine::row(Tag::Skip, format!("image shim version not recorded (state/infra.toml)  <- {INFRA_STATUS_HINT}"))),
+        Some(img) if img != mine => {
+            // B3-R4 (I1): an image shim newer than this ai-env (a pull and a deploy with no install) is cleared by
+            // installing; `make deploy` would stamp the checkout's version again. Otherwise (an unparseable one too)
+            // the image is behind.
+            let newer = matches!((semver(img), semver(mine)), (Some(theirs), Some(ours)) if theirs > ours);
+            let fix = if newer { INSTALL_HINT.to_string() } else { format!("make deploy, then {INFRA_STATUS_HINT}") };
+            rows.push(DoctorLine::row(Tag::No, format!("image shim {img} ≠ ai-env {mine}  <- {fix}")));
+        }
+        Some(img) => match sibling.map(str::trim) {
+            Some(sib) if sib == mine => rows.push(DoctorLine::row(Tag::Ok, format!("ai-env {mine} = ai-env-claude {sib} = image shim {img}"))),
+            // An unknown or other sibling version: `row_same_version` reports it.
+            _ => rows.push(DoctorLine::row(Tag::Ok, format!("ai-env {mine} = image shim {img}"))),
+        },
+    }
+    if let Some(l) = live {
+        let older = is_semver(&l.shim) && matches!((semver(&l.shim), semver(mine)), (Some(theirs), Some(ours)) if theirs < ours);
+        if older {
+            let fix = match &l.session {
+                Some(sid) => format!("ai-env session migrate {sid}"),
+                None => format!("ai-env vm terminate {}", l.vm),
+            };
+            rows.push(DoctorLine::row(Tag::Warn, format!("{} runs shim {}, older than ai-env {mine}  <- {fix}", l.vm, l.shim)));
+        }
+    }
+    rows
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageScan {
+    /// Not run from an ai-env checkout: no `.git` in the working directory or above it, or no `image/MANIFEST` at
+    /// the root of the checkout it is in.
+    NotACheckout,
+    /// `wrapper::image_findings` over `<checkout>/image`: each finding's rule, and the files scanned.
+    Scanned { rules: Vec<String>, files: usize },
+    Failed(String),
+}
+
+/// The root of the git checkout `dir` is in: the nearest of `dir` and its ancestors holding a `.git` entry, a
+/// directory or a file (a worktree's, a submodule's). Found without running git: under `ai-env as ops -- ai-env
+/// doctor` a git child would inherit the operator key (`without_credentials`).
+fn checkout_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|d| std::fs::symlink_metadata(d.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file()))
+}
+
+/// The image scan `make image-stage-scan` and `settings-sync` run (`wrapper::image_findings`), over the `image/` of
+/// the checkout the working directory is in ([`checkout_root`]), and that checkout's root. No checkout, or one
+/// without `image/MANIFEST`, is no ai-env checkout; any other refusal of `wrapper::image_dir_of` (a
+/// `claude/settings.json` that is no regular file), an unknown working directory or a scan that cannot run fails
+/// closed, as [`ImageScan::Failed`].
+fn image_scan(paths: &Paths, cfg: &BridgeConfig) -> (ImageScan, Option<PathBuf>) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => return (ImageScan::Failed(format!("no working directory: {e}")), None),
+    };
+    let Some(image) = checkout_root(&cwd).map(|top| top.join("image")).filter(|image| image.join("MANIFEST").is_file()) else {
+        return (ImageScan::NotACheckout, None);
+    };
+    let dir = match crate::bridge::wrapper::image_dir_of(Some(&image)) {
+        Ok(dir) => dir,
+        Err(e) => return (ImageScan::Failed(e.to_string()), None),
+    };
+    let root = dir.parent().map(Path::to_path_buf);
+    let scan = match crate::bridge::wrapper::image_findings(paths, cfg, &dir) {
+        Ok((findings, files)) => ImageScan::Scanned { rules: findings.into_iter().map(|f| f.rule).collect(), files },
+        Err(e) => ImageScan::Failed(e.to_string()),
+    };
+    (scan, root)
+}
+
+/// `<root>/target/image/image.json`'s `sha256` (`make image-zip`'s record of the zip that passed the scan): `None`
+/// when the file is absent, not a regular file, oversized, or holds no 64-hex `sha256`. Opened once (never through a
+/// symlink, never blocking on a FIFO), the open file checked, and read with a bound: a file swapped after a check
+/// is never read.
+fn staged_zip_sha256(root: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    const MAX: u64 = 64 * 1024;
+    let path = root.join("target").join("image").join("image.json");
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > MAX {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let sha = v.get("sha256")?.as_str()?;
+    (sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_ascii_lowercase())
+}
+
+/// The first 12 hex digits of a sha256 as a row shows it (`?` for anything that is not hex).
+fn short_sha(s: &str) -> String {
+    match s.get(..12) {
+        Some(head) if s.bytes().all(|b| b.is_ascii_hexdigit()) => head.to_ascii_lowercase(),
+        _ => "?".to_string(),
+    }
+}
+
+/// The checkout's `image/` scan (rules only, never a value or a file's content), then a warning when the deployed
+/// zip (`state/infra.toml`'s `zip_sha256`) is not the one `target/image/image.json` records.
+#[must_use]
+pub fn row_image_scan(scan: &ImageScan, deployed_zip: Option<&str>, staged_zip: Option<&str>) -> Vec<DoctorLine> {
+    let mut rows = vec![match scan {
+        ImageScan::NotACheckout => DoctorLine::row(Tag::Skip, "image/ not scanned: not in an ai-env checkout"),
+        ImageScan::Failed(e) => DoctorLine::row(Tag::Warn, format!("image/ scan failed: {e}")),
+        ImageScan::Scanned { rules, files } if rules.is_empty() => DoctorLine::row(Tag::Ok, format!("image/ scan: clean ({files} files)")),
+        ImageScan::Scanned { rules, .. } => {
+            let mut named: Vec<&str> = rules.iter().map(String::as_str).collect();
+            named.sort_unstable();
+            named.dedup();
+            DoctorLine::row(Tag::No, format!("image/ has {} finding(s): {}  <- fix them, then make image-zip and make deploy", rules.len(), named.join(", ")))
+        }
+    }];
+    let known = |z: Option<&str>| z.map(str::trim).filter(|z| !z.is_empty()).map(str::to_string);
+    if let (Some(deployed), Some(staged)) = (known(deployed_zip), known(staged_zip)) {
+        if !deployed.eq_ignore_ascii_case(&staged) {
+            rows.push(DoctorLine::row(
+                Tag::Warn,
+                format!("the deployed image zip {} is not target/image/image.json's {} (the zip that passed the scan)  <- make image-zip, then make deploy", short_sha(&deployed), short_sha(&staged)),
+            ));
+        }
+    }
+    rows
+}
+
+/// `aws budgets describe-budget` of the stack's budget, as the declared operator.
+#[must_use]
+pub fn budget_args(account: &str, name: &str) -> Vec<String> {
+    ["budgets", "describe-budget", "--account-id", account, "--budget-name", name, "--region", REGION, "--output", "json"].iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The limit, units and spend of a describe-budget answer (§B4.4), and whether the spend reached the limit; `None`
+/// when a field is missing or is not the shape a budget's amounts and units have, an amount is no number, or the
+/// spend is in another unit than the limit (the row names one).
+fn budget_summary(json: &str) -> Option<BudgetSummary> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let b = v.get("Budget")?;
+    let amount = |o: &serde_json::Value| -> Option<(String, String)> {
+        let a = o.get("Amount")?.as_str()?;
+        let u = o.get("Unit")?.as_str()?;
+        let ok = !a.is_empty() && a.len() <= 32 && a.bytes().all(|c| c.is_ascii_digit() || c == b'.') && !u.is_empty() && u.len() <= 16 && u.bytes().all(|c| c.is_ascii_alphanumeric());
+        ok.then(|| (a.to_string(), u.to_string()))
+    };
+    let (limit, unit) = amount(b.get("BudgetLimit")?)?;
+    let time = b.get("TimeUnit")?.as_str().filter(|t| !t.is_empty() && t.len() <= 16 && t.bytes().all(|c| c.is_ascii_alphabetic()))?.to_ascii_lowercase();
+    let (spent, spent_unit) = amount(b.get("CalculatedSpend")?.get("ActualSpend")?)?;
+    // Both are digits and dots already; one that is still no number (`1.2.3`, `.`) is no verdict: `exists`.
+    let reached = spent.parse::<f64>().ok()? >= limit.parse::<f64>().ok()?;
+    (spent_unit == unit).then_some(BudgetSummary { limit, unit, time, spent, reached })
+}
+
+/// What `budget_summary` read of `describe-budget`'s answer: the limit, its unit and time unit (lower case), the
+/// actual spend, and whether that spend reached the limit (B-DOC-1).
+struct BudgetSummary {
+    limit: String,
+    unit: String,
+    time: String,
+    spent: String,
+    reached: bool,
+}
+
+/// The budget row (L8). `name`: `[aws].budget_name`, else `state/infra.toml`'s. `answer`: `None` with no verified
+/// operator. An error is shown by its first line with every 12-digit run as `<acct>` (an error names ARNs).
+#[must_use]
+pub fn row_budget(name: Option<&str>, answer: Option<Result<&str, &str>>) -> DoctorLine {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return DoctorLine::row(Tag::Skip, format!("budget not checked: no budget name in bridge.toml [aws] or state/infra.toml  <- {INFRA_STATUS_HINT}"));
+    };
+    match answer {
+        None => DoctorLine::row(Tag::Skip, format!("budget {name} not checked ({NO_OPERATOR_ROW})")),
+        Some(Ok(json)) => match budget_summary(json) {
+            // A spend at or over its limit is no `[ok ]` (B-DOC-1).
+            Some(BudgetSummary { limit, unit, time, spent, reached: true }) => DoctorLine::row(Tag::Warn, format!("budget {name}: {spent} spent of {limit} {unit} {time}  <- ai-env cost --by day")),
+            Some(BudgetSummary { limit, unit, time, spent, reached: false }) => DoctorLine::row(Tag::Ok, format!("budget {name}: {limit} {unit} {time}, {spent} spent")),
+            None => DoctorLine::row(Tag::Ok, format!("budget {name} exists")),
+        },
+        Some(Err(e)) if e.contains("NotFoundException") => DoctorLine::row(Tag::No, format!("budget {name} missing  <- make deploy")),
+        Some(Err(e)) if e.contains("AccessDenied") => DoctorLine::row(Tag::Warn, format!("budget {name} not checked: AccessDenied  <- make deploy (ai-env-ops gains budgets:ViewBudget, S11 L8)")),
+        Some(Err(e)) => DoctorLine::row(Tag::Warn, format!("budget {name} not checked: {}", crate::bridge::gates::mask_account_ids(e.lines().next().unwrap_or("").trim()))),
+    }
+}
+
+/// The listing `row_base_image` reads (doctor.rs:943): `None` when it shows no AVAILABLE version above the pin.
+#[must_use]
+pub fn row_base_image_newer(listing: Option<Result<&str, &str>>) -> Option<DoctorLine> {
+    use crate::bridge::infra::{text_of, version_items};
+    let json = listing?.ok()?;
+    let pin = image_version_key(BASE_IMAGE_VERSION)?;
+    let mut newer: Vec<((u64, u64), String)> = version_items(json)
+        .ok()?
+        .iter()
+        .filter(|i| text_of(i, "status").as_deref() == Some("AVAILABLE"))
+        .filter_map(|i| {
+            let v = text_of(i, "imageVersion")?;
+            let key = image_version_key(&v)?;
+            (key > pin).then_some((key, v))
+        })
+        .collect();
+    newer.sort();
+    newer.dedup_by_key(|(k, _)| *k);
+    if newer.is_empty() {
+        return None;
+    }
+    let list = newer.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(", ");
+    Some(DoctorLine::row(Tag::Warn, format!("newer {BASE_IMAGE_NAME} version(s) {list} AVAILABLE (pinned {BASE_IMAGE_VERSION})  <- infra/image-config.json")))
+}
+
+/// One row per root (`BridgeConfig::roots`) that is not a directory.
+#[must_use]
+pub fn rows_roots_exist(cfg: &BridgeConfig, is_dir: &dyn Fn(&Path) -> bool) -> Vec<DoctorLine> {
+    cfg.roots()
+        .into_iter()
+        .filter(|r| !is_dir(r))
+        .map(|r| DoctorLine::row(Tag::Warn, format!("workspace root {} does not exist  <- create it, or remove it from bridge.toml", r.display())))
+        .collect()
+}
+
+/// `[aws].image_version` pinned (not `active`) to a version that is not the recorded active one, compared as
+/// [`new_vm_version`] normalises it (`N` is `N.0`); with no recorded active version, no row.
+#[must_use]
+pub fn row_image_version_pin(cfg: &BridgeConfig, state: Option<&InfraState>) -> Option<DoctorLine> {
+    let want = cfg.aws.image_version.trim();
+    if want.is_empty() || want == "active" {
+        return None;
+    }
+    let active = state?.latest_active_image_version.as_deref().map(str::trim).filter(|v| !v.is_empty())?;
+    let pinned = new_vm_version(cfg, state)?;
+    let same = match (image_version_key(&pinned), image_version_key(active)) {
+        (Some(p), Some(a)) => p == a,
+        _ => pinned == active,
+    };
+    (!same).then(|| DoctorLine::row(Tag::Warn, format!("[aws].image_version = {want} is pinned, but the active version is {active}: new VMs run {want}  <- image_version = \"active\" in bridge.toml")))
+}
+
 // ---- collection ------------------------------------------------------------------
 
 pub struct BridgeDoctor {
@@ -1676,6 +1938,8 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
     let base_id = format!("arn:aws:lambda:{REGION}:aws:microvm-image:{BASE_IMAGE_NAME}");
     let base = call(&base_image_args(&base_id));
     lines.push(row_base_image(base.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+    // S11 (B.4): the same listing, for AVAILABLE versions above the pin.
+    lines.extend(row_base_image_newer(base.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
 
     let loaded = paths.as_ref().ok().map(BridgeConfig::load);
     // The operator's identity, like every aws call here (doctor never unseals
@@ -1694,15 +1958,31 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
         }
     };
     let cfg = loaded.as_ref().and_then(|l| l.as_ref().ok()).and_then(Option::clone).unwrap_or_default();
+    // S11 (L8): the stack's budget, read as the verified operator (its account is in the call, never in a row).
+    let budget_name = cfg.aws.budget_name.clone().filter(|n| !n.trim().is_empty()).or_else(|| paths.as_ref().ok().and_then(|p| read_infra_state(p).ok().flatten()).and_then(|s| s.budget_name));
+    let account = checked.as_ref().and_then(|c| c.as_ref().ok()).map(|v| v.account.clone());
+    let budget = match (budget_name.as_deref().map(str::trim), account.as_deref()) {
+        (Some(name), Some(acct)) if !name.is_empty() => {
+            let args = budget_args(acct, name);
+            call(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+        _ => None,
+    };
+    lines.push(row_budget(budget_name.as_deref(), budget.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
     let key = cfg.creds.key.as_str();
     lines.push(row_keystore_key(store.key_exists(key), key));
-    let infra_state = match &paths {
+    let (infra_state, live) = match &paths {
         Ok(paths) => {
             lines.push(runtime_credentials(&paths.aws_env()));
             // S7: the setup-token and combined.env, read without a Touch ID.
             lines.extend(crate::bridge::setup_token::doctor_rows(paths, unix_now()));
             let state = read_infra_state(paths);
             lines.push(row_infra_state(&state, &paths.infra_state()));
+            // S11 (B.4): the checkout's image/ scan, then the deployed zip against the one that passed it.
+            let (scan, checkout) = image_scan(paths, &cfg);
+            let staged = checkout.as_deref().and_then(staged_zip_sha256);
+            let deployed = state.as_ref().ok().and_then(Option::as_ref).and_then(|s| s.zip_sha256.as_deref());
+            lines.extend(row_image_scan(&scan, deployed, staged.as_deref()));
             let recorded = state.as_ref().ok().and_then(Option::as_ref);
             let loaded = loaded.as_ref().expect("loaded with the paths");
             // The newest dns-path row the credential gate will read (a row of the transcript knob never counts): its
@@ -1724,16 +2004,25 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             let (tw, sp) = (cfg.review.tripwires_path(paths), cfg.review.settings_policy_path(paths));
             lines.push(row_review_files(&tw, tw.is_file(), &sp, sp.is_file()));
             lines.extend(rows_s8_loaded(paths, loaded));
+            lines.extend(rows_roots_exist(&cfg, &|p: &Path| p.is_dir()));
             lines.extend(row_pre_push_hooks(paths));
             lines.push(row_workspace_cap(vms.as_deref().unwrap_or_default(), &state, &cfg));
-            state.ok().flatten()
+            lines.extend(row_image_version_pin(&cfg, recorded));
+            // The newest live VM's shim and the session on it, for the version row below.
+            let live = live_shim_of(paths, vms.as_deref().unwrap_or_default());
+            (state.ok().flatten(), live)
         }
-        Err(_) => None,
+        Err(_) => (None, (None, None)),
     };
 
     let image_claude = infra_state.as_ref().and_then(|s| s.claude_version.as_deref());
-    let (cursor, bundled_out) = cursor_bundle_rows(&home().join(".cursor").join("extensions"), image_claude, &|bin: &Path| run_capture(&bin.to_string_lossy(), &["--version"], t).ok());
+    // S11 (T6): automatic admission only with `[claude].auto_admit` on and the wrapper's mode remote.
+    let auto = cfg.claude.auto_admit && matches!(cfg.wrapper.wrapper_mode(), Ok(WrapperMode::Remote));
+    let (cursor, bundled_out) = cursor_bundle_rows(&home().join(".cursor").join("extensions"), image_claude, &|bin: &Path| run_capture(&bin.to_string_lossy(), &["--version"], t).ok(), auto);
     lines.extend(cursor);
+    // S11 (C.4): the drift rows, after the Cursor rows: per running window's version its env and flag rows, then
+    // the view rows.
+    lines.extend(crate::bridge::drift::doctor_rows(paths.as_ref().ok(), &home().join(".cursor").join("extensions"), &cfg.wrapper));
     let path_claude = find_in_path("claude", &effective_path());
     let path_out = path_claude.as_ref().and_then(|p| run_capture(&p.to_string_lossy(), &["--version"], t).ok());
     lines.push(row_path_claude(path_claude.as_deref().zip(path_out.as_deref()), bundled_out.as_deref()));
@@ -1750,6 +2039,11 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
         Sibling::Missing => None,
     };
     lines.push(row_same_version(sib_out.as_deref(), env!("CARGO_PKG_VERSION")));
+    // S11 (L7): the third leg, the image's shim and the newest live VM's.
+    let sib_version = sib_out.as_deref().and_then(version_token);
+    let (live, live_unread) = live;
+    lines.extend(row_shim_version(env!("CARGO_PKG_VERSION"), sib_version.as_deref(), infra_state.as_ref().and_then(|s| s.shim_version.as_deref()), live.as_ref()));
+    lines.extend(live_unread);
 
     let settings_path = cursor_settings_path();
     match std::fs::read_to_string(&settings_path).ok().map(|t| parse_settings(&t)) {
@@ -1871,11 +2165,6 @@ mod tests {
         let (tag, t) = text(&row_infra_state(&Ok(None), sp));
         assert!(tag == Tag::Skip && t.contains("make infra-status WRITE=1"), "{t}");
         assert_eq!(text(&row_infra_state(&Err(BridgeError::Config("bad".into())), sp)).0, Tag::Warn);
-
-        assert!(row_image_claude(None, Some("2.1.283")).is_none());
-        assert_eq!(text(&row_image_claude(Some("2.1.283"), Some("2.1.283")).unwrap()).0, Tag::Ok);
-        let (tag, t) = text(&row_image_claude(Some("2.1.283"), Some("2.1.284")).unwrap());
-        assert!(tag == Tag::Warn && t.contains("make claude-update (pins 2.1.284, make test-docker, make deploy"), "{t}");
 
         let (tw, pol) = (Path::new("/r/tripwires.txt"), Path::new("/r/settings-policy.txt"));
         assert_eq!(text(&row_review_files(tw, false, pol, false)).0, Tag::Skip);
@@ -2963,7 +3252,7 @@ mod tests {
         assert_eq!(text(&row_keystore_key(true, "ai-env-bridge")).0, Tag::Ok);
     }
 
-    /// The selection P10, doctor, gate G4 and `make claude-update` share: a version `.obsolete` lists (left on disk
+    /// The selection P10, doctor, gate G4 and `ai-env claude` share: a version `.obsolete` lists (left on disk
     /// after installing an older one), a plain file or a symlink named like a bundle is none; a malformed `.obsolete`
     /// hides nothing; a release beats a suffixed name of the same version.
     #[test]
@@ -2991,8 +3280,9 @@ mod tests {
         assert!(installed_extension_names(&dir.join("absent")).is_empty());
     }
 
-    /// doctor's own call (B3 of the claude-update review): its rows rest on the installed selection (an obsolete newer
-    /// bundle is not the Cursor bundle), the claude it asks is the selected bundle's, and the image row compares with it.
+    /// doctor's own call (B3 of S10's claude-update review): its rows rest on the installed selection (an obsolete newer
+    /// bundle is not the Cursor bundle), the claude it asks is the selected bundle's; S11: the claude rows follow it
+    /// (phase 0's stub: the image's fallback note alone; none without a bundle or a window).
     #[test]
     fn cursor_bundle_rows_use_the_installed_selection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3013,16 +3303,27 @@ mod tests {
                 Some("2.1.287 (Claude Code)".to_string())
             },
             &[],
+            &[],
+            true,
         );
         assert_eq!(*asked.borrow(), vec![dir.join(bundle("2.1.287")).join("resources").join("native-binary").join("claude")]);
         assert_eq!(out.as_deref(), Some("2.1.287 (Claude Code)"));
         let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
         assert!(texts[0].contains("cursor extension 2.1.287, bundled claude 2.1.287") && !texts[0].contains("versions installed"), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("image claude 2.1.287 = Cursor bundle")), "{texts:?}");
-        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[]);
+        assert_eq!(lines.last().map(text), Some((Tag::Skip, "the image's claude 2.1.287 runs where no staged version can".to_string())), "{texts:?}");
+        // S11 (A3's rows, A §11.2): the selected bundle's version against the image's own claude.
+        assert!(lines.iter().map(text).any(|r| r == (Tag::Ok, "claude 2.1.287 (the Cursor bundle): the image's own claude; chats run it with nothing to fetch".to_string())), "{texts:?}");
+        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], true);
         let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
-        assert!(texts.iter().any(|t| t.contains("image claude 2.1.286 != Cursor bundle 2.1.287  <- make claude-update")), "{texts:?}");
-        let (lines, out) = bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") }, &[]);
+        assert!(texts.iter().any(|t| t == "the image's claude 2.1.286 runs where no staged version can"), "{texts:?}");
+        let admit = "claude 2.1.287 (the Cursor bundle): not admitted yet; chats run the image's 2.1.286  <- ai-env claude admit 2.1.287 (automatic while Docker answers: [claude].auto_admit)";
+        assert!(lines.iter().map(text).any(|r| r == (Tag::Warn, admit.to_string())), "{texts:?}");
+        // T6: no automatic admission to promise (`[claude].auto_admit` off, or not remote): the admit alone.
+        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], false);
+        let manual = "claude 2.1.287 (the Cursor bundle): not admitted yet; chats run the image's 2.1.286  <- ai-env claude admit 2.1.287";
+        assert!(lines.iter().map(text).any(|r| r == (Tag::Warn, manual.to_string())), "{:?}", lines.iter().map(text).collect::<Vec<_>>());
+        assert!(!texts.iter().any(|t| t.contains("Auto Update") || t.contains("make claude-update")), "{texts:?}");
+        let (lines, out) = bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") }, &[], &[], true);
         assert_eq!((lines.len(), text(&lines[0]).0, out), (1, Tag::Skip, None));
     }
 
@@ -3031,8 +3332,7 @@ mod tests {
     /// that brings it to the installed one), read from the census through
     /// `census::running_extensions` (a dead host, or a pid given to a later
     /// process, names nothing); a window on the installed extension, or
-    /// none at all, adds no row. The fixture drift judges the running
-    /// versions too.
+    /// none at all, adds no row.
     #[test]
     fn a_window_on_an_older_extension_is_named() {
         use crate::bridge::census::{running_extensions, RunningExtension};
@@ -3055,17 +3355,15 @@ mod tests {
         };
         let running = running_extensions(&rows, &identity);
         assert_eq!(running.iter().map(|w| (w.host, w.ext.as_str())).collect::<Vec<_>>(), [(5101, "2.1.301"), (5102, "2.1.302")]);
-        let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &running);
+        let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &running, &[], true);
         let texts: Vec<(Tag, String)> = lines.iter().map(text).collect();
         let older = (Tag::Warn, "a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); 2.1.302 is installed  <- reload that window".to_string());
         assert_eq!(texts.iter().filter(|(_, t)| t.starts_with("a Cursor window runs extension ")).cloned().collect::<Vec<_>>(), vec![older.clone()], "the window on the installed 2.1.302 adds no row: {texts:?}");
         assert_eq!(texts[0].0, Tag::Ok, "the installed bundle first: {texts:?}");
         assert_eq!(texts[1], older, "right after it: {texts:?}");
-        let drift = texts.iter().find(|(_, t)| t.contains("fixtures tagged")).expect("the fixtures are not the installed 2.1.302's");
-        assert_eq!(drift, &(Tag::Warn, format!("cursor extension 2.1.302 ≠ fixtures tagged {FIXTURE_EXT_VERSION}; a Cursor window runs 2.1.301  <- re-capture tests/fixtures/argv from `ai-env wrapper census`")));
         // No live window, or every one on the installed extension: no window row.
         for windows in [Vec::new(), vec![RunningExtension { host: 5102, ext: "2.1.302".into(), started: since, seen: (since + 120) * 1000 }]] {
-            let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &windows);
+            let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &windows, &[], true);
             assert!(lines.iter().all(|l| !text(l).1.starts_with("a Cursor window runs")), "{windows:?}");
         }
         // No installed bundle: nothing to reload a window onto (the bundle row says it is missing).
@@ -3088,31 +3386,6 @@ mod tests {
         assert!(t.contains("2.1.267") && t.contains("≠ bundled 2.1.278"), "{t}");
         assert_eq!(text(&row_path_claude(Some((Path::new("/x"), "2.1.278 (Claude Code)")), Some("2.1.278 (Claude Code)"))).0, Tag::Ok);
         assert_eq!(text(&row_path_claude(None, None)).0, Tag::Skip);
-    }
-
-    /// The fixtures against the installed bundle and (S9) the versions live
-    /// windows run: the installed one's drift is re-captured, a window's
-    /// own other version named beside it; a window alone on another version
-    /// than matching fixtures is reloaded; with no bundle installed, a
-    /// window's drift is re-captured.
-    #[test]
-    fn fixture_drift_row() {
-        use crate::bridge::census::RunningExtension;
-        let on = |ext: &str| RunningExtension { host: 4200, ext: ext.into(), started: 1, seen: 1000 };
-        assert_eq!(FIXTURE_EXT_VERSION, "2.1.307");
-        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[]), None, "the fixtures match the installed bundle");
-        assert_eq!(row_fixture_drift(None, &[]), None, "no bundle: nothing to drift from");
-        assert_eq!(row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on(FIXTURE_EXT_VERSION)]), None, "a window on the fixtures' version");
-        let (tag, t) = text(&row_fixture_drift(Some("2.1.290"), &[]).unwrap());
-        assert_eq!(tag, Tag::Warn);
-        assert!(t.starts_with("cursor extension 2.1.290 ≠ fixtures tagged 2.1.307  <- re-capture tests/fixtures/argv from `ai-env wrapper census`"), "{t}");
-        assert_eq!(row_fixture_drift(Some("2.1.290"), &[on("2.1.290"), on(FIXTURE_EXT_VERSION)]), row_fixture_drift(Some("2.1.290"), &[]), "windows on the installed or the fixtures' version add nothing");
-        let (_, t) = text(&row_fixture_drift(Some("2.1.290"), &[on("2.1.289"), on("2.1.288"), on("2.1.289")]).unwrap());
-        assert_eq!(t, "cursor extension 2.1.290 ≠ fixtures tagged 2.1.307; a Cursor window runs 2.1.288, 2.1.289  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
-        let (tag, t) = text(&row_fixture_drift(Some(FIXTURE_EXT_VERSION), &[on("2.1.277")]).unwrap());
-        assert_eq!((tag, t.as_str()), (Tag::Warn, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.307  <- reload that window (the installed bundle matches the fixtures)"));
-        let (_, t) = text(&row_fixture_drift(None, &[on("2.1.277")]).unwrap());
-        assert_eq!(t, "a Cursor window runs extension 2.1.277 ≠ fixtures tagged 2.1.307  <- re-capture tests/fixtures/argv from `ai-env wrapper census`");
     }
 
     #[test]
@@ -3178,6 +3451,20 @@ mod tests {
         assert_eq!(text(&rows[0]).0, Tag::No);
         let noexec = row_wrapper_setting(Some(&missing), &|_| (true, false), &sib);
         assert!(text(&noexec[0]).1.contains("not executable"));
+        // S11 (B.4): each names its fix; with the sibling missing too, the install comes first.
+        assert_eq!(text(&rows[0]), (Tag::No, format!("{WRAPPER_SETTING} = /gone does not exist  <- ai-env wrapper install --write")));
+        assert_eq!(text(&noexec[0]), (Tag::No, format!("{WRAPPER_SETTING} = /gone is not executable  <- ai-env wrapper install --write")));
+        let path_only = row_wrapper_setting(Some(&missing), &|_| (false, false), &Sibling::PathOnly(PathBuf::from("/p/ai-env-claude")));
+        assert_eq!(text(&path_only[0]), (Tag::No, format!("{WRAPPER_SETTING} = /gone does not exist  <- ai-env wrapper install --write")));
+        let install = "cargo install --path crates/ai-env-cli --locked, then ai-env wrapper install --write";
+        let alone = row_wrapper_setting(Some(&missing), &|_| (false, false), &Sibling::Missing);
+        assert_eq!(text(&alone[0]), (Tag::No, format!("{WRAPPER_SETTING} = /gone does not exist  <- {install}")));
+        let alone = row_wrapper_setting(Some(&missing), &|_| (true, false), &Sibling::Missing);
+        assert_eq!(text(&alone[0]), (Tag::No, format!("{WRAPPER_SETTING} = /gone is not executable  <- {install}")));
+        assert_eq!(text(&row_wrapper_setting(Some(&missing), &|_| (true, true), &Sibling::Missing)[0]), (Tag::Ok, format!("{WRAPPER_SETTING} = /gone")), "a working wrapper needs no fix");
+        // The bypass mode is a warning (a_bypass_permission_mode_is_a_warning holds its text).
+        let bypass = parse_settings("{\"claudeCode.initialPermissionMode\": \"bypassPermissions\"}").unwrap();
+        assert_eq!(text(&row_wrapper_setting(Some(&bypass), &|_| (true, true), &sib)[1]).0, Tag::Warn);
 
         let (tag, t) = text(&row_settings_unparseable(Path::new("/s.json"), "expected value at line 1 column 2"));
         assert_eq!(tag, Tag::Warn);
@@ -3247,5 +3534,260 @@ mod tests {
         assert_eq!(exists_exec(&dir.path().join("nope")), (false, false));
         let path = std::env::join_paths([&b, &a, &b]).unwrap();
         assert_eq!(all_in_path("tool", &path.to_string_lossy()), vec![b.join("tool"), a.join("tool")]);
+    }
+
+    // ---- S11 (B.4): the doctor matrix ------------------------------------------------
+
+    /// Every broken precondition doctor knows is `[NO ]`, names its fix
+    /// after `  <- `, and makes doctor exit 1.
+    #[test]
+    fn matrix_each_broken_precondition_is_no_with_a_fix() {
+        let missing = parse_settings("{\"claudeCode.claudeProcessWrapper\": \"/gone/ai-env-claude\"}").unwrap();
+        let next = Sibling::Next(PathBuf::from("/b/ai-env-claude"));
+        let deprecated = serde_json::json!({"items": [{"imageArn": "arn:aws:lambda:eu-central-1:aws:microvm-image:al2023-1", "imageVersion": BASE_IMAGE_VERSION, "status": "DEPRECATED"}]}).to_string();
+        let not_found = "An error occurred (NotFoundException) when calling the DescribeBudget operation: Unable to get budget: ai-env-monthly - the budget doesn't exist.";
+        let table: Vec<(&str, DoctorLine)> = vec![
+            ("the wrapper path missing", row_wrapper_setting(Some(&missing), &|_| (false, false), &next).remove(0)),
+            ("the wrapper path missing, the sibling too", row_wrapper_setting(Some(&missing), &|_| (false, false), &Sibling::Missing).remove(0)),
+            ("the wrapper path not executable", row_wrapper_setting(Some(&missing), &|_| (true, false), &next).remove(0)),
+            ("the wrapper path not executable, the sibling missing", row_wrapper_setting(Some(&missing), &|_| (true, false), &Sibling::Missing).remove(0)),
+            ("the sibling missing", row_sibling(&Sibling::Missing)),
+            ("ai-env-claude's skew", row_same_version(Some("ai-env-claude 0.0.9"), "0.1.0")),
+            ("the image shim", row_shim_version("0.11.0", Some("0.11.0"), Some("0.1.0"), None).remove(0)),
+            ("image findings", row_image_scan(&ImageScan::Scanned { rules: vec!["symlink".into()], files: 7 }, None, None).remove(0)),
+            ("the budget missing", row_budget(Some("ai-env-monthly"), Some(Err(not_found)))),
+            ("a DEPRECATED base image", row_base_image(Some(Ok(&deprecated)))),
+            ("the runtime credentials not sealed", row_runtime_credentials(&AwsEnvState::NotSealed("is not an ai-env container".into()), Path::new("/r/credentials/aws.env"))),
+        ];
+        for (case, line) in table {
+            let (tag, t) = text(&line);
+            assert_eq!(tag, Tag::No, "{case}: {t}");
+            let fix = t.split_once("  <- ").map(|(_, f)| f.trim()).unwrap_or_else(|| panic!("{case}: no fix: {t}"));
+            assert!(!fix.is_empty(), "{case}: an empty fix: {t}");
+            assert_eq!(crate::commands::doctor_exit_code(&[DoctorLine::row(Tag::Ok, "fine"), line], false), 1, "{case}");
+        }
+    }
+
+    /// L7: ai-env against the image's recorded shim (equality), the sibling
+    /// named when it is the same; then the newest live VM's shim when it is
+    /// older, its fix the session's migrate or the VM's terminate.
+    #[test]
+    fn row_shim_version_three_legs() {
+        let rows = |sib: Option<&str>, img: Option<&str>, live: Option<&LiveShim>| -> Vec<(Tag, String)> { row_shim_version("0.11.0", sib, img, live).iter().map(text).collect() };
+        assert_eq!(rows(Some("0.11.0"), None, None), vec![(Tag::Skip, "image shim version not recorded (state/infra.toml)  <- make infra-status WRITE=1".to_string())]);
+        assert_eq!(rows(Some("0.11.0"), Some(" "), None)[0].0, Tag::Skip, "a blank record is none");
+        assert_eq!(rows(Some("0.11.0"), Some("0.1.0"), None), vec![(Tag::No, "image shim 0.1.0 ≠ ai-env 0.11.0  <- make deploy, then make infra-status WRITE=1".to_string())]);
+        // B3-R4 (I1): an image shim newer than this ai-env is cleared by installing it; one that does not parse keeps the deploy.
+        assert_eq!(rows(Some("0.11.0"), Some("0.12.0"), None), vec![(Tag::No, "image shim 0.12.0 ≠ ai-env 0.11.0  <- install with: cargo install --path crates/ai-env-cli --locked".to_string())]);
+        assert_eq!(rows(Some("0.11.0"), Some("dev"), None), vec![(Tag::No, "image shim dev ≠ ai-env 0.11.0  <- make deploy, then make infra-status WRITE=1".to_string())]);
+        assert_eq!(rows(Some("0.11.0"), Some("0.11.0"), None), vec![(Tag::Ok, "ai-env 0.11.0 = ai-env-claude 0.11.0 = image shim 0.11.0".to_string())]);
+        for sib in [None, Some("0.10.0")] {
+            assert_eq!(rows(sib, Some("0.11.0"), None), vec![(Tag::Ok, "ai-env 0.11.0 = image shim 0.11.0".to_string())], "{sib:?}: row_same_version names the sibling");
+        }
+        let live = |shim: &str, session: Option<&str>| LiveShim { vm: "microvm-a".into(), shim: shim.into(), session: session.map(str::to_string) };
+        let sid = "01926f2e-0000-7000-8000-00000000000a";
+        let with = rows(Some("0.11.0"), Some("0.11.0"), Some(&live("0.1.0", Some(sid))));
+        assert_eq!(with.len(), 2, "{with:?}");
+        assert_eq!(with[1], (Tag::Warn, format!("microvm-a runs shim 0.1.0, older than ai-env 0.11.0  <- ai-env session migrate {sid}")));
+        let without = rows(Some("0.11.0"), None, Some(&live("0.1.0", None)));
+        assert_eq!(without[1], (Tag::Warn, "microvm-a runs shim 0.1.0, older than ai-env 0.11.0  <- ai-env vm terminate microvm-a".to_string()), "whatever the image's record");
+        for not_older in ["0.11.0", "0.12.0", "0.11.0-rc.1", "not a version", "0.1"] {
+            assert_eq!(rows(Some("0.11.0"), Some("0.11.0"), Some(&live(not_older, None))).len(), 1, "{not_older}");
+        }
+        assert_eq!(crate::commands::doctor_exit_code(&row_shim_version("0.11.0", None, Some("0.11.0"), Some(&live("0.1.0", None))), false), 0, "the live leg warns");
+
+        // The newest live row (by created) whose /health named its shim, and the session (not closed) on it.
+        let row = |id: &str, status: RowStatus, created: &str, shim: Option<&str>| VmRow { shim_version: shim.map(str::to_string), ..vm(id, status, created) };
+        let session = |sid: &str, status: &str, seen: &str| crate::bridge::registry::SessionRow { session_id: sid.into(), microvm_id: Some("microvm-new".into()), status: status.into(), last_seen: seen.into(), ..Default::default() };
+        let vms = [
+            row("microvm-old", RowStatus::Running, "2026-10-20T08:00:00.000Z", Some("0.1.0")),
+            row("microvm-new", RowStatus::Suspended, "2026-10-22T08:00:00.000Z", Some("0.1.0")),
+            row("microvm-unread", RowStatus::Running, "2026-10-23T08:00:00.000Z", None),
+            row("microvm-gone", RowStatus::Terminated, "2026-10-23T09:00:00.000Z", Some("0.0.1")),
+        ];
+        let (closed, open) = ("01926f2e-0000-7000-8000-00000000000a", "01926f2e-0000-7000-8000-00000000000b");
+        let sessions = [session(closed, "closed", "2026-10-23T10:00:00Z"), session(open, "active", "2026-10-22T10:00:00Z"), session("not-a-session-id", "active", "2026-10-23T11:00:00Z")];
+        assert_eq!(live_shim(&vms, &sessions), Some(LiveShim { vm: "microvm-new".into(), shim: "0.1.0".into(), session: Some(open.into()) }));
+        assert_eq!(live_shim(&vms, &[]).map(|l| l.session), Some(None));
+        assert_eq!(live_shim(&vms[2..], &sessions), None, "no live row named its shim");
+        // As rows() reads the session registry: none yet is no session; one that cannot be read judges nothing (its
+        // VM would look session-less, the fix a terminate) and says so.
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().to_path_buf(), None);
+        assert_eq!(live_shim_of(&paths, &vms), (Some(LiveShim { vm: "microvm-new".into(), shim: "0.1.0".into(), session: None }), None));
+        // B3's review: one row that cannot be read (its VM would look session-less) judges nothing either.
+        std::fs::create_dir_all(paths.sessions()).unwrap();
+        std::fs::write(paths.sessions().join(format!("{open}.toml")), "session_id = [ not toml").unwrap();
+        let (none, unread) = live_shim_of(&paths, &vms);
+        let (tag, t) = text(&unread.expect("a warning"));
+        assert!(none.is_none() && tag == Tag::Warn && t.starts_with(&format!("live VM shim not checked: session registry unreadable: 1 row(s) cannot be read ({open}: ")), "{t}");
+        std::fs::remove_dir_all(paths.sessions()).unwrap();
+        std::fs::write(paths.sessions(), "not a directory").unwrap();
+        let (none, unread) = live_shim_of(&paths, &vms);
+        assert_eq!(none, None);
+        let (tag, t) = text(&unread.expect("a warning"));
+        assert_eq!(tag, Tag::Warn);
+        assert!(t.starts_with("live VM shim not checked: session registry unreadable: ") && !t.contains("terminate"), "{t}");
+    }
+
+    /// The checkout's image/ scan names rules only, sorted and unique, with
+    /// their count; a deployed zip other than image.json's is one warning.
+    #[test]
+    fn row_image_scan_rows() {
+        let one = |scan: &ImageScan| -> Vec<(Tag, String)> { row_image_scan(scan, None, None).iter().map(text).collect() };
+        assert_eq!(one(&ImageScan::NotACheckout), vec![(Tag::Skip, "image/ not scanned: not in an ai-env checkout".to_string())]);
+        assert_eq!(one(&ImageScan::Failed("/c/image/claude/settings.json is not a regular file".into())), vec![(Tag::Warn, "image/ scan failed: /c/image/claude/settings.json is not a regular file".to_string())]);
+        assert_eq!(one(&ImageScan::Scanned { rules: vec![], files: 7 }), vec![(Tag::Ok, "image/ scan: clean (7 files)".to_string())]);
+        let found = ImageScan::Scanned { rules: vec!["unexpected-key".into(), "symlink".into(), "unexpected-key".into()], files: 7 };
+        assert_eq!(one(&found), vec![(Tag::No, "image/ has 3 finding(s): symlink, unexpected-key  <- fix them, then make image-zip and make deploy".to_string())]);
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        assert_eq!(row_image_scan(&found, Some(&a), Some(&a.to_uppercase())).len(), 1, "the same zip");
+        assert_eq!(row_image_scan(&found, Some(&a), None).len(), 1, "nothing staged: nothing to compare");
+        assert_eq!(row_image_scan(&found, None, Some(&b)).len(), 1, "nothing deployed: nothing to compare");
+        let rows = row_image_scan(&ImageScan::Scanned { rules: vec![], files: 7 }, Some(&a), Some(&b));
+        assert_eq!(text(&rows[1]), (Tag::Warn, format!("the deployed image zip {} is not target/image/image.json's {} (the zip that passed the scan)  <- make image-zip, then make deploy", &a[..12], &b[..12])));
+        assert_eq!(text(&row_image_scan(&found, Some("not hex"), Some(&b))[1]).1, format!("the deployed image zip ? is not target/image/image.json's {} (the zip that passed the scan)  <- make image-zip, then make deploy", &b[..12]));
+        // image.json's sha256 as make image-zip writes it; anything else is no record.
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(staged_zip_sha256(d.path()), None);
+        let file = d.path().join("target").join("image").join("image.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("{{\"zip\":\"target/image/ai-env-image.zip\",\"sha256\":\"{b}\",\"key\":\"ai-env/image-{}.zip\",\"claudeVersion\":\"2.1.305\",\"shimVersion\":\"0.1.0\"}}\n", &b[..16])).unwrap();
+        assert_eq!(staged_zip_sha256(d.path()), Some(b.clone()));
+        std::fs::write(&file, "{\"sha256\": \"not hex\"}").unwrap();
+        assert_eq!(staged_zip_sha256(d.path()), None);
+        // Never through a symlink, never a FIFO (opened without blocking), never past 64 KiB.
+        std::fs::write(d.path().join("real.json"), format!("{{\"sha256\":\"{b}\"}}")).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(d.path().join("real.json"), &file).unwrap();
+        assert_eq!(staged_zip_sha256(d.path()), None, "a symlink");
+        std::fs::remove_file(&file).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(&file).status().unwrap().success());
+        assert_eq!(staged_zip_sha256(d.path()), None, "a FIFO");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, format!("{{\"sha256\":\"{b}\",\"pad\":\"{}\"}}", " ".repeat(64 * 1024))).unwrap();
+        assert_eq!(staged_zip_sha256(d.path()), None, "oversized");
+    }
+
+    /// The image scan's checkout, found without running git: the nearest `.git`, a directory or a worktree's file.
+    #[test]
+    fn checkout_root_is_the_nearest_dot_git() {
+        let d = tempfile::tempdir().unwrap();
+        let (top, nested) = (d.path().join("top"), d.path().join("top").join("a").join("b"));
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(checkout_root(&nested), Some(top.as_path()));
+        assert_eq!(checkout_root(&top), Some(top.as_path()));
+        let worktree = top.join("a");
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/a\n").unwrap();
+        assert_eq!(checkout_root(&nested), Some(worktree.as_path()), "a worktree's .git file");
+    }
+
+    /// L8: the budget as the verified operator; its account never in a row.
+    #[test]
+    fn row_budget_rows() {
+        let acct = "7".repeat(12);
+        assert_eq!(budget_args(&acct, "ai-env-monthly"), ["budgets", "describe-budget", "--account-id", acct.as_str(), "--budget-name", "ai-env-monthly", "--region", "eu-central-1", "--output", "json"]);
+        let name = Some("ai-env-monthly");
+        assert_eq!(text(&row_budget(None, None)), (Tag::Skip, "budget not checked: no budget name in bridge.toml [aws] or state/infra.toml  <- make infra-status WRITE=1".to_string()));
+        assert_eq!(text(&row_budget(Some("  "), Some(Ok("{}")))).0, Tag::Skip, "a blank name is none");
+        assert_eq!(text(&row_budget(name, None)), (Tag::Skip, "budget ai-env-monthly not checked (no operator identity: ai-env as ops -- ai-env doctor)".to_string()));
+        let answer = serde_json::json!({"Budget": {"BudgetName": "ai-env-monthly", "BudgetLimit": {"Amount": "50.0", "Unit": "USD"}, "TimeUnit": "MONTHLY", "BudgetType": "COST", "CalculatedSpend": {"ActualSpend": {"Amount": "3.21", "Unit": "USD"}, "ForecastedSpend": {"Amount": "9.0", "Unit": "USD"}}}}).to_string();
+        assert_eq!(text(&row_budget(name, Some(Ok(&answer)))), (Tag::Ok, "budget ai-env-monthly: 50.0 USD monthly, 3.21 spent".to_string()));
+        // B-DOC-1: a spend at or over its limit is a warning naming the cost view; one below it stays [ok ].
+        for (spent, tag) in [("50", Tag::Warn), ("50.00", Tag::Warn), ("72.4", Tag::Warn), ("49.99", Tag::Ok)] {
+            let row = row_budget(name, Some(Ok(&answer.replace("\"3.21\"", &format!("\"{spent}\"")))));
+            let want = if tag == Tag::Warn { format!("budget ai-env-monthly: {spent} spent of 50.0 USD monthly  <- ai-env cost --by day") } else { format!("budget ai-env-monthly: 50.0 USD monthly, {spent} spent") };
+            assert_eq!(text(&row), (tag, want), "{spent}");
+        }
+        // Digits and dots that make no number: no verdict, the budget exists.
+        assert_eq!(text(&row_budget(name, Some(Ok(&answer.replace("\"3.21\"", "\"3.2.1\""))))), (Tag::Ok, "budget ai-env-monthly exists".to_string()));
+        let other_unit = answer.replace("\"3.21\",\"Unit\":\"USD\"", "\"3.21\",\"Unit\":\"EUR\"");
+        assert_ne!(other_unit, answer);
+        assert_eq!(text(&row_budget(name, Some(Ok(&other_unit)))), (Tag::Ok, "budget ai-env-monthly exists".to_string()), "a spend in another unit than the limit");
+        let no_spend = serde_json::json!({"Budget": {"BudgetName": "ai-env-monthly", "BudgetLimit": {"Amount": "50.0", "Unit": "USD"}, "TimeUnit": "MONTHLY"}}).to_string();
+        for exists in [no_spend.as_str(), "not json", "{\"Budget\": {\"BudgetLimit\": {\"Amount\": \"5\\n0\", \"Unit\": \"USD\"}}}"] {
+            assert_eq!(text(&row_budget(name, Some(Ok(exists)))), (Tag::Ok, "budget ai-env-monthly exists".to_string()), "{exists}");
+        }
+        let missing = "An error occurred (NotFoundException) when calling the DescribeBudget operation: Unable to get budget: ai-env-monthly - the budget doesn't exist.";
+        assert_eq!(text(&row_budget(name, Some(Err(missing)))), (Tag::No, "budget ai-env-monthly missing  <- make deploy".to_string()));
+        let denied = format!("An error occurred (AccessDeniedException) when calling the DescribeBudget operation: User: arn:aws:iam::{acct}:user/ai-env-ops is not authorized to perform: budgets:ViewBudget on resource: arn:aws:budgets::{acct}:budget/ai-env-monthly");
+        let row = row_budget(name, Some(Err(&denied)));
+        assert_eq!(text(&row), (Tag::Warn, "budget ai-env-monthly not checked: AccessDenied  <- make deploy (ai-env-ops gains budgets:ViewBudget, S11 L8)".to_string()));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+        let other = format!("An error occurred (ThrottlingException) when calling the DescribeBudget operation for {acct}: Rate exceeded");
+        let (tag, t) = text(&row_budget(name, Some(Err(&other))));
+        assert_eq!((tag, t.as_str()), (Tag::Warn, "budget ai-env-monthly not checked: An error occurred (ThrottlingException) when calling the DescribeBudget operation for <acct>: Rate exceeded"));
+        assert!(!t.contains(&acct), "{t}");
+    }
+
+    /// The listing row_base_image reads: AVAILABLE versions above the pin,
+    /// in version order; a DEPRECATED pin stays row_base_image's [NO ].
+    #[test]
+    fn row_base_image_newer_names_available_versions() {
+        let item = |v: &str, s: &str| serde_json::json!({"imageArn": "arn:aws:lambda:eu-central-1:aws:microvm-image:al2023-1", "imageVersion": v, "status": s});
+        let listing = |items: Vec<serde_json::Value>| serde_json::json!({ "items": items }).to_string();
+        assert_eq!(row_base_image_newer(None), None);
+        assert_eq!(row_base_image_newer(Some(Err("aws: timed out after 15s"))), None, "row_base_image says it");
+        assert_eq!(row_base_image_newer(Some(Ok("not json"))), None);
+        assert_eq!(row_base_image_newer(Some(Ok(&listing(vec![item(BASE_IMAGE_VERSION, "AVAILABLE")])))), None);
+        assert_eq!(row_base_image_newer(Some(Ok(&listing(vec![item("2", "DEPRECATED"), item("3", "EXPIRING"), item("0", "AVAILABLE")])))), None, "only AVAILABLE versions above the pin");
+        let json = listing(vec![item("3", "AVAILABLE"), item("1", "AVAILABLE"), item("2", "AVAILABLE"), item("2.0", "AVAILABLE"), item("4", "EXPIRING"), item("x", "AVAILABLE")]);
+        let row = row_base_image_newer(Some(Ok(&json))).expect("two newer versions");
+        assert_eq!(text(&row), (Tag::Warn, "newer al2023-1 version(s) 2, 3 AVAILABLE (pinned 1)  <- infra/image-config.json".to_string()));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+        let json = listing(vec![item(BASE_IMAGE_VERSION, "DEPRECATED"), item("2", "AVAILABLE")]);
+        assert_eq!(text(&row_base_image(Some(Ok(&json)))).0, Tag::No);
+        assert_eq!(row_base_image_newer(Some(Ok(&json))).map(|r| text(&r).0), Some(Tag::Warn));
+    }
+
+    #[test]
+    fn rows_roots_exist_warn_per_missing_root() {
+        let cfg = BridgeConfig::parse("[workspaces]\nroots = [\"/w/here\", \"/w/gone\"]\n").unwrap();
+        let rows: Vec<(Tag, String)> = rows_roots_exist(&cfg, &|p: &Path| p == Path::new("/w/here")).iter().map(text).collect();
+        assert_eq!(rows, vec![(Tag::Warn, "workspace root /w/gone does not exist  <- create it, or remove it from bridge.toml".to_string())]);
+        assert!(rows_roots_exist(&cfg, &|_| true).is_empty());
+        assert_eq!(rows_roots_exist(&cfg, &|_| false).len(), 2, "one row per root");
+        assert!(rows_roots_exist(&BridgeConfig::default(), &|_| false).is_empty(), "no root, no row");
+        // As rows() calls it: a directory is a root, a file or nothing is not.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("file"), "x").unwrap();
+        let (dir, file, gone) = (d.path().display(), d.path().join("file"), d.path().join("gone"));
+        let cfg = BridgeConfig::parse(&format!("[workspaces]\nroots = [\"{dir}\", \"{}\", \"{}\"]\n", file.display(), gone.display())).unwrap();
+        let rows: Vec<String> = rows_roots_exist(&cfg, &|p: &Path| p.is_dir()).iter().map(|r| text(r).1).collect();
+        assert_eq!(rows, vec![format!("workspace root {} does not exist  <- create it, or remove it from bridge.toml", file.display()), format!("workspace root {} does not exist  <- create it, or remove it from bridge.toml", gone.display())]);
+    }
+
+    #[test]
+    fn row_image_version_pin_warns_off_active() {
+        let state = |active: Option<&str>| InfraState { latest_active_image_version: active.map(str::to_string), ..InfraState::default() };
+        let pinned = |v: &str| BridgeConfig::parse(&format!("[aws]\nimage_version = \"{v}\"\n")).unwrap();
+        assert_eq!(row_image_version_pin(&BridgeConfig::default(), Some(&state(Some("12.0")))), None, "active follows the recorded version");
+        assert_eq!(row_image_version_pin(&pinned("12"), Some(&state(Some("12.0")))), None, "N is N.0");
+        assert_eq!(row_image_version_pin(&pinned("12.0"), Some(&state(Some("12")))), None, "an older state's N");
+        assert_eq!(row_image_version_pin(&pinned("11"), Some(&state(None))), None, "no recorded active version");
+        assert_eq!(row_image_version_pin(&pinned("11"), None), None);
+        let row = row_image_version_pin(&pinned("11"), Some(&state(Some("12.0")))).expect("pinned off active");
+        assert_eq!(text(&row), (Tag::Warn, "[aws].image_version = 11 is pinned, but the active version is 12.0: new VMs run 11  <- image_version = \"active\" in bridge.toml".to_string()));
+        assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
+    }
+
+    #[test]
+    fn a_bypass_permission_mode_is_a_warning() {
+        let sib = Sibling::Next(PathBuf::from("/b/ai-env-claude"));
+        let s = parse_settings("{\"claudeCode.claudeProcessWrapper\": \"/b/ai-env-claude\", \"claudeCode.initialPermissionMode\": \"bypassPermissions\"}").unwrap();
+        let rows = row_wrapper_setting(Some(&s), &|_| (true, true), &sib);
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            vec![
+                (Tag::Ok, format!("{WRAPPER_SETTING} = /b/ai-env-claude")),
+                (Tag::Warn, format!("{PERMISSION_SETTING} = bypassPermissions: every chat starts with no permission prompt  <- ai-env wrapper install --write --permission-mode default")),
+            ]
+        );
+        assert_eq!(crate::commands::doctor_exit_code(&rows, false), 0, "a warning, not a failure");
+        for mode in ["default", "manual", "acceptEdits", "plan"] {
+            let s = parse_settings(&format!("{{\"claudeCode.initialPermissionMode\": \"{mode}\"}}")).unwrap();
+            assert_eq!(text(&row_wrapper_setting(Some(&s), &|_| (true, true), &sib)[1]), (Tag::Ok, format!("{PERMISSION_SETTING} = {mode}")), "{mode}");
+        }
     }
 }

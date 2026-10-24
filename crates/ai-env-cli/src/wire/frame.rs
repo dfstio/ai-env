@@ -14,8 +14,15 @@
 //! `park_refused`, `unpark`), sent only on a socket whose shim names
 //! [`CAP_PARK_V1`], and two reply fields a reader may ignore
 //! (`SpawnDetail.parked`, `Health.mem_total_mib`).
+//!
+//! S11 (plans/s11-contracts.md §1) adds four caps, each named by a shim
+//! once its served flag holds ([`CAP_CODEOUT_MANIFEST_V1`],
+//! [`CAP_VIEW_PARENT_V1`], [`CAP_TRANSCRIPT_GZIP_V1`],
+//! [`CAP_CLAUDE_STAGE_V1`]), a spawn's staged claudes (`spawn.claude`, sent
+//! only behind `CAP_CLAUDE_STAGE_V1`), and two reply fields a reader may
+//! ignore (`spawned.claude_sha256`, `HealthDetail.claude_cache`).
 use crate::wire::redact::Secret;
-use crate::wire::workspace::WorkspaceView;
+use crate::wire::workspace::{ClaudeCacheView, ClaudeRef, WorkspaceView};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -126,10 +133,31 @@ pub const CAP_TRANSCRIPT_S3_V1: &str = "transcript_s3_v1";
 /// once the shim's park is built (`shim::agent::PARK_SERVED`).
 pub const CAP_PARK_V1: &str = "park_v1";
 
+/// S11 (C.1): the shim answers a code-out that sets
+/// `CodeoutRequest.manifest_when_empty` with its manifest line alone (200)
+/// when nothing is new. Named with a helper, once `shim::code::MANIFEST_SERVED`.
+pub const CAP_CODEOUT_MANIFEST_V1: &str = "codeout_manifest_v1";
+
+/// S11 (C.2): the view answers `first_parent` when `ViewQuery.parent` asks.
+/// Named with a helper, `shim::s3xfer::SERVED` and `VIEW_PARENT_SERVED`.
+pub const CAP_VIEW_PARENT_V1: &str = "view_parent_v1";
+
+/// S11 (L5): a pull may name gzip parts (`PullPart.encoding`), which the
+/// shim's curl decodes. Named with a helper, `shim::s3xfer::SERVED` and `GZIP_SERVED`.
+pub const CAP_TRANSCRIPT_GZIP_V1: &str = "transcript_gzip_v1";
+
+/// S11 (A.3, A.4): the shim serves `POST /claude/stage`, `GET /claude/stage`
+/// and `POST /claude/relay`, and runs a spawn's `claude` refs. Named, with
+/// or without a helper, when `shim::claudebin::SERVED` holds and the cache
+/// has a store (the shim is root, or runs with `--fs-root`).
+pub const CAP_CLAUDE_STAGE_V1: &str = "claude_stage_v1";
+
 /// The stage whose image first names `cap` (what `BridgeError::NoCapability`
 /// and `remote::Failure::OldImage` say an older image predates):
 /// `credential_cache` S7, `workspace_v1` S8, `git_http_v1` and
-/// `transcript_s3_v1` S9, `park_v1` S10, any other `this ai-env`.
+/// `transcript_s3_v1` S9, `park_v1` S10, `codeout_manifest_v1`,
+/// `view_parent_v1`, `transcript_gzip_v1` and `claude_stage_v1` S11, any
+/// other `this ai-env`.
 #[must_use]
 pub fn cap_stage(cap: &str) -> &'static str {
     match cap {
@@ -137,6 +165,7 @@ pub fn cap_stage(cap: &str) -> &'static str {
         CAP_WORKSPACE_V1 => "S8",
         CAP_GIT_HTTP_V1 | CAP_TRANSCRIPT_S3_V1 => "S9",
         CAP_PARK_V1 => "S10",
+        CAP_CODEOUT_MANIFEST_V1 | CAP_VIEW_PARENT_V1 | CAP_TRANSCRIPT_GZIP_V1 | CAP_CLAUDE_STAGE_V1 => "S11",
         _ => "this ai-env",
     }
 }
@@ -512,14 +541,22 @@ pub enum Frame {
         /// carries its secret in `secrets`, re-sends included).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<String>,
+        /// S11 (A.4, L2): the staged claudes this spawn may run, in preference order (at most
+        /// `wire::workspace::CLAUDE_REFS_MAX`): the shim runs the first its cache holds, else `--claude`. Sent only to a
+        /// shim naming [`CAP_CLAUDE_STAGE_V1`]; left out when empty, so a spawn naming none is written as S10's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        claude: Vec<ClaudeRef>,
     },
     Spawned {
         spawn_id: SpawnId,
         pid: u32,
         pgid: u32,
-        /// Only when argv[0] is `claude`.
+        /// The version of the claude that ran: S11, always when argv[0] is `claude` (the cached one's, else the image's probe).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_version: Option<String>,
+        /// S11: the sha256 of the cached binary that ran; `None` when the image's claude ran or argv[0] is not `claude`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_sha256: Option<String>,
     },
     SpawnErr {
         spawn_id: SpawnId,
@@ -676,9 +713,9 @@ impl std::fmt::Debug for Frame {
             Frame::Hello { client, resume, idle_s, .. } => write!(f, "{kind}(client={} {}, resume={}, idle_s={idle_s:?})", client.name, client.version, resume.len()),
             Frame::HelloOk { wire, spawns, resumed, run_hook_seen, .. } => write!(f, "{kind}(wire={wire}, spawns={}, resumed={}, run_hook_seen={run_hook_seen})", spawns.len(), resumed.len()),
             Frame::HelloErr { code, .. } => write!(f, "{kind}({code:?})"),
-            Frame::Spawn { spawn_id, argv, env, secrets, deliver_secret, credential, .. } => {
+            Frame::Spawn { spawn_id, argv, env, secrets, deliver_secret, credential, claude, .. } => {
                 let argv0 = argv.first().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or("");
-                write!(f, "{kind}({spawn_id}, argv0={argv0}, argc={}, env={}, secrets={}, deliver={deliver_secret:?}, credential={credential:?})", argv.len(), env.len(), secrets.len())
+                write!(f, "{kind}({spawn_id}, argv0={argv0}, argc={}, env={}, secrets={}, deliver={deliver_secret:?}, credential={credential:?}, claude={})", argv.len(), env.len(), secrets.len(), claude.len())
             }
             Frame::Spawned { spawn_id, pid, pgid, .. } => write!(f, "{kind}({spawn_id}, pid={pid}, pgid={pgid})"),
             Frame::SpawnErr { spawn_id, code, .. } => write!(f, "{kind}({spawn_id}, {code:?})"),
@@ -1123,6 +1160,9 @@ pub struct HealthDetail {
     /// any older shim), so a detail without it reads, and is written, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceView>,
+    /// S11: the VM's claude cache (`shim::claudebin`); left out by a shim without one (and by any older shim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_cache: Option<ClaudeCacheView>,
 }
 
 #[cfg(test)]
@@ -1177,8 +1217,9 @@ mod tests {
                 deliver_secret: Deliver::Fd,
                 detach_grace_s: Some(60),
                 credential: None,
+                claude: vec![ClaudeRef { version: "2.1.308".into(), sha256: "5a".repeat(32) }],
             },
-            Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.287".into()) },
+            Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.308".into()), claude_sha256: Some("5a".repeat(32)) },
             Frame::SpawnErr { spawn_id: sid(), code: SpawnErrCode::Exec, message: "boom".into() },
             Frame::Stdin { spawn_id: sid(), seq: 1, data: text("{\"type\":\"user\"}\n") },
             Frame::StdinEof { spawn_id: sid(), seq: 1 },
@@ -1276,7 +1317,7 @@ mod tests {
         let no_cred = Frame::from_json(&format!("{{\"v\":1,\"t\":\"spawn_err\",\"spawn_id\":\"{SID}\",\"code\":\"no_credential\",\"message\":\"m\"}}")).unwrap();
         assert!(matches!(no_cred, Frame::SpawnErr { code: SpawnErrCode::NoCredential, .. }));
         // A spawn naming a credential carries the name only.
-        let spawn = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: Some("X_TOKEN".into()) };
+        let spawn = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: Some("X_TOKEN".into()), claude: Vec::new() };
         assert!(spawn.to_json().ends_with(",\"credential\":\"X_TOKEN\"}"), "{}", spawn.to_json());
         // An S6 shim's hello_ok: no caps, no view; and it serialises back without them.
         let s6 = "{\"v\":1,\"t\":\"hello_ok\",\"wire\":1,\"shim_version\":\"0.1.0\",\"claude_version\":null,\"microvm_id\":null,\"image_version\":null,\"boot_nonce\":\"n\",\"owner\":null,\"has_credentials\":false,\"uptime_s\":1,\"run_hook_seen\":true,\"spawns\":[],\"resumed\":[]}";
@@ -1431,6 +1472,67 @@ mod tests {
         let json = serde_json::to_string(&parked).unwrap();
         assert!(json.ends_with(",\"frozen\":true,\"parked\":{\"pid\":51234,\"started\":1792483200}}"), "{json}");
         assert_eq!(serde_json::from_str::<SpawnDetail>(&json).unwrap(), parked);
+    }
+
+    /// S11 (index §1, A §11.3, C §X.1): four caps beside S7's to S10's, each
+    /// named by its stage; the nine are unique; a later one names no stage;
+    /// an S10 `Health` without them reads and is written as before.
+    #[test]
+    fn the_s11_caps_are_additive_and_named_by_stage() {
+        let s11 = [CAP_CODEOUT_MANIFEST_V1, CAP_VIEW_PARENT_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_CLAUDE_STAGE_V1];
+        assert_eq!(s11, ["codeout_manifest_v1", "view_parent_v1", "transcript_gzip_v1", "claude_stage_v1"]);
+        let all = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_PARK_V1, CAP_CODEOUT_MANIFEST_V1, CAP_VIEW_PARENT_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_CLAUDE_STAGE_V1];
+        assert_eq!(all.iter().collect::<std::collections::BTreeSet<_>>().len(), 9, "unique");
+        assert_eq!(all.map(cap_stage), ["S7", "S8", "S9", "S9", "S10", "S11", "S11", "S11", "S11"]);
+        assert_eq!(cap_stage("codeout_manifest_v2"), "this ai-env");
+        let s10 = "{\"status\":\"ok\",\"shim_version\":\"0.1.0\",\"claude_version\":\"2.1.305\",\"microvm_id\":null,\"owner\":null,\"created\":null,\"boot_nonce\":null,\"run_hook_seen\":true,\"uptime_s\":3,\"wire\":1,\"caps\":[\"credential_cache\",\"workspace_v1\",\"git_http_v1\",\"transcript_s3_v1\",\"park_v1\"]}";
+        let h: Health = serde_json::from_str(s10).unwrap();
+        assert!(s11.iter().all(|c| !h.caps.iter().any(|have| have == c)));
+        assert_eq!(serde_json::to_string(&h).unwrap(), s10, "byte-identical for an S10 reader");
+        let mut caps = h.caps.clone();
+        caps.extend(s11.map(str::to_string));
+        let new = Health { caps, ..h.clone() };
+        assert_eq!(serde_json::from_str::<Health>(&serde_json::to_string(&new).unwrap()).unwrap(), new, "the wire stays v1: the caps are a list");
+        assert_eq!(new.caps[..5], h.caps[..], "an S10 shim's list is a prefix of an S11 one's");
+    }
+
+    /// S11 (A §1.5): `spawn.claude` and `spawned.claude_sha256` are
+    /// additive: an S10 `spawned` parses (both fields absent) and is written
+    /// back byte for byte; a spawn naming no ref is written as S10's; set,
+    /// each comes last and round-trips.
+    #[test]
+    fn the_s11_spawn_fields_are_additive() {
+        let s10 = format!("{{\"v\":1,\"t\":\"spawned\",\"spawn_id\":\"{SID}\",\"pid\":42,\"pgid\":42,\"claude_version\":\"2.1.305\"}}");
+        let f = Frame::from_json(&s10).unwrap();
+        assert!(matches!(&f, Frame::Spawned { claude_version: Some(v), claude_sha256: None, .. } if v == "2.1.305"));
+        assert_eq!(f.to_json(), s10, "byte-identical for an S10 Mac");
+        let cached = Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.308".into()), claude_sha256: Some("5a".repeat(32)) };
+        assert!(cached.to_json().ends_with(&format!(",\"claude_version\":\"2.1.308\",\"claude_sha256\":\"{}\"}}", "5a".repeat(32))), "{}", cached.to_json());
+        assert_eq!(Frame::from_json(&cached.to_json()).unwrap(), cached);
+        let bare = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: Vec::new() };
+        let s10_spawn = format!("{{\"v\":1,\"t\":\"spawn\",\"spawn_id\":\"{SID}\",\"argv\":[\"claude\"],\"env\":{{}},\"deliver_secret\":\"fd\",\"detach_grace_s\":900}}");
+        assert_eq!(bare.to_json(), s10_spawn, "no refs: S10's spawn");
+        assert_eq!(Frame::from_json(&s10_spawn).unwrap(), bare);
+        let refs = vec![ClaudeRef { version: "2.1.308".into(), sha256: "5a".repeat(32) }, ClaudeRef { version: "2.1.307".into(), sha256: "6b".repeat(32) }];
+        let named = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: refs.clone() };
+        let json = named.to_json();
+        assert!(json.ends_with(&format!(",\"claude\":[{{\"version\":\"2.1.308\",\"sha256\":\"{}\"}},{{\"version\":\"2.1.307\",\"sha256\":\"{}\"}}]}}", "5a".repeat(32), "6b".repeat(32))), "{json}");
+        assert!(matches!(Frame::from_json(&json).unwrap(), Frame::Spawn { claude, .. } if claude == refs));
+    }
+
+    /// S11 (A §1.5): a spawn's `Debug` counts its refs and never names a
+    /// version or a sha256; a `spawned`'s is unchanged.
+    #[test]
+    fn spawn_debug_shows_the_ref_count_only() {
+        let all = every_variant();
+        let spawn = format!("{:?}", all[3]);
+        assert!(spawn.ends_with(", claude=1)"), "{spawn}");
+        assert!(!spawn.contains("2.1.308") && !spawn.contains(&"5a".repeat(32)), "{spawn}");
+        let spawned = format!("{:?}", all[4]);
+        assert_eq!(spawned, format!("spawned({SID}, pid=42, pgid=42)"));
+        let Frame::Spawn { claude, .. } = &all[3] else { panic!("spawn") };
+        let three = Frame::Spawn { claude: vec![claude[0].clone(); 3], spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None };
+        assert!(format!("{three:?}").ends_with(", credential=None, claude=3)"), "{three:?}");
     }
 
     /// S8 changes neither earlier golden conversation: both files are pinned
@@ -1616,6 +1718,38 @@ mod tests {
         let resumed = frames[last..].iter().position(|f| matches!(f, Frame::HelloOk { resumed, .. } if resumed.len() == 1 && resumed[0].spawn_id == id && resumed[0].status == ResumeStatus::Ok));
         let resumed = resumed.expect("a second socket's hello resumes the parked spawn") + last;
         assert!(frames[resumed..].iter().any(|f| matches!(f, Frame::StdinEof { .. })) && frames[resumed..].iter().any(|f| matches!(f, Frame::Exit { .. })), "stdin_eof and the exit after it");
+    }
+
+    /// The golden claude spawn (S11, tests/fixtures/wire/claude-golden.jsonl,
+    /// LD-33): a `hello`; a `hello_ok` naming `claude_stage_v1`; a spawn
+    /// naming two refs; its `spawned` naming the first ref's version and
+    /// sha256; a stdout chunk and its ack; the exit. Every line parses as v1
+    /// and serialises back byte-identically, each kind from the side that
+    /// sends it.
+    #[test]
+    fn golden_claude_spawn_round_trips() {
+        let text = include_str!("../../tests/fixtures/wire/claude-golden.jsonl");
+        let mut frames: Vec<Frame> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            let n = i + 1;
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            let dir = v["dir"].as_str().unwrap_or_default().to_string();
+            let raw = line.split_once(",\"frame\":").and_then(|(_, rest)| rest.strip_suffix('}')).unwrap_or_else(|| panic!("line {n}: no frame"));
+            let f = Frame::from_json(raw).unwrap_or_else(|e| panic!("line {n}: {e}"));
+            assert!(f.to_json() == raw, "line {n} ({}): not byte-identical once re-serialised", f.kind());
+            match (dir.as_str(), &f) {
+                ("mac", Frame::Hello { .. } | Frame::Spawn { .. } | Frame::Ack { .. }) => {}
+                ("vm", Frame::HelloOk { caps, .. }) => assert!(caps.iter().any(|c| c == CAP_CLAUDE_STAGE_V1), "line {n}: the shim names {CAP_CLAUDE_STAGE_V1}"),
+                ("vm", Frame::Spawned { .. } | Frame::Stdout { .. } | Frame::Exit { .. }) => {}
+                _ => panic!("line {n}: {dir} does not send {}", f.kind()),
+            }
+            frames.push(f);
+        }
+        assert_eq!(frames.iter().map(Frame::kind).collect::<Vec<_>>(), ["hello", "hello_ok", "spawn", "spawned", "stdout", "ack", "exit"]);
+        let Frame::Spawn { claude, .. } = &frames[2] else { panic!("a spawn") };
+        assert!(claude.len() == 2 && claude.len() <= crate::wire::workspace::CLAUDE_REFS_MAX && claude.iter().all(|r| r.check().is_ok()), "{claude:?}");
+        let Frame::Spawned { claude_version, claude_sha256, .. } = &frames[3] else { panic!("spawned") };
+        assert_eq!((claude_version.as_deref(), claude_sha256.as_deref()), (Some(claude[0].version.as_str()), Some(claude[0].sha256.as_str())), "the first ref ran");
     }
 
     #[test]

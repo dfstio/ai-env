@@ -353,13 +353,14 @@ fn forget(name: &str, yes: bool) -> Result<()> {
         voice::warn(&format!("the VM registry cannot be read ({e}): VMs that received the token are not listed; `ai-env vm list` shows them"));
         (Vec::new(), Vec::new())
     });
-    let held: Vec<_> = held.into_iter().filter(|h| h.tag.as_deref().is_none_or(|t| seals.contains(t))).collect();
+    // A1 joint review (J2): a VM any of whose seals is one of the account's (a chat may still run on an earlier one).
+    let held: Vec<_> = held.into_iter().filter(|h| (h.tags.is_empty() && h.tag.is_none()) || h.tags.iter().chain(h.tag.iter()).any(|t| seals.contains(t.as_str()))).collect();
     let verb = if yes { "deleting" } else { "would delete" };
     for f in &files {
         outln!("{verb} {}", f.display());
     }
     for h in &held {
-        let what = h.tag.as_deref().map_or_else(|| "a token whose seal its row does not record (it may be this one)".to_string(), |t| format!("Claude account {name}'s token (seal {t})"));
+        let what = h.tags.iter().chain(h.tag.iter()).find(|t| seals.contains(t.as_str())).map_or_else(|| "a token whose seal its row does not record (it may be this one)".to_string(), |t| format!("Claude account {name}'s token (seal {t})"));
         outln!("{} ({}) received {what} at {}: only terminating it clears its copies: ai-env vm terminate {}", h.id, h.status, rfc3339_utc(h.credential_at), h.id);
     }
     for u in &unread {

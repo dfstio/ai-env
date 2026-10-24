@@ -47,6 +47,16 @@ pub const IMAGE_TEXT: &str = "[image]";
 pub const CUSTOM_TITLES_MAX: usize = 16;
 pub const CUSTOM_TITLE_LINE_MAX: usize = 4096;
 
+/// S11 (C.4): the extension version the view format is pinned at: the reader
+/// this module's doc names (`fetchSessionsInDir` for the list, the SDK
+/// reader's filter for a reopen).
+pub const VIEW_EXT_VERSION: &str = "2.1.302";
+
+/// S11 (C.4): what the picker and the SDK reader key on in a session file, as
+/// the 2.1.302 bundle's `extension.js` names them (each also in 2.1.309's,
+/// checked 23 Oct 2026): doctor greps a newer extension's bundle for each.
+pub const VIEW_READER_STRINGS: [&str; 15] = ["fetchSessionsInDir", "parentUuid", "isSidechain", "isMeta", "isCompactSummary", "sessionId", "aiTitle", "\"ai-title\"", "customTitle", "\"custom-title\"", "userType", "entrypoint", "gitBranch", "\"claude-vscode\"", "teamName"];
+
 /// `[tool: NAME]` for a NAME of `[A-Za-z0-9_.:-]{1,64}`, else `[tool]`.
 #[must_use]
 pub fn tool_text(name: &str) -> String {
@@ -88,6 +98,14 @@ pub struct TranscriptViewReply {
     pub git_branch: Option<String>,
     #[serde(default)]
     pub entries: Vec<ViewEntry>,
+    /// S11 (C.2): the chain parent of the first entry: its node's
+    /// `parentUuid` text, which is the uuid of the node just before it in
+    /// the chain (`chain_of`'s order), or of one before the tail. `None` for
+    /// a chain root, with no entries, and always unless the query asked
+    /// (`ViewQuery.parent`): the shim leaves it out, so a reader that
+    /// refuses unknown fields (an S10 Mac) never meets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_parent: Option<String>,
 }
 
 /// One message of a view: a user prompt, or one assistant reply collapsed.
@@ -116,7 +134,8 @@ impl TranscriptViewReply {
     /// [`VIEW_BLOCK_MAX`] bytes each, [`VIEW_FILE_MAX`] in all; a title of at
     /// most [`VIEW_TITLE_MAX`] characters; a uuid and a timestamp of at most
     /// [`VIEW_ID_MAX`] bytes each, a version and a git branch of at most
-    /// [`VIEW_META_MAX`]; no NUL anywhere. uuids and timestamps are not
+    /// [`VIEW_META_MAX`]; no NUL anywhere; S11: a first parent of 1 to
+    /// [`VIEW_ID_MAX`] bytes, only with a message. uuids and timestamps are not
     /// judged otherwise (the Mac re-mints them). So its compact JSON stays
     /// under `wire::workspace::JSON_PAYLOAD_MAX`.
     pub fn check(&self, n: u32) -> Result<(), String> {
@@ -142,6 +161,14 @@ impl TranscriptViewReply {
         for (what, value) in [("version", &self.version), ("git branch", &self.git_branch)] {
             if value.as_deref().is_some_and(|v| v.len() > VIEW_META_MAX || nul(v)) {
                 return Err(format!("has a {what} of more than {VIEW_META_MAX} bytes, or a NUL"));
+            }
+        }
+        if let Some(p) = &self.first_parent {
+            if p.is_empty() || p.len() > VIEW_ID_MAX || nul(p) {
+                return Err(format!("has a first parent that is empty, over {VIEW_ID_MAX} bytes, or holds a NUL"));
+            }
+            if self.entries.is_empty() {
+                return Err("names a first parent but no message".into());
             }
         }
         let mut total = 0usize;
@@ -411,7 +438,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&good).unwrap(), EXAMPLE, "round-trips byte for byte");
         assert_eq!(good.check(10), Ok(()));
         assert_eq!(good.check(2), Ok(()));
-        let absent = TranscriptViewReply { v: VIEW_V, present: false, title: None, version: None, git_branch: None, entries: Vec::new() };
+        let absent = TranscriptViewReply { v: VIEW_V, present: false, title: None, version: None, git_branch: None, entries: Vec::new(), first_parent: None };
         assert_eq!(serde_json::to_string(&absent).unwrap(), r#"{"v":1,"present":false,"entries":[]}"#);
         assert_eq!(absent.check(10), Ok(()));
         let with = |f: &dyn Fn(&mut TranscriptViewReply)| {
@@ -458,6 +485,34 @@ mod tests {
     /// name `<projects>/<slug>/<ID>.jsonl`; `--continue` and `-c` the newest
     /// session file; a file that is no view, an ID that is no session id, a
     /// symlink, a flag after `--` or as another flag's value is none.
+    /// S11 (C.2): `first_parent` is additive: a reply without it (S10's) is
+    /// written byte for byte as before; set, it comes last and round-trips;
+    /// `check()` refuses one empty, over 64 bytes or holding a NUL, and one
+    /// with no message. The view's pins (C.4) are data.
+    #[test]
+    fn first_parent_is_additive_and_checked() {
+        let good: TranscriptViewReply = serde_json::from_str(EXAMPLE).unwrap();
+        assert_eq!(good.first_parent, None);
+        assert_eq!(serde_json::to_string(&good).unwrap(), EXAMPLE, "S10's bytes without it");
+        let parent = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6f";
+        let with = TranscriptViewReply { first_parent: Some(parent.into()), ..good.clone() };
+        let json = serde_json::to_string(&with).unwrap();
+        assert_eq!(json, format!("{},\"first_parent\":\"{parent}\"}}", EXAMPLE.trim_end_matches('}')), "last");
+        assert_eq!(serde_json::from_str::<TranscriptViewReply>(&json).unwrap(), with);
+        assert_eq!(with.check(10), Ok(()));
+        assert_eq!(TranscriptViewReply { first_parent: Some("p".repeat(VIEW_ID_MAX)), ..good.clone() }.check(10), Ok(()));
+        for bad in [String::new(), "p".repeat(VIEW_ID_MAX + 1), "a\0b".to_string()] {
+            let e = TranscriptViewReply { first_parent: Some(bad.clone()), ..good.clone() }.check(10).unwrap_err();
+            assert!(e.contains("has a first parent that is empty, over 64 bytes, or holds a NUL"), "{bad:?}: {e}");
+        }
+        let empty = TranscriptViewReply { present: true, entries: Vec::new(), first_parent: Some(parent.into()), ..good.clone() };
+        assert!(empty.check(10).unwrap_err().contains("names a first parent but no message"));
+        assert_eq!((VIEW_EXT_VERSION, VIEW_READER_STRINGS.len()), ("2.1.302", 15));
+        let unique: std::collections::BTreeSet<&str> = VIEW_READER_STRINGS.iter().copied().collect();
+        assert_eq!(unique.len(), VIEW_READER_STRINGS.len());
+        assert!(VIEW_READER_STRINGS.contains(&"fetchSessionsInDir") && VIEW_READER_STRINGS.contains(&"\"claude-vscode\""));
+    }
+
     #[test]
     fn a_local_resume_finds_a_view_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -523,8 +578,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// the assistant entries between two user prompts collapse into one message
 /// (rule 4); the blocks of rule 5; the last `n` messages, the first a user's,
 /// the oldest dropped until the blocks fit `VIEW_FILE_MAX` (rule 6); the
-/// title, version, branch, uuids and timestamps of rule 7. The reply is
-/// checked before it is returned: an `Err` is a builder bug, never a tail's.
+/// title, version, branch, uuids and timestamps of rule 7; S11 (C.2.2):
+/// `first_parent`, the first message's `parentUuid` text, its chain parent
+/// (after a `/compact`, the summary or a line written after it), none for a
+/// chain root or a view without a message. The reply is checked before it
+/// is returned: an `Err` is a builder bug, never a tail's.
 pub fn build_view(tail: &[u8], n: u32) -> Result<TranscriptViewReply, String> {
     let most = n.min(VIEW_MESSAGES_MAX) as usize;
     let (nodes, title) = index_lines(tail);
@@ -567,6 +625,8 @@ pub fn build_view(tail: &[u8], n: u32) -> Result<TranscriptViewReply, String> {
         kept.pop_front();
     }
     let newest = kept.back();
+    // S11 (C.2.2): the first kept entry's chain parent (a prompt: its own node's `parentUuid`); none without one.
+    let first_parent = kept.front().and_then(|m| m.parent.clone());
     let reply = TranscriptViewReply {
         v: VIEW_V,
         present: true,
@@ -574,6 +634,7 @@ pub fn build_view(tail: &[u8], n: u32) -> Result<TranscriptViewReply, String> {
         version: newest.and_then(|m| m.version.clone()),
         git_branch: newest.and_then(|m| m.git_branch.clone()),
         entries: kept.into_iter().map(|m| ViewEntry { role: m.role, uuid: m.uuid, timestamp: m.timestamp, blocks: m.blocks }).collect(),
+        first_parent,
     };
     reply.check(n).map_err(|e| format!("build_view made a view that {e}"))?;
     Ok(reply)
@@ -761,6 +822,13 @@ fn id_of(text: Option<String>) -> String {
     text.map(without_nul).filter(|t| t.len() <= VIEW_ID_MAX).unwrap_or_default()
 }
 
+/// S11 (C.2.2): a node's `parentUuid` text as the view's `first_parent`
+/// names it: its NULs removed; none when it is no string, empty or over
+/// `VIEW_ID_MAX` bytes (`id_of`'s rule; the Mac never re-mints it).
+fn parent_of(node: &Node<'_>) -> Option<String> {
+    node.parent.clone().map(without_nul).filter(|p| !p.is_empty() && p.len() <= VIEW_ID_MAX)
+}
+
 /// A message being gathered: a prompt, or the reply collapsing the assistant
 /// entries up to the next prompt, its last entry its uuid's and timestamp's;
 /// its last `VIEW_BLOCKS_MAX` blocks kept, the earlier ones counted.
@@ -797,6 +865,9 @@ struct Kept {
     blocks: Vec<String>,
     /// Its blocks' bytes, summed.
     bytes: usize,
+    /// S11 (C.2.2): its last entry's `parentUuid` text (`parent_of`); the view's `first_parent` when it comes
+    /// first (rule 6 makes that a prompt, whose last entry is its own node).
+    parent: Option<String>,
 }
 
 /// Keep `m` among the last `most` messages: a message left without a block
@@ -822,6 +893,7 @@ fn keep(kept: &mut VecDeque<Kept>, most: usize, m: Gathered<'_, '_>) {
         git_branch: meta_of(line.git_branch),
         blocks,
         bytes,
+        parent: parent_of(m.last),
     });
     if kept.len() > most {
         kept.pop_front();
@@ -838,6 +910,12 @@ mod builder_tests {
     const EXAMPLE_TAIL: &[u8] = include_bytes!("../../tests/fixtures/view/tails/example.jsonl");
     /// A compacted chat with a rewound question.
     const BRANCHED_TAIL: &[u8] = include_bytes!("../../tests/fixtures/view/tails/branched.jsonl");
+    /// S11 (C.2.2): a chain, its compact boundary and summary, then the first turn after them (U) cut mid-reply,
+    /// at its `tool_use`.
+    const COMPACTED_TAIL: &[u8] = include_bytes!("../../tests/fixtures/view/tails/compacted-first-turn.jsonl");
+    /// The compacted tail's summary and its first turn's prompt U.
+    const SUMMARY: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4c11";
+    const U: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4c12";
 
     /// The uuid of entry `n`.
     fn id(n: u32) -> String {
@@ -1070,5 +1148,98 @@ mod builder_tests {
         assert_eq!((reply.version.as_deref(), reply.git_branch.as_deref()), (Some("2.1.302"), Some("dev")));
         let first_only = build_view(lines[..5].join("\n").as_bytes(), 50).unwrap();
         assert_eq!((first_only.version, first_only.git_branch.as_deref()), (None, Some("dev")), "a version over VIEW_META_MAX is none; a branch's NUL removed");
+    }
+
+    /// S11 (C.2.2, C-4): the first turn after a `/compact`, cut at its
+    /// `tool_use`: the view opens with that turn's prompt U, and its
+    /// `first_parent` is the summary U chains to (the boundary and the
+    /// summary never shown); a meta line written after the summary is U's
+    /// parent in its place. A view left without a message names none.
+    #[test]
+    fn a_compacted_first_turn_names_the_summary() {
+        let reply = build_view(COMPACTED_TAIL, 10).unwrap();
+        assert_eq!(texts(&reply), [(ViewRole::User, vec!["Run the slow check again"]), (ViewRole::Assistant, vec!["[tool: Bash]"])]);
+        assert_eq!((reply.entries[0].uuid.as_str(), reply.first_parent.as_deref()), (U, Some(SUMMARY)), "U opens the view; its chain parent is the summary");
+        assert_eq!(reply.check(10), Ok(()));
+        let text = serde_json::to_string(&reply).unwrap();
+        for absent in ["before the compact", "the summary, never in the view", "Conversation compacted"] {
+            assert!(!text.contains(absent), "{absent} in {text}");
+        }
+        assert_eq!(build_view(COMPACTED_TAIL, 2).unwrap().first_parent.as_deref(), Some(SUMMARY));
+        let alone = build_view(COMPACTED_TAIL, 1).unwrap();
+        assert_eq!((alone.entries.len(), alone.first_parent), (0, None), "the reply alone goes (rule 6): no message, no first parent");
+        // A command's meta line after the summary: U chains to it, and it is no message of the view.
+        let text = std::str::from_utf8(COMPACTED_TAIL).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let meta = id(0x4c20);
+        let meta_line = entry("user", &meta, Some(SUMMARY), json!("<local-command-caveat>Caveat: a meta entry, never in the view.</local-command-caveat>"), json!({"isMeta": true}));
+        let u_line = lines[4].replacen(&format!("\"parentUuid\":\"{SUMMARY}\""), &format!("\"parentUuid\":\"{meta}\""), 1);
+        assert_ne!(u_line, lines[4]);
+        let tail = [lines[..4].join("\n"), meta_line, u_line, lines[5].to_string()].join("\n") + "\n";
+        let reply = build_view(tail.as_bytes(), 10).unwrap();
+        assert_eq!((reply.entries.len(), reply.entries[0].uuid.as_str(), reply.first_parent.as_deref()), (2, U, Some(meta.as_str())));
+    }
+
+    /// S11 (C.2.2): the branched tail's first message (the first prompt
+    /// after its compact) names its summary; asked for the last two
+    /// messages, the first is the live branch's prompt, which names the
+    /// reply it was asked after.
+    #[test]
+    fn the_branched_tail_names_its_summary() {
+        let reply = build_view(BRANCHED_TAIL, 10).unwrap();
+        assert_eq!(reply.entries[0].blocks, ["First question after the compact"]);
+        assert_eq!(reply.first_parent.as_deref(), Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4b11"), "its summary");
+        let two = build_view(BRANCHED_TAIL, 2).unwrap();
+        assert_eq!(two.entries[0].blocks, ["The question asked instead"]);
+        assert_eq!(two.first_parent.as_deref(), Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4b13"), "the first answer, on the live branch");
+    }
+
+    /// S11 (C.2.2): a first message that is its chain's root (`parentUuid`
+    /// null) names no first parent: the example tail (S10's golden view, byte
+    /// for byte), a chat's first prompt, an empty tail.
+    #[test]
+    fn a_chain_root_names_no_first_parent() {
+        let reply = build_view(EXAMPLE_TAIL, 10).unwrap();
+        assert_eq!((reply.entries[0].uuid.as_str(), reply.first_parent.as_deref()), ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a60", None));
+        assert_eq!(serde_json::to_string(&reply).unwrap(), tests_example(), "S10's golden view, byte for byte");
+        let reply = build_view(chat(3).as_bytes(), 50).unwrap();
+        assert_eq!((reply.entries.len(), reply.entries[0].uuid.clone(), reply.first_parent), (6, id(16), None));
+        assert_eq!(build_view(b"", 10).unwrap().first_parent, None);
+    }
+
+    /// S11 (C.2.2): `first_parent` is the first message's `parentUuid` text
+    /// whether or not its node is in the tail (the last ten messages of a
+    /// chat begin mid-chain; a tail cut before a prompt starts the chain at
+    /// it; a tail torn inside the prompt's line starts it at its reply,
+    /// which rule 6 drops). The text as it is: its NULs removed; none when it
+    /// is no string, empty or over `VIEW_ID_MAX` bytes.
+    #[test]
+    fn a_tail_cut_mid_chain_names_the_parent_uuid_text() {
+        let tail = chat(12);
+        let reply = build_view(tail.as_bytes(), 10).unwrap();
+        assert_eq!((reply.entries[0].uuid.clone(), reply.first_parent.clone()), (id(8 * 16), Some(id(7 * 16 + 5))), "turn 7's last reply, in the tail");
+        let lines: Vec<&str> = tail.lines().collect();
+        let at = lines.iter().position(|l| l.contains(&format!("\"uuid\":\"{}\"", id(8 * 16)))).unwrap();
+        let cut = lines[at..].join("\n");
+        let reply = build_view(cut.as_bytes(), 50).unwrap();
+        assert_eq!((reply.entries[0].uuid.clone(), reply.first_parent.clone()), (id(8 * 16), Some(id(7 * 16 + 5))), "the text, though its node is not in the tail");
+        let torn = build_view(&cut.as_bytes()[10..], 50).unwrap();
+        assert_eq!((torn.entries[0].uuid.clone(), torn.first_parent.clone()), (id(9 * 16), Some(id(8 * 16 + 5))));
+        let answer = entry("assistant", &id(2), Some(&id(1)), json!([{"type": "text", "text": "ok"}]), json!({}));
+        let cases = [
+            (json!("0199a1b2-c3d4-7e5f-8a9b-\u{0}00000000000f"), Some("0199a1b2-c3d4-7e5f-8a9b-00000000000f".to_string())),
+            (json!("p".repeat(VIEW_ID_MAX)), Some("p".repeat(VIEW_ID_MAX))),
+            (json!("p".repeat(VIEW_ID_MAX + 1)), None),
+            (json!(""), None),
+            (json!("\u{0}"), None),
+            (json!(7), None),
+            (Value::Null, None),
+        ];
+        for (parent, want) in cases {
+            let prompt = entry("user", &id(1), None, json!("go"), json!({"parentUuid": parent.clone()}));
+            let reply = build_view(format!("{prompt}\n{answer}\n").as_bytes(), 10).unwrap();
+            assert_eq!((reply.entries.len(), reply.first_parent.clone()), (2, want), "{parent}");
+            assert_eq!(reply.check(10), Ok(()), "{parent}");
+        }
     }
 }

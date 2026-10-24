@@ -210,7 +210,7 @@ async fn a_codeout_answer_splits_into_its_manifest_and_pack() {
     let server = Server::start(vec![answer(200, framed(&manifest, &pack)), answer(200, framed(&manifest, &pack)), answer(204, Vec::new()), answer(200, framed(&bad, &pack))]).await;
     let (dp, t) = (server.dp(), target());
     let dir = tempfile::tempdir().unwrap();
-    let req = CodeoutRequest { path: "/w".into(), haves: vec![H.into()], wip: true, max_bytes: 1024 };
+    let req = CodeoutRequest { path: "/w".into(), haves: vec![H.into()], wip: true, max_bytes: 1024, manifest_when_empty: false };
     let dest = dir.path().join("in.pack");
     let r = dp.post_codeout(&t, &token(9418), &req, &dest, 1024).await.unwrap();
     let body = r.body.unwrap();

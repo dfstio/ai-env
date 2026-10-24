@@ -745,12 +745,14 @@ exit 1
 "#;
 
 /// [`TOOL_PROBE`] as the tools doctor probes beside its AWS rows: the
-/// toolchain, the cross tools and claude. Each new file runs once here:
-/// macOS assesses a new executable at its first exec, which on a busy Mac can
-/// outlast doctor's 5 s probes.
+/// toolchain, the cross tools and claude; and git, logged the same way (S11
+/// B3-R1: doctor's image scan finds the checkout without running git, so a git
+/// that ever runs must inherit no credential either). Each new file runs once
+/// here: macOS assesses a new executable at its first exec, which on a busy Mac
+/// can outlast doctor's 5 s probes.
 fn log_probed_tools(env: &Env) {
     use std::os::unix::fs::PermissionsExt as _;
-    for name in ["claude", "rustup", "cargo-lambda", "zig"] {
+    for name in ["claude", "rustup", "cargo-lambda", "zig", "git"] {
         let dest = env.root().join("bin").join(name);
         fs::write(&dest, TOOL_PROBE).unwrap();
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
@@ -774,6 +776,13 @@ fn doctor_never_unseals_and_names_ai_env_as_ops_for_a_root_caller() {
     seal_ops(&env, keys::OPS_TAIL);
     refuse_tools(&env);
     log_probed_tools(&env);
+    // S11 (B3-R1): a recorded workspace root, so doctor's pre-push row runs git there (`review::hook_state`): the
+    // logged stand-in, which must inherit no credential under `ai-env as ops` either.
+    let ws_root = env.root().join("work").display().to_string();
+    let rows = env.root().join("bridge").join("state").join("workspaces");
+    fs::create_dir_all(env.root().join("work")).unwrap();
+    fs::create_dir_all(&rows).unwrap();
+    fs::write(rows.join("work.toml"), format!("v = 1\n\n[ws.\"{ws_root}\"]\nroot = \"{ws_root}\"\n")).unwrap();
     let probe_log = env.root().join("probes.log");
     let doctor = |extra: &[(&str, &str)]| {
         reset(&env);
@@ -838,7 +847,9 @@ fn doctor_never_unseals_and_names_ai_env_as_ops_for_a_root_caller() {
     for tool in ["rustup run", "zig version", "claude --version", "claude auth status --json"] {
         assert!(probes.iter().any(|l| l.starts_with(tool)), "{tool} was probed: {probes:?}");
     }
-    assert!(probes.iter().all(|l| l.ends_with(" | -")), "a probed tool saw a credential: {probes:?}");
+    // S11 (B3-R1): and the pre-push row's git on the recorded root (GitRun's `-c` overrides first).
+    assert!(probes.iter().any(|l| l.starts_with("git ") && l.contains(" rev-parse --git-dir |")), "git ran on the recorded root: {probes:?}");
+    assert!(probes.iter().all(|l| l.ends_with(" | -")), "a probed tool (or git) saw a credential: {probes:?}");
     // The ops runner's key refused: running it again would unseal the same key, so the row says to re-seal it (D23).
     let mut refused = ops_vars.clone();
     refused.push(("FAKE_AWS_KEY_USERS", "9001:ai-env-deployer"));

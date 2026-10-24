@@ -296,7 +296,7 @@ impl<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource> SyncCtx<'_, A, D, T> 
                     let fp = end_fp(&stat_now)?;
                     match self.push(sid, "segment", &rel, &key, from, len, &sha).await? {
                         PushOutcome::Stored(version) => {
-                            man.commit_segment(ManifestPart { key: key.render(), version_id: version, from, len, sha256: sha }, &fp, stat_now.ino, &vm, &at);
+                            man.commit_segment(ManifestPart { key: key.render(), version_id: version, from, len, sha256: sha, encoding: None, stored_len: None, stored_sha256: None }, &fp, stat_now.ino, &vm, &at);
                             report.pushed = Some(Pushed { kind: "segment", from, len, key: key.render() });
                             break;
                         }
@@ -324,7 +324,7 @@ impl<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource> SyncCtx<'_, A, D, T> 
                     let key = S3Key::Base { session: sid.to_string(), gen };
                     match self.push(sid, "base", &rel, &key, 0, len, &sha).await? {
                         PushOutcome::Stored(version) => {
-                            man.commit_base(gen, ManifestPart { key: key.render(), version_id: version, from: 0, len, sha256: sha }, &fp, stat_now.ino, &vm, &at);
+                            man.commit_base(gen, ManifestPart { key: key.render(), version_id: version, from: 0, len, sha256: sha, encoding: None, stored_len: None, stored_sha256: None }, &fp, stat_now.ino, &vm, &at);
                             if first_commit {
                                 // A chat closed before its first sync left its whole transcript as a tail from 0, if any.
                                 supersede(man, S3Key::Tail { session: sid.to_string(), gen: 1, offset: 0 }.render());
@@ -412,7 +412,7 @@ impl<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource> SyncCtx<'_, A, D, T> 
                 }
             };
             pushed += 1;
-            files.push(ManifestFile { rel: f.rel.clone(), key: key.render(), version_id: version, len: f.size, sha256: f.sha256.clone() });
+            files.push(ManifestFile { rel: f.rel.clone(), key: key.render(), version_id: version, len: f.size, sha256: f.sha256.clone(), encoding: None, stored_len: None, stored_sha256: None });
         }
         for kept in &man.files {
             if !files.iter().any(|f| f.rel == kept.rel) {
@@ -648,7 +648,7 @@ impl<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource> SyncCtx<'_, A, D, T> 
     /// that fails its check is (plans/s9-contracts.md §6.3 rule 1): the old
     /// view stays, the row says `refused`.
     pub async fn write_view(&self, sid: &str, rel: &str) -> Result<ViewOutcome, BridgeError> {
-        let q = ViewQuery { rel: rel.to_string(), n: self.sync.view_messages };
+        let q = ViewQuery { rel: rel.to_string(), n: self.sync.view_messages, parent: false };
         let refuse = |why: String| {
             let outcome = ViewOutcome::Refused(why);
             audit_view(self.paths, sid, &self.target.vm_id, &outcome);
@@ -703,7 +703,7 @@ pub fn write_placeholder_view(sync: &TranscriptSync, sid: &str, rules: &Rules) -
     }
     let now = crate::wire::time::rfc3339_utc_ms(crate::wire::time::unix_now_ms());
     let entry = ViewEntry { role: ViewRole::User, uuid: String::new(), timestamp: now, blocks: vec![PLACEHOLDER_TEXT.to_string()] };
-    let reply = TranscriptViewReply { v: VIEW_V, present: true, title: Some(PLACEHOLDER_TITLE.to_string()), version: None, git_branch: None, entries: vec![entry] };
+    let reply = TranscriptViewReply { v: VIEW_V, present: true, title: Some(PLACEHOLDER_TITLE.to_string()), version: None, git_branch: None, entries: vec![entry], first_parent: None };
     crate::bridge::view::write_view(&target, &reply, sync.view_messages, rules).map(Some)
 }
 

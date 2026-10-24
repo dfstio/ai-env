@@ -2888,11 +2888,11 @@ impl Ctx {
     /// file answers `present: false`.
     fn transcript_view(&self, projects: &Path, rel: &str, n: u32) -> Step<TranscriptViewReply> {
         use crate::wire::view::{build_view, VIEW_TAIL_MAX, VIEW_V};
-        let q = crate::wire::workspace::ViewQuery { rel: rel.to_string(), n };
+        let q = crate::wire::workspace::ViewQuery { rel: rel.to_string(), n, parent: false };
         if let Err(e) = q.check() {
             return refuse(refusal::BAD_REQUEST, &if e.starts_with("the ") { e } else { format!("the view query {e}") });
         }
-        let absent = TranscriptViewReply { v: VIEW_V, present: false, title: None, version: None, git_branch: None, entries: Vec::new() };
+        let absent = TranscriptViewReply { v: VIEW_V, present: false, title: None, version: None, git_branch: None, entries: Vec::new(), first_parent: None };
         let Some(at) = self.transcript_at(projects, rel, false)? else { return Ok(absent) };
         let AtName::File(file) = at.open(self, "the transcript")? else { return Ok(absent) };
         let size = file.metadata()?.len();

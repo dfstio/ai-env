@@ -127,18 +127,32 @@ fn audit_request(paths: &Paths, sid: &str, nonce: &str, how: &str, wrapper_pid: 
     }
 }
 
-/// What the move came to, as the command reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Moved {
-    outcome: String,
-    how: &'static str,
-    from_vm: String,
-    to_vm: Option<String>,
-    ms: u64,
-    /// The command's exit (the row's `code` for a failure).
-    code: i32,
+/// What a move came to (S11, B.1: public for the panel): the CLI's `report` prints it, the panel renders it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Moved {
+    pub outcome: String,
+    /// `live` or `offline`.
+    pub how: &'static str,
+    pub from_vm: String,
+    pub to_vm: Option<String>,
+    pub ms: u64,
+    /// The command's exit: 0, or the answer's `code` (3, 5, 7, 8, 9; else 1).
+    pub code: i32,
     /// What failed, for the error line (none for `done`).
-    why: Option<String>,
+    pub why: Option<String>,
+}
+
+impl Moved {
+    /// `report`'s line for `sid`: `session <sid>: moved from <old> to <new> (<how>)` when `code` is 0, else
+    /// `session <sid>: <why>` (the line of the error `report` returns, its exit `code`).
+    #[must_use]
+    pub fn line(&self, sid: &str) -> String {
+        if self.code == 0 {
+            format!("session {sid}: moved from {} to {} ({})", self.from_vm, self.to_vm.as_deref().unwrap_or("-"), self.how)
+        } else {
+            format!("session {sid}: {}", self.why.as_deref().unwrap_or("the move failed"))
+        }
+    }
 }
 
 /// `ai-env session migrate UUID [--json]` (the module doc), as S10 wave 1c
@@ -160,21 +174,28 @@ struct Moved {
 /// - Output: `session <sid>: moved from <old> to <new> (<live|offline>)`;
 ///   `--json`: one document `{"session","outcome","how","from_vm","to_vm","ms","code"}`.
 pub fn cmd_migrate(store: &Keystore, uuid: &str, json: bool) -> crate::errors::Result<()> {
+    report(uuid, &migrate(store, uuid, &uuid::Uuid::now_v7().to_string())?, json)
+}
+
+/// `cmd_migrate`'s body without `report` (S11, B.1: the panel's too): the checks before any Touch ID, then the
+/// live or the offline move with `nonce` as the request's (the live wrapper's `session_move_end` carries it as
+/// `request`; the offline move audits it in `session_migrate_request`). `Ok` for every answered move, whatever its
+/// outcome (`code` says it); `Err` for a refusal before the move and for an offline move's error.
+pub fn migrate(store: &Keystore, uuid: &str, nonce: &str) -> crate::errors::Result<Moved> {
     if !registry::is_uuid(uuid) {
         return Err(CliError::Usage(format!("not a session id: {uuid}")));
     }
     let paths = Paths::resolve()?;
     let row = target(&paths, uuid)?;
     let old = row.microvm_id.clone().unwrap_or_default();
-    let moved = if live_wrapper(&row) {
+    if live_wrapper(&row) {
         if row.v < 2 {
             return Err(CliError::Msg(format!("session {uuid}'s wrapper (pid {}) predates S10: close the chat and reopen it, then run ai-env session migrate again", row.pid)));
         }
-        migrate_live(&paths, &row, &old)?
+        migrate_live(&paths, &row, &old, nonce)
     } else {
-        migrate_offline(store, &paths, &row, &old)?
-    };
-    report(uuid, &moved, json)
+        migrate_offline(store, &paths, &row, &old, nonce)
+    }
 }
 
 /// The checks before any Touch ID (the module doc): the row, of a remote
@@ -229,10 +250,9 @@ fn live_wrapper(row: &SessionRow) -> bool {
 /// wrapper's answer (its `session_move_end` with the nonce) read off
 /// `audit.jsonl` from where it ended when the request went, at most
 /// [`MIGRATE_WAIT`]; the wrapper gone before it is exit 8.
-fn migrate_live(paths: &Paths, row: &SessionRow, old: &str) -> crate::errors::Result<Moved> {
+fn migrate_live(paths: &Paths, row: &SessionRow, old: &str, nonce: &str) -> crate::errors::Result<Moved> {
     let sid = &row.session_id;
-    let nonce = uuid::Uuid::now_v7().to_string();
-    let req = MigrateRequest { v: 1, nonce: nonce.clone(), requested_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), by_pid: std::process::id() };
+    let req = MigrateRequest { v: 1, nonce: nonce.to_string(), requested_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()), by_pid: std::process::id() };
     let started = std::time::Instant::now();
     let mut from = std::fs::metadata(paths.audit()).map_or(0, |m| m.len());
     write_request(paths, sid, &req)?;
@@ -243,19 +263,23 @@ fn migrate_live(paths: &Paths, row: &SessionRow, old: &str) -> crate::errors::Re
         let _ = registry::remove_if_present(&paths.session_migrate_request(sid));
         return Err(CliError::Msg(format!("session {sid}'s wrapper (pid {}) could not be signalled: {e}", row.pid)));
     }
-    audit_request(paths, sid, &nonce, "live", Some(row.pid));
+    audit_request(paths, sid, nonce, "live", Some(row.pid));
     let until = started + MIGRATE_WAIT;
+    // S11: the audit's own reader (`audit::read::since`), the answer the `session_move_end` whose `request` is the nonce.
+    let answer_in = |rows: &[crate::bridge::audit::read::Read]| {
+        rows.iter().find(|r| r.event == crate::bridge::remote::audit_event::SESSION_MOVE_END && r.detail.get("request").map(String::as_str) == Some(nonce)).map(|r| serde_json::to_value(&r.detail).unwrap_or_default())
+    };
     loop {
-        let (rows, next) = audit_since(&paths.audit(), from);
+        let (rows, next) = crate::bridge::audit::read::since(&paths.audit(), from);
         from = next;
-        if let Some(answer) = rows.iter().find(|r| r["event"] == crate::bridge::remote::audit_event::SESSION_MOVE_END && r["detail"]["request"] == nonce.as_str()) {
-            return Ok(answered(&answer["detail"], old, started));
+        if let Some(detail) = answer_in(&rows) {
+            return Ok(answered(&detail, old, started));
         }
         if !registry::pid_alive(row.pid) {
             // One more read: the wrapper may have answered as it ended.
-            let (rows, _) = audit_since(&paths.audit(), from);
-            if let Some(answer) = rows.iter().find(|r| r["event"] == crate::bridge::remote::audit_event::SESSION_MOVE_END && r["detail"]["request"] == nonce.as_str()) {
-                return Ok(answered(&answer["detail"], old, started));
+            let (rows, _) = crate::bridge::audit::read::since(&paths.audit(), from);
+            if let Some(detail) = answer_in(&rows) {
+                return Ok(answered(&detail, old, started));
             }
             return Err(CliError::VmLost(format!("session {sid}'s wrapper (pid {}) exited before it answered the move", row.pid)));
         }
@@ -264,22 +288,6 @@ fn migrate_live(paths: &Paths, row: &SessionRow, old: &str) -> crate::errors::Re
         }
         std::thread::sleep(POLL);
     }
-}
-
-/// The rows of `path` past byte `from` (whole lines only), and where the next read starts.
-fn audit_since(path: &Path, from: u64) -> (Vec<serde_json::Value>, u64) {
-    use std::io::{Read as _, Seek as _};
-    let Ok(mut f) = std::fs::File::open(path) else { return (Vec::new(), from) };
-    if f.seek(std::io::SeekFrom::Start(from)).is_err() {
-        return (Vec::new(), from);
-    }
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return (Vec::new(), from);
-    }
-    let end = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-    let rows = buf[..end].split(|b| *b == b'\n').filter(|l| !l.is_empty()).filter_map(|l| serde_json::from_slice(l).ok()).collect();
-    (rows, from + end as u64)
 }
 
 /// The wrapper's answer (its `session_move_end`'s detail) as the command
@@ -309,12 +317,12 @@ fn report(sid: &str, m: &Moved, json: bool) -> crate::errors::Result<()> {
         let doc = serde_json::json!({ "session": sid, "outcome": m.outcome, "how": m.how, "from_vm": m.from_vm, "to_vm": m.to_vm, "ms": m.ms, "code": m.code });
         outln!("{}", serde_json::to_string_pretty(&doc).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?);
     } else if m.code == 0 {
-        outln!("session {sid}: moved from {} to {} ({})", m.from_vm, m.to_vm.as_deref().unwrap_or("-"), m.how);
+        outln!("{}", m.line(sid));
     }
     if m.code == 0 {
         return Ok(());
     }
-    let why = format!("session {sid}: {}", m.why.as_deref().unwrap_or("the move failed"));
+    let why = m.line(sid);
     Err(match m.code {
         3 => {
             eprintln!("ai-env: {why}");
@@ -369,7 +377,7 @@ impl Drop for Migrating<'_> {
 
 /// The offline flow (the module doc): one Touch ID (the runtime key alone),
 /// the move, the row rewritten; its row `migrating` throughout.
-fn migrate_offline(store: &Keystore, paths: &Paths, row: &SessionRow, old: &str) -> crate::errors::Result<Moved> {
+fn migrate_offline(store: &Keystore, paths: &Paths, row: &SessionRow, old: &str, nonce: &str) -> crate::errors::Result<Moved> {
     use crate::bridge::vm::cmd::{backend, runtime, Backend, Ctx};
     let sid = &row.session_id;
     let ctx = Ctx::load()?;
@@ -379,8 +387,7 @@ fn migrate_offline(store: &Keystore, paths: &Paths, row: &SessionRow, old: &str)
     let sync = crate::bridge::s3::TranscriptSync::for_workspace(&ctx.paths, &ctx.cfg, &ctx.knobs, &ws, &projects)?;
     let rt = runtime()?;
     let _held = Migrating::hold(paths, row)?;
-    let nonce = uuid::Uuid::now_v7().to_string();
-    audit_request(paths, sid, &nonce, "offline", None);
+    audit_request(paths, sid, nonce, "offline", None);
     let started = std::time::Instant::now();
     let to = rt.block_on(async {
         match backend(store, &ctx).await? {
@@ -419,6 +426,8 @@ where
     plan.workspace_cap = true;
     plan.transcript_cap = true;
     plan.avoid = vec![old.to_string()];
+    // S11 (L5): a gzip-staged chat is restored only on a VM that decodes it.
+    plan.caps_required = crate::bridge::s3::manifest::caps_required(&ctx.paths, sid);
     let selected = run::select_vm_detailed(&**api, &ctx.paths, &plan, ctx.poll(Poll::RUNNING)).await.map_err(|f| f.error)?;
     let (vm_row, vm) = (selected.row().clone(), selected.vm().clone());
     let (vm_row, caps) = workspace_caps(ctx, &**api, ep, vm_row).await?;

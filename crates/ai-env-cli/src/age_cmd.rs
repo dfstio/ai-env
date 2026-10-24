@@ -905,7 +905,9 @@ mod tests {
             kill.kill_group();
             t.elapsed()
         });
-        assert!(held < Duration::from_millis(200), "kill_group held the runtime's thread {held:?}");
+        // Holding the thread for the SIGKILL step costs KILL_AFTER_TERM at least (this group ignores its TERM); the
+        // hand-off returns at once, though a loaded gate has seen it take over 200 ms (S10 I1, S11 final gate).
+        assert!(held < KILL_AFTER_TERM, "kill_group held the runtime's thread {held:?}");
         let t = Instant::now();
         join_kills();
         let (joined, since_term) = (t.elapsed(), term.elapsed());

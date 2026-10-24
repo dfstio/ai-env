@@ -63,13 +63,22 @@ holds no token. `src/wire/ratelimit.rs` and `src/bridge/authwatch.rs` read
 it (a usage limit, never a refusal), and `tests/fakes/claude-v2.sh`'s
 `FAKE_USAGE_LIMIT` prints its shape.
 
-`rate-limit-event-constructed-2.1.305.jsonl` is constructed, not captured:
-two `rate_limit_event` lines built from the `rate_limit_info` schema in
-claude 2.1.305's bundle (read as data), for the parsers until part B
-records a real one. The first is an `allowed_warning` with both unified
-windows (`five_hour` 23 %, `seven_day` 81 %) beside the top-level
-`rateLimitType`, `utilization`, `resetsAt`, `overageStatus`,
-`isUsingOverage` and `surpassedThreshold`; the second a `rejected` one
-(`seven_day`, `utilization` 1.02, `overageStatus` rejected) with no
-windows. Their times are unix seconds of 21-24 Oct 2026 and their ids made
-up. `src/wire/ratelimit.rs`'s tests read them.
+`rate-limit-event-2.1.306.jsonl` is claude 2.1.306's own: the two
+`rate_limit_event` lines of S10's A1 check (21 Oct 2026,
+`target/s8/a1-check.json`, the `accounts[].lines.rate_limit_event` strings
+its `--json` wrote, scrubbed there), copied verbatim by a one-line script
+that printed nothing (S11, C6). The first is an `allowed` one with both
+unified windows (`five_hour` 2 %, `seven_day` 0, an integer) beside the
+top-level `resetsAt` and `rateLimitType` (`five_hour`), `overageStatus`,
+`overageDisabledReason` and `isUsingOverage`; the second a `rejected` one
+(`seven_day`, whose window is at 1, an integer) with both windows. Neither
+has a top-level `utilization` or a `surpassedThreshold`. Their times are
+unix seconds of 21-24 Oct 2026 and their ids that check's turns'; they hold
+no token (`grep -c sk-ant-` is 0, and
+`the_real_rate_limit_fixture_holds_no_secret` in
+`src/bridge/accounts/usage.rs` runs the scrubber and the built-in
+tripwires over them). `src/wire/ratelimit.rs`'s,
+`src/bridge/accounts/usage.rs`'s and `src/bridge/accounts/check.rs`'s
+tests read them. The two shapes no real line has shown yet, an
+`allowed_warning` with both windows and a `rejected` one with none, are
+inline JSON in those tests (S10's constructed file, deleted in S11).

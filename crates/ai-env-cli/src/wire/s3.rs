@@ -69,6 +69,10 @@ pub const EGRESS_CHECK_PREFIX: &str = "v1/_egress-check/";
 /// The egress check's key outside [`KEY_PREFIX`] (`s3-own-outside-prefix`):
 /// never written, IAM refuses it.
 pub const OUTSIDE_PROBE_PREFIX: &str = "x/_egress-check/";
+/// S11 (A.2): a Claude Code version's linux-arm64 binary, as a stager VM put it. Its `/mac/` segment puts it
+/// under the bucket policy's `DenyMacWritesThroughTheEndpoint` (`v1/*/mac/*`): no VM writes it through the
+/// endpoint; the stager's PUT comes from outside it (infra/policies.ts:494-497).
+pub const CLAUDE_PREFIX: &str = "v1/_claude/mac/";
 
 /// One object of the store. [`S3Key::render`] and [`S3Key::parse`] are
 /// inverse: a key `parse` refuses names nothing of ours.
@@ -88,6 +92,8 @@ pub enum S3Key {
     EgressCheck { nonce: String },
     /// `x/_egress-check/<nonce>`, the same nonce: no session, not the VM's.
     OutsideProbe { nonce: String },
+    /// S11: `v1/_claude/mac/<version>/<sha256>`: the raw bytes (no Content-Encoding) whose sha256 names them.
+    Claude { version: String, sha256: String },
 }
 
 /// 64 lowercase hex digits (a sha256).
@@ -124,12 +130,14 @@ impl S3Key {
             S3Key::File { session, sha256 } => format!("{KEY_PREFIX}{session}/vm/f/{sha256}"),
             S3Key::EgressCheck { nonce } => format!("{EGRESS_CHECK_PREFIX}{nonce}"),
             S3Key::OutsideProbe { nonce } => format!("{OUTSIDE_PROBE_PREFIX}{nonce}"),
+            S3Key::Claude { version, sha256 } => format!("{CLAUDE_PREFIX}{version}/{sha256}"),
         }
     }
 
     /// The object `key` names, `None` for any other text: a session id
     /// (`wire::workspace::is_uuid`), sha256s of 64 lowercase hex, a
-    /// generation in canonical decimal, an offset of 16 lowercase hex digits.
+    /// generation in canonical decimal, an offset of 16 lowercase hex digits;
+    /// S11's claude key a version `wire::pin::is_version` takes, then a sha256.
     #[must_use]
     pub fn parse(key: &str) -> Option<S3Key> {
         if let Some(nonce) = key.strip_prefix(EGRESS_CHECK_PREFIX) {
@@ -137,6 +145,10 @@ impl S3Key {
         }
         if let Some(nonce) = key.strip_prefix(OUTSIDE_PROBE_PREFIX) {
             return is_nonce(nonce).then(|| S3Key::OutsideProbe { nonce: nonce.to_string() });
+        }
+        if let Some(rest) = key.strip_prefix(CLAUDE_PREFIX) {
+            let (version, sha) = rest.split_once('/')?;
+            return (crate::wire::pin::is_version(version) && is_sha256_hex(sha)).then(|| S3Key::Claude { version: version.to_string(), sha256: sha.to_string() });
         }
         let rest = key.strip_prefix(KEY_PREFIX)?;
         let segs: Vec<&str> = rest.split('/').collect();
@@ -151,12 +163,12 @@ impl S3Key {
         }
     }
 
-    /// The session it belongs to (none for the egress check's keys).
+    /// The session it belongs to (none for the egress check's keys and a claude binary's).
     #[must_use]
     pub fn session(&self) -> Option<&str> {
         match self {
             S3Key::Mac { session, .. } | S3Key::Base { session, .. } | S3Key::Segment { session, .. } | S3Key::Tail { session, .. } | S3Key::File { session, .. } => Some(session),
-            S3Key::EgressCheck { .. } | S3Key::OutsideProbe { .. } => None,
+            S3Key::EgressCheck { .. } | S3Key::OutsideProbe { .. } | S3Key::Claude { .. } => None,
         }
     }
 
@@ -200,6 +212,10 @@ pub const SIGNED_HEADERS_PUT: &str = "content-length;host;if-none-match;x-amz-ch
 pub const SIGNED_HEADERS_GET: &str = "host;x-amz-expected-bucket-owner";
 /// a tail's (no length or checksum: the tail's bytes are unknown when it is signed).
 pub const SIGNED_HEADERS_TAIL: &str = "host;if-none-match;x-amz-expected-bucket-owner";
+/// S11: the largest claude binary a stage or a fetch moves (290 MB today).
+pub const CLAUDE_MAX: u64 = 1 << 30;
+/// S11: a claude fetch's presigned GET and a relay's presigned PUT live this long (a fetch may wait its turn in the shim).
+pub const CLAUDE_EXPIRY: Duration = Duration::from_secs(900);
 
 /// The `x-amz-checksum-sha256` value (base64 of the 32 bytes) of a lowercase-hex digest; `None` for any other text.
 #[must_use]
@@ -539,6 +555,39 @@ mod tests {
         for bad in ["https://10.42.0.10:3128", "http://8.8.8.8:3128", "http://10.42.0.10", "http://10.42.0.10:0", "http://10.42.0.10:03128", "http://010.42.0.10:3128", "http://10.42.0.10:3128/", "http://user@10.42.0.10:3128", "http://10.42.0.10:+3128"] {
             assert!(proxy_check(bad).is_err(), "{bad}");
         }
+    }
+
+    /// S11 (A §1.2): `v1/_claude/mac/<version>/<sha256>` renders and parses
+    /// back, names no session and is no VM key; every near miss is none of
+    /// the store's: an uppercase or short sha, a version that is not N.N.N
+    /// (`2.1`, `2.1.308-beta`, empty), no `mac`, `vm` for `mac`, a segment more.
+    #[test]
+    fn claude_keys_render_parse_and_refuse_near_misses() {
+        let key = S3Key::Claude { version: "2.1.308".into(), sha256: SHA.into() };
+        let text = format!("v1/_claude/mac/2.1.308/{SHA}");
+        assert_eq!(key.render(), text);
+        assert_eq!(S3Key::parse(&text), Some(key.clone()));
+        assert_eq!((key.session(), key.is_vm()), (None, false));
+        assert!(text.starts_with(CLAUDE_PREFIX) && text.starts_with(KEY_PREFIX));
+        for bad in [
+            format!("v1/_claude/mac/2.1.308/{}", SHA.to_uppercase()),
+            format!("v1/_claude/mac/2.1.308/{}", &SHA[..63]),
+            format!("v1/_claude/mac/2.1/{SHA}"),
+            format!("v1/_claude/mac/2.1.308-beta/{SHA}"),
+            format!("v1/_claude/mac//{SHA}"),
+            format!("v1/_claude/2.1.308/{SHA}"),
+            format!("v1/_claude/vm/2.1.308/{SHA}"),
+            format!("v1/_claude/mac/2.1.308/{SHA}/x"),
+            format!("v1/_claude/mac/2.1.308/{SHA}/"),
+            "v1/_claude/mac/2.1.308".to_string(),
+            "v1/_claude/mac/".to_string(),
+            format!("x/_claude/mac/2.1.308/{SHA}"),
+        ] {
+            assert_eq!(S3Key::parse(&bad), None, "{bad}");
+        }
+        assert_eq!(check_url(&url(&text, "", SIGNED_HEADERS_GET, 900, '9')), Ok(()), "a presigned GET of it is one of the store's");
+        assert_eq!((CLAUDE_MAX, CLAUDE_EXPIRY), (1 << 30, Duration::from_secs(900)));
+        const { assert!(CLAUDE_EXPIRY.as_secs() <= TAIL_EXPIRY.as_secs(), "check_url takes its X-Amz-Expires") };
     }
 
     /// The URL's rules, and its custody: registered with the scrubber while

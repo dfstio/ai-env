@@ -332,6 +332,20 @@ impl RemoteRig {
             if ai_env_cli::shim::agent::PARK_SERVED {
                 s.health_caps.push(CAP_PARK_V1.to_string());
             }
+            // S11, each under its flag as the shim names it (§1 of the contracts' index): part C's three (the rig's
+            // shims have a helper; the transfer caps also need `s3xfer::SERVED`), then part A's (they have a store).
+            if ai_env_cli::shim::code::MANIFEST_SERVED {
+                s.health_caps.push(ai_env_cli::wire::frame::CAP_CODEOUT_MANIFEST_V1.to_string());
+            }
+            if ai_env_cli::shim::s3xfer::SERVED && ai_env_cli::shim::s3xfer::VIEW_PARENT_SERVED {
+                s.health_caps.push(ai_env_cli::wire::frame::CAP_VIEW_PARENT_V1.to_string());
+            }
+            if ai_env_cli::shim::s3xfer::SERVED && ai_env_cli::shim::s3xfer::GZIP_SERVED {
+                s.health_caps.push(ai_env_cli::wire::frame::CAP_TRANSCRIPT_GZIP_V1.to_string());
+            }
+            if ai_env_cli::shim::claudebin::SERVED {
+                s.health_caps.push(ai_env_cli::wire::frame::CAP_CLAUDE_STAGE_V1.to_string());
+            }
             s.health_detail_at = Some(at);
         });
         rig
@@ -1147,5 +1161,54 @@ impl super::Prepared {
     /// audit and the fakes' logs it writes are the rig's tempdir's.
     pub fn launch_wrapper(self, cmd: Command) -> super::Harness {
         self.launch(cmd)
+    }
+}
+
+// ---- S11 (A3): a staged claude for the rig (plans/s11-contracts-A.md §9.5) -----------------------------------
+
+impl RemoteRig {
+    /// S11 (A.4): `version`'s staged binary: claude-v2.sh's bytes reporting `version` and reading the rig's
+    /// `vm-claude.knobs`, with `defaults` embedded (`curl::fake_claude_bytes`), put in the rig's fake S3 at its
+    /// `S3Key::Claude`, and a `staged` record of it under the rig's bridge root (signed, admitted and staged as
+    /// A2's writers leave one). A VM fetches it through the real route (`POST /claude/stage`). Its ref.
+    pub fn stage_claude(&self, version: &str, defaults: &[(&str, &str)]) -> ai_env_cli::wire::workspace::ClaudeRef {
+        use ai_env_cli::bridge::claude::{AdmissionRow, Record, SignatureRow, StagingRow};
+        use sha2::Digest as _;
+        let bytes = super::curl::fake_claude_bytes(version, Some(&self.root.join("vm-claude.knobs")), defaults);
+        let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        let cref = ai_env_cli::wire::workspace::ClaudeRef { version: version.to_string(), sha256: sha256.clone() };
+        let key = cref.key().render();
+        let version_id = self.s3.put(&key, &bytes);
+        let size = u64::try_from(bytes.len()).expect("a size");
+        Record::update(&self.paths(), version, |r| {
+            let at = "2026-10-23T10:00:00Z".to_string();
+            r.signature = Some(SignatureRow { outcome: "ok".into(), linux_sha256: Some(sha256.clone()), linux_size: Some(size), at: at.clone(), ..SignatureRow::default() });
+            r.admission = Some(AdmissionRow { outcome: "admitted".into(), markers: Some("ok".into()), ai_env: "0.1.0".into(), at: at.clone(), ..AdmissionRow::default() });
+            r.staging = Some(StagingRow { state: "staged".into(), s3_key: key.clone(), s3_version_id: Some(version_id.clone()), at, ..StagingRow::default() });
+        })
+        .expect("the staged record");
+        cref
+    }
+
+    /// S11: [`RemoteRig::wrapper`] handed the claude of the Cursor bundle `ext` (a hard link of the rig's claude
+    /// at `<root>/extensions/anthropic.claude-code-<ext>-darwin-arm64/resources/native-binary/claude`): argv[1]
+    /// names V, as Cursor's does.
+    pub fn wrapper_for_bundle(&self, ext: &str, extra_args: &[&str], envs: &[(&str, &str)]) -> Command {
+        let (vm, mac): (Vec<_>, Vec<_>) = envs.iter().copied().partition(|(k, _)| on_vm(k));
+        self.set_vm_knobs(&vm);
+        let dir = self.root.join("extensions").join(format!("anthropic.claude-code-{ext}-darwin-arm64")).join("resources").join("native-binary");
+        std::fs::create_dir_all(&dir).expect("the bundle's directory");
+        let claude = dir.join("claude");
+        if !claude.exists() {
+            std::fs::hard_link(self.root.join("claude"), &claude).or_else(|_| std::fs::copy(self.root.join("claude"), &claude).map(|_| ())).expect("the bundle's claude");
+        }
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-env-claude"));
+        cmd.arg(&claude).args(SESSION_ARGV).args(extra_args).current_dir(self.work());
+        self.environ(&mut cmd);
+        cmd.env("AI_ENV_BRIDGE_MODE", "remote");
+        for (k, v) in mac {
+            cmd.env(k, v);
+        }
+        cmd
     }
 }

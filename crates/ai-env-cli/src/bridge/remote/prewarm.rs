@@ -87,9 +87,11 @@ impl Prewarm {
 /// The prewarm for one wrapper invocation (the module doc): `None` when it
 /// does not apply (any argv but [`AUTH_STATUS`], any mode but remote), else
 /// what happened. Prints at most one stderr line (`ai-env-claude:`), for a
-/// sibling missing or only on `PATH`.
+/// sibling missing or only on `PATH`. S11: `ext` is V, the Claude Code
+/// version argv[1]'s bundle names, which the sibling's `vm warm` fetches
+/// (`--claude-version`; A3 passes it on).
 #[must_use]
-pub fn maybe_prewarm(loaded: &Loaded, mode: Mode, args: &[String], cwd: Option<&Path>) -> Option<Prewarm> {
+pub fn maybe_prewarm(loaded: &Loaded, mode: Mode, args: &[String], cwd: Option<&Path>, ext: Option<&str>) -> Option<Prewarm> {
     if mode != Mode::Remote || args != AUTH_STATUS {
         return None;
     }
@@ -100,8 +102,12 @@ pub fn maybe_prewarm(loaded: &Loaded, mode: Mode, args: &[String], cwd: Option<&
         return Some(Prewarm::Skipped("cwd"));
     };
     let pinned = std::env::var_os(crate::bridge::remote::PIN_KNOB).is_some_and(|v| !v.is_empty());
-    let wanted = match decide(paths, cfg, &cwd, pinned) {
-        Ok(setting) => setting,
+    // S11 (§4.6): an `auto` prewarm runs, whatever the rows say, while V is admitted and not staged: staging rides
+    // its one Touch ID, once per version (`rides_staging`), on a VM that can stage (`decide_rides`).
+    let ext = ext.filter(|v| crate::wire::pin::is_version(v));
+    let unstaged = ext.filter(|v| rides_staging(paths, v));
+    let (wanted, overridden) = match decide_rides(paths, cfg, &cwd, pinned, unstaged.is_some()) {
+        Ok(decided) => decided,
         Err(why) => return Some(Prewarm::Skipped(why)),
     };
     let Ok(slug) = crate::wire::slug::project_dir_name(&cwd) else {
@@ -122,7 +128,21 @@ pub fn maybe_prewarm(loaded: &Loaded, mode: Mode, args: &[String], cwd: Option<&
             return Some(Prewarm::Skipped("no_sibling"));
         }
     };
-    match spawn_detached(&program, &cwd, &lock) {
+    let mut argv: Vec<&std::ffi::OsStr> = vec!["vm".as_ref(), "warm".as_ref(), cwd.as_os_str(), "--prewarm".as_ref()];
+    if let Some(v) = ext {
+        // S11 (LD-9): the sibling's `vm warm` fetches the wrapper's V, not whatever bundle is installed by then.
+        argv.extend([std::ffi::OsStr::new("--claude-version"), std::ffi::OsStr::new(v)]);
+    }
+    // S11: a prewarm that runs only for V's staging takes V's marker first; one taken already (a race) or that
+    // cannot be made skips as before S11.
+    let marker = match (overridden, unstaged) {
+        (Some(why), Some(v)) => match take_staging_marker(paths, v) {
+            Some(marker) => Some(marker),
+            None => return Some(Prewarm::Skipped(why)),
+        },
+        _ => None,
+    };
+    match spawn_detached(&program, &argv, &lock) {
         Ok(pid) => {
             let detail = [("workspace", cwd.display().to_string()), ("pid", pid.to_string()), ("setting", wanted.name().to_string())];
             // Unsynced: `auth status` waits for this row, and its F_FULLFSYNC (about 5 ms) put it past T1.2's 10 ms.
@@ -133,15 +153,54 @@ pub fn maybe_prewarm(loaded: &Loaded, mode: Mode, args: &[String], cwd: Option<&
         }
         Err(e) => {
             tracing::warn!("prewarm: {e}");
+            if let Some(marker) = marker {
+                // Nothing rode it: the next prewarm may.
+                let _ = std::fs::remove_file(marker);
+            }
             Some(Prewarm::Skipped("spawn_failed"))
         }
     }
 }
 
+/// S11 (§4.6, D5): `state/claude/<v>.prewarm`, the empty mark of the one prewarm that ran only for V's staging.
+pub(crate) fn staging_marker(paths: &Paths, version: &str) -> std::path::PathBuf {
+    paths.claude_dir().join(format!("{version}.prewarm"))
+}
+
+/// V (`N.N.N`) admitted and its object not present (`claude::needs_staging`), and no prewarm ran for its staging
+/// yet (no marker): the no-skip rule may hold for it. File reads only.
+fn rides_staging(paths: &Paths, version: &str) -> bool {
+    crate::bridge::claude::needs_staging(paths, version) && std::fs::symlink_metadata(staging_marker(paths, version)).is_err()
+}
+
+/// V's marker made (`O_EXCL`, `O_NOFOLLOW`, 0600; once per version, whatever that prewarm's staging does): its
+/// path, or `None` when it exists already or cannot be made.
+fn take_staging_marker(paths: &Paths, version: &str) -> Option<std::path::PathBuf> {
+    let marker = staging_marker(paths, version);
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&marker) {
+        Ok(_) => Some(marker),
+        Err(e) => {
+            tracing::warn!(version, "the prewarm's staging mark: {e}");
+            None
+        }
+    }
+}
+
+/// [`decide_rides`]' setting alone.
+#[cfg(test)]
+fn decide(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool, unstaged: bool) -> Result<PrewarmMode, &'static str> {
+    decide_rides(paths, cfg, cwd, pinned, unstaged).map(|(setting, _)| setting)
+}
+
 /// The conditions read from files (the module doc): the setting that holds,
 /// or the word of the first that does not. `pinned`: `AI_ENV_BRIDGE_VM` is
-/// set in the wrapper's environment (Cursor's).
-fn decide(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool) -> Result<PrewarmMode, &'static str> {
+/// set in the wrapper's environment (Cursor's). S11: `unstaged`, V is
+/// admitted, its object not present, and no prewarm ran for its staging yet
+/// ([`rides_staging`]): an `auto` prewarm then skips neither for `vm_exists`
+/// nor for `token_held` when a reusable VM's recorded caps name
+/// `claude_stage_v1` (only there can its warm stage and fetch V); the skip
+/// word it overrode comes back with the setting.
+fn decide_rides(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool, unstaged: bool) -> Result<(PrewarmMode, Option<&'static str>), &'static str> {
     if cfg.wrapper.validate().is_err() || cfg.vm.validate().is_err() {
         return Err("config");
     }
@@ -188,9 +247,14 @@ fn decide(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool) -> Result
         // A suspend empties the shim's cache: only a running row that names this seal holds it.
         let sealed = crate::bridge::agent::credential::seal_tag(&paths.setup_token_env());
         let held = sealed.is_some() && reusable.iter().any(|r| r.status == RowStatus::Running && r.credential_at.is_some() && r.credential_tag == sealed);
-        return Err(if held { "token_held" } else { "vm_exists" });
+        let why = if held { "token_held" } else { "vm_exists" };
+        let can_stage = reusable.iter().any(|r| crate::bridge::workspace::vm_capability_of(r, crate::wire::frame::CAP_CLAUDE_STAGE_V1) == crate::bridge::workspace::Capability::Yes);
+        if !(unstaged && can_stage) {
+            return Err(why);
+        }
+        return Ok((setting, Some(why)));
     }
-    Ok(setting)
+    Ok((setting, None))
 }
 
 /// Whether `cwd` is in a git work tree, as far as files tell (no git run): a
@@ -237,7 +301,17 @@ fn newest_verdict(paths: &Paths, probe: &str) -> Option<String> {
 /// while a prewarm holds it, `recent` when the last one finished within
 /// [`COOLDOWN`] (its `finished_at=` line).
 fn warm_lock(paths: &Paths, slug: &str) -> Result<File, &'static str> {
-    let path = paths.workspace_warm_lock(slug);
+    cooldown_lock(&paths.workspace_warm_lock(slug), COOLDOWN, "warming")
+}
+
+/// A detached child's lock (the prewarm's, S11's automatic admission's
+/// `state/claude/<v>.lock`): `path` (0600, its directory made private)
+/// locked without waiting: the open file (close-on-exec), never unlocked
+/// here, at its first byte again once read (the child inherits this offset
+/// with the open file). `busy` while another holds it, `recent` when its
+/// `finished_at=` line is within `cooldown`, `config` when it cannot be
+/// opened.
+pub(crate) fn cooldown_lock(path: &Path, cooldown: Duration, busy: &'static str) -> Result<File, &'static str> {
     if let Some(dir) = path.parent() {
         crate::bridge::registry::ensure_private_dir(dir).map_err(|_| "config")?;
     }
@@ -248,16 +322,16 @@ fn warm_lock(paths: &Paths, slug: &str) -> Result<File, &'static str> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+        .open(path)
         .map_err(|_| "config")?;
     // SAFETY: flock(2) on a descriptor this function owns.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("warming");
+        return Err(busy);
     }
     let mut text = String::new();
     let _ = file.seek(SeekFrom::Start(0)).and_then(|_| Read::by_ref(&mut file).take(4096).read_to_string(&mut text));
     let finished = text.lines().find_map(|l| l.strip_prefix("finished_at=")).and_then(|v| v.trim().parse::<u64>().ok());
-    if finished.is_some_and(|at| crate::wire::time::unix_now().saturating_sub(at) < COOLDOWN.as_secs()) {
+    if finished.is_some_and(|at| crate::wire::time::unix_now().saturating_sub(at) < cooldown.as_secs()) {
         // Dropped: the close releases the lock (nobody else holds this open file).
         return Err("recent");
     }
@@ -269,7 +343,7 @@ fn warm_lock(paths: &Paths, slug: &str) -> Result<File, &'static str> {
 /// the credentials ai-env knows (`age_cmd::CHILD_ENV_REMOVED`) and any name
 /// that looks like one (TOKEN, KEY, SECRET, PASSWORD), as `vm exec --env`
 /// judges them.
-fn prewarm_env() -> Vec<CString> {
+pub(crate) fn prewarm_env() -> Vec<CString> {
     std::env::vars_os()
         .filter(|(k, _)| {
             let name = k.to_string_lossy().to_ascii_uppercase();
@@ -302,18 +376,22 @@ fn dup_high(fd: RawFd) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
-/// Start `program vm warm <cwd> --prewarm` detached, and its pid: a double
-/// fork (the intermediate exits at once and is reaped here, so the prewarm
-/// is never a child of the claude this wrapper execs), then in the prewarm
+/// Start `program <args…>` detached (the prewarm's `vm warm <cwd> --prewarm
+/// [--claude-version <v>]`, S11's `claude admit <v> --auto`), and its pid: a
+/// double fork (the intermediate exits at once and is reaped here, so the
+/// child is never a child of the claude this wrapper execs), then in the child
 /// `setsid`, `chdir("/")`, stdio on `/dev/null`, `lock`'s open file on fd 3
 /// (every other descriptor closed), and `execve` of the absolute path: no
 /// shell, no `PATH`. Everything it needs is built before the first fork;
 /// after it only async-signal-safe calls run. The wrapper waits for the two
 /// forks, never for the exec (a failed exec is the prewarm's exit 127).
-fn spawn_detached(program: &Path, cwd: &Path, lock: &File) -> std::io::Result<u32> {
-    let cstr = |b: &[u8]| CString::new(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the prewarm's argv"));
+pub(crate) fn spawn_detached(program: &Path, args: &[&std::ffi::OsStr], lock: &File) -> std::io::Result<u32> {
+    let cstr = |b: &[u8]| CString::new(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a NUL in the detached child's argv"));
     let path = cstr(program.as_os_str().as_bytes())?;
-    let argv_c = [path.clone(), cstr(b"vm")?, cstr(b"warm")?, cstr(cwd.as_os_str().as_bytes())?, cstr(b"--prewarm")?];
+    let mut argv_c = vec![path.clone()];
+    for a in args {
+        argv_c.push(cstr(a.as_bytes())?);
+    }
     let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
     let env_c = prewarm_env();
@@ -452,21 +530,21 @@ mod tests {
     #[test]
     fn the_conditions_come_from_files_alone() {
         let w = world("auto", Some(PROMPTED));
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Ok(PrewarmMode::Auto));
-        assert_eq!(decide(&w.paths, &w.cfg, w.ws.parent().unwrap(), false), Err("outside_roots"));
-        assert_eq!(decide(&world("auto", None).paths, &w.cfg, &w.ws, false), Err("touchid_gui"), "no row");
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Ok(PrewarmMode::Auto));
+        assert_eq!(decide(&w.paths, &w.cfg, w.ws.parent().unwrap(), false, false), Err("outside_roots"));
+        assert_eq!(decide(&world("auto", None).paths, &w.cfg, &w.ws, false, false), Err("touchid_gui"), "no row");
         let t = world("auto", Some("terminal-only"));
-        assert_eq!(decide(&t.paths, &t.cfg, &t.ws, false), Err("touchid_gui"), "the newest row decides");
+        assert_eq!(decide(&t.paths, &t.cfg, &t.ws, false, false), Err("touchid_gui"), "the newest row decides");
         let n = world("never", Some(PROMPTED));
-        assert_eq!(decide(&n.paths, &n.cfg, &n.ws, false), Err("never"));
+        assert_eq!(decide(&n.paths, &n.cfg, &n.ws, false, false), Err("never"));
         let bad = world("sometimes", Some(PROMPTED));
-        assert_eq!(decide(&bad.paths, &bad.cfg, &bad.ws, false), Err("config"));
+        assert_eq!(decide(&bad.paths, &bad.cfg, &bad.ws, false, false), Err("config"));
         // A reusable row: auto skips, always does not.
         row(&w, "microvm-reuse01", RowStatus::Suspended, None);
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("vm_exists"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"));
         let a = world("always", Some(PROMPTED));
         row(&a, "microvm-reuse02", RowStatus::Suspended, None);
-        assert_eq!(decide(&a.paths, &a.cfg, &a.ws, false), Ok(PrewarmMode::Always));
+        assert_eq!(decide(&a.paths, &a.cfg, &a.ws, false, false), Ok(PrewarmMode::Always));
         // The sealed token held by a running VM of the workspace: auto says so; always warms anyway.
         for x in [&w, &a] {
             std::fs::create_dir_all(x.paths.credentials()).unwrap();
@@ -475,11 +553,68 @@ mod tests {
         let tag = crate::bridge::agent::credential::seal_tag(&w.paths.setup_token_env());
         row(&w, "microvm-held0001", RowStatus::Suspended, tag.clone());
         row(&w, "microvm-held0002", RowStatus::Running, Some("another-seal".into()));
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("vm_exists"), "a suspended VM's cache is empty, another seal is not this one");
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"), "a suspended VM's cache is empty, another seal is not this one");
         row(&w, "microvm-held0003", RowStatus::Running, tag.clone());
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("token_held"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("token_held"));
         row(&a, "microvm-held0004", RowStatus::Running, tag);
-        assert_eq!(decide(&a.paths, &a.cfg, &a.ws, false), Ok(PrewarmMode::Always), "always: whatever the rows say");
+        assert_eq!(decide(&a.paths, &a.cfg, &a.ws, false, false), Ok(PrewarmMode::Always), "always: whatever the rows say");
+    }
+
+    /// `r` rewritten with the caps its `/health` showed: a 13.0 image's (`claude_stage_v1` among them) or a 12.0's.
+    fn with_caps(w: &World, mut r: VmRow, claude: bool) {
+        use crate::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CREDENTIAL_CACHE, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1};
+        let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string(), CAP_WORKSPACE_V1.to_string(), CAP_TRANSCRIPT_S3_V1.to_string()];
+        if claude {
+            caps.push(CAP_CLAUDE_STAGE_V1.to_string());
+        }
+        r.caps = Some(caps);
+        registry::write_row(&w.paths, &r).unwrap();
+    }
+
+    /// S11 (§4.6): while V is admitted and not staged, an `auto` prewarm skips neither for a reusable VM nor for one
+    /// holding the sealed token (staging rides its Touch ID, once per version) when such a VM can stage (its caps
+    /// name `claude_stage_v1`); every other condition holds as ever, and a staged V, or one whose prewarm ran
+    /// already (its marker), skips again.
+    #[test]
+    fn an_auto_prewarm_does_not_skip_for_an_unstaged_admitted_version() {
+        let w = world("auto", Some(PROMPTED));
+        // A 12.0 fleet: its warm answers `no_cap` before any staging, so nothing is worth a Touch ID.
+        with_caps(&w, row(&w, "microvm-reuse11", RowStatus::Suspended, None), false);
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, true), Err("vm_exists"), "no VM that can stage: the skip holds");
+        with_caps(&w, row(&w, "microvm-reuse11", RowStatus::Suspended, None), true);
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, true), Ok(PrewarmMode::Auto), "an unstaged V: no skip");
+        assert_eq!(decide_rides(&w.paths, &w.cfg, &w.ws, false, true), Ok((PrewarmMode::Auto, Some("vm_exists"))), "what it overrode");
+        let cold = world("auto", Some(PROMPTED));
+        assert_eq!(decide_rides(&cold.paths, &cold.cfg, &cold.ws, false, true), Ok((PrewarmMode::Auto, None)), "a cold start overrides nothing");
+        std::fs::create_dir_all(w.paths.credentials()).unwrap();
+        std::fs::write(w.paths.setup_token_env(), "a sealed container's text").unwrap();
+        with_caps(&w, row(&w, "microvm-held0011", RowStatus::Running, crate::bridge::agent::credential::seal_tag(&w.paths.setup_token_env())), true);
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("token_held"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, true), Ok(PrewarmMode::Auto), "an unstaged V: no skip");
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, true, true), Err("pinned"), "the rest holds");
+        assert_eq!(decide(&world("auto", None).paths, &w.cfg, &w.ws, false, true), Err("touchid_gui"));
+        // What `maybe_prewarm` asks: V admitted and not staged, or stale; not seen, staged or failed.
+        let sha = "a".repeat(64);
+        let admitted = |r: &mut crate::bridge::claude::Record| {
+            r.signature = Some(crate::bridge::claude::SignatureRow { outcome: "ok".into(), linux_sha256: Some(sha.clone()), linux_size: Some(290), ..Default::default() });
+            r.admission = Some(crate::bridge::claude::AdmissionRow { outcome: "admitted".into(), ..Default::default() });
+        };
+        crate::bridge::claude::Record::update(&w.paths, "2.1.310", admitted).unwrap();
+        assert!(crate::bridge::claude::needs_staging(&w.paths, "2.1.310"));
+        // Once per version: the prewarm that rides takes V's marker; the next one finds it and skips as before.
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(rides_staging(&w.paths, "2.1.310"));
+        let marker = take_staging_marker(&w.paths, "2.1.310").expect("the first takes it");
+        assert_eq!(std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!rides_staging(&w.paths, "2.1.310"), "a second prewarm for V does not ride");
+        assert_eq!(take_staging_marker(&w.paths, "2.1.310"), None, "nor takes it again");
+        assert!(crate::bridge::claude::needs_staging(&w.paths, "2.1.310"), "V still needs its staging (vm warm, claude update)");
+        crate::bridge::claude::Record::update(&w.paths, "2.1.310", |r| r.staging = Some(crate::bridge::claude::StagingRow { state: "staged".into(), ..Default::default() })).unwrap();
+        assert!(!crate::bridge::claude::needs_staging(&w.paths, "2.1.310"));
+        assert!(!crate::bridge::claude::needs_staging(&w.paths, "2.1.311"));
+        assert!(!rides_staging(&w.paths, "2.1.311"));
     }
 
     /// A row that is no reusable VM of this workspace, one SELECT_VM would
@@ -507,20 +642,20 @@ mod tests {
             edit(&mut r);
             registry::write_row(&w.paths, &r).unwrap();
         }
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Ok(PrewarmMode::Auto));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Ok(PrewarmMode::Auto));
         // A row at 1.0: reused while nothing says which version is active, or 1.0 is; passed over after a deploy.
         row(&w, "microvm-v1000001", RowStatus::Running, None);
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("vm_exists"), "no version recorded: any");
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"), "no version recorded: any");
         record_active(&w, "1.0");
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("vm_exists"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("vm_exists"));
         record_active(&w, "2.0");
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Ok(PrewarmMode::Auto), "the chat would start a 2.0 VM");
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Ok(PrewarmMode::Auto), "the chat would start a 2.0 VM");
         let mut pinned = world("auto", Some(PROMPTED));
         pinned.cfg.aws.image_version = "1".into();
         row(&pinned, "microvm-v1000002", RowStatus::Running, None);
-        assert_eq!(decide(&pinned.paths, &pinned.cfg, &pinned.ws, false), Err("vm_exists"), "1 runs 1.0");
+        assert_eq!(decide(&pinned.paths, &pinned.cfg, &pinned.ws, false, false), Err("vm_exists"), "1 runs 1.0");
         pinned.cfg.aws.image_version = "2".into();
-        assert_eq!(decide(&pinned.paths, &pinned.cfg, &pinned.ws, false), Ok(PrewarmMode::Auto));
+        assert_eq!(decide(&pinned.paths, &pinned.cfg, &pinned.ws, false, false), Ok(PrewarmMode::Auto));
     }
 
     /// What no chat would use is never warmed, in any setting: a cwd in no
@@ -534,21 +669,21 @@ mod tests {
             let mode = if setting == "auto" { PrewarmMode::Auto } else { PrewarmMode::Always };
             let deep = w.ws.join("src").join("lib");
             std::fs::create_dir_all(&deep).unwrap();
-            assert_eq!(decide(&w.paths, &w.cfg, &deep, false), Ok(mode), "{setting}: in the work tree, below its top");
-            assert_eq!(decide(&w.paths, &w.cfg, &w.ws, true), Err("pinned"), "{setting}");
+            assert_eq!(decide(&w.paths, &w.cfg, &deep, false, false), Ok(mode), "{setting}: in the work tree, below its top");
+            assert_eq!(decide(&w.paths, &w.cfg, &w.ws, true, false), Err("pinned"), "{setting}");
             let off = world_with(setting, Some(PROMPTED), "reuse_per_workspace = false\n");
-            assert_eq!(decide(&off.paths, &off.cfg, &off.ws, false), Err("reuse_off"), "{setting}");
+            assert_eq!(decide(&off.paths, &off.cfg, &off.ws, false, false), Err("reuse_off"), "{setting}");
             std::fs::remove_dir(w.ws.join(".git")).unwrap();
-            assert_eq!(decide(&w.paths, &w.cfg, &deep, false), Err("not_git"), "{setting}");
+            assert_eq!(decide(&w.paths, &w.cfg, &deep, false, false), Err("not_git"), "{setting}");
             // A linked worktree's `.git` is a file.
             std::fs::write(w.ws.join(".git"), "gitdir: /elsewhere/.git/worktrees/work\n").unwrap();
-            assert_eq!(decide(&w.paths, &w.cfg, &deep, false), Ok(mode), "{setting}: a worktree");
+            assert_eq!(decide(&w.paths, &w.cfg, &deep, false, false), Ok(mode), "{setting}: a worktree");
         }
         // The roots bound the search: a repository above the outermost root is not the workspace's (git's ceiling).
         let w = world("auto", Some(PROMPTED));
         std::fs::remove_dir(w.ws.join(".git")).unwrap();
         std::fs::create_dir_all(w.ws.parent().unwrap().join(".git")).unwrap();
-        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false), Err("not_git"));
+        assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("not_git"));
     }
 
     /// The warm lock: taken without waiting; `warming` while another holds
@@ -600,10 +735,10 @@ mod tests {
     fn only_auth_status_in_remote_mode_is_considered() {
         let loaded = Loaded::default();
         let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        assert_eq!(maybe_prewarm(&loaded, Mode::Passthrough, &args(&AUTH_STATUS), None), None);
-        assert_eq!(maybe_prewarm(&loaded, Mode::LocalChild, &args(&AUTH_STATUS), None), None);
-        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&["auth", "status"]), None), None);
-        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&["auth", "status", "--json", "--x"]), None), None);
-        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&AUTH_STATUS), None), Some(Prewarm::Skipped("unconfigured")));
+        assert_eq!(maybe_prewarm(&loaded, Mode::Passthrough, &args(&AUTH_STATUS), None, None), None);
+        assert_eq!(maybe_prewarm(&loaded, Mode::LocalChild, &args(&AUTH_STATUS), None, None), None);
+        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&["auth", "status"]), None, None), None);
+        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&["auth", "status", "--json", "--x"]), None, None), None);
+        assert_eq!(maybe_prewarm(&loaded, Mode::Remote, &args(&AUTH_STATUS), None, None), Some(Prewarm::Skipped("unconfigured")));
     }
 }

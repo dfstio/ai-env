@@ -187,6 +187,7 @@ pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, sta
         cred_retried: false,
         cred_suspended: false,
         claude: None,
+        claude_cap: false,
         park: park.map(Parking::new),
     };
     session.run().await
@@ -700,6 +701,8 @@ struct Session<'e, 'a, A: MicrovmApi, E: EndpointClient> {
     /// carries it when `spawned` (or a reattach) names none (S8: the remote
     /// link compares it with `authwatch::AUTH_TIMERS`).
     claude: Option<String>,
+    /// S11 (A.4): the last `hello_ok` named `claude_stage_v1`: only then does the spawn carry `spec.claude`.
+    claude_cap: bool,
     /// S10 §D: a wrapper session's park (none: S9's session, which never parks).
     park: Option<Parking>,
 }
@@ -721,7 +724,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     self.note(format!("reattached to spawn {} after {ms} ms (socket {})", self.st.id, link.n));
                 }
                 self.link(true);
-                self.audit("agent_reconnect", &[("reason", why), ("ms", ms)]);
+                self.audit(crate::bridge::audit::event::AGENT_RECONNECT, &[("reason", why), ("ms", ms)]);
             }
             // S10: an unpark that had to dial is done once a socket carries the spawn again.
             self.unparked();
@@ -842,7 +845,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 let wait = retry_after_s.map_or(backoff, |s| units(p, s).max(backoff));
                 // Audited before the budget and the wait: a 429 that ends the session, or whose wait a detach cuts short, has its row too.
                 let retry_after = retry_after_s.map_or_else(|| "none".to_string(), |s| s.to_string());
-                self.audit("endpoint_429", &[("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
+                self.audit(crate::bridge::audit::event::ENDPOINT_429, &[("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
                 retry.failed(e.to_string());
                 retry.throttled = Some(retry_after_s);
                 self.give_up_past(retry, wait)?;
@@ -1123,6 +1126,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         if ok.claude_version.is_some() {
             self.claude.clone_from(&ok.claude_version);
         }
+        // S11 (A.4): the spawn names staged claudes only to a shim that runs them (an S10 shim would ignore the field).
+        self.claude_cap = ok.caps.iter().any(|c| c == crate::wire::frame::CAP_CLAUDE_STAGE_V1);
         // S10: whether this shim parks; a parking session on one that does not says so once.
         if let Some(p) = &mut self.park {
             p.served = ok.caps.iter().any(|c| c == CAP_PARK_V1);
@@ -1155,7 +1160,11 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 self.attached = true;
                 if !self.st.started {
                     let (pid, pgid) = found.map_or((0, 0), |s| (s.pid, s.pgid));
-                    self.started(pid, pgid, self.claude.clone());
+                    // S11 (A.4): only `spawned` names what ran. A spawn that named staged claudes may run a cached
+                    // one, which `hello_ok`'s (the image's) is not: what ran is unknown then, never the image's.
+                    let named_refs = self.claude_cap && self.st.spec.as_ref().is_some_and(|s| !s.claude.is_empty());
+                    let claude = if named_refs { None } else { self.claude.clone() };
+                    self.started(pid, pgid, claude, None);
                     // `spawned` died with its socket (and maybe the `credential_ok`
                     // before it): the spawn runs, so the VM holds the credential.
                     if let Some(d) = &self.delivery {
@@ -1247,6 +1256,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             deliver_secret,
             detach_grace_s: spec.detach_grace_s,
             credential,
+            claude: if self.claude_cap { spec.claude.clone() } else { Vec::new() },
         };
         link.send(&frame).await;
         self.st.phase = Phase::SpawnSent;
@@ -1662,12 +1672,12 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             return Ok(None);
         }
         match frame {
-            Frame::Spawned { pid, pgid, claude_version, .. } => {
+            Frame::Spawned { pid, pgid, claude_version, claude_sha256, .. } => {
                 self.st.phase = Phase::Running;
                 self.attached = true;
                 if !self.st.started {
                     let claude = claude_version.or_else(|| self.claude.clone());
-                    self.started(pid, pgid, claude);
+                    self.started(pid, pgid, claude, claude_sha256);
                 }
                 self.spawn_has_its_copy();
                 self.flush(link).await;
@@ -1907,7 +1917,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         self.paused = false;
         self.attached = false;
         self.adopt(&rotated.ok, link).await?;
-        self.audit("agent_rotate", &[("mode", "proactive".into())]);
+        self.audit(crate::bridge::audit::event::AGENT_ROTATE, &[("mode", "proactive".into())]);
         self.note(format!("rotated to a fresh endpoint token (socket {})", link.n));
         Ok(())
     }
@@ -2018,7 +2028,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
 
     async fn remint(&mut self, why: &str) -> Result<(), BridgeError> {
         self.token = mint_token(self.env).await?;
-        self.audit("agent_remint", &[("reason", why.to_string())]);
+        self.audit(crate::bridge::audit::event::AGENT_REMINT, &[("reason", why.to_string())]);
         Ok(())
     }
 
@@ -2113,7 +2123,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                 let backoff = rot.retry.next(p);
                 let wait = retry_after_s.map_or(backoff, |s| units(p, s).max(backoff));
                 let retry_after = retry_after_s.map_or_else(|| "none".to_string(), |s| s.to_string());
-                self.audit("endpoint_429", &[("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
+                self.audit(crate::bridge::audit::event::ENDPOINT_429, &[("retry_after", retry_after), ("waited_ms", wait.as_millis().to_string())]);
                 wait
             }
             _ => rot.retry.next(p),
@@ -2128,9 +2138,9 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         &self.env.target.vm_id
     }
 
-    fn started(&mut self, pid: u32, pgid: u32, claude_version: Option<String>) {
+    fn started(&mut self, pid: u32, pgid: u32, claude_version: Option<String>, claude_sha256: Option<String>) {
         self.st.started = true;
-        let _ = self.io.events.send(SpawnEvent::Started { spawn_id: self.st.id.clone(), pid, pgid, claude_version });
+        let _ = self.io.events.send(SpawnEvent::Started { spawn_id: self.st.id.clone(), pid, pgid, claude_version, claude_sha256 });
     }
 
     fn note(&self, text: String) {
@@ -2405,7 +2415,7 @@ mod tests {
     }
 
     fn cat_spec() -> SpawnSpec {
-        SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None }
+        SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: None, id: None, claude: Vec::new() }
     }
 
     fn lines(n: usize) -> Vec<Vec<u8>> {
@@ -2422,6 +2432,8 @@ mod tests {
         notes: Vec<String>,
         links: Vec<bool>,
         started: Option<(u32, u32)>,
+        /// S11: the claude `Started` named (its version, its sha256).
+        claude: Option<(Option<String>, Option<String>)>,
         exit: Option<RemoteExit>,
     }
 
@@ -2429,7 +2441,10 @@ mod tests {
         /// One event, marked consumed as soon as it is "written".
         fn add(&mut self, ev: SpawnEvent, consumed: &Consumed) {
             match ev {
-                SpawnEvent::Started { pid, pgid, .. } => self.started = Some((pid, pgid)),
+                SpawnEvent::Started { pid, pgid, claude_version, claude_sha256, .. } => {
+                    self.started = Some((pid, pgid));
+                    self.claude = Some((claude_version, claude_sha256));
+                }
                 SpawnEvent::Stdout { seq, bytes } => {
                     self.out_seqs.push(seq);
                     self.stdout.extend(bytes);
@@ -2518,7 +2533,7 @@ mod tests {
         assert!(matches!(frame(ws).await, Frame::Hello { .. }));
         put(ws, &hello_ok(vec![], vec![])).await;
         let Frame::Spawn { spawn_id, .. } = frame(ws).await else { panic!("no spawn") };
-        put(ws, &Frame::Spawned { spawn_id: spawn_id.clone(), pid: 4242, pgid: 4242, claude_version: None }).await;
+        put(ws, &Frame::Spawned { spawn_id: spawn_id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None }).await;
         spawn_id
     }
 
@@ -2534,7 +2549,7 @@ mod tests {
     /// A session as `run` builds it (a fresh token), before its first socket.
     async fn session<'e, 'a>(env: &'e AgentEnv<'a, FakeMicrovmApi, FakeMicrovmApi>, io: SpawnIo, start: Start) -> Session<'e, 'a, FakeMicrovmApi, FakeMicrovmApi> {
         let token = mint_token(env).await.unwrap();
-        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None, park: None }
+        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None, claude_cap: false, park: None }
     }
 
     /// A socket to the rig's endpoint with the session's token, and the endpoint's end of it.
@@ -2644,7 +2659,7 @@ mod tests {
                     assert_eq!(argv, vec!["cat".to_string()]);
                     self.spawn = Some(spawn_id.clone());
                     self.attached = n;
-                    self.send(n, &Frame::Spawned { spawn_id, pid: 4242, pgid: 4242, claude_version: None });
+                    self.send(n, &Frame::Spawned { spawn_id, pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None });
                     if self.script.silent == Some(n) {
                         return Action::Silent;
                     }
@@ -2764,12 +2779,20 @@ mod tests {
         tokio::time::timeout(LIMIT, f).await.expect("the test ran past its limit")
     }
 
+    /// A frame the session sent, as the wire goldens spell it: this Mac's host (`host`, its `"host":` pair) and
+    /// this build's `client.version` put back to the goldens' `mike@mbp` and 0.1.0 (the files stay byte-identical
+    /// whatever the workspace version).
+    fn as_golden(text: &str, host: &str) -> String {
+        let version = format!("\"version\":{}", serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap());
+        text.replace(host, "\"host\":\"mike@mbp\"").replace(&version, "\"version\":\"0.1.0\"")
+    }
+
     // ---- the tests -----------------------------------------------------------------------
 
     /// tests/fixtures/wire/exec-golden.jsonl from both ends: the client's
     /// frames equal the golden Mac lines (between two VM lines in any order;
-    /// the spawn id and the host substituted), and the golden VM lines bring
-    /// the bytes and the exit.
+    /// the spawn id, the host and the client's version substituted), and the
+    /// golden VM lines bring the bytes and the exit.
     #[tokio::test]
     async fn the_golden_conversation_both_directions() {
         bounded(async {
@@ -2802,7 +2825,7 @@ mod tests {
                         if let Ok(Frame::Spawn { spawn_id, .. }) = Frame::from_json(t.as_str()) {
                             id = spawn_id.0;
                         }
-                        let mut text = t.as_str().replace(&host, "\"host\":\"mike@mbp\"");
+                        let mut text = as_golden(t.as_str(), &host);
                         if !id.is_empty() {
                             text = text.replace(&id, golden_id);
                         }
@@ -3645,6 +3668,86 @@ mod tests {
         .await;
     }
 
+    /// S11 (W1): the socket is lost after `spawn` went out and before `spawned` came back, and the reattach finds
+    /// the spawn running: a spawn that named staged claudes (to a shim serving `claude_stage_v1`) reports no claude
+    /// (the shim may have run a cached one; `hello_ok` names the image's); one that named none reports the image's.
+    #[tokio::test]
+    async fn a_reattach_past_a_lost_spawned_never_names_the_images_claude_for_a_spawn_with_refs() {
+        for refs in [true, false] {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (sio, cio) = spawn_channels(8);
+                let ok = |spawns: Vec<SpawnStatus>, resumed: Vec<Resumed>| {
+                    let mut f = hello_ok(spawns, resumed);
+                    if let Frame::HelloOk { claude_version, caps, .. } = &mut f {
+                        *claude_version = Some("2.1.305".into());
+                        *caps = vec![crate::wire::frame::CAP_CLAUDE_STAGE_V1.to_string()];
+                    }
+                    f
+                };
+                let shim = async {
+                    let mut ws1 = rig.endpoint.next().await;
+                    assert!(matches!(frame(&mut ws1).await, Frame::Hello { .. }));
+                    put(&mut ws1, &ok(vec![], vec![])).await;
+                    let Frame::Spawn { spawn_id: id, claude, .. } = frame(&mut ws1).await else { panic!("no spawn") };
+                    assert_eq!(claude.len(), usize::from(refs), "the refs go to a shim that serves them");
+                    // Cut (no Close) before `spawned`.
+                    drop(ws1);
+                    let mut ws2 = rig.endpoint.next().await;
+                    assert!(matches!(frame(&mut ws2).await, Frame::Hello { .. }));
+                    put(&mut ws2, &ok(vec![status(&id, 0, 0)], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Ok }])).await;
+                    put(&mut ws2, &Frame::Exit { spawn_id: id.clone(), seq: 1, code: Some(0), signal: None, stderr_dropped: 0, stdout_truncated: false }).await;
+                    assert_eq!(frame(&mut ws2).await, Frame::Ack { spawn_id: id, seq: 1, err_seq: 0 });
+                };
+                let mut spec = cat_spec();
+                if refs {
+                    spec.claude = vec![crate::wire::workspace::ClaudeRef { version: "2.1.310".into(), sha256: "b".repeat(64) }];
+                }
+                let (result, seen, ()) = tokio::join!(run_spawn(&env, Start::New(spec), sio), consume(cio, None, Duration::ZERO), shim);
+                assert_eq!(result.unwrap().exit.status(), 0, "refs: {refs}");
+                assert_eq!(seen.started, Some((4242, 4242)), "refs: {refs}");
+                assert_eq!(seen.claude, Some(((!refs).then(|| "2.1.305".to_string()), None)), "refs: {refs}");
+            })
+            .await;
+        }
+    }
+
+    /// S11 (A.4): a spawn's staged claudes go only to a shim whose `hello_ok` names `claude_stage_v1`; to one that
+    /// does not (an S10 shim, or one whose claude cache has no store) the `spawn` names none.
+    #[tokio::test]
+    async fn a_spawn_names_its_staged_claudes_only_to_a_shim_with_the_cap() {
+        let refs = vec![crate::wire::workspace::ClaudeRef { version: "2.1.310".into(), sha256: "b".repeat(64) }];
+        for cap in [true, false] {
+            bounded(async {
+                let rig = rig(true).await;
+                let env = rig.env(policy());
+                let (sio, cio) = spawn_channels(8);
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                    let mut ok = hello_ok(vec![], vec![]);
+                    if let Frame::HelloOk { caps, .. } = &mut ok {
+                        *caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
+                        if cap {
+                            caps.push(crate::wire::frame::CAP_CLAUDE_STAGE_V1.to_string());
+                        }
+                    }
+                    put(&mut ws, &ok).await;
+                    let Frame::Spawn { spawn_id: id, claude, .. } = frame(&mut ws).await else { panic!("no spawn") };
+                    assert_eq!(claude, if cap { refs.clone() } else { Vec::new() }, "cap: {cap}");
+                    put(&mut ws, &Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None }).await;
+                    put(&mut ws, &exit0(&id, 1)).await;
+                    assert_eq!(frame(&mut ws).await, Frame::Ack { spawn_id: id, seq: 1, err_seq: 0 });
+                };
+                let spec = SpawnSpec { claude: refs.clone(), ..cat_spec() };
+                let (result, _, ()) = tokio::join!(run_spawn(&env, Start::New(spec), sio), consume(cio, None, Duration::ZERO), shim);
+                assert_eq!(result.unwrap().exit.status(), 0, "cap: {cap}");
+            })
+            .await;
+        }
+    }
+
     #[tokio::test]
     async fn attach_continues_the_shims_stdin_numbering_and_replays_from_the_asked_seq() {
         bounded(async {
@@ -4356,7 +4459,7 @@ mod tests {
 
     /// The spawn is answered `spawned`, then exits 0.
     async fn run_and_exit(ws: &mut Ws, id: &SpawnId) {
-        put(ws, &Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None }).await;
+        put(ws, &Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None }).await;
         put(ws, &exit0(id, 1)).await;
     }
 
@@ -4669,7 +4772,7 @@ mod tests {
                 s.st.phase = Phase::SpawnSent;
                 let (mut link, _ws) = link_to(&rig, &s).await;
                 let id = s.st.id.clone();
-                let spawned = || Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None };
+                let spawned = || Frame::Spawned { spawn_id: id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None };
                 let before = rig.audit("credential_deliver").len();
                 if found {
                     unrecord(&rig);
@@ -5188,7 +5291,7 @@ mod tests {
             assert!(matches!(next_frame(ws).await, Frame::Hello { .. }));
             put(ws, &hello_ok_parks(vec![], vec![])).await;
             let Frame::Spawn { spawn_id, .. } = next_frame(ws).await else { panic!("no spawn") };
-            put(ws, &Frame::Spawned { spawn_id: spawn_id.clone(), pid: 4242, pgid: 4242, claude_version: None }).await;
+            put(ws, &Frame::Spawned { spawn_id: spawn_id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None }).await;
             spawn_id
         }
 
@@ -5258,13 +5361,14 @@ mod tests {
 
         /// The session's frames up to the golden's next shim line (as many as
         /// `want` holds), as the golden spells them: its host (`host`, this
-        /// Mac's, put back) and its probe `ts`. A reattach's ack of what the
-        /// old socket acked (S6's, no golden line) is skipped.
+        /// Mac's) and client version (this build's) put back ([`as_golden`]),
+        /// and its probe `ts`. A reattach's ack of what the old socket acked
+        /// (S6's, no golden line) is skipped.
         async fn golden_read(ws: &mut Ws, want: &[String], host: &str, heard: &mut Heard) -> Vec<String> {
             let mut got = Vec::new();
             while got.len() < want.len() {
                 let Message::Text(t) = ws.next().await.unwrap().unwrap() else { continue };
-                let mut text = t.as_str().replace(host, "\"host\":\"mike@mbp\"");
+                let mut text = as_golden(t.as_str(), host);
                 match Frame::from_json(&text).unwrap() {
                     Frame::Ping { ts } => {
                         heard.ts = Some(ts);
@@ -5282,13 +5386,13 @@ mod tests {
         /// tests/fixtures/wire/park-golden.jsonl from the Mac's end (as
         /// `the_golden_conversation_both_directions` replays the exec golden):
         /// the session's frames between two shim lines equal the golden's Mac
-        /// lines (in any order; the host and the probe's `ts` put in), and the
-        /// golden's shim lines bring its answers. The pump's verdict stays
-        /// idle, so the session's own stdio times its parks: the first, `after`
-        /// past the first turn's output, is refused (`busy`), the second
-        /// `after` past the refusal is parked. The host's line then unparks
-        /// it on the open socket (`unpark`, the probe's `ping`, the line); a
-        /// third park follows its echo. The shim closes that parked socket;
+        /// lines (in any order; the host, the client's version and the probe's
+        /// `ts` put in), and the golden's shim lines bring its answers. The
+        /// pump's verdict stays idle, so the session's own stdio times its parks:
+        /// the first, `after` past the first turn's output, is refused (`busy`),
+        /// the second `after` past the refusal is parked. The host's line then
+        /// unparks it on the open socket (`unpark`, the probe's `ping`, the line);
+        /// a third park follows its echo. The shim closes that parked socket;
         /// the host's next input redials (here a chunk that brings no stdin of
         /// its own, so the golden's next frame is the EOF that follows it: a
         /// bare EOF while parked with no socket would end the session, no
@@ -5303,7 +5407,7 @@ mod tests {
                 env.target.session_token = Secret::new("golden-session-token".into());
                 let (ctl, pump) = park_ctl(&rig, terms(150));
                 let golden_id = "0192f1e0-2b7c-7c3a-9a1b-4d5e6f708196";
-                let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(900), id: Some(SpawnId(golden_id.into())) };
+                let spec = SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(900), id: Some(SpawnId(golden_id.into())), claude: Vec::new() };
                 let host = format!("\"host\":{}", serde_json::to_string(&crate::bridge::vm::owner()).unwrap());
                 let (sio, cio) = spawn_channels(8);
                 let ConsumerIo { input, control: _control, mut events, consumed } = cio;

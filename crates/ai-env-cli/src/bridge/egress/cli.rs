@@ -267,12 +267,10 @@ fn alone(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
-/// One audit row (`actor=cli`); a failure to write is a warning (what it
-/// records already happened). Never a parameter value.
+/// One audit row (its actor `AuditRow::new`'s, S11); a failure to write is a
+/// warning (what it records already happened). Never a parameter value.
 fn audit(paths: &Paths, event: &str, pairs: &[(&str, String)]) {
-    let mut d = audit::detail(pairs);
-    d.insert("actor".into(), "cli".into());
-    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(event, None, d)) {
+    if let Err(e) = audit::append(&paths.audit(), &AuditRow::new(event, None, audit::detail(pairs))) {
         note(&format!("warning: audit row {event} not written: {e}"));
     }
 }
@@ -578,7 +576,7 @@ fn apply_edit(ctx: &Ctx, instance: &str, e: Edit<'_>) -> Result<()> {
     }
     say(&e.message);
     let r = reload_proxy(ctx, instance, false, e.what, e.deny);
-    audit(&ctx.paths, "egress_reload", &[("result", r.result().to_string())]);
+    audit(&ctx.paths, crate::bridge::audit::event::EGRESS_RELOAD, &[("result", r.result().to_string())]);
     let held = if e.changed { format!("{name} is written") } else { format!("{name} already holds it") };
     match &r {
         Reload::Applied { line, .. } => {
@@ -683,7 +681,7 @@ fn allow(slug: &str, host: &str, remove: bool) -> Result<()> {
         let value = if changed { render_extras(&extras) } else { l.raw("extras").value.clone() };
         let claim = (remove && !effective).then(|| format!("the proxy denies {host} now"));
         let pairs = vec![("slug", slug.to_string()), ("host", host.clone()), ("action", (if remove { "remove" } else { "add" }).to_string())];
-        apply_edit(&ctx, instance, Edit { what, lists: &l, param: "extras", value, changed, deny: remove, gone: !effective, message, claim, event: "egress_allow", pairs })
+        apply_edit(&ctx, instance, Edit { what, lists: &l, param: "extras", value, changed, deny: remove, gone: !effective, message, claim, event: crate::bridge::audit::event::EGRESS_ALLOW, pairs })
     })
 }
 
@@ -711,7 +709,7 @@ fn suspend(host: &str, restore: bool) -> Result<()> {
         let value = if changed { render_suspended(&hosts.iter().cloned().collect::<Vec<_>>()) } else { l.raw("suspended").value.clone() };
         let claim = (!restore).then(|| format!("the proxy denies {host} now"));
         let pairs = vec![("host", host.clone()), ("action", (if restore { "restore" } else { "suspend" }).to_string())];
-        apply_edit(&ctx, instance, Edit { what, lists: &l, param: "suspended", value, changed, deny: !restore, gone: !restore, message, claim, event: "egress_suspend", pairs })
+        apply_edit(&ctx, instance, Edit { what, lists: &l, param: "suspended", value, changed, deny: !restore, gone: !restore, message, claim, event: crate::bridge::audit::event::EGRESS_SUSPEND, pairs })
     })
 }
 
@@ -722,7 +720,7 @@ fn reload(if_changed: bool) -> Result<()> {
     ctx.operator("egress reload")?;
     locked(&ctx.paths, || {
         let r = reload_proxy(&ctx, instance, if_changed, "ai-env egress reload", false);
-        audit(&ctx.paths, "egress_reload", &[("result", r.result().to_string())]);
+        audit(&ctx.paths, crate::bridge::audit::event::EGRESS_RELOAD, &[("result", r.result().to_string())]);
         match &r {
             Reload::Applied { unchanged, line } => say(&format!("proxy {instance}: {} ({line})", if *unchanged { "unchanged since the last apply" } else { "applied" })),
             Reload::Stopped(state) => say(&format!("the proxy is {state}: it reads its parameters when it starts (`ai-env proxy start`)")),
@@ -804,7 +802,7 @@ fn proxy_stop(yes: bool) -> Result<()> {
     ctx.operator("proxy stop")?;
     live_proxy("proxy stop", instance)?;
     let now = ops::stop_instance(instance).map_err(aws("proxy stop"))?;
-    audit(&ctx.paths, "proxy_stop", &[("instance", instance.to_string()), ("vpc_vms", vms.len().to_string())]);
+    audit(&ctx.paths, crate::bridge::audit::event::PROXY_STOP, &[("instance", instance.to_string()), ("vpc_vms", vms.len().to_string())]);
     note(&format!("proxy {instance}: {now}; waiting for stopped"));
     wait_state(instance, "stopped", ctx.wait(Wait::INSTANCE)).map_err(aws("proxy stop"))?;
     say(&format!("proxy {instance}: stopped; vpc VMs have no egress until `ai-env proxy start`"));
@@ -895,7 +893,7 @@ fn proxy_start() -> Result<()> {
     ctx.operator("proxy start")?;
     live_proxy("proxy start", instance)?;
     let now = ops::start_instance(instance).map_err(aws("proxy start"))?;
-    audit(&ctx.paths, "proxy_start", &[("instance", instance.to_string())]);
+    audit(&ctx.paths, crate::bridge::audit::event::PROXY_START, &[("instance", instance.to_string())]);
     note(&format!("proxy {instance}: {now}; waiting for running, SSM Online, then squid"));
     wait_state(instance, "running", ctx.wait(Wait::INSTANCE)).map_err(aws("proxy start"))?;
     wait_online(instance, ctx.wait(Wait::SSM_ONLINE)).map_err(aws("proxy start"))?;
@@ -967,7 +965,7 @@ fn proxy_patch() -> Result<()> {
     note(&format!("patching {instance} through SSM: dnf -y upgrade --security --releasever=latest (its output in {PATCH_LOG}), then systemctl restart squid"));
     let inv: Invocation = ops::run_document(instance, ProxyDoc::Patch, "ai-env proxy patch", ctx.wait(Wait::PATCH)).map_err(aws("proxy patch"))?;
     let ok = inv.succeeded();
-    audit(&ctx.paths, "proxy_patch", &[("instance", instance.to_string()), ("result", if ok { "ok".to_string() } else { format!("{} exit {}", inv.status, inv.code) })]);
+    audit(&ctx.paths, crate::bridge::audit::event::PROXY_PATCH, &[("instance", instance.to_string()), ("result", if ok { "ok".to_string() } else { format!("{} exit {}", inv.status, inv.code) })]);
     patch_report(instance, &inv, || status_line(&ctx, instance, "ai-env proxy patch"), say)
 }
 

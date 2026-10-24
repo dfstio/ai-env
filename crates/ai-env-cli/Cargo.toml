@@ -224,6 +224,27 @@ name = "parking"
 path = "tests/parking.rs"
 required-features = ["bridge", "shim"]
 
+# S11 (wave 1, A2): `ai-env claude` (admit, stage, update, gc, forget, status) through the real binary under the fake
+# API, its release curl, gpgv and make the lab knobs' fakes; declared in phase 0 with an ignored placeholder.
+[[test]]
+name = "claude_cmd"
+path = "tests/claude_cmd.rs"
+required-features = ["bridge", "shim"]
+
+# S11 (wave 1, B2): `ai-env audit tail|grep`, `ai-env cost`, `session list|show` and `vm list` on the s11 fixtures;
+# declared in phase 0 with an ignored placeholder.
+[[test]]
+name = "control"
+path = "tests/control.rs"
+required-features = ["bridge"]
+
+# S11 (wave 1, B1): the loopback panel (`ai-env panel serve`) over raw HTTP/1.1; declared in phase 0 with an ignored
+# placeholder.
+[[test]]
+name = "panel"
+path = "tests/panel.rs"
+required-features = ["bridge"]
+
 # Negative fixture for `make lint-negative`: clippy must REJECT it (every clippy.toml
 # disallowed method is called once). Built only with the lint-negative feature.
 [[example]]
@@ -235,6 +256,8 @@ required-features = ["lint-negative"]
 default = ["bridge", "shim"]
 # Mac side: AWS control plane, TLS client stack, WebSocket client.
 bridge = [
+    # S11 B.5: the loopback panel (ai-env panel serve), on the shim's pinned axum (no new crate)
+    "dep:axum",
     "dep:aws-config",
     "dep:aws-sdk-lambdamicrovms",
     "dep:aws-smithy-http-client",

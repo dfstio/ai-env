@@ -112,6 +112,8 @@ use crate::wire::frame::{
     ARGV_MAX_BYTES, CHUNK_MAX, DETACH_GRACE_EXEC_S, ENV_MAX_ENTRIES, GROUP_KILL_AFTER, LADDER_KILL_AFTER, LADDER_TERM_AFTER, MAX_SPAWNS, STDERR_BUFFER_BYTES, STDIN_WINDOW_BYTES, STDOUT_WINDOW_CHUNKS,
 };
 use crate::wire::frame::{ParkOwner, ParkRefusal, PARK_GRACE_MAX_S};
+use crate::shim::claudebin::PickedClaude;
+use crate::wire::workspace::{ClaudeRef, CLAUDE_REFS_MAX};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -169,6 +171,13 @@ pub struct SpawnRequest {
     /// connection resolves it from the shim's cache into `secrets` before the
     /// spawn manager sees the request, so delivery is the one tested path.
     pub credential: Option<String>,
+    /// `spawn.claude` (S11, A.4): the staged claudes this spawn may run, in
+    /// preference order (at most `CLAUDE_REFS_MAX`).
+    pub claude: Vec<ClaudeRef>,
+    /// What a `claude` argv[0] runs (S11): `None` until the `/agent`
+    /// connection resolved it (`resolve_claude`, from the shim's cache),
+    /// and for any other argv[0].
+    pub picked: Option<PickedClaude>,
 }
 
 impl SpawnRequest {
@@ -176,7 +185,7 @@ impl SpawnRequest {
     #[must_use]
     pub fn from_frame(f: Frame) -> Option<SpawnRequest> {
         match f {
-            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s, credential }),
+            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential, claude } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s, credential, claude, picked: None }),
             _ => None,
         }
     }
@@ -187,7 +196,7 @@ impl std::fmt::Debug for SpawnRequest {
         let argv0 = short(self.argv.first().map_or("", |a| basename(a)));
         write!(
             f,
-            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?}, credential={:?})",
+            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?}, credential={:?}, claude={})",
             short(&self.spawn_id.0),
             self.argv.len(),
             if self.cwd.is_some() { "set" } else { "home" },
@@ -195,7 +204,8 @@ impl std::fmt::Debug for SpawnRequest {
             self.secrets.len(),
             self.deliver,
             self.detach_grace_s,
-            self.credential
+            self.credential,
+            self.claude.len()
         )
     }
 }
@@ -385,6 +395,9 @@ struct Spawn {
     /// group, lives, its memory may hold that value
     /// ([`SpawnManager::credential_holders`]).
     holds_secret: bool,
+    /// S11: the sha256 of the cached claude it runs (`SpawnRequest.picked`
+    /// with a path): [`SpawnManager::running_claudes`] keeps that binary.
+    claude_sha256: Option<String>,
     /// The leader's pid, which is also the group id (setsid).
     pid: u32,
     started_at: String,
@@ -996,7 +1009,9 @@ impl SpawnManager {
             None => cwd_parts(opts.home.as_os_str().as_bytes()),
         }
         .map_err(|m| (SpawnErrCode::Cwd, format!("working directory \"{cwd_text}\": {m}")))?;
-        let program = resolve(&req.argv[0], &opts.claude).map_err(|m| (SpawnErrCode::NotFound, m))?;
+        // S11: a `claude` argv[0] runs the cached binary the connection picked, else `--claude`.
+        let cached = if req.argv[0] == "claude" { req.picked.as_ref().and_then(|p| p.path.clone()) } else { None };
+        let program = resolve(&req.argv[0], &opts.claude, cached.as_deref()).map_err(|m| (SpawnErrCode::NotFound, m))?;
         let secrets = std::mem::take(&mut req.secrets);
         let secret = secrets.iter().next();
         let secret_kind = match (secret, req.deliver) {
@@ -1015,7 +1030,7 @@ impl SpawnManager {
             .args(&req.argv[1..])
             .env_clear()
             .env("HOME", &opts.home)
-            .env("PATH", CHILD_PATH)
+            .env("PATH", child_path(cached.as_deref()))
             .env("CLAUDE_CONFIG_DIR", opts.home.join(".claude"))
             .env("DISABLE_AUTOUPDATER", "1")
             .envs(&req.env);
@@ -1062,6 +1077,7 @@ impl SpawnManager {
         let record = Spawn {
             argv0: argv0.clone(),
             holds_secret,
+            claude_sha256: req.picked.as_ref().filter(|p| p.path.is_some()).and_then(|p| p.sha256.clone()),
             pid,
             started_at: crate::wire::time::rfc3339_utc(crate::wire::time::unix_now()),
             grace: Duration::from_secs(u64::from(req.detach_grace_s.unwrap_or(DETACH_GRACE_EXEC_S))),
@@ -1105,13 +1121,16 @@ impl SpawnManager {
         }
         drop(held);
         self.start_clock();
+        // S11: which claude ran, when the connection picked one (argv[0] `claude`).
+        let ran = req.picked.as_ref().map_or(String::new(), |p| format!(" claude={} src={}", p.version.as_deref().unwrap_or("-"), if p.path.is_some() { "cache" } else { "image" }));
         log(&format!(
-            "ai-env: spawn {id} pid={pid} pgid={pid} argv0={argv0} argc={} cwd=\"{cwd_text}\" uid={} secret={secret_kind}",
+            "ai-env: spawn {id} pid={pid} pgid={pid} argv0={argv0} argc={} cwd=\"{cwd_text}\" uid={} secret={secret_kind}{ran}",
             req.argv.len(),
             opts.uid.map_or("-".to_string(), |u| u.to_string())
         ));
         inner.bump();
-        Ok(Frame::Spawned { spawn_id: id, pid, pgid: pid, claude_version: None })
+        let (claude_version, claude_sha256) = req.picked.map_or((None, None), |p| (p.version, p.sha256));
+        Ok(Frame::Spawned { spawn_id: id, pid, pgid: pid, claude_version, claude_sha256 })
     }
 
     /// The clock task, once a runtime exists (the first hello or spawn); on
@@ -1175,6 +1194,15 @@ impl SpawnManager {
     pub fn credential_holders(&self) -> u32 {
         let n = self.inner.lock().spawns.values().filter(|s| s.holds_secret && (s.leader.is_none() || group_alive(s.pid))).count();
         u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// S11: the sha256s of the cached claudes live spawns run (a spawn whose
+    /// leader died counts while a process of its group lives on: it may start
+    /// a nested `claude` from the binary's directory). The cache never evicts
+    /// one of them.
+    #[must_use]
+    pub fn running_claudes(&self) -> std::collections::BTreeSet<String> {
+        self.inner.lock().spawns.values().filter(|s| s.leader.is_none() || group_alive(s.pid)).filter_map(|s| s.claude_sha256.clone()).collect()
     }
 
     /// The shim's credential cache (S7).
@@ -2072,11 +2100,12 @@ fn secret_pipe(value: &[u8]) -> io::Result<OwnedFd> {
     Ok(read)
 }
 
-/// The program for argv[0]: `claude` → `--claude`; a path (with `/`) as
-/// given; a bare name looked up on the child's PATH, here, before the fork.
-fn resolve(argv0: &str, claude: &Path) -> Result<PathBuf, String> {
+/// The program for argv[0]: `claude` → the cached binary the connection
+/// picked (S11), else `--claude`; a path (with `/`) as given; a bare name
+/// looked up on the child's PATH, here, before the fork.
+fn resolve(argv0: &str, claude: &Path, picked: Option<&Path>) -> Result<PathBuf, String> {
     if argv0 == "claude" {
-        return Ok(claude.to_path_buf());
+        return Ok(picked.unwrap_or(claude).to_path_buf());
     }
     if argv0.contains('/') {
         return Ok(PathBuf::from(argv0));
@@ -2086,6 +2115,19 @@ fn resolve(argv0: &str, claude: &Path) -> Result<PathBuf, String> {
         .map(|dir| Path::new(dir).join(argv0))
         .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
         .ok_or_else(|| format!("{}: not found on PATH={CHILD_PATH}", short(argv0)))
+}
+
+/// A spawn's PATH (S11): the cached claude's directory first when one runs,
+/// so a nested `claude` runs it too; [`CHILD_PATH`] otherwise. A frame still
+/// cannot set PATH ([`RESERVED_ENV`]).
+fn child_path(cached: Option<&Path>) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::new();
+    if let Some(dir) = cached.and_then(Path::parent) {
+        path.push(dir.as_os_str());
+        path.push(":");
+    }
+    path.push(CHILD_PATH);
+    path
 }
 
 /// The components of a spawn's working directory, a VM path ([`cwd_parts`]'s
@@ -2127,6 +2169,16 @@ fn check_request(req: &SpawnRequest) -> Result<(), String> {
     }
     if req.secrets.len() > 1 {
         return Err(format!("{} secrets (at most one)", req.secrets.len()));
+    }
+    // S11: the staged claudes it names (compared with the cache's index only, never joined into a path).
+    if req.claude.len() > CLAUDE_REFS_MAX {
+        return Err(format!("claude names {} refs (at most {CLAUDE_REFS_MAX})", req.claude.len()));
+    }
+    for (i, r) in req.claude.iter().enumerate() {
+        r.check().map_err(|e| format!("claude ref {i} {e}"))?;
+        if req.claude[..i].iter().any(|before| before.sha256 == r.sha256) {
+            return Err(format!("claude ref {i} names a sha256 an earlier ref names"));
+        }
     }
     for (k, v) in &req.secrets {
         check_name(k)?;
@@ -2253,13 +2305,13 @@ mod tests {
     }
 
     fn req(argv: &[&str]) -> SpawnRequest {
-        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None, credential: None }
+        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), picked: None }
     }
 
     async fn start(m: &SpawnManager, conn: ConnGen, r: SpawnRequest) -> (SpawnId, u32) {
         let id = r.spawn_id.clone();
         match m.spawn(conn, r).await {
-            Frame::Spawned { spawn_id, pid, pgid, claude_version: None } if spawn_id == id && pgid == pid => (id, pid),
+            Frame::Spawned { spawn_id, pid, pgid, claude_version: None, claude_sha256: None } if spawn_id == id && pgid == pid => (id, pid),
             f => panic!("{f:?}"),
         }
     }
@@ -2428,6 +2480,7 @@ mod tests {
         let mut s = Spawn {
             argv0: "x".into(),
             holds_secret: false,
+            claude_sha256: None,
             pid: 0,
             started_at: String::new(),
             grace: Duration::ZERO,
@@ -3037,6 +3090,33 @@ mod tests {
         assert!(log.contains("ai-env: spawns stopped (terminate): KILL to 1 group(s), 0 still running"), "{log}");
     }
 
+    /// S11 (A §2.5): more than `CLAUDE_REFS_MAX` refs, a ref that fails its
+    /// check, or one sha256 twice is `bad_request` naming `claude`, before
+    /// anything starts; a request naming good refs starts.
+    #[tokio::test]
+    async fn a_spawn_with_too_many_or_bad_refs_is_bad_request() {
+        let home = tempfile::tempdir().unwrap();
+        let m = manager(home.path());
+        let r = |n: u8| ClaudeRef { version: format!("2.1.{n}"), sha256: format!("{n:02x}").repeat(32) };
+        let with = |refs: Vec<ClaudeRef>| {
+            let mut q = req(&["true"]);
+            q.claude = refs;
+            q
+        };
+        let bad_sha = ClaudeRef { version: "2.1.1".into(), sha256: "AB".repeat(32) };
+        let bad_version = ClaudeRef { version: "2.1".into(), sha256: "ab".repeat(32) };
+        let twice = ClaudeRef { version: "2.1.9".into(), sha256: r(1).sha256 };
+        let too_many: Vec<ClaudeRef> = (1..=u8::try_from(CLAUDE_REFS_MAX).unwrap() + 1).map(r).collect();
+        for (refs, needle) in [(too_many, "claude names 5 refs (at most 4)"), (vec![r(1), bad_sha], "claude ref 1 "), (vec![bad_version], "claude ref 0 "), (vec![r(1), twice], "claude ref 1 names a sha256 an earlier ref names")] {
+            let (code, message) = refused(&m, with(refs)).await;
+            assert_eq!(code, SpawnErrCode::BadRequest, "{message}");
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        let good = with((1..=u8::try_from(CLAUDE_REFS_MAX).unwrap()).map(r).collect());
+        let id = good.spawn_id.clone();
+        assert!(matches!(m.spawn(1, good).await, Frame::Spawned { spawn_id, claude_version: None, claude_sha256: None, .. } if spawn_id == id), "four good refs start; nothing was picked");
+    }
+
     #[tokio::test]
     async fn bad_requests_are_refused_by_name_and_never_echo_values() {
         let home = tempfile::tempdir().unwrap();
@@ -3434,10 +3514,16 @@ mod tests {
 
     #[test]
     fn programs_resolve_like_a_shell_but_claude() {
-        assert_eq!(resolve("claude", Path::new("/opt/c")).unwrap(), PathBuf::from("/opt/c"));
-        assert_eq!(resolve("./x", Path::new("/opt/c")).unwrap(), PathBuf::from("./x"));
-        assert!(resolve("sh", Path::new("/opt/c")).unwrap().starts_with("/"), "found on the child PATH");
-        assert!(resolve("no-such-program-for-ai-env-tests", Path::new("/opt/c")).unwrap_err().contains("not found on PATH=/usr/local/bin:/usr/bin:/bin"));
+        assert_eq!(resolve("claude", Path::new("/opt/c"), None).unwrap(), PathBuf::from("/opt/c"));
+        // S11: a picked (cached) binary wins for `claude`, and only for it.
+        let picked = Path::new("/opt/ai-env/claude/abc/claude");
+        assert_eq!(resolve("claude", Path::new("/opt/c"), Some(picked)).unwrap(), picked);
+        assert_eq!(resolve("./x", Path::new("/opt/c"), Some(picked)).unwrap(), PathBuf::from("./x"));
+        assert_eq!(child_path(Some(picked)), std::ffi::OsString::from("/opt/ai-env/claude/abc:/usr/local/bin:/usr/bin:/bin"), "the cached binary's directory leads");
+        assert_eq!(child_path(None), std::ffi::OsString::from(CHILD_PATH));
+        assert_eq!(resolve("./x", Path::new("/opt/c"), None).unwrap(), PathBuf::from("./x"));
+        assert!(resolve("sh", Path::new("/opt/c"), None).unwrap().starts_with("/"), "found on the child PATH");
+        assert!(resolve("no-such-program-for-ai-env-tests", Path::new("/opt/c"), None).unwrap_err().contains("not found on PATH=/usr/local/bin:/usr/bin:/bin"));
     }
 
     /// S8: a workspace helper holds off the idle sweep. With a hold alive, a
@@ -3545,6 +3631,7 @@ mod tests {
         Spawn {
             argv0: "x".into(),
             holds_secret: false,
+            claude_sha256: None,
             pid: 0,
             started_at: String::new(),
             grace: Duration::ZERO,

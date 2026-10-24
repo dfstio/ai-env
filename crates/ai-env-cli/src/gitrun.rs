@@ -136,6 +136,8 @@ pub struct GitRun {
     env: Vec<(OsString, OsString)>,
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    /// [`GitRun::without_credentials`].
+    no_credentials: bool,
 }
 
 impl GitRun {
@@ -143,7 +145,7 @@ impl GitRun {
     /// entries only), the environment minus every inherited `GIT_*` variable.
     #[must_use]
     pub fn mac(cwd: &Path) -> GitRun {
-        GitRun { program: find_git(std::env::var_os("PATH").as_deref()), cwd: cwd.to_path_buf(), side: Side::Mac, env: Vec::new(), timeout: DEFAULT_TIMEOUT, cancel: None }
+        GitRun { program: find_git(std::env::var_os("PATH").as_deref()), cwd: cwd.to_path_buf(), side: Side::Mac, env: Vec::new(), timeout: DEFAULT_TIMEOUT, cancel: None, no_credentials: false }
     }
 
     /// A run in the VM in `cwd`, as the agent whose home is `home`: `git`
@@ -152,7 +154,7 @@ impl GitRun {
     /// environment (the image's system config, which names the agent, stays).
     #[must_use]
     pub fn vm(cwd: &Path, home: &Path) -> GitRun {
-        GitRun { program: find_git(Some(OsStr::new(VM_PATH))), cwd: cwd.to_path_buf(), side: Side::Vm { home: home.to_path_buf() }, env: Vec::new(), timeout: DEFAULT_TIMEOUT, cancel: None }
+        GitRun { program: find_git(Some(OsStr::new(VM_PATH))), cwd: cwd.to_path_buf(), side: Side::Vm { home: home.to_path_buf() }, env: Vec::new(), timeout: DEFAULT_TIMEOUT, cancel: None, no_credentials: false }
     }
 
     /// Run this program instead of the `git` found on `PATH` (an absolute
@@ -168,6 +170,19 @@ impl GitRun {
     #[must_use]
     pub fn env(mut self, key: &str, value: impl AsRef<OsStr>) -> GitRun {
         self.env.push((OsString::from(key), value.as_ref().to_os_string()));
+        self
+    }
+
+    /// On the Mac, also remove what a git run has no business seeing (B3's
+    /// review, D16): the variables the age children lose
+    /// ([`crate::age_cmd::CHILD_ENV_REMOVED`]: the OAuth token, the API
+    /// key, an AWS key, a session token, the stack's passphrase) and the
+    /// `ai-env as` marker ([`crate::commands::RUNNER_MARKER`]), so a git
+    /// under `ai-env as ops -- ai-env doctor` inherits no credential. (A VM
+    /// run starts from an empty environment already.)
+    #[must_use]
+    pub fn without_credentials(mut self) -> GitRun {
+        self.no_credentials = true;
         self
     }
 
@@ -312,6 +327,11 @@ impl GitRun {
             Side::Mac => {
                 for name in inherited.into_iter().filter(|n| n.as_bytes().starts_with(b"GIT_")) {
                     cmd.env_remove(name);
+                }
+                if self.no_credentials {
+                    for name in crate::age_cmd::CHILD_ENV_REMOVED.iter().chain(&[crate::commands::RUNNER_MARKER]) {
+                        cmd.env_remove(name);
+                    }
                 }
             }
             Side::Vm { home } => {
@@ -759,6 +779,25 @@ mod tests {
         let git_vars: Vec<&str> = out.lines().filter(|l| l.starts_with("GIT_")).collect();
         assert_eq!(git_vars, ["GIT_INDEX_FILE=/tmp/index.w"], "{out}");
         assert!(out.lines().any(|l| l.starts_with("PATH=")), "the rest is inherited: {out}");
+    }
+
+    /// B3's review (D16): `without_credentials` removes every credential
+    /// variable and the `ai-env as` marker from a Mac run; a plain run
+    /// leaves them as inherited.
+    #[test]
+    fn a_run_without_credentials_drops_them_and_the_runner_marker() {
+        let d = tempfile::tempdir().unwrap();
+        let removed = |run: &GitRun| -> Vec<String> {
+            let cmd = run.command(["rev-parse", "--git-dir"], Vec::<OsString>::new()).unwrap();
+            let mut names: Vec<String> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+            names.sort_unstable();
+            names
+        };
+        let plain = GitRun::mac(d.path()).with_program(Path::new("/usr/bin/true"));
+        assert!(removed(&plain).is_empty());
+        let mut want: Vec<String> = crate::age_cmd::CHILD_ENV_REMOVED.iter().chain(&[crate::commands::RUNNER_MARKER]).map(|n| (*n).to_string()).collect();
+        want.sort_unstable();
+        assert_eq!(removed(&plain.without_credentials()), want);
     }
 
     #[test]

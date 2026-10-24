@@ -346,6 +346,58 @@ impl Paths {
     pub fn transcript_lock(&self, sid: &str) -> PathBuf {
         self.transcripts().join(format!("{sid}.lock"))
     }
+
+    /// `state/transcripts/<sid>/spool` (S11, a real 0700 directory): the stage's gzip spool files
+    /// (`<n>.gz`, `n` the file's index in the chat's files, 0 the main).
+    #[must_use]
+    pub fn transcript_spool(&self, sid: &str) -> PathBuf {
+        self.transcript_dir(sid).join("spool")
+    }
+
+    /// `state/claude` (S11, 0700): this Mac's record of each Claude Code version (`bridge::claude`).
+    /// Each function below takes a version `wire::pin::is_version` already accepted: they only join.
+    #[must_use]
+    pub fn claude_dir(&self) -> PathBuf {
+        self.root.join("state").join("claude")
+    }
+
+    /// `state/claude/<v>.toml` (0600): the version's record (seen, signed, admitted, staged, …).
+    #[must_use]
+    pub fn claude_record(&self, version: &str) -> PathBuf {
+        self.claude_dir().join(format!("{version}.toml"))
+    }
+
+    /// `state/claude/<v>` (0700): the version's Linux binary, its verified manifest and signature.
+    #[must_use]
+    pub fn claude_bin_dir(&self, version: &str) -> PathBuf {
+        self.claude_dir().join(version)
+    }
+
+    /// `state/claude/<v>/claude` (0755: the container's uid 1000 runs it through the bind mount).
+    #[must_use]
+    pub fn claude_bin(&self, version: &str) -> PathBuf {
+        self.claude_bin_dir(version).join("claude")
+    }
+
+    /// `state/claude/<v>.lock` (0600): a non-blocking flock held by every command that admits or stages
+    /// the version; its `finished_at=` and `outcome=` lines are the automatic admission's last attempt.
+    #[must_use]
+    pub fn claude_lock(&self, version: &str) -> PathBuf {
+        self.claude_dir().join(format!("{version}.lock"))
+    }
+
+    /// `state/claude/records.lock` (0600): held for a record's read, change and write.
+    #[must_use]
+    pub fn claude_records_lock(&self) -> PathBuf {
+        self.claude_dir().join("records.lock")
+    }
+
+    /// `state/argv-dropped/<claude>/<flag>` (0600 in 0700 directories, empty): `argv_dropped` was audited
+    /// for this flag and claude version on this Mac.
+    #[must_use]
+    pub fn argv_dropped_marker(&self, claude: &str, flag: &str) -> PathBuf {
+        self.root.join("state").join("argv-dropped").join(claude).join(flag)
+    }
 }
 
 /// `arn:aws:lambda:eu-central-1:<12 digits>:network-connector:<name>[:<N>]`,
@@ -1137,6 +1189,23 @@ pub struct BridgeConfig {
     pub seed: SeedCfg,
     /// S9: `[transcript]`, a remote chat's view on this Mac.
     pub transcript: TranscriptCfg,
+    /// S11: `[claude]`, how this Mac follows the Claude Code versions Cursor installs.
+    pub claude: ClaudeCfg,
+}
+
+/// `[claude]` (S11): how this Mac follows the Claude Code versions Cursor installs.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaudeCfg {
+    /// D5: a wrapper that sees an unadmitted version starts its admission detached (`ai-env claude admit <v>
+    /// --auto`), which runs only when Docker answers; `false`: only `ai-env claude admit` or `update` admits.
+    pub auto_admit: bool,
+}
+
+impl Default for ClaudeCfg {
+    fn default() -> Self {
+        ClaudeCfg { auto_admit: true }
+    }
 }
 
 /// `[transcript]` (S9): what this Mac keeps of a remote chat whose
@@ -1263,6 +1332,27 @@ mod tests {
         assert_eq!(p.session_migrate_request(sid), PathBuf::from(format!("/r/state/sessions/{sid}.migrate.json")));
         assert_eq!(p.gc_lock(), PathBuf::from("/r/state/gc.lock"));
         assert_eq!(p.gc_stamp(), PathBuf::from("/r/state/gc.stamp"));
+        // S11: the gzip spool (part C), the claude records and binaries, the argv markers (part A).
+        assert_eq!(p.transcript_spool(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/spool")));
+        assert_eq!(p.claude_dir(), PathBuf::from("/r/state/claude"));
+        assert_eq!(p.claude_record("2.1.308"), PathBuf::from("/r/state/claude/2.1.308.toml"));
+        assert_eq!(p.claude_bin_dir("2.1.308"), PathBuf::from("/r/state/claude/2.1.308"));
+        assert_eq!(p.claude_bin("2.1.308"), PathBuf::from("/r/state/claude/2.1.308/claude"));
+        assert_eq!(p.claude_lock("2.1.308"), PathBuf::from("/r/state/claude/2.1.308.lock"));
+        assert_eq!(p.claude_records_lock(), PathBuf::from("/r/state/claude/records.lock"));
+        assert_eq!(p.argv_dropped_marker("2.1.308", "--x"), PathBuf::from("/r/state/argv-dropped/2.1.308/--x"));
+    }
+
+    /// S11 (A §6.1): `[claude]` holds `auto_admit` alone, true by default (no table needed); any other key
+    /// is refused, as an S10 build refuses the table.
+    #[test]
+    fn the_claude_table_and_its_default() {
+        assert!(BridgeConfig::parse("").unwrap().claude.auto_admit);
+        assert_eq!(ClaudeCfg::default(), ClaudeCfg { auto_admit: true });
+        assert!(!BridgeConfig::parse("[claude]\nauto_admit = false\n").unwrap().claude.auto_admit);
+        assert!(BridgeConfig::parse("[claude]\n").unwrap().claude.auto_admit, "an empty table keeps the default");
+        assert!(BridgeConfig::parse("[claude]\nkeep = 3\n").is_err(), "the keep counts are constants, not keys");
+        assert!(BridgeConfig::parse("[claude]\nauto_admit = \"yes\"\n").is_err());
     }
 
     /// S10 (§5): `max_readdress` (3), `park` (on) and `park_after_s` (unset:

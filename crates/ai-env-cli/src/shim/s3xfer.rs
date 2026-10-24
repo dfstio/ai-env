@@ -37,6 +37,18 @@
 //! 4xx that pushing again cannot change); curl without a status, a 5xx, or
 //! a 4xx S3 asks to retry (408, 409 `ConditionalRequestConflict`, 429, 400
 //! `RequestTimeout`) keeps it for the next hook.
+//!
+//! S11 (part C): `view_parent_v1` and `transcript_gzip_v1` are named as
+//! [`VIEW_PARENT_SERVED`] and [`GZIP_SERVED`] hold. The view answers
+//! `first_parent` only when the query asked (`ViewQuery.parent`), so an S10
+//! reader never meets it. A pull part stored gzip (`PullPart.encoding`) is
+//! fetched with curl's `compressed` line: curl asks for and decodes
+//! `Content-Encoding: gzip`, and every check (the status, not past `len`,
+//! the length, the part's and the file's sha256) runs on the decoded bytes,
+//! so an object served without that header fails them and nothing is
+//! renamed. A build without the flag refuses an encoded part before any
+//! curl runs. Part A's claude cache (`shim::claudebin`) builds its curls
+//! with this module's `pub(crate)` pieces (A §2.4).
 use crate::shim::health::ShimState;
 use crate::wire::workspace::{refusal, WsRefusal};
 use axum::extract::{Request, State};
@@ -47,7 +59,7 @@ use std::time::Instant;
 use crate::shim::asagent::{self, flag, AgentCmd, AgentProc, AgentProcError, EOF_GRACE};
 use crate::wire::s3::{sha256_b64, PresignedUrl, PUSH_MAX};
 use crate::wire::view::TranscriptViewReply;
-use crate::wire::workspace::{budget, HelperHead, JsonPayloadReply, PullPartReport, TranscriptPull, TranscriptPullReply, TranscriptPush, TranscriptPushReply, TranscriptReadReply, TranscriptStat, TranscriptTail, TranscriptWriteReply, ViewQuery};
+use crate::wire::workspace::{budget, HelperHead, JsonPayloadReply, PartEncoding, PullPartReport, TranscriptPull, TranscriptPullReply, TranscriptPush, TranscriptPushReply, TranscriptReadReply, TranscriptStat, TranscriptTail, TranscriptWriteReply, ViewQuery};
 use crate::wire::workspace::{JSON_PAYLOAD_MAX, PULL_MAX, TRANSFERS_MAX, TRANSFER_REQUEST_MAX};
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
@@ -62,25 +74,31 @@ use tokio::task::JoinHandle;
 
 /// Whether this build serves the transfer routes and the extended stat (and names `transcript_s3_v1`).
 pub const SERVED: bool = true;
+/// S11 (C.2, `view_parent_v1`): whether the view answers `first_parent` when asked (and names the cap). While false
+/// the view never answers it.
+pub const VIEW_PARENT_SERVED: bool = true;
+/// S11 (C.3, `transcript_gzip_v1`): whether a pull decodes a gzip part (and names the cap). While false a pull
+/// naming an encoded part is refused before any curl runs.
+pub const GZIP_SERVED: bool = true;
 
 /// A push's stdout kept, for S3's `<Code>` (its error document).
-const CURL_STDOUT_MAX: usize = 16 * 1024;
+pub(crate) const CURL_STDOUT_MAX: usize = 16 * 1024;
 /// One stderr line of curl as it is read and logged, at most.
 const CURL_LINE_MAX: usize = 4096;
 /// One logged line of curl's, in characters.
 const CURL_SHOWN_MAX: usize = 300;
 /// curl's own wait for its connection (the proxy's, or the lab's S3).
-const CONNECT_TIMEOUT_S: u64 = 20;
+pub(crate) const CONNECT_TIMEOUT_S: u64 = 20;
 /// S10: curl ends a transfer slower than this many bytes a second ...
 pub const SPEED_LIMIT: u64 = 1024;
 /// ... for this many seconds in a row (a stalled transfer fails then, not at its `max-time`).
 pub const SPEED_TIME_S: u64 = 60;
 /// The first word of the line curl's write-out prints on its stderr.
-const STATUS_WORD: &str = "ai-env-curl ";
+pub(crate) const STATUS_WORD: &str = "ai-env-curl ";
 /// curl's write-out (S9 §3.4): S3's status, version id, checksum and ETag, one line on stderr.
-const WRITE_OUT: &str = r#"write-out = "%{stderr}ai-env-curl status=%{http_code} version=%header{x-amz-version-id} checksum=%header{x-amz-checksum-sha256} etag=%header{etag}\n""#;
+pub(crate) const WRITE_OUT: &str = r#"write-out = "%{stderr}ai-env-curl status=%{http_code} version=%header{x-amz-version-id} checksum=%header{x-amz-checksum-sha256} etag=%header{etag}\n""#;
 /// One read of a part.
-const CHUNK: usize = 64 * 1024;
+pub(crate) const CHUNK: usize = 64 * 1024;
 
 // ---- the runs and the tails ------------------------------------------------------------------
 
@@ -155,7 +173,7 @@ impl Transfers {
 /// `TRANSFER_REQUEST_MAX` (413 past it); a body of another type, one that
 /// does not arrive whole within its transfer time, or one that does not
 /// parse is 400. The `Err` is the refusal, answered and logged.
-async fn json_body<T: DeserializeOwned>(op: &'static str, started: Instant, req: Request) -> Result<T, Box<Response>> {
+pub(crate) async fn json_body<T: DeserializeOwned>(op: &'static str, started: Instant, req: Request) -> Result<T, Box<Response>> {
     let len = match crate::shim::code::content_length(&req, TRANSFER_REQUEST_MAX as u64) {
         Ok(len) => len,
         Err(stop) => {
@@ -176,7 +194,7 @@ async fn json_body<T: DeserializeOwned>(op: &'static str, started: Instant, req:
 
 /// A body's parse error as a refusal names it: where, and what, unless the
 /// text quotes a value (a value may be a presigned URL).
-fn parse_error(e: &serde_json::Error) -> String {
+pub(crate) fn parse_error(e: &serde_json::Error) -> String {
     let what = e.to_string();
     if what.contains('"') {
         format!("invalid at line {} column {}", e.line(), e.column())
@@ -186,31 +204,31 @@ fn parse_error(e: &serde_json::Error) -> String {
 }
 
 /// A request's `check` refusal, named after the request (its rel's message is already whole).
-fn checked(what: &str, e: String) -> WsRefusal {
+pub(crate) fn checked(what: &str, e: String) -> WsRefusal {
     let message = if e.starts_with("the ") { e } else { format!("the {what} {e}") };
     WsRefusal::new(refusal::BAD_REQUEST, &message)
 }
 
 /// A refusal a run ends with, boxed (as `code::query`'s: a `WsRefusal` is large).
-type Refused = Box<WsRefusal>;
+pub(crate) type Refused = Box<WsRefusal>;
 
 /// 500 `transfer_failed` (§1.6): the transfer to or from S3 did not happen.
-fn transfer_failed(message: &str) -> Refused {
+pub(crate) fn transfer_failed(message: &str) -> Refused {
     Box::new(WsRefusal::new(refusal::TRANSFER_FAILED, message))
 }
 
 /// The whole seconds left before `deadline`, at least 1 (curl's `max-time`).
-fn seconds_left(deadline: tokio::time::Instant) -> u64 {
+pub(crate) fn seconds_left(deadline: tokio::time::Instant) -> u64 {
     deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs().max(1)
 }
 
 /// The run's budget left before `deadline`.
-fn left(deadline: tokio::time::Instant) -> std::time::Duration {
+pub(crate) fn left(deadline: tokio::time::Instant) -> std::time::Duration {
     deadline.saturating_duration_since(tokio::time::Instant::now())
 }
 
 /// 504 `timeout`: `op` did not finish within its budget.
-fn timed_out(op: &str) -> Refused {
+pub(crate) fn timed_out(op: &str) -> Refused {
     Box::new(AgentProcError::Timeout.refusal(op))
 }
 
@@ -357,6 +375,10 @@ pub async fn pull(State(state): State<Arc<ShimState>>, req: Request) -> Response
     };
     if let Err(e) = p.check() {
         return asagent::refuse(op, started, &checked("pull", e));
+    }
+    // S11 (C.3.2): a build that does not decode (`GZIP_SERVED` false) refuses an encoded part before any curl runs.
+    if !GZIP_SERVED && p.parts.iter().any(|part| part.encoding.is_some()) {
+        return asagent::refuse(op, started, &WsRefusal::new(refusal::BAD_REQUEST, "the pull names an encoded part this shim does not decode"));
     }
     if state.is_draining() {
         return asagent::refuse(op, started, &AgentProcError::Draining.refusal(op));
@@ -517,13 +539,16 @@ async fn finish_quietly(proc: AgentProc, op: &str) {
 /// status, length and sha256 checked as it ends (a part longer than its
 /// `len` is cut there, never sent past it: its report's `len` counts the
 /// chunk that passed it); the first bad part ends the pull, its report last.
-/// The reports, and the sha256 of every byte sent.
+/// S11 (C.3.2): a gzip part's GET carries curl's `compressed` line, so every
+/// check runs on the decoded bytes (a decoded stream past `len`, a bomb, is
+/// cut there as any part is). The reports, and the sha256 of every byte sent.
 async fn stream_parts(state: &ShimState, p: &TranscriptPull, stdin: &mut ChildStdin, deadline: tokio::time::Instant) -> Result<(Vec<PullPartReport>, String), PullStop> {
     let mut whole = Sha256::new();
     let mut reports = Vec::new();
     let mut buf = vec![0u8; CHUNK];
     for part in &p.parts {
-        let config = curl_config(&part.url, p.proxy.as_deref(), seconds_left(deadline), &Kind::Get { owner: &p.owner });
+        let compressed = part.encoding == Some(PartEncoding::Gzip);
+        let config = curl_config(&part.url, p.proxy.as_deref(), seconds_left(deadline), &Kind::Get { owner: &p.owner, compressed });
         let mut curl = Curl::start(state, "transcript-pull", &config).map_err(|r| PullStop::NoStatus(r.message.clone()))?;
         let mut h = Sha256::new();
         let (mut got, mut over) = (0u64, false);
@@ -559,7 +584,8 @@ async fn stream_parts(state: &ShimState, p: &TranscriptPull, stdin: &mut ChildSt
     Ok((reports, hex::encode(whole.finalize())))
 }
 
-/// `GET /transcript/view?rel=&n=` (`ViewQuery`): a `wire::view::TranscriptViewReply`.
+/// `GET /transcript/view?rel=&n=` (`ViewQuery`; S11: `&parent=true`): a `wire::view::TranscriptViewReply`, its
+/// `first_parent` only when asked.
 pub async fn view(State(state): State<Arc<ShimState>>, req: Request) -> Response {
     let (op, started) = ("transcript-view", Instant::now());
     let q: ViewQuery = match crate::shim::code::query(&req) {
@@ -574,16 +600,22 @@ pub async fn view(State(state): State<Arc<ShimState>>, req: Request) -> Response
     }
     let args = vec![flag("projects", crate::shim::health::projects(&state)), flag("rel", &q.rel), flag("n", q.n.to_string())];
     let cmd = AgentCmd { op, args, budget: budget::TRANSCRIPT_VIEW, stdin: false, during_stop: false };
-    match run_payload::<TranscriptViewReply>(&state, cmd).await {
-        // The helper runs as the agent: only the shape the Mac takes goes out.
-        Ok(reply) => match reply.check(q.n) {
-            Ok(()) => {
-                asagent::log(op, 200, None, started);
-                asagent::answered(200, &reply)
-            }
-            Err(e) => asagent::refuse(op, started, &AgentProcError::BadHead(format!("the view {e}")).refusal(op)),
-        },
-        Err(r) => asagent::refuse(op, started, &r),
+    let mut reply = match run_payload::<TranscriptViewReply>(&state, cmd).await {
+        Ok(reply) => reply,
+        Err(r) => return asagent::refuse(op, started, &r),
+    };
+    // S11 (C.2.3): `first_parent` only when the query asked (and this build serves it), so a reader that refuses
+    // unknown fields (an S10 Mac) never meets it.
+    if !(VIEW_PARENT_SERVED && q.parent) {
+        reply.first_parent = None;
+    }
+    // The helper runs as the agent: only the shape the Mac takes goes out.
+    match reply.check(q.n) {
+        Ok(()) => {
+            asagent::log(op, 200, None, started);
+            asagent::answered(200, &reply)
+        }
+        Err(e) => asagent::refuse(op, started, &AgentProcError::BadHead(format!("the view {e}")).refusal(op)),
     }
 }
 
@@ -723,11 +755,12 @@ async fn tail_size(state: &ShimState, tail: &TranscriptTail, deadline: tokio::ti
 // ---- curl ------------------------------------------------------------------------------------
 
 /// What a curl run does (S9 §3.4).
-enum Kind<'a> {
+pub(crate) enum Kind<'a> {
     /// A PUT of `len` bytes from stdin: a push (its checksum) or a tail (none).
     Put { len: u64, checksum: Option<&'a str>, owner: &'a str },
-    /// A pull part's GET.
-    Get { owner: &'a str },
+    /// A pull part's GET (S11: and the claude cache's fetch). `compressed` (S11, C.3): curl asks for and decodes
+    /// `Content-Encoding: gzip` (its `compressed` line); false for an identity object, whose lines are S10's.
+    Get { owner: &'a str, compressed: bool },
 }
 
 /// curl's configuration (S9 §3.4, pinned line by line), for its fd 3 and
@@ -736,7 +769,7 @@ enum Kind<'a> {
 /// limit, [`SPEED_LIMIT`] bytes a second for [`SPEED_TIME_S`]; `proto`
 /// `=http` for a lab URL), the proxy when the request names one, then the
 /// request's own.
-fn curl_config(url: &PresignedUrl, proxy: Option<&str>, max_time: u64, kind: &Kind<'_>) -> String {
+pub(crate) fn curl_config(url: &PresignedUrl, proxy: Option<&str>, max_time: u64, kind: &Kind<'_>) -> String {
     let proto = if url.is_lab() { "=http" } else { "=https" };
     let mut lines = vec![
         format!("url = \"{}\"", url.expose()),
@@ -761,30 +794,36 @@ fn curl_config(url: &PresignedUrl, proxy: Option<&str>, max_time: u64, kind: &Ki
             }
             lines.extend([header("If-None-Match: *"), header(&format!("x-amz-expected-bucket-owner: {owner}")), "output = \"-\"".to_string()]);
         }
-        Kind::Get { owner } => lines.extend(["request = \"GET\"".to_string(), header(&format!("x-amz-expected-bucket-owner: {owner}")), "fail".to_string(), "output = \"-\"".to_string()]),
+        Kind::Get { owner, compressed } => {
+            lines.extend(["request = \"GET\"".to_string(), header(&format!("x-amz-expected-bucket-owner: {owner}"))]);
+            if *compressed {
+                lines.push("compressed".to_string());
+            }
+            lines.extend(["fail".to_string(), "output = \"-\"".to_string()]);
+        }
     }
     lines.join("\n") + "\n"
 }
 
 /// What curl said on its stderr: its last status line (after `ai-env-curl `), its last other line (scrubbed).
 #[derive(Debug, Default)]
-struct CurlSaid {
-    status: Option<String>,
-    last: Option<String>,
+pub(crate) struct CurlSaid {
+    pub(crate) status: Option<String>,
+    pub(crate) last: Option<String>,
 }
 
 /// One curl run: its pipes, its stderr read by a task of its own (the
 /// status line kept, every other line logged scrubbed). Killed when dropped.
-struct Curl {
+pub(crate) struct Curl {
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: Option<ChildStdout>,
+    pub(crate) stdin: Option<ChildStdin>,
+    pub(crate) stdout: Option<ChildStdout>,
     said: Option<JoinHandle<CurlSaid>>,
 }
 
 impl Curl {
     /// curl as `ai-env-net` when the shim is root (as the shim's own uid otherwise: the native tests), `config` on its fd 3.
-    fn start(state: &ShimState, op: &'static str, config: &str) -> Result<Curl, Refused> {
+    pub(crate) fn start(state: &ShimState, op: &'static str, config: &str) -> Result<Curl, Refused> {
         let ids = nix::unistd::geteuid().is_root().then_some((state.opts.net_uid, state.opts.net_gid));
         let mut child = crate::shim::childproc::spawn_curl(&state.opts.curl, ids, config.as_bytes()).map_err(|e| transfer_failed(&format!("curl did not start: {e}")))?;
         let said = child.stderr.take().map(|err| tokio::spawn(read_stderr(err, op)));
@@ -792,12 +831,12 @@ impl Curl {
     }
 
     /// End it now.
-    async fn kill(&mut self) {
+    pub(crate) async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
 
     /// Its stdin closed, its stdout dropped, its exit code (`None`: a signal) and what its stderr said.
-    async fn finish(mut self) -> (Option<i32>, CurlSaid) {
+    pub(crate) async fn finish(mut self) -> (Option<i32>, CurlSaid) {
         drop(self.stdin.take());
         drop(self.stdout.take());
         let code = self.child.wait().await.ok().and_then(|s| s.code());
@@ -810,7 +849,7 @@ impl Curl {
 }
 
 /// curl's stderr to its end: the last status line kept, every other line logged scrubbed and the last one kept.
-async fn read_stderr(err: ChildStderr, op: &'static str) -> CurlSaid {
+pub(crate) async fn read_stderr(err: ChildStderr, op: &'static str) -> CurlSaid {
     let mut said = CurlSaid::default();
     let mut reader = tokio::io::BufReader::new(err);
     let mut line = Vec::new();
@@ -837,7 +876,7 @@ async fn read_stderr(err: ChildStderr, op: &'static str) -> CurlSaid {
 }
 
 /// At most `max` bytes of `out` kept, the rest read away (curl never waits on a full pipe).
-async fn read_capped(out: Option<&mut ChildStdout>, max: usize) -> Vec<u8> {
+pub(crate) async fn read_capped(out: Option<&mut ChildStdout>, max: usize) -> Vec<u8> {
     let mut kept = Vec::new();
     let Some(out) = out else { return kept };
     let mut buf = vec![0u8; 8192];
@@ -854,15 +893,15 @@ async fn read_capped(out: Option<&mut ChildStdout>, max: usize) -> Vec<u8> {
 }
 
 /// The fields of curl's status line that the shim reads.
-struct CurlStatus {
+pub(crate) struct CurlStatus {
     /// `%{http_code}`: 0 when no HTTP exchange happened.
-    http: u16,
+    pub(crate) http: u16,
     /// `x-amz-version-id`, when it is one (`[A-Za-z0-9._+/=-]`, at most 1024 bytes).
-    version: Option<String>,
+    pub(crate) version: Option<String>,
 }
 
 /// `status=<code> version=<id> checksum=<b64> etag=<etag>`.
-fn parse_status(fields: &str) -> Option<CurlStatus> {
+pub(crate) fn parse_status(fields: &str) -> Option<CurlStatus> {
     let (mut http, mut version) = (None, None);
     for field in fields.split(' ') {
         if let Some(v) = field.strip_prefix("status=") {
@@ -875,7 +914,7 @@ fn parse_status(fields: &str) -> Option<CurlStatus> {
 }
 
 /// S3's `<Code>` in an error document: 1 to 64 characters of `[A-Za-z0-9]`.
-fn s3_code(body: &[u8]) -> Option<String> {
+pub(crate) fn s3_code(body: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(body).ok()?;
     let start = text.find("<Code>")? + "<Code>".len();
     let code = &text[start..start + text[start..].find("</Code>")?];
@@ -883,7 +922,7 @@ fn s3_code(body: &[u8]) -> Option<String> {
 }
 
 /// Why there is no HTTP status: curl's exit and its last other stderr line (scrubbed, without its `curl: (N) `).
-fn no_status(code: Option<i32>, said: &CurlSaid) -> String {
+pub(crate) fn no_status(code: Option<i32>, said: &CurlSaid) -> String {
     let line = said.last.as_deref().map_or("nothing on stderr", |l| l.strip_prefix("curl: ").map_or(l, |rest| rest.split_once(") ").filter(|(n, _)| n.starts_with('(')).map_or(rest, |(_, msg)| msg)));
     match code {
         Some(c) => format!("curl exited {c} before an HTTP status ({line})"),
@@ -905,7 +944,9 @@ mod tests {
 
     /// The configuration of each request kind, line by line (S9 §3.4): a
     /// push with its checksum and the proxy, a tail without either, a part's
-    /// GET; a lab URL speaks plain http.
+    /// GET; a lab URL speaks plain http. S11 (C.3.2): a gzip part's GET adds
+    /// `compressed` after the owner header and before `fail`, its other lines
+    /// an identity GET's byte for byte.
     #[test]
     fn the_curl_config_is_the_contracts() {
         use crate::wire::s3::{SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT};
@@ -922,11 +963,15 @@ mod tests {
         let tail = curl_config(&put, None, 8, &Kind::Put { len: 7, checksum: None, owner: "123456789012" });
         assert!(!tail.contains("header = \"x-amz-checksum-sha256") && !tail.contains("proxy") && tail.contains("max-time = 8\n"), "{tail}");
         let get = url(key, SIGNED_HEADERS_GET, true);
-        let text = curl_config(&get, None, 9, &Kind::Get { owner: "123456789012" });
+        let text = curl_config(&get, None, 9, &Kind::Get { owner: "123456789012", compressed: false });
         assert_eq!(
             text,
             format!("url = \"{}\"\nsilent\nshow-error\nproto = \"=http\"\nconnect-timeout = 20\nmax-time = 9\nspeed-limit = 1024\nspeed-time = 60\n{WRITE_OUT}\nrequest = \"GET\"\nheader = \"x-amz-expected-bucket-owner: 123456789012\"\nfail\noutput = \"-\"\n", get.expose())
         );
+        let id = curl_config(&get, None, 9, &Kind::Get { owner: "ACCOUNT", compressed: false });
+        let gz = curl_config(&get, None, 9, &Kind::Get { owner: "ACCOUNT", compressed: true });
+        assert_eq!(gz, id.replace("\nfail\n", "\ncompressed\nfail\n"), "compressed after the owner header, before fail; the rest the identity GET's");
+        assert_eq!(gz.lines().filter(|l| *l == "compressed").count(), 1);
     }
 
     /// S10 (R1): S3's final answer to a tail's push ends its URL: 200, 412

@@ -1,0 +1,28 @@
+v = 1
+status = "terminated"
+id = "microvm-0a5fc800-0000-4000-8000-00000000000a"
+client_token = "0199eff0-0000-7000-8000-00000000000a"
+workspace = "/w/project"
+slug = "-w-project"
+image_arn = ""
+image_version = "1.0"
+owner = "mike@mac"
+created = "2026-10-22T07:59:58.000Z"
+commit = ""
+started_at = 1792656000
+wall_deadline = 1792684800
+max_duration_s = 28800
+egress = "internet"
+ingress = []
+egress_connectors = []
+egress_gate = "passed"
+shell = false
+state_seen = "TERMINATED"
+state_seen_at = 1792664470
+terminated_at = 1792664470
+terminated_by = "migrate"
+
+[idle]
+max_idle_s = 300
+suspended_s = 3600
+auto_resume = true

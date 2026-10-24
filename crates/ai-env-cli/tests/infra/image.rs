@@ -416,10 +416,10 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
 
-/// `$(LAB_UNSET)` as the live recipes run it: the eighteen lab knobs
+/// `$(LAB_UNSET)` as the live recipes run it: the twenty-one lab knobs
 /// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
 /// Makefile's list to every one the code and ops.sh read).
-const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_ASSUME_TTY -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES -u AI_ENV_BRIDGE_LAB_PARK_AFTER_MS";
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES -u AI_ENV_BRIDGE_LAB_PARK_AFTER_MS -u AI_ENV_BRIDGE_LAB_RELEASE_CURL -u AI_ENV_BRIDGE_LAB_GPGV -u AI_ENV_BRIDGE_LAB_ADMIT_MAKE -u AI_ENV_BRIDGE_LAB_NOW";
 
 /// The stand-in's log line of the operator CLI's keyless build (D18: infra.mk's `$(AI_ENV_BUILD)`, TIER's first
 /// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
@@ -516,7 +516,7 @@ fn test_docker_runs_both_docker_suites_before_the_stamp_and_stamps_nothing_after
     }
 }
 
-// ---- claude-pin (fake curl and gpg) ----
+// ---- claude-pin (S11: the real `ai-env claude manifest` under the fake API, its curl and gpgv the knobs') ----
 
 /// The Claude Code release key the Makefile pins, read from it.
 fn release_fpr() -> String {
@@ -538,91 +538,172 @@ fn release_manifest(version: &str) -> String {
     .to_string()
 }
 
-/// A temp tree for claude-pin: the fakes (gpg only when `with_gpg`), the
-/// served release files, and `img/claude.lock` holding the repo's lock.
-fn pin_tree(with_gpg: bool, manifest_version: &str, with_sig: bool) -> (tempfile::TempDir, PathBuf) {
+/// `<fake>.knobs`: the knob file a fake run with a cleared environment sources (tests/fakes/curl.sh and gpgv.sh), one
+/// `export NAME='value'` line each.
+fn knobs_for(fake: &Path, vars: &[(&str, &str)]) {
+    let text: String = vars.iter().map(|(k, v)| format!("export {k}='{v}'\n")).collect();
+    std::fs::write(format!("{}.knobs", fake.display()), text).unwrap();
+}
+
+/// A temp tree for claude-pin: the release curl (`tests/fakes/curl.sh` as `release-curl`) and gpgv
+/// (`tests/fakes/gpgv.sh`), their knobs in their `.knobs` files (`gpgv`'s: `FAKE_GPGV_*`), the served release
+/// files, `img/claude.lock` holding the repo's lock, and a curl and a gpg that must not run (logged failures).
+fn pin_tree(manifest_version: &str, with_sig: bool, gpgv: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
     let t = tempfile::tempdir().unwrap();
-    let mut fakes = vec![("curl.sh", "curl")];
-    if with_gpg {
-        fakes.push(("gpg.sh", "gpg"));
-    }
-    let bin = bin_with(t.path(), &fakes);
+    let bin = bin_with(t.path(), &[("curl.sh", "release-curl"), ("gpgv.sh", "gpgv"), ("logged.sh", "curl"), ("logged.sh", "gpg")]);
     let rel = t.path().join("release");
     std::fs::create_dir_all(&rel).unwrap();
     std::fs::write(rel.join("manifest.json"), release_manifest(manifest_version)).unwrap();
     if with_sig {
         std::fs::write(rel.join("manifest.json.sig"), "fake detached signature\n").unwrap();
     }
+    let (dir, curl_log) = (rel.display().to_string(), t.path().join("curl.log").display().to_string());
+    knobs_for(&bin.join("release-curl"), &[("FAKE_CURL_DIR", &dir), ("FAKE_CURL_LOG", &curl_log)]);
+    let gpgv_log = t.path().join("gpgv.log").display().to_string();
+    let mut g = gpgv.to_vec();
+    g.push(("FAKE_GPGV_LOG", &gpgv_log));
+    knobs_for(&bin.join("gpgv"), &g);
     std::fs::create_dir_all(t.path().join("img")).unwrap();
     std::fs::copy(Path::new(REPO).join("image/claude.lock"), t.path().join("img/claude.lock")).unwrap();
     (t, bin)
 }
 
-fn claude_pin(t: &Path, tools: &Path, envs: &[(&str, &str)]) -> Output {
+/// `make claude-pin` with this test run's `ai-env` as AI_ENV, under the fake API with the release curl and gpgv
+/// knobs (the real programs are never its fallback there).
+fn claude_pin(t: &Path, tools: &Path) -> Output {
     make(t, tools, &["claude-pin"])
         .arg(format!("CLAUDE_VERSION={CLAUDE_VERSION}"))
         .arg(format!("IMAGE_OUT={}", t.join("out").display()))
         .arg(format!("IMAGE_DIR={}", t.join("img").display()))
         .arg(format!("AI_ENV={}", bin()))
-        .env("FAKE_CURL_DIR", t.join("release"))
-        .envs(envs.iter().copied())
+        .env("FAKE_LOG", t.join("tools.log"))
+        .env("AI_ENV_BRIDGE_LAB_FAKE_API", t.join("fake.json"))
+        .env("AI_ENV_BRIDGE_LAB_RELEASE_CURL", tools.join("release-curl"))
+        .env("AI_ENV_BRIDGE_LAB_GPGV", tools.join("gpgv"))
         .bounded()
 }
 
+/// claude-pin (S11) fails closed: a bad signature, one by a key the vendored keyring lacks (alone or beside the
+/// release key's revoked one: gpgv's NO_PUBKEY), a revoked or an expired key's, a key gpgv lacks, a missing signature
+/// or a signed manifest of another version write no lock and leave no manifest behind; neither a curl nor a gpg of
+/// PATH ever runs (no gpg branch, no "NOT verified" pin).
 #[test]
-fn claude_pin_fails_closed_when_the_release_key_is_in_the_keyring() {
+fn claude_pin_fails_closed_without_a_good_signature() {
     let lock_before = std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).unwrap();
     let fpr = release_fpr();
     let other = "0123456789ABCDEF0123456789ABCDEF01234567";
     type Envs<'a> = &'a [(&'a str, &'a str)];
-    // (what, fake knobs, a .sig served, the manifest's version, the refusal)
+    // (what, gpgv's knobs, a .sig served, the manifest's version, the refusal)
     let refused: &[(&str, Envs, bool, &str, &str)] = &[
-        ("a BAD signature", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "bad")], true, CLAUDE_VERSION, "is not a good signature by the release key"),
-        ("a good signature by another key", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "good"), ("FAKE_GPG_PRIMARY", other)], true, CLAUDE_VERSION, "is not a good signature by the release key"),
-        ("no manifest.json.sig", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "good")], false, CLAUDE_VERSION, "cannot download manifest.json.sig"),
-        ("a signed manifest of another version", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "good"), ("FAKE_GPG_PRIMARY", fpr.as_str())], true, "2.1.282", "not 2.1.283; lock not written"),
-        // The release key's own signature is revoked; a good one by some other
-        // key must not lend it its GOODSIG (the pair is checked per signature).
-        ("a revoked release signature next to another key's good one", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "mixed"), ("FAKE_GPG_PRIMARY", fpr.as_str()), ("FAKE_GPG_OTHER", other)], true, CLAUDE_VERSION, "is not a good signature by the release key"),
-        // The same pair in the other order: the GOODSIG must not carry over the NEWSIG.
-        ("another key's good signature, then a revoked release one", &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "mixed-other-first"), ("FAKE_GPG_PRIMARY", fpr.as_str()), ("FAKE_GPG_OTHER", other)], true, CLAUDE_VERSION, "is not a good signature by the release key"),
+        ("a BAD signature", &[("FAKE_GPGV_VERIFY", "bad"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], true, CLAUDE_VERSION, "is not the release key's (bad)"),
+        ("a good signature by a key the vendored keyring lacks", &[("FAKE_GPGV_VERIFY", "good"), ("FAKE_GPGV_PRIMARY", other)], true, CLAUDE_VERSION, "is not the release key's (no_pubkey)"),
+        ("the release key's revoked signature beside one by a key the vendored keyring lacks", &[("FAKE_GPGV_VERIFY", "mixed"), ("FAKE_GPGV_PRIMARY", fpr.as_str()), ("FAKE_GPGV_OTHER", other)], true, CLAUDE_VERSION, "(no_pubkey)"),
+        ("the same, the other key's first", &[("FAKE_GPGV_VERIFY", "mixed-other-first"), ("FAKE_GPGV_PRIMARY", fpr.as_str()), ("FAKE_GPGV_OTHER", other)], true, CLAUDE_VERSION, "(no_pubkey)"),
+        ("a revoked key", &[("FAKE_GPGV_VERIFY", "revoked"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], true, CLAUDE_VERSION, "(revoked)"),
+        ("an expired key", &[("FAKE_GPGV_VERIFY", "expired"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], true, CLAUDE_VERSION, "(expired)"),
+        ("a key gpgv lacks", &[("FAKE_GPGV_VERIFY", "no_pubkey"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], true, CLAUDE_VERSION, "(no_pubkey)"),
+        ("no manifest.json.sig", &[("FAKE_GPGV_VERIFY", "good"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], false, CLAUDE_VERSION, "manifest.json.sig: curl exit 22"),
+        ("a signed manifest of another version", &[("FAKE_GPGV_VERIFY", "good"), ("FAKE_GPGV_PRIMARY", fpr.as_str())], true, "2.1.282", "the signed manifest is for version 2.1.282, not 2.1.283"),
     ];
-    for (what, envs, with_sig, version, want) in refused {
-        let (t, bin) = pin_tree(true, version, *with_sig);
-        let out = claude_pin(t.path(), &bin, envs);
+    for (what, gpgv, with_sig, version, want) in refused {
+        let (t, bin) = pin_tree(version, *with_sig, gpgv);
+        let out = claude_pin(t.path(), &bin);
         let all = all(&out);
         assert!(!out.status.success(), "{what}: pinned anyway: {all}");
-        assert!(all.contains(want) && all.contains("lock not written"), "{what}: {all}");
+        assert!(all.contains(want) && all.contains("nothing written"), "{what}: {all}");
         assert_eq!(read(&t.path().join("img/claude.lock")), lock_before, "{what}: the lock changed");
+        let d = t.path().join(format!("out/claude-pin/{CLAUDE_VERSION}"));
+        assert!(!d.join("manifest.json").exists() && !d.join("manifest.json.sig").exists(), "{what}: a manifest was left behind");
+        assert_eq!(read(&t.path().join("tools.log")), "", "{what}: PATH's curl or gpg ran");
     }
 }
 
+/// claude-pin (S11) writes the lock once gpgv verified the manifest against the vendored key alone: the primary key's
+/// signature or a subkey's (VALIDSIG naming the primary last). The release curl ran `-q` first, https only, into the
+/// pin's directory; gpgv got the embedded keyring by an absolute path in a temp home, never PATH's or a user's.
 #[test]
-fn claude_pin_writes_the_lock_on_a_release_signature_or_warns_without_the_key() {
+fn claude_pin_writes_the_lock_on_a_good_signature() {
     let fpr = release_fpr();
-    // Signed by a subkey of the release key: gpg names the subkey first and the primary key last.
-    let (t, bin) = pin_tree(true, CLAUDE_VERSION, true);
-    let out = claude_pin(t.path(), &bin, &[("FAKE_GPG_KEY", "1"), ("FAKE_GPG_VERIFY", "good"), ("FAKE_GPG_PRIMARY", fpr.as_str())]);
-    let all_t = all(&out);
-    assert!(out.status.success() && all_t.contains(&format!("manifest signature verified ({fpr})")), "{all_t}");
-    assert!(read(&t.path().join("img/claude.lock")).contains(&format!("CLAUDE_SHA256={}", "cd".repeat(32))), "{all_t}");
-
-    // gpg without the release key: pinned, with the warning.
-    let (u, bin) = pin_tree(true, CLAUDE_VERSION, true);
-    let out = claude_pin(u.path(), &bin, &[("FAKE_GPG_KEY", "0")]);
-    let all_u = all(&out);
-    assert!(out.status.success() && all_u.contains("signature NOT verified"), "{all_u}");
-    assert!(read(&u.path().join("img/claude.lock")).contains(&format!("CLAUDE_SHA256={}", "cd".repeat(32))), "{all_u}");
-
-    // No gpg at all (only when /usr/bin:/bin has none to hide).
-    if ["/usr/bin/gpg", "/bin/gpg"].iter().any(|p| Path::new(p).exists()) {
-        eprintln!("skipped the no-gpg case: a system gpg on /usr/bin:/bin cannot be hidden from PATH");
-        return;
+    for verify in ["good", "subkey"] {
+        let (t, bin) = pin_tree(CLAUDE_VERSION, true, &[("FAKE_GPGV_VERIFY", verify), ("FAKE_GPGV_PRIMARY", fpr.as_str())]);
+        let out = claude_pin(t.path(), &bin);
+        let text = all(&out);
+        assert!(out.status.success(), "{verify}: {text}");
+        assert!(text.contains(&format!("claude {CLAUDE_VERSION}: the release manifest's signature is the release key's ({fpr})")), "{verify}: {text}");
+        assert!(read(&t.path().join("img/claude.lock")).contains(&format!("CLAUDE_SHA256={}", "cd".repeat(32))), "{verify}: {text}");
+        let d = t.path().join(format!("out/claude-pin/{CLAUDE_VERSION}"));
+        assert_eq!(read(&d.join("manifest.json")), release_manifest(CLAUDE_VERSION), "{verify}: the verified manifest is kept");
+        assert_eq!(std::fs::metadata(d.join("manifest.json.sig")).unwrap().permissions().mode() & 0o777, 0o644);
+        let curl = lines_of(&t.path().join("curl.log"));
+        assert_eq!(curl.len(), 2, "{verify}: the manifest and its signature: {curl:?}");
+        for (line, file) in curl.iter().zip(["manifest.json", "manifest.json.sig"]) {
+            assert!(line.starts_with("-q --proto =https --tlsv1.2 -fsSL --max-time 60 --max-filesize 1048576 -o "), "{line}");
+            assert!(line.ends_with(&format!(" https://downloads.claude.ai/claude-code-releases/{CLAUDE_VERSION}/{file}")), "{line}");
+        }
+        let gpgv = lines_of(&t.path().join("gpgv.log"));
+        assert_eq!(gpgv.len(), 1, "{gpgv:?}");
+        let argv: Vec<&str> = gpgv[0].split(' ').collect();
+        assert_eq!((argv[0], argv[1], argv[2], argv[4]), ("--status-fd", "1", "--homedir", "--keyring"), "{gpgv:?}");
+        assert!(argv[5].starts_with(argv[3]) && argv[5].ends_with("/release.gpg"), "the keyring in gpgv's temp home: {gpgv:?}");
+        assert_eq!(read(&t.path().join("tools.log")), "", "{verify}: PATH's curl or gpg ran");
     }
-    let (v, bin) = pin_tree(false, CLAUDE_VERSION, false);
-    let out = claude_pin(v.path(), &bin, &[]);
-    let all_v = all(&out);
-    assert!(out.status.success() && all_v.contains("signature NOT verified (gpg missing"), "{all_v}");
+}
+
+/// A cargo that logs its argv and the variables `make claude-admit-docker` sets or removes (`unset` when absent) to
+/// `CARGO_LOG`, and runs nothing.
+const CARGO_LOGGED: &str = r#"printf '%s\n' "$*" >> "$CARGO_LOG"
+for v in CARGO_TARGET_DIR AI_ENV_DOCKER_TESTS AI_ENV_DOCKER_IMAGE AI_ENV_CLAUDE_UNDER_TEST AI_ENV_CLAUDE_UNDER_TEST_VERSION AI_ENV_CLAUDE_UNDER_TEST_SHA256 AWS_SECRET_ACCESS_KEY AI_ENV_BRIDGE_AS; do
+  eval "printf '%s=%s\\n' $v \"\${$v-unset}\"" >> "$CARGO_LOG"
+done
+exit 0"#;
+
+/// `claude_under_test` and its mounts (S11, D2): what `make claude-admit-docker` runs, its usage and its local image
+/// checks before cargo; then one cargo test of the three claude-facing L2 tests, by their exact names, in its own target
+/// dir, with the claude under test and no key.
+#[test]
+fn claude_admit_docker_runs_the_three_tests_on_the_claude_under_test() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = bin_with(t.path(), &[("docker.sh", "docker")]);
+    let log = t.path().join("cargo.log");
+    script(&bin.join("cargo"), CARGO_LOGGED);
+    let sha = "ab".repeat(32);
+    let args = ["claude-admit-docker", "CLAUDE_BIN=/t/claude", "CLAUDE_VERSION=2.1.308"];
+    let sha_arg = format!("CLAUDE_SHA256={sha}");
+    // The usage: every variable named.
+    let out = make(t.path(), &bin, &args).env("CARGO_LOG", &log).bounded();
+    assert_eq!(out.status.code(), Some(2), "{}", all(&out));
+    assert!(all(&out).contains("usage: make claude-admit-docker CLAUDE_BIN=<absolute path> CLAUDE_VERSION=<version> CLAUDE_SHA256=<sha256>"), "{}", all(&out));
+    // No local image: exit 2 naming its build, cargo never run.
+    let out = make(t.path(), &bin, &args).arg(&sha_arg).env("CARGO_LOG", &log).bounded();
+    assert_eq!(out.status.code(), Some(2), "{}", all(&out));
+    assert!(all(&out).contains("claude-admit-docker: ai-env-agent:local is missing: make image-build-local"), "{}", all(&out));
+    assert!(!log.exists(), "cargo ran without the image");
+    // The image there: one cargo test, the three tests by name, the claude under test, its own target dir, no key.
+    let out = make(t.path(), &bin, &args).arg(&sha_arg).env("CARGO_LOG", &log).env("FAKE_DOCKER_IMAGE_ID", "sha256:0123").env("AWS_SECRET_ACCESS_KEY", "x").env("AI_ENV_BRIDGE_AS", "ops:9002").bounded();
+    assert!(out.status.success(), "{}", all(&out));
+    let calls = lines_of(&log);
+    assert_eq!(
+        calls[0],
+        "+1.98.1 test -p ai-env-cli --features bridge --test docker_exec --test shim_docker -- --ignored --exact --test-threads=1 l2_wrapper_remote_session_initializes_the_pinned_claude l2_claude_auth_status_json_is_logged_out_with_no_network l2_claude_version_matches_the_lock",
+        "{calls:#?}"
+    );
+    let want = [
+        format!("CARGO_TARGET_DIR={}/target/claude-admit", std::fs::canonicalize(REPO).unwrap().display()),
+        "AI_ENV_DOCKER_TESTS=1".to_string(),
+        "AI_ENV_DOCKER_IMAGE=ai-env-agent:local".to_string(),
+        "AI_ENV_CLAUDE_UNDER_TEST=/t/claude".to_string(),
+        "AI_ENV_CLAUDE_UNDER_TEST_VERSION=2.1.308".to_string(),
+        format!("AI_ENV_CLAUDE_UNDER_TEST_SHA256={sha}"),
+        "AWS_SECRET_ACCESS_KEY=unset".to_string(),
+        "AI_ENV_BRIDGE_AS=unset".to_string(),
+    ];
+    assert_eq!(calls[1..], want, "{calls:#?}");
+    // Each test the target names exists, as a Docker test of its file.
+    for (file, name) in [("docker_exec.rs", "l2_wrapper_remote_session_initializes_the_pinned_claude"), ("docker_exec.rs", "l2_claude_auth_status_json_is_logged_out_with_no_network"), ("shim_docker.rs", "l2_claude_version_matches_the_lock")] {
+        let text = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join(file));
+        assert!(text.contains(&format!("#[ignore = \"Docker: make test-docker\"]\nfn {name}() {{")), "{file}: {name}");
+        assert!(text.contains("fn claude_under_test() -> Option<(PathBuf, String)>") && text.contains("fn expected_claude() -> String"), "{file}: the harness");
+    }
 }
 
 // ---- s3-preflight (fake docker, curl; every other tool a logged failure) ----
@@ -701,6 +782,52 @@ fn s3_preflight_p3_needs_an_arm64_daemon_with_free_disk() {
         } else {
             assert!(!calls.iter().any(|c| c.starts_with("run")), "no probe container without an arm64 daemon: {calls:?}");
         }
+    }
+}
+
+// ---- S11 (A2): s3-preflight's P4 names gpgv, P10 a skew as a note ----
+
+/// [`preflight`] with node 22, npm and zip present (P4 reaches its `[ok ]` text) and AI_ENV a stand-in whose `infra
+/// pin --check-bundle` prints `p10` and exits `p10_rc` (anything else goes to tests/fakes/ai-env.sh). Its `[..]` rows.
+fn preflight_p4_p10(t: &Path, p10: &str, p10_rc: i32) -> Vec<String> {
+    let mut fakes = vec![("docker.sh", "docker"), ("curl.sh", "curl"), ("ai-env.sh", "ai-env-stand-in")];
+    fakes.extend(["pulumi", "aws", "gpg", "rustup", "cargo"].iter().map(|n| ("logged.sh", *n)));
+    let bin = bin_with(t, &fakes);
+    script(&bin.join("node"), "case \"${1:-}\" in --version) echo v22.0.0 ;; esac\nexit 0");
+    script(&bin.join("npm"), "exit 0");
+    script(&bin.join("zip"), "exit 0");
+    let quoted = p10.replace('\'', "'\\''");
+    script(&bin.join("ai-env-p10"), &format!("if [ \"$1 $2 $3\" = 'infra pin --check-bundle' ]; then echo 'a window note'; echo '{quoted}'; exit {p10_rc}; fi\nexec \"$(dirname \"$0\")/ai-env-stand-in\" \"$@\""));
+    std::fs::create_dir_all(t.join("out")).unwrap();
+    let out = make(t, &bin, &["s3-preflight", "PHASE=a"])
+        .arg(format!("IMAGE_OUT={}", t.join("out").display()))
+        .arg(format!("AI_ENV={}", bin.join("ai-env-p10").display()))
+        .env("FAKE_LOG", t.join("tools.log"))
+        .bounded();
+    stdout(&out).lines().filter(|l| l.starts_with('[')).map(str::to_string).collect()
+}
+
+/// P4 (S11, LD-37) names gpgv as `release::gpgv_path` finds it (Homebrew's, else /usr/local's; never PATH's), and
+/// never turns `[NO ]` for it: without one it says what fails closed.
+#[test]
+fn p4_names_gpgv() {
+    let t = tempfile::tempdir().unwrap();
+    let rows = preflight_p4_p10(t.path(), "pin: lock 2.1.283 equals the Cursor bundle", 0);
+    let has = ["/opt/homebrew/bin/gpgv", "/usr/local/bin/gpgv"].iter().any(|p| Path::new(p).is_file());
+    let want = if has { "[ok ] P4 node v22.0.0, npm, zip, gpgv".to_string() } else { "[ok ] P4 node v22.0.0, npm, zip (no gpgv: make claude-pin and ai-env claude admit fail closed: brew install gnupg)".to_string() };
+    assert_eq!(row(&rows, "P4"), want, "{rows:?}");
+    assert!(!row(&rows, "P4").contains(" gpg,") && !row(&rows, "P4").contains("gpg)"), "gpg is no longer named: {rows:?}");
+}
+
+/// P10 (S11, A.7): `infra pin --check-bundle`'s exit 0 is `[ok ]`, its exit 3 (the lock is the image's fallback, VMs
+/// follow the bundle) a `[-  ]` note, anything else `[NO ]`, each with the output's last line.
+#[test]
+fn p10_is_a_note_on_skew() {
+    let skew = "pin: lock 2.1.283 is the image's fallback; Cursor bundle 2.1.308: VMs follow it (ai-env claude status)";
+    for (line, rc, tag) in [("pin: lock 2.1.283 equals the Cursor bundle", 0, "[ok ]"), (skew, 3, "[-  ]"), ("ai-env: cannot read image/claude.lock", 1, "[NO ]"), ("ai-env: pin: no bundle", 2, "[NO ]")] {
+        let t = tempfile::tempdir().unwrap();
+        let rows = preflight_p4_p10(t.path(), line, rc);
+        assert_eq!(row(&rows, "P10"), format!("{tag} P10 {line}"), "exit {rc}: {rows:?}");
     }
 }
 
@@ -1251,7 +1378,7 @@ fn vm_build_copies_the_bootstrap_it_built_whatever_the_cargo_target_dir() {
         .arg(format!("CARGO_LAMBDA={}", bin.join("cargo-lambda").display()))
         .arg(format!("LLVM_BIN={}", t.path().join("llvm").display()))
         .env("CARGO_TARGET_DIR", t.path().join("elsewhere"))
-        // A make under `cargo run` (claude-update's passes, logs/test34.txt): cargo hands its child CARGO, a program's
+        // A make under `cargo run` (S10's claude-update passes, logs/test34.txt; retired in S11): cargo hands its child CARGO, a program's
         // path; make must not export its own CARGO (`cargo +1.98.1`) under that name to cargo-lambda.
         .env("CARGO", "/usr/bin/true")
         .env("FAKE_CL_BOOTSTRAP", t.path().join("fresh"))
@@ -1617,20 +1744,15 @@ fn make_n_of_the_s5_targets_names_their_commands_and_runs_nothing() {
             ],
         ),
         ("test-proxy", vec!["AI_ENV_PROXY_TESTS=1 AI_ENV_PROXY_SYSTEMD=1 cargo +1.98.1 test -p ai-env-cli --features bridge --test proxy_docker -- --include-ignored --test-threads=1".into()]),
-        // No $(MAKE) on its line: GNU make would run it even under -n (ops.sh runs every step's make itself).
-        (
-            "claude-update",
-            vec![
-                format!("{probe_cli} LOCK='image/claude.lock' CLAUDE_RELEASES='https://downloads.claude.ai/claude-code-releases' CLAUDE_GPG_FPR='31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE'"),
-                "/bin/bash infra/scripts/ops.sh claude-update".into(),
-            ],
-        ),
+        // S11: retired; its one line names what replaced it, and no ops.sh step runs.
+        ("claude-update", vec!["claude-update: retired (S11): VMs follow Cursor's Claude Code with no deploy: ai-env claude update".into()]),
     ];
     for (target, wants) in &cases {
         let text = dry(&[*target], &[]);
         for want in wants {
             assert!(text.contains(want.as_str()), "{target}: {want} missing from the dry run: {text}");
         }
+        assert!(!text.contains("ops.sh claude-update"), "{target}: the retired update's ops.sh step: {text}");
         for never in ["--yes", "--show-secrets", "--follow"] {
             assert!(!text.contains(never), "{target}: {never} in the dry run: {text}");
         }
@@ -2764,7 +2886,6 @@ fn the_live_s5_targets_drop_every_lab_knob() {
         ("AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL", "1"),
         ("AI_ENV_BRIDGE_LAB_BACKOFF_MS", "5"),
         ("AI_ENV_BRIDGE_LAB_FAKE_SHELL", "1"),
-        ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1"),
         ("AI_ENV_BRIDGE_LAB_AGENT_ADDR", "127.0.0.1:9"),
         ("AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS", "300"),
         ("AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS", "1500"),
@@ -3198,506 +3319,32 @@ fn deploy_stops_before_pulumi_up_when_the_replacement_guard_refuses_or_the_previ
     assert!(!text.contains(&wrong) && c.iter().all(|l| !l.contains(&wrong)), "the value is never shown");
 }
 
-/// `make claude-update` (ops.sh claude-update): it follows the installed Cursor bundle, does only what is not current
-/// (pin, test-docker unless it passed for the zip, deploy, infra-status, the live active version, proxy-start, the
-/// egress check --if-needed), stops at the first failure naming the step, refuses before changing anything without a
-/// terminal, the passphrase, Docker, a bundle, or under make -i, -k or -p (whose data base would print the runner's key:
-/// an option's argument, -I's directory, is no switch), stops on a rollback or a pin it cannot follow, resumes all of a
-/// deploy's steps after a failure past it (the marker), and says what it found on the way (the release site, a
-/// downgrade, a proxy it started, VMs on another version, the version count and which old versions no VM runs, a lock to
-/// commit: git runs without the key).
-/// S8 operators: it asks once for the identity the run needs, ai-env as deployer when a deploy is due, else ai-env as
-/// ops: after the steps that need no AWS (pin, test-docker: without any key, as the fake make records) and before the
-/// first that does; it runs itself again under the runner, which then sees the lock and test-docker's stamp current
-/// and never repeats them, prints the summary once, checks the identity (ops.sh identity; refused after the pass before
-/// it pinned or tested, it says what that pass left) and runs every other step as that identity. Under a runner that
-/// covers the tier it asks nothing; a cancelled runner changes nothing after it. A deploy due before the bootstrap (no
-/// deployer exported, so no deployer key) is the account root's: refused before anything runs, naming what to run
-/// instead (the pin and make test-docker when due, then make deploy as the account root).
-/// A39: a deploy due with the passphrase not set as Pulumi takes it (neither variable, or an empty
-/// PULUMI_CONFIG_PASSPHRASE, which Pulumi takes before the file) unseals the sealed file (PULUMI_SEALED, by default
-/// under HOME): one `ai-env run -f` after pin and test-docker and before the runner's ask (the Touch ID before the
-/// paste), the only hop under a runner that covers the deployer, whose identity is checked before anything runs; an
-/// empty sealed value stops before the paste, saying what the pass before the unseal left; no file refuses before
-/// anything runs; nothing to deploy unseals nothing. Only the make deploy step ever holds the passphrase, and the
-/// deployer's runner that carries it there: no read of ops.sh's own (the bundle, the outputs, the checks), and neither
-/// pin, test-docker, the status, the proxy, the check nor git.
+/// `make claude-update` is retired (S11, A.7): VMs follow the Cursor extension's claude with no deploy. The target
+/// stays only to name what replaced it (exit 2, nothing run: no ops.sh, no make, no tool), BREAKGLASS=1 or not; its
+/// help says so; ops.sh has no claude-update command any more (its usage, exit 2).
 #[test]
-fn claude_update_follows_the_cursor_bundle_and_stops_at_the_first_failure() {
-    const TTY: (&str, &str) = ("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1");
-    const PASS: (&str, &str) = ("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null");
-    const PIN288: &str = "make --no-print-directory claude-pin CLAUDE_VERSION=2.1.288";
-    const PIN286: &str = "make --no-print-directory claude-pin CLAUDE_VERSION=2.1.286";
-    let (test, deploy, status, proxy, check) = (
-        "make --no-print-directory test-docker",
-        "make --no-print-directory deploy EXPECT_BUILD_FAILURE=",
-        "make --no-print-directory infra-status WRITE=1",
-        "make --no-print-directory proxy-start",
-        "egress check --if-needed",
-    );
-    /// What a case changes in the default world (the image active at 3.0 as the outputs say, the proxy running).
-    #[derive(Clone, Copy, PartialEq)]
-    enum World {
-        Plain,
-        Rollback,
-        ProxyStopped,
-        Stamped,
-        StampedStale,
-        StampedOtherClaude,
-        OlderVm,
-        Pinned,
-        PinnedDeployed,
-        PinnedUnreadable,
-        OtherZip,
-        VersionsRun,
-        Pending,
-        PendingOther,
-        PendingDeploy,
-        /// The stack before the bootstrap: its outputs name no operator user.
-        NoDeployer,
-        /// The stack before the bootstrap, and make test-docker passed for the current zip of the bundle (as Stamped).
-        NoDeployerStamped,
-        /// The lock tracked by git and changed (a fake git, which logs whether a key reached it).
-        LockTracked,
-        /// The stack's passphrase sealed where ops.sh looks by default (A39).
-        Sealed,
-        /// The README's first line without `ai-env edit`: the sealed passphrase empty.
-        SealedEmpty,
-        /// The passphrase sealed in `sealed.env` of the working directory (PULUMI_SEALED names it).
-        SealedElsewhere,
+fn claude_update_is_retired_naming_ai_env_claude_update() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let retired = "claude-update: retired (S11): VMs follow Cursor's Claude Code with no deploy: ai-env claude update (admits and stages the installed bundle's version; ai-env claude status shows where each version is)";
+    for args in [&["claude-update"][..], &["claude-update", "BREAKGLASS=1"]] {
+        let out = make(t.path(), &bin, args).env("FAKE_LOG", &log).bounded();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", all(&out));
+        assert_eq!(stdout(&out).trim_end(), retired, "{args:?}");
+        assert_eq!(read(&log), "", "{args:?}: a tool ran");
     }
-    struct Case<'a> {
-        what: &'a str,
-        bundle: &'a str,
-        locked: &'a str,
-        deployed: &'a str,
-        envs: Vec<(&'a str, &'a str)>,
-        world: World,
-        code: i32,
-        steps: Vec<&'a str>,
-        wants: Vec<&'a str>,
-        /// The runner the run asks for (`ai-env as <tier> --`), if it gets that far.
-        runner: Option<&'a str>,
-        /// The marker of a runner the whole run is under (`deployer`, `ops`), whose key the stand-in's tails give.
-        under: Option<&'a str>,
-        /// The run unseals the sealed passphrase (A39: one `ai-env run -f`, after pin and test-docker, before the ask).
-        unsealed: bool,
+    let help = stdout(&make(t.path(), &bin, &["help"]).bounded());
+    let line = help.lines().find(|l| l.contains("claude-update")).expect("claude-update in make help");
+    assert!(line.contains("(retired, S11)") && line.contains("ai-env claude update"), "{line}");
+    let out = ops5(t.path(), &bin, &["claude-update"]).bounded();
+    assert_eq!(out.status.code(), Some(2), "{}", all(&out));
+    assert!(stderr(&out).starts_with("usage: ops.sh ") && !stderr(&out).contains("claude-update"), "{}", stderr(&out));
+    let ops = read(&Path::new(REPO).join("infra/scripts/ops.sh"));
+    for gone in ["cmd_claude_update", "claude_update_step", "update_step", "active_is_deployed", "versions_note", "make_switch", "NO_PASS_ENV", "with_pass"] {
+        assert!(!ops.contains(gone), "ops.sh still holds {gone}");
     }
-    let full = vec![TTY, PASS];
-    let c = |what, bundle, locked, deployed, envs: Vec<(&'static str, &'static str)>, world, code, steps: Vec<&'static str>, wants: Vec<&'static str>| {
-        // The run asks once, after the steps that need no AWS, for the deployer when it deploys, else for ops.
-        let runner = if steps.contains(&deploy) || (code == 3 && steps.contains(&test)) {
-            Some("deployer")
-        } else if steps.iter().any(|s| !s.starts_with("make --no-print-directory claude-pin") && *s != test) {
-            Some("ops")
-        } else {
-            None
-        };
-        Case { what, bundle, locked, deployed, envs, world, code, steps, wants, runner, under: None, unsealed: false }
-    };
-    let mut cases: Vec<Case> = vec![
-        c("up to date", "2.1.287", "2.1.287", "2.1.287", vec![], World::Plain, 0, vec![status, check], vec!["claude-update: 2.1.287 is pinned and deployed: nothing to build or deploy", "claude-update [2/3] new VMs start the deployed image version", "claude-update: new VMs start image version 3.0, the deployed one, built from ai-env/image-0123456789abcdef.zip", "done: new VMs start image version 3.0 with Claude Code 2.1.287", "claude-update: this run needs ai-env as ops (the status and the egress check): asking once, before the first step that needs AWS", "claude-update: identity user/ai-env-ops (the operator of stack dev)"]),
-        c("a new bundle", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [2/7] make test-docker", "claude-update: this run needs ai-env as deployer (a deploy is due): asking once, before the first step that needs AWS", "claude-update: make test-docker already passed for", "claude-update: identity user/ai-env-deployer (the deployer of stack dev)", "claude-update [1/5] make deploy", "claude-update [4/5] make proxy-start (squid serving the deployed parameters)", "the new pin rests on the release manifest over HTTPS only", "make test-egress, the broader live test the deploy names, is not part of the daily update"]),
-        c("pinned, not deployed", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Plain, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "!the new pin rests"]),
-        c("the zip already tested", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::Stamped, 0, vec![deploy, status, proxy, check], vec!["make test-docker already passed for", "claude-update [1/5] make deploy"]),
-        c("a failed deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_MAKE_FAIL", "deploy")], World::Plain, 2, vec![PIN288, test, deploy], vec!["claude-update: STOPPED at step 1/5 (make deploy: exit 2)"]),
-        c("a failed check", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![status, check], vec!["STOPPED at step 3/3 (ai-env egress check --if-needed: exit 3)"]),
-        c("a rollback", "2.1.287", "2.1.287", "2.1.287", vec![], World::Rollback, 1, vec![status], vec!["new VMs start image version 3.0, not the deployed 4.0 (a rollback with make image-deactivate or image-activate?)", "make image-activate VERSION=4.0", "STOPPED at step 2/3"]),
-        c("no terminal", "2.1.288", "2.1.287", "2.1.287", vec![PASS], World::Plain, 1, vec![], vec!["claude-update: needs a terminal"]),
-        // Neither passphrase variable set and nothing sealed to unseal (A39): refused before anything runs, naming the
-        // README's two lines and the export (the path, under the test's HOME, is checked below).
-        c("no passphrase", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Plain, 1, vec![], vec!["claude-update: a deploy is due, and the dev stack's passphrase is in neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none), and there is no sealed ", "/.config/ai-env/pulumi.env to unseal (make deploy's preview runs --non-interactive): seal it once (README \"Identities\"): printf 'PULUMI_CONFIG_PASSPHRASE=\\n' | ai-env encrypt -k ai-env-bridge - > \"", "/.config/ai-env/pulumi.env\"; or export PULUMI_CONFIG_PASSPHRASE_FILE (a file holding it): nothing changed"]),
-        c("Docker down", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DOCKER_RC", "1")], World::Plain, 1, vec![], vec!["claude-update: Docker does not answer (docker info)"]),
-        c("make -k", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -k")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
-        c("a variable is no flag", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
-        c("no bundle", "", "2.1.287", "2.1.287", full.clone(), World::Plain, 1, vec![], vec!["claude-update: cannot read the Cursor bundle's version (ai-env infra pin --bundle-version: exit 1, above; exit 1 when no bundle is installed): nothing changed"]),
-        c("not a version", "2.1.288;id", "2.1.287", "2.1.287", full.clone(), World::Plain, 1, vec![], vec!["printed \"2.1.288;id\", not a version: nothing changed"]),
-        c("no stack outputs", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_PULUMI_OUTPUTS", "/nonexistent/outputs.json")], World::Plain, 1, vec![], vec!["claude-update: cannot read the stack outputs of dev"]),
-        c("the release site ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.289")], World::Plain, 0, vec![status, check], vec!["the release site's latest 2.1.289 is newer than the Cursor bundle 2.1.287", "once Cursor updates the extension, run make claude-update again"]),
-        c("the bundle ahead", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_LATEST", "2.1.286")], World::Plain, 0, vec![status, check], vec!["the Cursor bundle 2.1.287 is ahead of the release site's latest 2.1.286"]),
-        c("a downgrade", "2.1.286", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN286, test, deploy, status, proxy, check], vec!["a DOWNGRADE: the Cursor bundle 2.1.286 is older than the deployed 2.1.287"]),
-        // The summary is said under the runner, after the pin made the lock.
-        c("no lock", "2.1.288", "", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "image/claude.lock 2.1.288; deployed 2.1.287"]),
-        c("a stopped proxy", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::ProxyStopped, 0, vec![test, deploy, status, proxy, check], vec!["claude-update: the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
-        c("a VM on another version", "2.1.287", "2.1.287", "2.1.287", vec![], World::OlderVm, 0, vec![status, check], vec!["VMs still on another image version, and its claude: microvm-older (2.0)"]),
-        c("the deploy left another version", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_DEPLOYS", "2.1.287")], World::Plain, 1, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: the stack now reports Claude Code 2.1.287, not the Cursor bundle's 2.1.288 (did the extension update during the run?): run make claude-update again"]),
-        c("built from another zip", "2.1.287", "2.1.287", "2.1.287", vec![], World::OtherZip, 1, vec![status], vec!["image version 3.0 was built from s3://ai-env-artifacts-0000000/ai-env/image-fedcba9876543210.zip, not the zip the stack deployed (s3://ai-env-artifacts-0000000/ai-env/image-0123456789abcdef.zip)", "STOPPED at step 2/3"]),
-        c("a pinned image version", "2.1.287", "2.1.287", "2.1.287", vec![], World::Pinned, 1, vec![status], vec!["bridge.toml's [aws].image_version = \"1\" pins new VMs to that version: the deployed 3.0 does not reach them", "STOPPED at step 2/3"]),
-        c("many versions", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0")], World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: 0 of 50 image versions (each update adds one; at 50 a deploy fails)", "make image-prune KEEP=3 YES=1"]),
-        c("old versions, one a VM runs", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0")], World::VersionsRun, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: 6 of 50 image versions", "  (not 1.1: a VM runs it)", "  make image-deactivate VERSION=1.0", "!image-deactivate VERSION=1.1", "!image-deactivate VERSION=2.0", "!image-deactivate VERSION=2.1"]),
-        c("old versions, the VMs unlisted", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("VERSIONS_WARN", "0"), ("FAKE_AWS_FAIL_OP", "lambda-microvms list-microvms")], World::VersionsRun, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["  (the VMs could not be listed: make image-versions, then deactivate only an old version no VM runs)", "!make image-deactivate"]),
-        c("make -i", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "i")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
-        c("make -k and a variable", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "k -- AI_ENV=x")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
-        c("make -s -i", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -si")], World::Plain, 2, vec![], vec!["claude-update: not under make -i or -k"]),
-        c("a long option and a variable", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --no-print-directory -- kind=1")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
-        c("make -j", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", " --jobserver-fds=3,4 -j")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
-        // make -p prints every environment variable at the end of every make under it, the runner's key among them (D1).
-        c("make -p", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", "p")], World::Plain, 2, vec![], vec!["claude-update: not under make -p (", "!not under make -i"]),
-        c("make -s -p", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("MAKEFLAGS", " --no-print-directory -sp")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
-        c("make -p with nothing to deploy", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "p -- kind=1")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
-        // `make -s -I /tmp/kip -p` writes `spI /tmp/kip`: the directory is -I's argument, not switches (no i, k or p).
-        c("an option's argument is no switch", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "sI /tmp/kip")], World::Plain, 0, vec![status, check], vec!["is pinned and deployed"]),
-        c("an include directory beside -p", "2.1.287", "2.1.287", "2.1.287", vec![("MAKEFLAGS", "spI /tmp/kip")], World::Plain, 2, vec![], vec!["claude-update: not under make -p ("]),
-        // A stale stamp is not honoured: test-docker runs before the runner, and the run under it finds its own stamp.
-        c("a stamp of another zip", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedStale, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "make test-docker already passed for"]),
-        c("a stamp of another claude", "2.1.287", "2.1.287", "2.1.286", full.clone(), World::StampedOtherClaude, 0, vec![test, deploy, status, proxy, check], vec!["claude-update [1/6] make test-docker", "make test-docker already passed for"]),
-        c("pinned to the deployed version", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedDeployed, 0, vec![status, check], vec!["bridge.toml's [aws].image_version = \"3\" pins new VMs to the deployed 3.0 today, but no later update will reach them"]),
-        c("a pin it cannot read", "2.1.287", "2.1.287", "2.1.287", vec![], World::PinnedUnreadable, 1, vec![status], vec!["bridge.toml names image_version in a form this script does not read (aws = { image_version = \"1\" })", "STOPPED at step 2/3"]),
-        c("a failed check after a deploy", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_CHECK_RC", "3")], World::Plain, 3, vec![PIN288, test, deploy, status, proxy, check], vec!["STOPPED at step 5/5 (ai-env egress check --if-needed: exit 3)"]),
-        c("a deploy's run resumed", "2.1.287", "2.1.287", "2.1.287", vec![], World::Pending, 0, vec![status, proxy, check], vec!["claude-update: 2.1.287 is deployed, and the run that deployed it stopped before its end", "claude-update [3/4] make proxy-start", "the proxy was stopped before this run and runs now", "make test-egress, the broader live test the deploy names"]),
-        c("another bundle's marker", "2.1.287", "2.1.287", "2.1.287", vec![], World::PendingOther, 0, vec![status, check], vec!["is pinned and deployed", "!stopped before its end", "!make test-egress"]),
-        c("a new bundle after an unfinished run", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::PendingDeploy, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["the proxy was stopped before this run and runs now: make proxy-stop when idle"]),
-        // The runner refused: the steps before it ran, nothing after it.
-        c("a cancelled runner", "2.1.288", "2.1.287", "2.1.287", vec![TTY, PASS, ("FAKE_AIENV_AS", "cancel")], World::Plain, 3, vec![PIN288, test], vec!["ai-env: as deployer: nothing was pasted: cancelled, nothing was run", "!claude-update: Cursor bundle"]),
-        c("a cancelled Touch ID", "2.1.287", "2.1.287", "2.1.287", vec![("FAKE_AIENV_AS", "cancel")], World::Plain, 3, vec![], vec!["ai-env: cancelled", "!claude-update: Cursor bundle"]),
-    ];
-    cases.last_mut().unwrap().runner = Some("ops");
-    // Under a runner that covers the tier: no ask, one pass, the steps numbered as one plan; pin and test-docker
-    // still without the key.
-    for (what, under, bundle, steps, wants) in [
-        ("a deploy under the deployer's runner", "deployer", "2.1.288", vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288", "claude-update [6/7] make proxy-start", "!asking once"]),
-        ("the status under the ops runner", "ops", "2.1.287", vec![status, check], vec!["claude-update [3/3] ai-env egress check --if-needed", "!asking once"]),
-        ("the status under the deployer's runner, which covers ops", "deployer", "2.1.287", vec![status, check], vec!["is pinned and deployed", "!asking once"]),
-    ] {
-        let mut case = c(what, bundle, "2.1.287", "2.1.287", full.clone(), World::Plain, 0, steps, wants);
-        case.runner = None;
-        case.under = Some(under);
-        cases.push(case);
-    }
-    // A deploy is due, but the run is under the ops key: the deployer is asked (an escalation).
-    let mut case = c("a deploy under the ops runner", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::Plain, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: this run needs ai-env as deployer (a deploy is due)"]);
-    case.under = Some("ops");
-    cases.push(case);
-    // A deploy due before the bootstrap: the stack exports no deployer, so there is no key to ask for; that deploy is the
-    // account root's (make deploy runs it as the root). Refused before anything runs, the pin and the test included (D15),
-    // naming what to run instead from the steps it decided: the pin and make test-docker when they are due, then make
-    // deploy as the account root.
-    let no_deployer = "claude-update: a deploy is due, but stack dev exports no deployer yet, so there is no deployer key to ask for: that deploy is the bootstrap, the account root's (README \"The bootstrap\"): nothing changed";
-    for (what, bundle, locked, deployed, world, instead) in [
-        ("a deploy due before the bootstrap", "2.1.288", "2.1.287", "2.1.287", World::NoDeployer, "claude-update: run instead: make claude-pin CLAUDE_VERSION=2.1.288, make test-docker, then make deploy as the account root (the bootstrap)"),
-        ("a deploy due before the bootstrap, the bundle pinned", "2.1.287", "2.1.287", "2.1.286", World::NoDeployer, "claude-update: run instead: make test-docker, then make deploy as the account root (the bootstrap)"),
-        ("a deploy due before the bootstrap, the zip tested", "2.1.287", "2.1.287", "2.1.286", World::NoDeployerStamped, "claude-update: run instead: make deploy as the account root (the bootstrap)"),
-    ] {
-        cases.push(c(what, bundle, locked, deployed, full.clone(), world, 1, vec![], vec![no_deployer, instead]));
-    }
-    // The identity refused under the runner, after the pass before it pinned and tested: that pass's work is said, never
-    // "nothing changed" (D24). The deployer's key answers as another user here.
-    let refused = "claude-update: the identity of this run is refused: user/rust: not the deployer of stack dev (user/ai-env-deployer)";
-    for (what, locked, deployed, steps, left) in [
-        ("the identity refused after the pin", "2.1.287", "2.1.287", vec![PIN288, test], "nothing deployed: the pass before the runner pinned image/claude.lock to 2.1.288 and passed make test-docker (kept: make claude-update again resumes)"),
-        ("the identity refused after test-docker", "2.1.288", "2.1.287", vec![test], "nothing deployed: the pass before the runner passed make test-docker (kept: make claude-update again resumes)"),
-    ] {
-        let mut case = c(what, "2.1.288", locked, deployed, vec![TTY, PASS, ("FAKE_AWS_KEY_USERS", "9001:rust 9002:ai-env-ops")], World::Plain, 1, steps, vec![refused, left, "!nothing changed"]);
-        case.runner = Some("deployer");
-        cases.push(case);
-    }
-    // The lock tracked and changed: said at the end, git run without the key and without an fsmonitor (D17).
-    cases.push(c("a lock to commit", "2.1.288", "2.1.287", "2.1.287", full.clone(), World::LockTracked, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: image/claude.lock changed: review and commit it"]));
-    // A39: the stack's passphrase sealed, neither variable set. A deploy due unseals it once, after pin and test-docker
-    // and before the deployer's ask (each said on stderr first); the pass under it asks for the runner as before. An
-    // empty sealed value stops before the ask, saying what the pass before the unseal left; a dismissed Touch ID is
-    // ai-env run's exit, nothing after it. An empty PULUMI_CONFIG_PASSPHRASE beside its file is no passphrase (Pulumi
-    // takes the empty one first): unsealed too.
-    let unsealing = "claude-update: a deploy is due: the dev stack's passphrase: ai-env run -f ";
-    let then_asks = "(one Touch ID), then ai-env as deployer: asking once each, before the first step that needs AWS";
-    let empty = "/.config/ai-env/pulumi.env, but it sets neither PULUMI_CONFIG_PASSPHRASE nor PULUMI_CONFIG_PASSPHRASE_FILE (Pulumi takes PULUMI_CONFIG_PASSPHRASE first, even empty, and an empty one counts as none: set it with ai-env edit \"";
-    let empty_left = "\", README \"Identities\"): stopped before the first step that needs AWS: nothing deployed: the pass before the unseal pinned image/claude.lock to 2.1.288 and passed make test-docker (kept: make claude-update again resumes)";
-    // (what, the environment, the world, the exit, the steps, the wants)
-    type Sealed<'a> = (&'a str, Vec<(&'a str, &'a str)>, World, i32, Vec<&'a str>, Vec<&'a str>);
-    let sealed_cases: [Sealed; 5] = [
-        ("the passphrase sealed", vec![TTY], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, then_asks, "claude-update: this run needs ai-env as deployer (a deploy is due): asking once", "claude-update [1/5] make deploy"]),
-        ("an empty passphrase beside its file", vec![TTY, ("PULUMI_CONFIG_PASSPHRASE", ""), PASS], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, then_asks, "claude-update [1/5] make deploy"]),
-        ("the sealed passphrase empty", vec![TTY], World::SealedEmpty, 1, vec![PIN288, test], vec![unsealing, "claude-update: this run is under ai-env run -f ", empty, empty_left, "!claude-update: Cursor bundle", "!this run needs ai-env as"]),
-        ("a cancelled unseal", vec![TTY, ("FAKE_AIENV_RUN", "cancel")], World::Sealed, 3, vec![PIN288, test], vec![unsealing, "ai-env: cancelled", "!claude-update: Cursor bundle", "!this run needs ai-env as"]),
-        ("PULUMI_SEALED names the file", vec![TTY, ("PULUMI_SEALED", "sealed.env")], World::SealedElsewhere, 0, vec![PIN288, test, deploy, status, proxy, check], vec!["claude-update: a deploy is due: the dev stack's passphrase: ai-env run -f sealed.env (one Touch ID), then ai-env as deployer"]),
-    ];
-    for (what, envs, world, code, steps, wants) in sealed_cases {
-        let mut case = c(what, "2.1.288", "2.1.287", "2.1.287", envs, world, code, steps, wants);
-        case.unsealed = true;
-        if code != 0 {
-            case.runner = None;
-        }
-        cases.push(case);
-    }
-    // Under the deployer's runner the unseal is the only hop; with nothing to deploy nothing is unsealed.
-    let mut case = c("the passphrase sealed under the deployer's runner", "2.1.288", "2.1.287", "2.1.287", vec![TTY], World::Sealed, 0, vec![PIN288, test, deploy, status, proxy, check], vec![unsealing, "(one Touch ID), before the first step that needs AWS", "!then ai-env as", "!this run needs ai-env as"]);
-    case.runner = None;
-    case.under = Some("deployer");
-    case.unsealed = true;
-    cases.push(case);
-    cases.push(c("nothing to deploy, a sealed file", "2.1.287", "2.1.287", "2.1.287", vec![], World::Sealed, 0, vec![status, check], vec!["is pinned and deployed", "!the dev stack's passphrase"]));
-    for case in cases {
-        let what = case.what;
-        let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path();
-        let bin = s5_bin(t);
-        // The steps' make: each call logged with the marker, whether a credential (the key, its secret or a session
-        // token) and whether the stack's passphrase is in its environment (never a value); claude-pin writes the lock
-        // and test-docker the zip, its image.json and its stamp, as the real ones do; a deploy moves the stack outputs'
-        // claudeVersion to the version it deployed (FAKE_DEPLOYS).
-        script(
-            &bin.join("make"),
-            r#"k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}
-p=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}
-printf 'make %s%s%s%s\n' "$*" "${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}" "${k:+ [KEY]}" "${p:+ [PASS]}" >> "$FAKE_AIENV_LOG"
-case " $* " in *" ${FAKE_MAKE_FAIL:-none} "*) exit 2 ;; esac
-case " $* " in
-  *" claude-pin "*) for a in "$@"; do case "$a" in CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\nCLAUDE_PLATFORM=linux-arm64\n' "${a#CLAUDE_VERSION=}" > "$LOCK" ;; esac; done ;;
-  *" test-docker "*) v=$(sed -n 's/^CLAUDE_VERSION=//p' "$LOCK"); mkdir -p "$IMAGE_OUT"; printf 'a zip of %s' "$v" > "$IMAGE_OUT/image.zip"; printf '{"claudeVersion":"%s"}\n' "$v" > "$IMAGE_OUT/image.json"; shasum -a 256 "$IMAGE_OUT/image.zip" | cut -d' ' -f1 > "$IMAGE_OUT/test-docker.ok" ;;
-  *" deploy "*) sed -i '' "s/\"claudeVersion\":\"[^\"]*\"/\"claudeVersion\":\"$FAKE_DEPLOYS\"/" "$FAKE_PULUMI_OUTPUTS" ;;
-esac
-exit 0"#,
-        );
-        script(&bin.join("docker"), "exit \"${FAKE_DOCKER_RC:-0}\"");
-        script(&bin.join("curl"), "test -n \"${FAKE_LATEST:-}\" || exit 6\necho \"$FAKE_LATEST\"");
-        std::fs::create_dir_all(t.join("image")).unwrap();
-        if !case.locked.is_empty() {
-            std::fs::write(t.join("image/claude.lock"), format!("CLAUDE_VERSION={}\nCLAUDE_PLATFORM=linux-arm64\n", case.locked)).unwrap();
-        }
-        let mut o = outputs();
-        o["claudeVersion"] = json!(case.deployed);
-        o["latestActiveImageVersion"] = json!(if case.world == World::Rollback { "4.0" } else { "3.0" });
-        o["bucket"] = json!("ai-env-artifacts-0000000");
-        o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
-        write_outputs(t, &if matches!(case.world, World::NoDeployer | World::NoDeployerStamped) { o } else { with_operators(o) });
-        if case.world == World::LockTracked {
-            // git: each call logged with the marker and whether a credential or the stack's passphrase reached it (never
-            // a value); the lock is tracked (ls-files) and changed (diff --quiet exits 1).
-            script(
-                &bin.join("git"),
-                "k=${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}${AWS_SESSION_TOKEN:-}\np=${PULUMI_CONFIG_PASSPHRASE+x}${PULUMI_CONFIG_PASSPHRASE_FILE+x}\nprintf 'git %s%s%s%s\\n' \"$*\" \"${AI_ENV_BRIDGE_AS:+ [AS=$AI_ENV_BRIDGE_AS]}\" \"${k:+ [KEY]}\" \"${p:+ [PASS]}\" >> \"$FAKE_AIENV_LOG\"\ncase \" $* \" in *\" diff \"*) exit 1 ;; esac\nexit 0",
-            );
-        }
-        // A39: the stack's passphrase sealed, as the stand-in's `ai-env run -f` reads it.
-        match case.world {
-            World::Sealed => {
-                seal_passphrase(&sealed_path(t), "");
-            }
-            World::SealedEmpty => {
-                seal_passphrase(&sealed_path(t), "empty");
-            }
-            World::SealedElsewhere => {
-                seal_passphrase(&t.join("sealed.env"), "");
-            }
-            _ => {}
-        }
-        std::fs::create_dir_all(t.join("aws/image")).unwrap();
-        std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
-        std::fs::write(t.join("aws/image/active"), "3.0").unwrap();
-        let built_from = if case.world == World::OtherZip { "fedcba9876543210" } else { "0123456789abcdef" };
-        std::fs::write(t.join("aws/image/uri"), format!("s3://ai-env-artifacts-0000000/ai-env/image-{built_from}.zip")).unwrap();
-        seed_proxy(t, if case.world == World::ProxyStopped { "stopped" } else { "running" });
-        if matches!(case.world, World::Stamped | World::StampedStale | World::StampedOtherClaude | World::NoDeployerStamped) {
-            std::fs::create_dir_all(t.join("out")).unwrap();
-            std::fs::write(t.join("out/image.zip"), "a zip").unwrap();
-            let claude = if case.world == World::StampedOtherClaude { "2.1.286" } else { case.bundle };
-            std::fs::write(t.join("out/image.json"), json!({"claudeVersion": claude}).to_string()).unwrap();
-            let sha = ai_env_cli::bridge::egress::value_sha256(if case.world == World::StampedStale { "another zip" } else { "a zip" });
-            std::fs::write(t.join("out/test-docker.ok"), format!("{sha}\n")).unwrap();
-        }
-        let toml = match case.world {
-            World::Pinned => Some("[aws]\nimage_version = \"1\"\n"),
-            World::PinnedDeployed => Some("[aws]\nimage_version = \"3\"\n"),
-            World::PinnedUnreadable => Some("aws = { image_version = \"1\" }\n"),
-            _ => None,
-        };
-        if let Some(toml) = toml {
-            std::fs::create_dir_all(t.join("bridge")).unwrap();
-            std::fs::write(t.join("bridge/bridge.toml"), toml).unwrap();
-        }
-        if case.world == World::VersionsRun {
-            std::fs::write(t.join("aws/image/versions"), "1.0 ACTIVE\n1.1 ACTIVE\n2.0 ACTIVE\n2.1 INACTIVE\n2.5 ACTIVE\n3.0 ACTIVE\n").unwrap();
-            std::fs::write(t.join("aws/vms"), "microvm-a 1.1 RUNNING\nmicrovm-b 1.0 TERMINATED\n").unwrap();
-        }
-        // The resume marker a deploy's run leaves until its last step passed.
-        let seeded = match case.world {
-            World::Pending | World::PendingDeploy => Some("2.1.287 stopped\n"),
-            World::PendingOther => Some("2.1.286 running\n"),
-            _ => None,
-        };
-        if let Some(m) = seeded {
-            std::fs::create_dir_all(t.join("out")).unwrap();
-            std::fs::write(t.join("out/claude-update.pending"), m).unwrap();
-        }
-        if case.world == World::OlderVm {
-            let rows = t.join("bridge/state/vms");
-            std::fs::create_dir_all(&rows).unwrap();
-            std::fs::write(rows.join("microvm-older.toml"), "v = 1\nstatus = \"running\"\nid = \"microvm-older\"\nimage_version = \"2.0\"\n").unwrap();
-            std::fs::write(rows.join("microvm-same.toml"), "v = 1\nstatus = \"running\"\nid = \"microvm-same\"\nimage_version = \"3.0\"\n").unwrap();
-            std::fs::write(rows.join("microvm-gone.toml"), "v = 1\nstatus = \"terminated\"\nid = \"microvm-gone\"\nimage_version = \"1.0\"\n").unwrap();
-        }
-        let under: Vec<(String, String)> = match case.under {
-            Some("deployer") => super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL),
-            Some(_) => super::aws_keys::identity_env("ops", super::aws_keys::OPS_TAIL),
-            None => vec![],
-        };
-        let out = ops5(t, &bin, &["claude-update"])
-            .current_dir(t)
-            .env("LOCK", "image/claude.lock")
-            .env("CLAUDE_RELEASES", "https://downloads.invalid/claude-code-releases")
-            .env("CLAUDE_GPG_FPR", "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
-            .env("FAKE_AIENV_BUNDLE", case.bundle)
-            .env("FAKE_DEPLOYS", case.bundle)
-            .envs(under.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .envs(case.envs.iter().copied())
-            .bounded();
-        let text = all(&out);
-        assert_eq!(out.status.code(), Some(case.code), "{what}: {text}");
-        for want in &case.wants {
-            match want.strip_prefix('!') {
-                Some(no) => assert!(!text.contains(no), "{what}: want no {no:?}: {text}"),
-                None => assert!(text.contains(want), "{what}: want {want:?}: {text}"),
-            }
-        }
-        // Written before a deploy this run started, kept by any failure after it, gone once the run is done.
-        let marker = std::fs::read_to_string(t.join("out/claude-update.pending")).ok();
-        let want_marker = if case.code == 0 {
-            None
-        } else if case.steps.contains(&deploy) {
-            Some(format!("{} {}\n", case.bundle, if case.world == World::ProxyStopped { "stopped" } else { "running" }))
-        } else {
-            seeded.map(String::from)
-        };
-        assert_eq!(marker, want_marker, "{what}: the resume marker: {text}");
-        let c = calls(t);
-        let ran: Vec<String> = c.iter().filter(|l| l.starts_with("make ") || l.starts_with("egress check")).map(|l| l.split(" [").next().unwrap().to_string()).collect();
-        assert_eq!(ran, case.steps, "{what}: {text}");
-        // One ask at most, for the tier the run needs, from the pass outside any runner.
-        let asked: Vec<&String> = c.iter().filter(|l| l.starts_with("as ") && !l.starts_with("as --check ")).collect();
-        match case.runner {
-            Some(tier) => {
-                assert_eq!(asked.len(), 1, "{what}: one runner: {c:#?}");
-                assert!(asked[0].starts_with(&format!("as {tier} -- env AI_ENV_CLI={} /bin/bash ", bin.join("ai-env-stand-in").display())) && asked[0].contains("/infra/scripts/ops.sh claude-update [AI_ENV=unset]"), "{what}: {}", asked[0]);
-            }
-            None => assert_eq!(asked, Vec::<&String>::new(), "{what}: no runner"),
-        }
-        // pin and test-docker never see a key; every other step runs as the identity of the run. A39: only the deploy
-        // step holds the stack's passphrase (pin and test-docker without any key or it, the steps after the deploy, the
-        // check and git without it), and the deployer's runner that carries it there: no read of ops.sh's own either
-        // (the stand-in's bundle, checks and builds, pulumi's stack outputs).
-        let marker_of = match (case.under, case.runner) {
-            (_, Some("deployer")) | (Some("deployer"), None) => "deployer:9001",
-            _ => "ops:9002",
-        };
-        for l in c.iter().filter(|l| l.starts_with("make ")) {
-            let keyless = l.contains(" claude-pin ") || l.contains(" test-docker");
-            assert_eq!(!l.contains(" [KEY]") && !l.contains(" [AS="), keyless, "{what}: {l}");
-            if !keyless {
-                assert!(l.contains(&format!(" [AS={marker_of}] [KEY]")), "{what}: {l}");
-            }
-            assert_eq!(l.ends_with(" [PASS]"), l.starts_with(&format!("{deploy} ")), "{what}: {l}");
-        }
-        let held: Vec<&String> = c.iter().filter(|l| l.contains("[PASS]")).collect();
-        assert!(held.iter().all(|l| l.starts_with(&format!("{deploy} ")) || l.starts_with("as deployer -- ")), "{what}: only the deploy step and its runner hold the passphrase: {held:#?}");
-        // One unseal of the sealed passphrase when the run needs it: after pin and test-docker, before the ask; nothing
-        // before it holds the passphrase, and its value is never shown.
-        let unseals: Vec<&String> = c.iter().filter(|l| l.starts_with("run -f ")).collect();
-        if case.unsealed {
-            let file = if case.world == World::SealedElsewhere { "sealed.env".to_string() } else { sealed_path(t).display().to_string() };
-            assert_eq!(unseals.len(), 1, "{what}: one unseal: {c:#?}");
-            assert!(unseals[0].starts_with(&format!("run -f {file} -- env AI_ENV_CLI={} /bin/bash ", bin.join("ai-env-stand-in").display())) && unseals[0].contains("/infra/scripts/ops.sh claude-update [AI_ENV=unset]"), "{what}: {}", unseals[0]);
-            let u = at(&c, "run -f ");
-            let before = case.steps.iter().take_while(|s| s.starts_with("make --no-print-directory claude-pin") || **s == test).count();
-            assert_eq!(c[..u].iter().filter(|l| l.starts_with("make ")).count(), before, "{what}: pin and test-docker before the unseal, nothing else: {c:#?}");
-            assert!(c[..u].iter().all(|l| !l.contains("[PASS]")), "{what}: nothing before the unseal holds the passphrase: {c:#?}");
-            if case.runner.is_some() {
-                assert!(u < at(&c, "as deployer -- "), "{what}: the Touch ID before the paste: {c:#?}");
-            }
-        } else {
-            assert_eq!(unseals, Vec::<&String>::new(), "{what}: nothing unsealed");
-        }
-        let passphrase = super::aws_keys::passphrase();
-        assert!(!text.contains(&passphrase) && c.iter().all(|l| !l.contains(&passphrase)), "{what}: the passphrase's value shown");
-        if what == "no passphrase" {
-            assert!(text.contains(&format!("there is no sealed {} to unseal", sealed_path(t).display())), "{what}: the refusal names the default file: {text}");
-        }
-        if case.code == 0 || case.steps.iter().any(|s| s.starts_with("make --no-print-directory infra-status") || *s == deploy) {
-            assert_eq!(text.matches("claude-update: Cursor bundle ").count(), 1, "{what}: the summary once, under the runner: {text}");
-        }
-        if case.code == 0 {
-            assert!(text.contains("claude-update: done: new VMs start image version 3.0 with Claude Code "), "{what}: {text}");
-            if case.world != World::LockTracked {
-                assert!(!text.contains("review and commit"), "{what}: the lock is outside any work tree here: {text}");
-            }
-        } else {
-            assert!(!text.contains("claude-update: done"), "{what}: {text}");
-        }
-        if case.world == World::LockTracked {
-            // The pass under the deployer's runner: git without its key or marker, and without an fsmonitor hook or
-            // daemon (one would outlive the run holding them).
-            let git: Vec<&String> = c.iter().filter(|l| l.starts_with("git ")).collect();
-            assert_eq!(git, ["git -c core.fsmonitor=false ls-files --error-unmatch -- image/claude.lock", "git -c core.fsmonitor=false diff --quiet -- image/claude.lock"], "{what}: {c:#?}");
-        }
-        if case.steps.is_empty() && case.code != 3 {
-            assert!(text.contains("nothing changed") || text.contains("claude-update: not under make -"), "{what}: a refusal says nothing changed: {text}");
-        }
-    }
-
-    // The identity of the run is checked under the runner before any step that needs AWS: the account root (an
-    // ambient root, the bootstrap's) is refused for an ops run, nothing changed.
-    let tmp = tempfile::tempdir().unwrap();
-    let t = tmp.path();
-    let bin = s5_bin(t);
-    script(&bin.join("make"), "printf 'make %s\\n' \"$*\" >> \"$FAKE_AIENV_LOG\"\nexit 0");
-    std::fs::create_dir_all(t.join("image")).unwrap();
-    std::fs::write(t.join("image/claude.lock"), "CLAUDE_VERSION=2.1.287\n").unwrap();
-    let mut o = with_operators(outputs());
-    o["claudeVersion"] = json!("2.1.287");
-    write_outputs(t, &o);
-    let out = ops5(t, &bin, &["claude-update"])
-        .current_dir(t)
-        .env("LOCK", "image/claude.lock")
-        .env("FAKE_AIENV_BUNDLE", "2.1.287")
-        .envs(super::aws_keys::marker_env("ambient").iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .env("FAKE_AWS_CALLER", "root")
-        .bounded();
-    let text = all(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("claude-update: the identity of this run is refused: root: an ops step runs as ai-env-ops or the deployer, never the account root (break-glass: make deploy BREAKGLASS=1, then the remaining steps by hand): nothing changed"), "{text}");
-    assert!(!calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || l.starts_with("ec2 ")), "nothing ran: {:?}", calls(t));
-
-    // A deploy is due under the account root's runner (it covers the deployer): once the stack has its deployer the
-    // deployer tier refuses the root, and an exported BREAKGLASS=1 is set aside (claude-update is never break-glass:
-    // make deploy BREAKGLASS=1, then the steps by hand). Nothing ran, not even pin or test-docker; nothing was asked.
-    // A39: whether the passphrase is exported or only sealed (then the unseal is the only hop, after the identity).
-    script(&bin.join("docker"), "exit 0");
-    seal_passphrase(&sealed_path(t), "");
-    for envs in [&[PASS][..], &[PASS, ("BREAKGLASS", "1")][..], &[][..], &[("BREAKGLASS", "1")][..]] {
-        std::fs::remove_file(t.join("calls.log")).ok();
-        let out = ops5(t, &bin, &["claude-update"])
-            .current_dir(t)
-            .env("LOCK", "image/claude.lock")
-            .env("FAKE_AIENV_BUNDLE", "2.1.288")
-            .env("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")
-            .envs(super::aws_keys::marker_env("root").iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .env("FAKE_AWS_CALLER", "root")
-            .envs(envs.iter().copied())
-            .bounded();
-        let text = all(&out);
-        assert_eq!(out.status.code(), Some(1), "{envs:?}: {text}");
-        assert!(text.contains("claude-update: the identity of this run is refused: root: stack dev has its deployer (user/ai-env-deployer): make deploy asks for that user's key (Strongbox); the account root only with BREAKGLASS=1 on the make command line: nothing changed"), "{envs:?}: {text}");
-        assert!(!text.contains("BREAK-GLASS") && !text.contains("stack's passphrase"), "{envs:?}: {text}");
-        assert!(
-            !calls(t).iter().any(|l| l.starts_with("make ") || l.starts_with("egress check") || l.starts_with("run -f ") || (l.starts_with("as ") && !l.starts_with("as --check "))),
-            "{envs:?}: nothing ran, nothing asked, nothing unsealed: {:?}",
-            calls(t)
-        );
-    }
-
-    // A runner that does not take (it runs the command without a marker that covers the tier): asked for once, never
-    // again; the pass under it stops before the first step that needs AWS.
-    script(
-        &bin.join("ai-env-nomarker"),
-        "case \"${1:-} ${2:-}\" in\n  \"as ops\"|\"as deployer\")\n    printf 'nomarker %s\\n' \"$*\" >> \"$FAKE_AIENV_LOG\"\n    shift 2\n    test \"${1:-}\" != -- || shift\n    exec \"$@\" ;;\nesac\nexec \"$(dirname \"$0\")/ai-env-stand-in\" \"$@\"",
-    );
-    std::fs::remove_file(t.join("calls.log")).ok();
-    let out = ops5(t, &bin, &["claude-update"]).current_dir(t).env("LOCK", "image/claude.lock").env("FAKE_AIENV_BUNDLE", "2.1.287").env("AI_ENV_CLI", bin.join("ai-env-nomarker")).bounded();
-    let text = all(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("claude-update: this run is under ai-env as ops, but ai-env as --check ops still fails: stopped before the first step that needs AWS"), "{text}");
-    let c = calls(t);
-    assert_eq!(c.iter().filter(|l| l.starts_with("nomarker as ops -- ")).count(), 1, "asked for once: {c:#?}");
-    assert!(!c.iter().any(|l| l.starts_with("make ") || l.starts_with("egress check")), "no step ran: {c:#?}");
 }
 
 // ---- S8 operators: TIER, ops.sh identity and stack-deployer, P8, operator-keys, deploy-policies, destroy ----
@@ -4132,7 +3779,7 @@ fn p8_admits_only_the_stacks_deployer_the_bootstrap_and_a_loud_break_glass() {
     }
 }
 
-/// ops.sh identity TIER [LABEL] beyond the deployer tier P8 shows: the ops tier (claude-update's) admits ai-env-ops
+/// ops.sh identity TIER [LABEL] beyond the deployer tier P8 shows: the ops tier (S10's claude-update's; the label below is only a label) admits ai-env-ops
 /// and the deployer, refuses the root and any other; root-keys (make operator-keys) admits the account root under its
 /// runner once the stack exports both users; breakglass (destroy-run) admits the account root under its runner with
 /// BREAKGLASS=1, whatever the stack exports, and refuses every user. With a label each line reads `LABEL: identity
@@ -4593,21 +4240,14 @@ fn make_help_lists_the_new_targets_and_every_make_line_is_a_sub_make_or_a_tier_l
     assert_eq!(vars["PASS_TARGETS"], "preview deploy deploy-policies destroy", "the targets whose X-run runs pulumi preview, up or destroy");
     let ops = read(&Path::new(REPO).join("infra/scripts/ops.sh"));
     assert!(ops.contains(&format!("\nNO_KEY_ENV=({NO_KEY})\n")), "ops.sh's NO_KEY_ENV is $(NO_KEY)");
-    // A39: claude-update's steps after its deploy (status, proxy, check) run under NO_PASS_ENV, the passphrase's two
-    // names, besides the export -n that keeps it from every step but the deploy: either alone keeps it from them.
-    assert!(ops.contains("\nNO_PASS_ENV=(env -u PULUMI_CONFIG_PASSPHRASE -u PULUMI_CONFIG_PASSPHRASE_FILE)\n"), "ops.sh's NO_PASS_ENV unsets the passphrase's two names");
-    for step in ["status)", "proxy)", "check)"] {
-        let line = ops.lines().map(str::trim_start).find(|l| l.starts_with(step) && l.contains(" update_step ")).unwrap_or_else(|| panic!("ops.sh: no claude-update {step} step"));
-        assert!(line.contains(" \"${NO_PASS_ENV[@]}\" "), "claude-update's {step} step runs under NO_PASS_ENV: {line}");
-    }
     // The two tsc compiles inside deploy-run (the plan check's and check-policies') run under the same six.
     for script in ["check-plan.sh", "check-policies.sh"] {
         assert!(read(&Path::new(REPO).join("infra/scripts").join(script)).contains(&format!("(cd \"$infra\" && {NO_KEY} \\\n")), "{script}: its tsc under $(NO_KEY)'s six");
     }
 }
 
-/// D18, nested (contracts §9.3): a make typed under `ai-env as` (`ai-env as deployer -- make preview deploy`,
-/// claude-update's make deploy) holds the runner's key, its secret and its marker, here with a session token beside
+/// D18, nested (contracts §9.3): a make typed under `ai-env as` (`ai-env as deployer -- make preview deploy`;
+/// S10's claude-update's make deploy, retired in S11) holds the runner's key, its secret and its marker, here with a session token beside
 /// them. No compile sees any of them: the wrapper's image zip and test-egress's test build, then TIER's own build of the
 /// operator CLI with the Makefile's default AI_ENV (`cargo run`, which compiles the tree when it changed; here
 /// [`CARGO_RUN`]), the first `cargo` call, before `ai-env as --check`, the first that sees the key; X-run then runs as
@@ -4740,7 +4380,7 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
         assert!(!all(out).contains(&passphrase) && !read(&tmp.path().join("calls.log")).contains(&passphrase), "{what}: the passphrase's value shown");
     }
 
-    // ops.sh's own calls of the CLI (key-issue, post-deploy, connector-probe, claude-update: need_ai_env): the CLI
+    // ops.sh's own calls of the CLI (key-issue, post-deploy, connector-probe: need_ai_env): the CLI
     // built without the key first.
     let (t, bin) = rk_tree(0);
     script(&bin.join("cargo"), CARGO_RUN);
@@ -4848,7 +4488,7 @@ fn make_p_is_refused_by_every_tiered_target_and_its_run_before_any_key_is_there_
 /// AI_ENV_PASTE_STDIN=1 (a test session's leftover) never reaches a runner: the make targets' operator CLI is a debug
 /// build (cargo run), whose `ai-env as deployer` would read the key from a stdin that is not a terminal (D11). TIER's
 /// two runner calls drop it (its keyless build, which reads no paste, shows it reached make), and so does ops.sh for
-/// every command, claude-update's runner among them. A39: so does the passphrase's unseal, and the runner under it.
+/// every command. A39: so does the passphrase's unseal, and the runner under it.
 #[test]
 fn the_debug_paste_knob_never_reaches_a_runner() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4873,40 +4513,6 @@ fn the_debug_paste_knob_never_reaches_a_runner() {
     let runner: Vec<&String> = c.iter().filter(|l| l.starts_with("run -f ") || l.starts_with("as ")).collect();
     assert!(runner.len() == 3 && runner[1].starts_with("run -f ") && runner[2].starts_with("as deployer -- "), "the check, the unseal, the runner: {c:#?}");
     assert!(runner.iter().all(|l| !l.contains("[PASTE")), "the knob reached the unseal or the runner: {runner:#?}");
-
-    // claude-update, nothing to deploy: every call of the operator CLI, its runner's included, is without it.
-    let tmp = tempfile::tempdir().unwrap();
-    let t = tmp.path();
-    let bin = s5_bin(t);
-    script(&bin.join("make"), "exit 0");
-    std::fs::create_dir_all(t.join("image")).unwrap();
-    std::fs::write(t.join("image/claude.lock"), "CLAUDE_VERSION=2.1.287\n").unwrap();
-    let mut o = with_operators(outputs());
-    o["claudeVersion"] = json!("2.1.287");
-    write_outputs(t, &o);
-    let _ = ops5(t, &bin, &["claude-update"]).current_dir(t).env("LOCK", "image/claude.lock").env("FAKE_AIENV_BUNDLE", "2.1.287").env("AI_ENV_PASTE_STDIN", "1").bounded();
-    let c = calls(t);
-    assert!(c.iter().any(|l| l.starts_with("as ops -- ")), "{c:#?}");
-    assert!(c.iter().filter(|l| l.contains("[AI_ENV=")).all(|l| !l.contains("[PASTE")), "the knob reached the operator CLI: {c:#?}");
-}
-
-/// make claude-update is never break-glass: BREAKGLASS=1 on its make command line, which MAKEFLAGS would hand to its
-/// nested make deploy (TIER then asks for ai-env as root under the deployer's runner, refused after the paste), stops
-/// it before ops.sh runs, exit 2 (D15); exported in the environment it counts for nothing, as everywhere.
-#[test]
-fn claude_update_refuses_breakglass_on_its_command_line_before_anything_runs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let t = tmp.path();
-    let bin = tier_world(t);
-    let out = tier_make(t, &bin, &["claude-update", "BREAKGLASS=1"], false, &[]);
-    let text = all(&out);
-    assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(text.contains("claude-update: never break-glass (BREAKGLASS=1 is on the make command line): as the account root, run make deploy BREAKGLASS=1, then the remaining steps by hand (README \"Break-glass\"): nothing changed"), "{text}");
-    assert_eq!(calls(t), Vec::<String>::new(), "nothing ran: {text}");
-    // Exported, it is no refusal: ops.sh runs (and stops here at the Cursor bundle it cannot read).
-    let out = tier_make(t, &bin, &["claude-update"], false, &[("BREAKGLASS", "1")]);
-    let text = all(&out);
-    assert!(!text.contains("never break-glass") && text.contains("claude-update: cannot read the Cursor bundle's version"), "{text}");
 }
 
 // ---- A39: the stack's sealed passphrase, unsealed by make (plans/s8-operators-contracts.md A39) ----
@@ -5206,7 +4812,7 @@ fn breakglass_under_a_runner_unseals_only_where_the_root_runs() {
 }
 
 /// A39 (D17): the stack's passphrase never reaches a command line make writes, whether make deploy unseals it or finds
-/// it exported (as a make nested under claude-update's unseal does): no recipe shell's argv (make runs each recipe line
+/// it exported (as a make nested under another's unseal does, S10's claude-update's): no recipe shell's argv (make runs each recipe line
 /// as `$(SHELL) -c LINE`, every sub-make's too, here through a logger of its arguments), and no output, while X-run's
 /// Pulumi calls hold it.
 #[test]
@@ -6085,98 +5691,6 @@ fn make_n_perf_wrapper_adds_the_prewarm_run_only_with_prewarm_1_on_the_command_l
     assert_eq!(read(&log), "", "make -n ran a tool");
 }
 
-// ---- S9 (G7): claude-update's node_modules ------------------------------------------------------
-
-/// The steps' make of [`claude_update_checks_infra_node_modules_before_test_docker`]: each call logged; claude-pin
-/// writes the lock and test-docker the zip, its image.json and its stamp, as the real ones do; a deploy moves the
-/// stack outputs' claudeVersion to the version it deployed (FAKE_DEPLOYS).
-const CLAUDE_UPDATE_FAKE_MAKE: &str = r#"printf 'make %s\n' "$*" >> "$FAKE_AIENV_LOG"
-case " $* " in
-  *" claude-pin "*) for a in "$@"; do case "$a" in CLAUDE_VERSION=*) printf 'CLAUDE_VERSION=%s\nCLAUDE_PLATFORM=linux-arm64\n' "${a#CLAUDE_VERSION=}" > "$LOCK" ;; esac; done ;;
-  *" test-docker "*) v=$(sed -n 's/^CLAUDE_VERSION=//p' "$LOCK"); mkdir -p "$IMAGE_OUT"; printf 'a zip of %s' "$v" > "$IMAGE_OUT/image.zip"; printf '{"claudeVersion":"%s"}\n' "$v" > "$IMAGE_OUT/image.json"; shasum -a 256 "$IMAGE_OUT/image.zip" | cut -d' ' -f1 > "$IMAGE_OUT/test-docker.ok" ;;
-  *" deploy "*) sed -i '' "s/\"claudeVersion\":\"[^\"]*\"/\"claudeVersion\":\"$FAKE_DEPLOYS\"/" "$FAKE_PULUMI_OUTPUTS" ;;
-esac
-exit 0"#;
-
-/// S9 (S8's B9: claude-update ran make test-docker, then make deploy failed for want of infra/node_modules): with a
-/// deploy due, claude-update checks the Pulumi program's `infra/node_modules` among its preconditions, before the
-/// pin, make test-docker or any runner: without its tsc (make deploy's check-policies and plan check compile with it)
-/// it refuses naming make infra-install, nothing run, nothing changed; with it, the run goes on to its first step. With
-/// nothing to deploy it asks for none. ops.sh runs from a copy under the test's tempdir, so the `infra/` it takes for
-/// the program's is the test's.
-#[test]
-fn claude_update_checks_infra_node_modules_before_test_docker() {
-    let refusal = "/node_modules is missing (make deploy's check-policies and plan check run its tsc): make infra-install, then make claude-update: nothing changed";
-    for (what, bundle, modules, refused) in [("a deploy due, no node_modules", "2.1.288", false, true), ("a deploy due, node_modules installed", "2.1.288", true, false), ("nothing to deploy, no node_modules", "2.1.287", false, false)] {
-        let tmp = tempfile::tempdir().unwrap();
-        let t = tmp.path();
-        let bin = s5_bin(t);
-        script(&bin.join("make"), CLAUDE_UPDATE_FAKE_MAKE);
-        script(&bin.join("docker"), "exit 0");
-        script(&bin.join("curl"), "exit 6");
-        std::fs::create_dir_all(t.join("image")).unwrap();
-        let lock = "CLAUDE_VERSION=2.1.287\nCLAUDE_PLATFORM=linux-arm64\n";
-        std::fs::write(t.join("image/claude.lock"), lock).unwrap();
-        let mut o = outputs();
-        o["claudeVersion"] = json!("2.1.287");
-        o["latestActiveImageVersion"] = json!("3.0");
-        o["bucket"] = json!("ai-env-artifacts-0000000");
-        o["zipKey"] = json!("ai-env/image-0123456789abcdef.zip");
-        write_outputs(t, &with_operators(o));
-        std::fs::create_dir_all(t.join("aws/image")).unwrap();
-        std::fs::write(t.join("aws/image/state"), "UPDATED").unwrap();
-        std::fs::write(t.join("aws/image/active"), "3.0").unwrap();
-        std::fs::write(t.join("aws/image/uri"), "s3://ai-env-artifacts-0000000/ai-env/image-0123456789abcdef.zip").unwrap();
-        seed_proxy(t, "running");
-        let ops = t.join("infra/scripts/ops.sh");
-        std::fs::create_dir_all(ops.parent().unwrap()).unwrap();
-        std::fs::copy(Path::new(REPO).join("infra/scripts/ops.sh"), &ops).unwrap();
-        if modules {
-            script(&t.join("infra/node_modules/.bin/tsc"), "exit 0");
-        }
-        let mut cmd = Command::new("/bin/bash");
-        isolate(&mut cmd, t).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
-        s5_env(&mut cmd, t);
-        let out = cmd
-            .arg(&ops)
-            .arg("claude-update")
-            .current_dir(t)
-            .env("REGION", "eu-central-1")
-            .env("IMAGE_NAME", "ai-env-agent")
-            .env("IMAGE_OUT", t.join("out"))
-            .env("STACK", "dev")
-            .env("IMAGE_WAIT_TIMEOUT", "5")
-            .env("IMAGE_WAIT_POLL", "1")
-            .env("VERSIONS_WARN", "40")
-            .env("VERSIONS_QUOTA", "50")
-            .env("CONNECTOR_WAIT_TIMEOUT", "5")
-            .env("CONNECTOR_WAIT_POLL", "1")
-            .env("AI_ENV_CLI", bin.join("ai-env-stand-in"))
-            .env("LOCK", "image/claude.lock")
-            .env("CLAUDE_RELEASES", "https://downloads.invalid/claude-code-releases")
-            .env("CLAUDE_GPG_FPR", "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE")
-            .env("FAKE_AIENV_BUNDLE", bundle)
-            .env("FAKE_DEPLOYS", bundle)
-            .env("AI_ENV_BRIDGE_LAB_ASSUME_TTY", "1")
-            .env("PULUMI_CONFIG_PASSPHRASE_FILE", "/dev/null")
-            .bounded();
-        let text = all(&out);
-        let c = calls(t);
-        assert_eq!(text.contains(refusal), refused, "{what}: {text}");
-        if refused {
-            assert_eq!(out.status.code(), Some(1), "{what}: {text}");
-            assert!(text.contains(&format!("claude-update: {}{refusal}", t.join("infra").display())) || text.contains("/infra/node_modules is missing ("), "{what}: the refusal names the program's directory: {text}");
-            assert!(c.iter().all(|l| !l.starts_with("make ") && !l.starts_with("as ") && !l.starts_with("run ")), "{what}: nothing ran (no pin, no test-docker, no runner): {c:#?}");
-            assert_eq!(std::fs::read_to_string(t.join("image/claude.lock")).unwrap(), lock, "{what}: the lock untouched");
-            assert!(!t.join("out/claude-update.pending").exists(), "{what}: no deploy began");
-        } else if modules {
-            assert!(text.contains("claude-update [1/7] make claude-pin CLAUDE_VERSION=2.1.288") && c.iter().any(|l| l.starts_with("make --no-print-directory claude-pin CLAUDE_VERSION=2.1.288")), "{what}: past the check, its first step: {text}");
-        } else {
-            assert!(out.status.success() && text.contains("is pinned and deployed"), "{what}: {text}");
-        }
-    }
-}
-
 /// S9 phase 4 (the surviving mutant M38): the S3 gateway endpoint's policy
 /// as `infra/policies.ts` builds it (`s3EndpointPolicy`, printed by
 /// `scripts/print-policies.ts`, compiled with the infra's own tsc as
@@ -6379,4 +5893,98 @@ fn test_aws_chat_dev_runs_the_gib_test_alone_on_the_dev_shape_or_refuses_before_
     let (out, calls) = run(&["S3=1"], &[("CHAT", "gib"), ("S3_CHAT_DEV", "x")]);
     assert!(out.status.success(), "{}", all(&out));
     assert_eq!(calls, vec![compiled, format!("{tail} live_s3_ [TESTS=1 S3=1 CHAT=unset] [LAB=]")], "CHAT in the environment is ignored: the S3 suite, no shape");
+}
+
+// ---- S11: test-aws S11=1 and S10=1 WALL=1 (C.5.4, C.6.1) ----
+
+/// `make -n test-aws S11=1` (S11's live tests, parts A's and C's, `live_s11_*`): the keyless compile first (D2),
+/// then the run with `AI_ENV_S11_TESTS=1` after `$(LAB_UNSET)` and the one `live_s11_` filter, no lab knob set and
+/// no slow switch; with SLOW=1 the slow switch alone (no code token minutes); with S10=1 the switches and filters add
+/// up. S11=1 in the environment is ignored. Nothing runs.
+#[test]
+fn make_n_test_aws_s11_1_runs_the_s11_tests_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n", "test-aws"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let compile = format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run");
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    let run_line = |text: &str| text.lines().find(|l| l.starts_with(LAB_UNSET)).unwrap_or_else(|| panic!("no test run in the dry run: {text}")).to_string();
+    let knobs_set = |text: &str| text.split_whitespace().filter(|w| w.starts_with("AI_ENV_BRIDGE_LAB_") && w.contains('=')).map(str::to_string).collect::<Vec<_>>();
+
+    let s11 = dry(&["S11=1"], &[]);
+    assert_eq!(s11.lines().next(), Some(compile.as_str()), "the keyless compile first: {s11}");
+    assert_eq!(run_line(&s11), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S11_TESTS=1  {tail} live_s11_"));
+    assert!(knobs_set(&s11).is_empty() && !s11.contains("AI_ENV_AWS_SLOW") && !s11.contains("AI_ENV_S10_TESTS"), "{s11}");
+    let slow = dry(&["S11=1", "SLOW=1"], &[]);
+    assert_eq!(run_line(&slow), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_S11_TESTS=1  {tail} live_s11_"), "the slow switch alone, no code token minutes");
+    assert!(knobs_set(&slow).is_empty(), "a lab knob set for S11's tests: {slow}");
+    assert_eq!(run_line(&dry(&["S10=1", "S11=1"], &[])), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S10_TESTS=1 AI_ENV_S11_TESTS=1  {tail} live_s10_ live_s11_"));
+    let plain = dry(&[], &[("S11", "1")]);
+    assert_eq!(run_line(&plain), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}"), "S11=1 in the environment is ignored");
+    assert!(!plain.contains("AI_ENV_S11_TESTS") && !plain.contains("live_s11_"), "{plain}");
+    assert_eq!(read(&log), "", "make -n ran a tool");
+}
+
+/// S11 (C.5.4): `make test-aws S10=1 WALL=1` runs S10's three wall tests alone, by their full names (libtest's
+/// filters are substrings, and no other test's name holds one), with the slow switch and no code token minutes; a dry
+/// run shows WALL's check after the keyless compile. Run (cargo a stand-in that logs): WALL=1 without S10=1, and WALL
+/// other than 1, are exit 2 after the compile, before the tests; WALL=1 in the environment is ignored (S10=1's suite).
+#[test]
+fn test_aws_wall_1_runs_the_three_wall_tests_or_refuses_before_them() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let walls = "live_s10_wall_migration live_s10_reopen_near_wall live_s10_reopen_after_wall";
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    let out = make(t.path(), &bin, &["-n", "test-aws", "S10=1", "WALL=1"]).env("FAKE_LOG", &log).bounded();
+    assert!(out.status.success(), "{}", all(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run"), "the keyless compile first: {text}");
+    assert!(lines[1].starts_with("test '1' = 1 || { echo \"test-aws: WALL=1 is not 1: "), "WALL's check next: {text}");
+    assert_eq!(lines[2], format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_S10_TESTS=1  {tail} {walls}"));
+    assert_eq!(read(&log), "", "make -n ran a tool");
+    let aws = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/aws.rs"));
+    for name in walls.split(' ') {
+        let named: Vec<&str> = aws.lines().filter(|l| l.trim_start().starts_with("fn ") && l.contains(name)).collect();
+        assert_eq!(named, [format!("fn {name}() {{").as_str()], "WALL=1's filter {name} names one test exactly");
+    }
+
+    let tools = t.path().join("bin2");
+    std::fs::create_dir_all(&tools).unwrap();
+    script(
+        &tools.join("cargo"),
+        r#"printf 'cargo %s [TESTS=%s SLOW=%s S10=%s] [LAB=%s]\n' "$*" "${AI_ENV_AWS_TESTS-}" "${AI_ENV_AWS_SLOW-}" "${AI_ENV_S10_TESTS-}" "$(env | sed -n 's/^\(AI_ENV_BRIDGE_LAB_[A-Z_]*\)=.*/\1/p' | tr '\n' ' ')" >> "$FAKE_LOG""#,
+    );
+    let calls = t.path().join("cargo.log");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        std::fs::remove_file(&calls).ok();
+        let out = make(t.path(), &tools, &["test-aws"]).args(args).env("FAKE_LOG", &calls).envs(envs.iter().copied()).bounded();
+        (out, lines_of(&calls))
+    };
+    let compiled = format!("{cargo} --no-run [TESTS= SLOW= S10=] [LAB=]");
+    for (what, args, want) in [
+        ("WALL=1 alone", &["WALL=1"][..], "test-aws: WALL=1 needs S10=1: make test-aws S10=1 WALL=1 runs S10's three wall tests alone"),
+        ("WALL=2", &["S10=1", "WALL=2"][..], "test-aws: WALL=2 is not 1: make test-aws S10=1 WALL=1 runs S10's three wall tests alone"),
+    ] {
+        let (out, calls) = run(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", all(&out));
+        assert!(all(&out).contains(want), "{what}: {}", all(&out));
+        assert_eq!(calls, vec![compiled.clone()], "{what}: the keyless compile alone, no test run");
+    }
+    let (out, calls) = run(&["S10=1", "WALL=1"], &[("AI_ENV_BRIDGE_LAB_FAKE_API", "/f.json")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![compiled.clone(), format!("{tail} {walls} [TESTS=1 SLOW=1 S10=1] [LAB=]")], "the three wall tests alone, slow, no lab knob");
+    let (out, calls) = run(&["S10=1"], &[("WALL", "1")]);
+    assert!(out.status.success(), "{}", all(&out));
+    assert_eq!(calls, vec![compiled, format!("{tail} live_s10_ [TESTS=1 SLOW= S10=1] [LAB=]")], "WALL in the environment is ignored: S10's suite");
 }

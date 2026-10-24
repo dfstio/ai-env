@@ -49,9 +49,17 @@
 //! no cap: [`SeedState::shallow`] (the VM's `.git/shallow`) and
 //! [`TranscriptPull::share`] (the pulls that run at once), and the one pull
 //! budget both ends and the presigned lifetime use ([`budget::pull_budget`]).
+//!
+//! S11 (plans/s11-contracts.md §5 group 1) adds, each behind its cap: a
+//! code-out that answers its manifest when nothing is new
+//! ([`CodeoutRequest::manifest_when_empty`], `CAP_CODEOUT_MANIFEST_V1`), the
+//! view's first parent ([`ViewQuery::parent`], `CAP_VIEW_PARENT_V1`), gzip
+//! pull parts ([`PullPart::encoding`], `CAP_TRANSCRIPT_GZIP_V1`), and the
+//! VM's claude cache ([`CLAUDE_STAGE_ROUTE`], [`CLAUDE_RELAY_ROUTE`],
+//! `CAP_CLAUDE_STAGE_V1`) with its five refusal codes.
 use crate::wire::mirror::mirror_key;
 use crate::wire::redact::scrub;
-use crate::wire::s3::{is_account_id, proxy_check, PresignedUrl, S3Key, PULL_PARTS_MAX, PUSH_MAX, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT, SIGNED_HEADERS_TAIL};
+use crate::wire::s3::{is_account_id, proxy_check, PresignedUrl, S3Key, CLAUDE_MAX, PULL_PARTS_MAX, PUSH_MAX, SIGNED_HEADERS_GET, SIGNED_HEADERS_PUT, SIGNED_HEADERS_TAIL};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -92,6 +100,10 @@ pub const TRANSCRIPT_PULL_ROUTE: &str = "/transcript/pull";
 pub const TRANSCRIPT_VIEW_ROUTE: &str = "/transcript/view";
 /// `POST`: a [`TranscriptTail`].
 pub const TRANSCRIPT_TAIL_ROUTE: &str = "/transcript/tail";
+/// S11: `POST` (a [`ClaudeStage`]) and `GET` (a [`ClaudeStageQuery`]) on [`APP_PORT`] (`CAP_CLAUDE_STAGE_V1`).
+pub const CLAUDE_STAGE_ROUTE: &str = "/claude/stage";
+/// S11: `POST` (a [`ClaudeRelay`]) on [`APP_PORT`].
+pub const CLAUDE_RELAY_ROUTE: &str = "/claude/relay";
 
 /// The one query of [`GIT_INFO_REFS_ROUTE`].
 pub const GIT_UPLOAD_PACK_QUERY: &str = "service=git-upload-pack";
@@ -172,6 +184,10 @@ pub const SUBTREE_BYTES_MAX: u64 = 256 * MIB;
 /// S10: the most shallow commits a [`SeedState`] reports; a VM with more
 /// reports none (`shallow` is `None`).
 pub const SHALLOW_REPORT_MAX: usize = 4096;
+/// S11 (L2): the most refs a `spawn` names: V and three more.
+pub const CLAUDE_REFS_MAX: usize = 4;
+/// S11: the longest a `POST /claude/stage` answer waits for its fetch before it answers 202.
+pub const CLAUDE_WAIT_MAX_S: u32 = 30;
 /// A helper's JSON payload ([`JsonPayloadReply`]), the Mac's `dataplane::MAX_JSON`: a view's reply
 /// (`VIEW_FILE_MAX` of text escaped at most 6 bytes per byte, plus its capped fields: under 1.6 MiB),
 /// a subtree stat (`SUBTREE_FILES_MAX` rels of at most `REL_MAX` bytes: under 1.1 MiB).
@@ -212,6 +228,10 @@ pub mod budget {
     pub const TRANSCRIPT_VIEW: Duration = Duration::from_secs(30);
     /// One tail push at `/suspend` or `/terminate`.
     pub const TRANSCRIPT_TAIL: Duration = Duration::from_secs(8);
+    /// S11: one fetch into the VM's claude cache, its probe included (the shim ends it past this: 504).
+    pub const CLAUDE_FETCH: Duration = Duration::from_secs(600);
+    /// S11: one relay, the release's GET and S3's PUT together.
+    pub const CLAUDE_RELAY: Duration = Duration::from_secs(600);
 
     /// What a pull's transfer gets beside [`TRANSCRIPT_PULL`].
     const PULL_BASE: Duration = Duration::from_secs(30);
@@ -276,8 +296,18 @@ pub mod refusal {
     /// 500 (S9): the transfer to or from S3 did not happen (curl reported no
     /// HTTP status: the proxy, a connection; or a helper failed).
     pub const TRANSFER_FAILED: &str = "transfer_failed";
+    /// 404 (S11): S3 answered 404 to a claude fetch's GET.
+    pub const NOT_STAGED: &str = "not_staged";
+    /// 422 (S11): what came is not the binary's `size` or `sha256` (the refusal's `size` is what came); nothing renamed.
+    pub const CHECKSUM_MISMATCH: &str = "checksum_mismatch";
+    /// 422 (S11): the fetched binary's `--version` is not `<v> (Claude Code)`; the file removed.
+    pub const VERSION_MISMATCH: &str = "version_mismatch";
+    /// 409 (S11): a relay on a VM that ran a spawn, took a credential or holds a seed record.
+    pub const NOT_FRESH: &str = "not_fresh";
+    /// 507 (S11): the disk could not take the binary after one eviction and one more try.
+    pub const DISK_FULL: &str = "disk_full";
     /// Every code above.
-    pub const ALL: [&str; 19] = [
+    pub const ALL: [&str; 24] = [
         BAD_REQUEST,
         SYMLINK_COMPONENT,
         PATH_OCCUPIED,
@@ -297,25 +327,33 @@ pub mod refusal {
         TIMEOUT,
         DRAINING,
         TRANSFER_FAILED,
+        NOT_STAGED,
+        CHECKSUM_MISMATCH,
+        VERSION_MISMATCH,
+        NOT_FRESH,
+        DISK_FULL,
     ];
 }
 
-/// The status a refusal of `code` is answered with: 400 `bad_request`; 409
-/// for what the workspace's state refuses; 413 `too_large`; 422 for a pack
-/// or refs the VM cannot take; 500 `git_failed`; 503 `draining`; 504
-/// `timeout`. An unknown code is 500. (A body without `Content-Length` is
-/// 411 with `bad_request`.)
+/// The status a refusal of `code` is answered with: 400 `bad_request`; 404
+/// `not_staged` (S11); 409 for what the workspace's state refuses (and
+/// `not_fresh`); 413 `too_large`; 422 for a pack or refs the VM cannot take
+/// (and a claude binary that is not the one asked); 500 `git_failed`; 503
+/// `draining`; 504 `timeout`; 507 `disk_full` (S11). An unknown code is
+/// 500. (A body without `Content-Length` is 411 with `bad_request`.)
 #[must_use]
 pub fn refusal_status(code: &str) -> u16 {
     use refusal::*;
     match code {
         BAD_REQUEST => 400,
-        SYMLINK_COMPONENT | PATH_OCCUPIED | NOT_CREATABLE | OTHER_WORKSPACE | DIRTY | DIVERGED | CHANGED | NOT_PRISTINE | BUSY | NOT_SEEDED => 409,
+        NOT_STAGED => 404,
+        SYMLINK_COMPONENT | PATH_OCCUPIED | NOT_CREATABLE | OTHER_WORKSPACE | DIRTY | DIVERGED | CHANGED | NOT_PRISTINE | BUSY | NOT_SEEDED | NOT_FRESH => 409,
         TOO_LARGE => 413,
-        BAD_PACK | MISSING_PREREQUISITES | BAD_REFS => 422,
+        BAD_PACK | MISSING_PREREQUISITES | BAD_REFS | CHECKSUM_MISMATCH | VERSION_MISMATCH => 422,
         TRANSFER_FAILED => 500,
         DRAINING => 503,
         TIMEOUT => 504,
+        DISK_FULL => 507,
         _ => 500,
     }
 }
@@ -975,6 +1013,13 @@ pub struct CodeoutRequest {
     /// The largest pack the reply may carry (`[seed].max_fetch_mib`, `box
     /// fetch --max-mib`): larger is 413 `too_large` with the size.
     pub max_bytes: u64,
+    /// S11 (C.1, `codeout_manifest_v1`): when nothing is new, answer 200
+    /// with the manifest line alone instead of a bare 204, so the Mac's
+    /// fetch record follows the VM's HEAD and branch. Sent only to a VM
+    /// whose caps name the cap; an older shim ignores it (no
+    /// `deny_unknown_fields`) and answers 204.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manifest_when_empty: bool,
 }
 
 impl CodeoutRequest {
@@ -1290,6 +1335,10 @@ impl TranscriptPull {
                 (None, S3Key::Tail { .. }) | (Some(_), _) => {}
                 (None, _) => return Err(format!("names a part (number {i}) without its sha256 that is no tail")),
             }
+            // S11 (L5): only the Mac encodes, and only its `v1/<sid>/mac/<sha256>` objects.
+            if part.encoding.is_some() && (!matches!(key, S3Key::Mac { .. }) || part.sha256.is_none()) {
+                return Err(format!("names an encoded part (number {i}) that is no Mac object, or without its sha256"));
+            }
         }
         Ok(())
     }
@@ -1305,6 +1354,31 @@ pub struct PullPart {
     /// `None` only for a tail object, which the Mac never saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// S11 (L5, `transcript_gzip_v1`): how the object is stored; `len` and
+    /// `sha256` stay the decoded bytes'. Sent only to a VM whose caps name
+    /// the cap: an older shim would ignore it and fail the part's checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<PartEncoding>,
+}
+
+/// How an object of the transcript store is stored (S11, L5): its bytes as
+/// S3 holds them. `len` and `sha256` beside it always mean the decoded bytes.
+/// No catch-all: an encoding this side does not know fails to parse (closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartEncoding {
+    /// `/usr/bin/gzip -n -6` of the bytes, stored with `Content-Encoding: gzip`.
+    Gzip,
+}
+
+impl PartEncoding {
+    /// `gzip`: the manifest's, the wire's and the `Content-Encoding` value.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            PartEncoding::Gzip => "gzip",
+        }
+    }
 }
 
 /// The `POST /transcript/pull` answer: 201 written, 200 not (a part's status, length or sha256 did not match).
@@ -1329,11 +1403,16 @@ pub struct PullPartReport {
     pub ok: bool,
 }
 
-/// `GET /transcript/view?rel=&n=`: `n` 1 to `wire::view::VIEW_MESSAGES_MAX`, the rel a `<slug>/<uuid>.jsonl`.
+/// `GET /transcript/view?rel=&n=[&parent=true]`: `n` 1 to `wire::view::VIEW_MESSAGES_MAX`, the rel a `<slug>/<uuid>.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewQuery {
     pub rel: String,
     pub n: u32,
+    /// S11 (C.2, `view_parent_v1`): ask for the reply's `first_parent`.
+    /// Sent only to a VM whose caps name the cap; an older shim ignores
+    /// the pair (no `deny_unknown_fields`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parent: bool,
 }
 
 impl ViewQuery {
@@ -1349,10 +1428,15 @@ impl ViewQuery {
         Ok(())
     }
 
-    /// The query's pairs: the rel, then `n`.
+    /// The query's pairs: the rel, then `n`, then `parent=true` only when set
+    /// (S11: serde_urlencoded reads a bool only from `true` or `false`).
     #[must_use]
     pub fn pairs(&self) -> Vec<(&'static str, String)> {
-        vec![("rel", self.rel.clone()), ("n", self.n.to_string())]
+        let mut out = vec![("rel", self.rel.clone()), ("n", self.n.to_string())];
+        if self.parent {
+            out.push(("parent", "true".to_string()));
+        }
+        out
     }
 }
 
@@ -1464,6 +1548,219 @@ fn transfer_url(url: &PresignedUrl, signed: &str, version: bool, what: &str) -> 
         return Err(format!("has a {what} URL carrying {extra}, which a {what} never signs"));
     }
     S3Key::parse(url.key()).ok_or_else(|| format!("has a {what} URL that names no object of the store"))
+}
+
+// ---- S11: claude always fresh (CAP_CLAUDE_STAGE_V1) ----------------------------------------
+//
+// Serde as S9's request types: no `deny_unknown_fields` (LD-1); an `Option`
+// is left out when `None`, a map when empty; the field order is the wire's.
+
+/// S11 (A.4): one staged claude: its version and its Linux binary's sha256 (what `S3Key::Claude` names).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClaudeRef {
+    pub version: String,
+    pub sha256: String,
+}
+
+impl ClaudeRef {
+    /// `version` `N.N.N` (`wire::pin::is_version`); `sha256` 64 lowercase hex.
+    pub fn check(&self) -> Result<(), String> {
+        if !crate::wire::pin::is_version(&self.version) {
+            return Err("names a claude version that is not N.N.N".into());
+        }
+        if !is_sha256_hex(&self.sha256) {
+            return Err("names a claude sha256 that is not 64 lowercase hex digits".into());
+        }
+        Ok(())
+    }
+
+    /// Its object: `S3Key::Claude { version, sha256 }`.
+    #[must_use]
+    pub fn key(&self) -> S3Key {
+        S3Key::Claude { version: self.version.clone(), sha256: self.sha256.clone() }
+    }
+}
+
+/// The size of a claude binary a stage or a relay names: 1 to `CLAUDE_MAX`.
+fn claude_size(size: u64) -> Result<(), String> {
+    if !(1..=CLAUDE_MAX).contains(&size) {
+        return Err(format!("names a claude binary of {size} bytes (1 to {CLAUDE_MAX})"));
+    }
+    Ok(())
+}
+
+/// `POST /claude/stage`: V's staged binary from S3 into the VM's cache (an answer at once when it is there).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStage {
+    pub version: String,
+    pub sha256: String,
+    /// The binary's size: 1 to `wire::s3::CLAUDE_MAX` (the signed manifest's).
+    pub size: u64,
+    /// A GET of exactly `S3Key::Claude { version, sha256 }` (`SIGNED_HEADERS_GET`, no `versionId`), `CLAUDE_EXPIRY`.
+    pub url: PresignedUrl,
+    /// `x-amz-expected-bucket-owner`: 12 digits.
+    pub owner: String,
+    /// squid (`wire::s3::proxy_check`); `None` in the lab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// How long the answer may wait for the fetch: 0 to `CLAUDE_WAIT_MAX_S`; past it 202, and the fetch goes on.
+    pub wait_s: u32,
+}
+
+impl ClaudeStage {
+    /// The ref's check, `size` 1 to `CLAUDE_MAX`, `wait_s` at most
+    /// `CLAUDE_WAIT_MAX_S`, the owner and the proxy, and the URL (a GET,
+    /// `SIGNED_HEADERS_GET`, no query but the signature's) naming exactly
+    /// `S3Key::Claude { version, sha256 }`.
+    pub fn check(&self) -> Result<(), String> {
+        self.of().check()?;
+        claude_size(self.size)?;
+        if self.wait_s > CLAUDE_WAIT_MAX_S {
+            return Err(format!("waits {} s for its fetch (at most {CLAUDE_WAIT_MAX_S})", self.wait_s));
+        }
+        owner_and_proxy(&self.owner, self.proxy.as_deref())?;
+        let key = transfer_url(&self.url, SIGNED_HEADERS_GET, false, "claude stage")?;
+        if key != self.of().key() {
+            return Err("fetches a key that is not its claude binary's (v1/_claude/mac/<version>/<sha256>)".into());
+        }
+        Ok(())
+    }
+
+    /// The binary it names.
+    #[must_use]
+    pub fn of(&self) -> ClaudeRef {
+        ClaudeRef { version: self.version.clone(), sha256: self.sha256.clone() }
+    }
+}
+
+/// `GET /claude/stage?sha256=`: what the cache knows of one binary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStageQuery {
+    pub sha256: String,
+}
+
+impl ClaudeStageQuery {
+    /// 64 lowercase hex.
+    pub fn check(&self) -> Result<(), String> {
+        if !is_sha256_hex(&self.sha256) {
+            return Err("names a sha256 that is not 64 lowercase hex digits".into());
+        }
+        Ok(())
+    }
+
+    /// `[("sha256", …)]`.
+    #[must_use]
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        vec![("sha256", self.sha256.clone())]
+    }
+}
+
+/// Where a claude binary stands in the VM's cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeStageState {
+    /// The spawn can run it: in the cache, or the image's own.
+    Ready,
+    /// A fetch of it is under way (or waits its turn).
+    Fetching,
+    /// The last fetch was refused (`why`), within `shim::claudebin::FAILED_KEEP`.
+    Failed,
+    /// `GET` only: neither cached, fetching nor failed.
+    Absent,
+}
+
+/// Where a ready claude comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeSrc {
+    /// The VM's cache holds it.
+    Cache,
+    /// It is the image's own claude (the lock's sha256): nothing was fetched.
+    Image,
+}
+
+/// What `POST /claude/stage` answers with 200, 201 and 202, and `GET /claude/stage` with 200.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStageReply {
+    pub state: ClaudeStageState,
+    /// With `ready` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<ClaudeSrc>,
+    /// With `failed` only: the refusal's code (`refusal::NOT_STAGED` and the other S11 codes, or `transfer_failed`, `timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// Bytes received so far (`fetching`), in all (`ready` by a fetch, `failed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub got_len: Option<u64>,
+    /// The sha256 of what came (`failed` with `checksum_mismatch`, `GET` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub got_sha256: Option<String>,
+    /// Ms the fetch took (`ready` by a fetch) or has run (`fetching`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+}
+
+/// `POST /claude/relay` (a fresh stager VM only): V's linux-arm64 release (`wire::pin::binary_url`, built in the
+/// shim from `version`) streamed into a presigned PUT of `S3Key::Claude`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeRelay {
+    pub version: String,
+    pub sha256: String,
+    /// 1 to `CLAUDE_MAX`: the release's, from the signed manifest.
+    pub size: u64,
+    /// A PUT signed for exactly `size`, `x-amz-checksum-sha256` of `sha256`, `If-None-Match: *` and `owner`
+    /// (`X-Amz-SignedHeaders` exactly `SIGNED_HEADERS_PUT`) of `S3Key::Claude { version, sha256 }`, `CLAUDE_EXPIRY`.
+    pub put: PresignedUrl,
+    pub owner: String,
+}
+
+impl ClaudeRelay {
+    /// The ref's check, `size`, the owner (no proxy: the stager is an
+    /// internet VM), and `put` (`SIGNED_HEADERS_PUT`, no query but the
+    /// signature's) naming exactly its key.
+    pub fn check(&self) -> Result<(), String> {
+        let of = ClaudeRef { version: self.version.clone(), sha256: self.sha256.clone() };
+        of.check()?;
+        claude_size(self.size)?;
+        owner_and_proxy(&self.owner, None)?;
+        let key = transfer_url(&self.put, SIGNED_HEADERS_PUT, false, "claude relay")?;
+        if key != of.key() {
+            return Err("puts to a key that is not its claude binary's (v1/_claude/mac/<version>/<sha256>)".into());
+        }
+        Ok(())
+    }
+}
+
+/// The relay's answer (200 whenever the PUT's curl reported an HTTP status): `s3_status`, `s3_code`,
+/// `version_id`, and the `len` and `sha256` of what the shim streamed.
+pub type ClaudeRelayReply = TranscriptPushReply;
+
+/// One binary of the VM's cache: its index's entry, and `/health/detail`'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeCacheEntry {
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+    /// Unix seconds.
+    pub fetched_at: u64,
+    pub last_used: u64,
+}
+
+/// `HealthDetail.claude_cache`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeCacheView {
+    /// Most recently used first; always written (an empty cache is `[]`).
+    #[serde(default)]
+    pub entries: Vec<ClaudeCacheEntry>,
+    /// The sha256 being fetched now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetching: Option<String>,
+    /// Refused within `FAILED_KEEP`: sha256 to refusal code.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed: BTreeMap<String, String>,
+    /// The image's own claude (`--claude`): the lock's version and sha256; `None` without a lock (the native tests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ClaudeRef>,
 }
 
 // ---- settings (T8.7) ---------------------------------------------------------------------
@@ -1946,7 +2243,7 @@ mod tests {
 
     #[test]
     fn codeout_requests_and_manifests_name_their_bounds() {
-        let req = CodeoutRequest { path: NFC.into(), haves: vec![H.into(), W.into()], wip: true, max_bytes: 256 * MIB };
+        let req = CodeoutRequest { path: NFC.into(), haves: vec![H.into(), W.into()], wip: true, max_bytes: 256 * MIB, manifest_when_empty: false };
         assert_eq!(req.check(), Ok(()));
         for (bad, why) in [
             (CodeoutRequest { haves: vec![H.into(); HAVES_MAX + 1], ..req.clone() }, "257 haves"),
@@ -2004,13 +2301,17 @@ mod tests {
             assert_eq!(known_refusal(code), Some(code));
         }
         let by_status = |s: u16| refusal::ALL.iter().copied().filter(|c| refusal_status(c) == s).collect::<Vec<_>>();
+        assert_eq!(refusal::ALL.len(), 24);
         assert_eq!(by_status(400), ["bad_request"]);
-        assert_eq!(by_status(409), ["symlink_component", "path_occupied", "not_creatable", "other_workspace", "dirty", "diverged", "changed", "not_pristine", "busy", "not_seeded"]);
+        assert_eq!(by_status(404), ["not_staged"]);
+        assert_eq!(by_status(409), ["symlink_component", "path_occupied", "not_creatable", "other_workspace", "dirty", "diverged", "changed", "not_pristine", "busy", "not_seeded", "not_fresh"]);
         assert_eq!(by_status(413), ["too_large"]);
-        assert_eq!(by_status(422), ["bad_pack", "missing_prerequisites", "bad_refs"]);
+        assert_eq!(by_status(422), ["bad_pack", "missing_prerequisites", "bad_refs", "checksum_mismatch", "version_mismatch"]);
         assert_eq!(by_status(500), ["git_failed", "transfer_failed"]);
         assert_eq!(by_status(503), ["draining"]);
         assert_eq!(by_status(504), ["timeout"]);
+        assert_eq!(by_status(507), ["disk_full"]);
+        assert_eq!(refusal::ALL[19..], ["not_staged", "checksum_mismatch", "version_mismatch", "not_fresh", "disk_full"], "S11's five, appended");
         assert_eq!((refusal_status("from_the_future"), known_refusal("from_the_future")), (500, None));
         assert_eq!((SeedApplied::Cloned.status(), SeedApplied::Replaced.status(), SeedApplied::UpToDate.status()), (201, 201, 200));
     }
@@ -2191,8 +2492,11 @@ mod tests {
         // only this pin catches what an S9 VM or Mac would no longer read.
         let s9: Vec<&str> = text.lines().skip(1).take(38).map(|l| l.trim_end_matches(',')).collect();
         assert_eq!(sha256_hex(s9.join("\n").as_bytes()), "99479d4fa86a4fe3492a297131875371e1e6930ee7bd821a119642f5accbf001", "an S9 codeport document changed");
+        // S11 (index §1, LD-32, C §X.2): S9's and S10's 40 documents, lines 2..=41, pinned the same way.
+        let s10: Vec<&str> = text.lines().skip(1).take(40).map(|l| l.trim_end_matches(',')).collect();
+        assert_eq!(sha256_hex(s10.join("\n").as_bytes()), "e9cde1e3a71bf14d661ee7cc0eac4e96bef8e473815ec314c1ecd9e1430c4ca2", "an S9 or S10 codeport document changed");
         let all: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
-        let cases: [(&str, RoundTrip); 40] = [
+        let cases: [(&str, RoundTrip); 55] = [
             ("path_query", again::<PathQuery>),
             ("rel_query", again::<RelQuery>),
             ("seed_query_clone", again::<SeedQuery>),
@@ -2235,6 +2539,23 @@ mod tests {
             // S10 (plans/s10-contracts.md §1.6).
             ("seed_state_shallow", again::<SeedState>),
             ("transcript_pull_shared", again::<TranscriptPull>),
+            // S11, part A (A §1.9).
+            ("claude_stage", again::<ClaudeStage>),
+            ("claude_stage_query", again::<ClaudeStageQuery>),
+            ("claude_stage_reply_ready_cache", again::<ClaudeStageReply>),
+            ("claude_stage_reply_ready_image", again::<ClaudeStageReply>),
+            ("claude_stage_reply_fetching", again::<ClaudeStageReply>),
+            ("claude_stage_reply_failed", again::<ClaudeStageReply>),
+            ("claude_relay", again::<ClaudeRelay>),
+            ("claude_relay_reply", again::<ClaudeRelayReply>),
+            ("refusal_checksum_mismatch", again::<WsRefusal>),
+            ("refusal_not_fresh", again::<WsRefusal>),
+            ("claude_cache_view", again::<ClaudeCacheView>),
+            // S11, part C (C §X.2).
+            ("codeout_request_manifest_when_empty", again::<CodeoutRequest>),
+            ("view_query_parent", again::<ViewQuery>),
+            ("transcript_view_reply_first_parent", again::<crate::wire::view::TranscriptViewReply>),
+            ("transcript_pull_gzip", again::<TranscriptPull>),
         ];
         let names: BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
         assert_eq!(all.keys().map(String::as_str).collect::<BTreeSet<_>>(), names, "one case per document");
@@ -2292,6 +2613,187 @@ mod tests {
         let ids = shallow.shallow.clone().unwrap_or_default();
         assert!(ids.len() == 2 && ids.iter().all(|id| ObjectFormat::Sha1.is_id(id)), "{ids:?}");
         assert_eq!(SeedState { shallow: None, ..shallow }, serde_json::from_str::<SeedState>(doc("seed_state_seeded")).unwrap(), "the seeded state, with its shallow list");
+        // S11, part A: every claude request passes its check; the relay's reply is a push's; the refusals' statuses.
+        let stage: ClaudeStage = serde_json::from_str(doc("claude_stage")).unwrap();
+        assert_eq!(stage.check(), Ok(()));
+        assert_eq!(serde_json::from_str::<ClaudeStageQuery>(doc("claude_stage_query")).unwrap().check(), Ok(()));
+        let relay: ClaudeRelay = serde_json::from_str(doc("claude_relay")).unwrap();
+        assert_eq!(relay.check(), Ok(()));
+        assert_eq!((stage.url.expires_s(), relay.put.expires_s()), (crate::wire::s3::CLAUDE_EXPIRY.as_secs(), crate::wire::s3::CLAUDE_EXPIRY.as_secs()));
+        let reply: TranscriptPushReply = serde_json::from_str(doc("claude_relay_reply")).unwrap();
+        assert_eq!((reply.s3_status, reply.len, reply.sha256), (200, stage.size, stage.sha256.clone()));
+        for (name, code, status) in [("refusal_checksum_mismatch", refusal::CHECKSUM_MISMATCH, 422), ("refusal_not_fresh", refusal::NOT_FRESH, 409)] {
+            let r: WsRefusal = serde_json::from_str(doc(name)).unwrap();
+            assert_eq!((known_refusal(&r.code), r.status()), (Some(code), status), "{name}");
+        }
+        let view: ClaudeCacheView = serde_json::from_str(doc("claude_cache_view")).unwrap();
+        assert!(view.entries.iter().all(|e| ClaudeRef { version: e.version.clone(), sha256: e.sha256.clone() }.check().is_ok()) && view.image.as_ref().is_some_and(|i| i.check().is_ok()));
+        // S11, part C: every request passes its check; the gzip pull is S9's first part, encoded, from a Mac object.
+        assert_eq!(serde_json::from_str::<CodeoutRequest>(doc("codeout_request_manifest_when_empty")).unwrap().check(), Ok(()));
+        assert_eq!(serde_json::from_str::<ViewQuery>(doc("view_query_parent")).unwrap().check(), Ok(()));
+        let first: crate::wire::view::TranscriptViewReply = serde_json::from_str(doc("transcript_view_reply_first_parent")).unwrap();
+        assert_eq!(first.check(10), Ok(()));
+        let gzip: TranscriptPull = serde_json::from_str(doc("transcript_pull_gzip")).unwrap();
+        assert_eq!(gzip.check(), Ok(()));
+        assert_eq!((gzip.parts[0].encoding, gzip.parts[0].len, gzip.parts[0].sha256.as_deref(), gzip.sha256.as_deref()), (Some(PartEncoding::Gzip), 48213, Some(D_BASE), Some(D_BASE)));
+        assert!(matches!(S3Key::parse(gzip.parts[0].url.key()), Some(S3Key::Mac { .. })));
+    }
+
+    /// S11 (C §X.2): the four part C fields are left out when unset, so
+    /// S10's documents are written as before; set, each round-trips and
+    /// comes last. The view query's pairs name `parent=true` only when set.
+    #[test]
+    fn the_s11_codeport_fields_are_additive() {
+        let text = include_str!("../../tests/fixtures/wire/codeport-golden.json");
+        let all: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
+        let doc = |name: &str| all[name].get();
+        let req: CodeoutRequest = serde_json::from_str(doc("codeout_request")).unwrap();
+        assert!(!req.manifest_when_empty, "an S10 request asks for no manifest");
+        assert_eq!(serde_json::to_string(&req).unwrap(), doc("codeout_request"), "unset: S10's bytes");
+        let with = CodeoutRequest { manifest_when_empty: true, ..req };
+        assert_eq!(serde_json::to_string(&with).unwrap(), doc("codeout_request_manifest_when_empty"));
+        assert_eq!(doc("codeout_request_manifest_when_empty"), format!("{},\"manifest_when_empty\":true}}", doc("codeout_request").trim_end_matches('}')), "the flag comes last");
+        let q: ViewQuery = serde_json::from_str(doc("view_query")).unwrap();
+        assert!(!q.parent);
+        assert_eq!(serde_json::to_string(&q).unwrap(), doc("view_query"));
+        assert_eq!(q.pairs(), vec![("rel", q.rel.clone()), ("n", "10".to_string())], "no parent pair unless asked");
+        let asked = ViewQuery { parent: true, ..q.clone() };
+        assert_eq!(serde_json::to_string(&asked).unwrap(), doc("view_query_parent"));
+        assert_eq!(asked.pairs(), vec![("rel", q.rel.clone()), ("n", "10".to_string()), ("parent", "true".to_string())]);
+        let pull: TranscriptPull = serde_json::from_str(doc("transcript_pull")).unwrap();
+        assert!(pull.parts.iter().all(|p| p.encoding.is_none()));
+        assert_eq!(serde_json::to_string(&pull).unwrap(), doc("transcript_pull"), "unencoded parts: S9's bytes");
+        let gzip: TranscriptPull = serde_json::from_str(doc("transcript_pull_gzip")).unwrap();
+        let part = serde_json::to_string(&gzip.parts[0]).unwrap();
+        assert!(part.ends_with(",\"encoding\":\"gzip\"}"), "{part}");
+        assert_eq!(serde_json::to_string(&PartEncoding::Gzip).unwrap(), "\"gzip\"");
+        assert_eq!(PartEncoding::Gzip.word(), "gzip");
+        assert!(serde_json::from_str::<PartEncoding>("\"br\"").is_err(), "an unknown encoding fails closed");
+        let view: crate::wire::view::TranscriptViewReply = serde_json::from_str(doc("transcript_view_reply")).unwrap();
+        assert_eq!(view.first_parent, None);
+        assert_eq!(serde_json::to_string(&view).unwrap(), doc("transcript_view_reply"), "no first parent: S9's bytes");
+        let first: crate::wire::view::TranscriptViewReply = serde_json::from_str(doc("transcript_view_reply_first_parent")).unwrap();
+        let json = serde_json::to_string(&first).unwrap();
+        assert!(json.ends_with(",\"first_parent\":\"0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6f\"}"), "{json}");
+        assert_eq!(serde_json::from_str::<crate::wire::view::TranscriptViewReply>(&json).unwrap(), first);
+    }
+
+    /// S11 (A §1.3): the GET of a claude stage must name exactly its binary's
+    /// object: no other version or sha256, no session key, no `versionId`,
+    /// the GET's signed headers; the ref, size, wait, owner and proxy rules.
+    #[test]
+    fn a_claude_stage_names_exactly_its_object() {
+        let v = "2.1.308";
+        let sha = sha256_hex(b"claude");
+        let key = |version: &str, s: &str| format!("v1/_claude/mac/{version}/{s}");
+        let stage = ClaudeStage { version: v.into(), sha256: sha.clone(), size: 290_478_208, url: presigned(&key(v, &sha), "", SIGNED_HEADERS_GET), owner: "123456789012".into(), proxy: Some("http://10.42.0.10:3128".into()), wait_s: CLAUDE_WAIT_MAX_S };
+        assert_eq!(stage.check(), Ok(()));
+        assert_eq!(stage.of(), ClaudeRef { version: v.into(), sha256: sha.clone() });
+        assert_eq!(stage.of().key().render(), key(v, &sha));
+        assert_eq!(ClaudeStage { proxy: None, wait_s: 0, size: crate::wire::s3::CLAUDE_MAX, ..stage.clone() }.check(), Ok(()), "the lab's, at once, the largest");
+        for (bad, why) in [
+            (ClaudeStage { url: presigned(&key("2.1.307", &sha), "", SIGNED_HEADERS_GET), ..stage.clone() }, "not its claude binary's"),
+            (ClaudeStage { url: presigned(&key(v, D_BASE), "", SIGNED_HEADERS_GET), ..stage.clone() }, "not its claude binary's"),
+            (ClaudeStage { url: presigned(&format!("v1/{ID}/mac/{sha}"), "", SIGNED_HEADERS_GET), ..stage.clone() }, "not its claude binary's"),
+            (ClaudeStage { url: presigned(&key(v, &sha), "versionId=fv1&", SIGNED_HEADERS_GET), ..stage.clone() }, "carrying versionId"),
+            (ClaudeStage { url: presigned(&key(v, &sha), "", SIGNED_HEADERS_PUT), ..stage.clone() }, "signed over other headers"),
+            (ClaudeStage { url: presigned("", "", SIGNED_HEADERS_GET), ..stage.clone() }, "names no object"),
+            (ClaudeStage { version: "2.1".into(), ..stage.clone() }, "not N.N.N"),
+            (ClaudeStage { sha256: sha.to_uppercase(), ..stage.clone() }, "64 lowercase hex"),
+            (ClaudeStage { size: 0, ..stage.clone() }, "of 0 bytes"),
+            (ClaudeStage { size: crate::wire::s3::CLAUDE_MAX + 1, ..stage.clone() }, "(1 to 1073741824)"),
+            (ClaudeStage { wait_s: CLAUDE_WAIT_MAX_S + 1, ..stage.clone() }, "waits 31 s"),
+            (ClaudeStage { owner: "12345678901".into(), ..stage.clone() }, "bucket owner"),
+            (ClaudeStage { proxy: Some("http://8.8.8.8:3128".into()), ..stage.clone() }, "the proxy"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert!(!e.contains(&"e".repeat(64)) && !e.contains("X-Amz-"), "never the URL: {e}");
+        }
+        let q = ClaudeStageQuery { sha256: sha.clone() };
+        assert_eq!((q.check(), q.pairs()), (Ok(()), vec![("sha256", sha.clone())]));
+        assert!(ClaudeStageQuery { sha256: "ab".into() }.check().unwrap_err().contains("64 lowercase hex"));
+        assert_eq!((CLAUDE_STAGE_ROUTE, CLAUDE_RELAY_ROUTE, CLAUDE_REFS_MAX, CLAUDE_WAIT_MAX_S), ("/claude/stage", "/claude/relay", 4, 30));
+        assert_eq!([budget::CLAUDE_FETCH, budget::CLAUDE_RELAY].map(|d| d.as_secs()), [600, 600]);
+    }
+
+    /// S11 (A §1.3): a relay PUTs exactly its binary's object, signed as a
+    /// push is (length, checksum, If-None-Match, owner), with no proxy.
+    #[test]
+    fn a_claude_relay_puts_exactly_its_object() {
+        let v = "2.1.308";
+        let sha = sha256_hex(b"claude");
+        let key = format!("v1/_claude/mac/{v}/{sha}");
+        let relay = ClaudeRelay { version: v.into(), sha256: sha.clone(), size: 290_478_208, put: presigned(&key, "", SIGNED_HEADERS_PUT), owner: "123456789012".into() };
+        assert_eq!(relay.check(), Ok(()));
+        for (bad, why) in [
+            (ClaudeRelay { put: presigned(&format!("v1/_claude/mac/2.1.309/{sha}"), "", SIGNED_HEADERS_PUT), ..relay.clone() }, "not its claude binary's"),
+            (ClaudeRelay { put: presigned(&format!("v1/{ID}/vm/f/{sha}"), "", SIGNED_HEADERS_PUT), ..relay.clone() }, "not its claude binary's"),
+            (ClaudeRelay { put: presigned(&key, "", SIGNED_HEADERS_GET), ..relay.clone() }, "signed over other headers"),
+            (ClaudeRelay { put: presigned(&key, "partNumber=1&uploadId=fu1&", SIGNED_HEADERS_PUT), ..relay.clone() }, "carrying partNumber"),
+            (ClaudeRelay { version: "2.1.308-beta".into(), ..relay.clone() }, "not N.N.N"),
+            (ClaudeRelay { sha256: sha[..63].to_string(), ..relay.clone() }, "64 lowercase hex"),
+            (ClaudeRelay { size: 0, ..relay.clone() }, "of 0 bytes"),
+            (ClaudeRelay { owner: "x".into(), ..relay.clone() }, "bucket owner"),
+        ] {
+            let e = bad.check().unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+            assert!(!e.contains("X-Amz-"), "never the URL: {e}");
+        }
+    }
+
+    /// S11 (A §1.2): no transcript route takes a claude key: a push's key
+    /// must fit its bytes, a pull part's must be of the rel's session, a
+    /// tail's the tail at `from`.
+    #[test]
+    fn no_transcript_route_takes_a_claude_key() {
+        let rel = format!("{SLUG}/{ID}.jsonl");
+        let key = format!("v1/_claude/mac/2.1.308/{D_SEGMENT}");
+        let push = TranscriptPush { rel: rel.clone(), from: 0, len: 3787, sha256: D_SEGMENT.into(), url: presigned(&key, "", SIGNED_HEADERS_PUT), owner: "123456789012".into(), proxy: None };
+        assert!(push.check().unwrap_err().contains("does not fit"));
+        let pull = TranscriptPull { rel: rel.clone(), parts: vec![PullPart { url: presigned(&key, "", SIGNED_HEADERS_GET), len: 3787, sha256: Some(D_SEGMENT.into()), encoding: None }], sha256: None, owner: "123456789012".into(), proxy: None, share: 1 };
+        assert!(pull.check().unwrap_err().contains("not of the rel's session"));
+        let tail = TranscriptTail { rel, from: 0, url: presigned(&key, "", SIGNED_HEADERS_TAIL), owner: "123456789012".into(), proxy: None, expires_at: 1_792_754_130 };
+        assert!(tail.check().unwrap_err().contains("not the tail at from"));
+    }
+
+    /// S11 (A §1.3, §1.5): the claude replies leave out what they do not
+    /// say; the cache view always writes its entries; `/health/detail`'s
+    /// `claude_cache` is left out while none (an older shim's detail reads
+    /// as before) and comes last when there; the encoded pull part's rule.
+    #[test]
+    fn the_claude_replies_and_the_cache_view_are_additive() {
+        let reply = ClaudeStageReply { state: ClaudeStageState::Absent, src: None, why: None, got_len: None, got_sha256: None, ms: None };
+        assert_eq!(serde_json::to_string(&reply).unwrap(), "{\"state\":\"absent\"}");
+        assert_eq!(serde_json::from_str::<ClaudeStageReply>("{\"state\":\"absent\",\"from_the_future\":1}").unwrap(), reply, "no deny_unknown_fields");
+        let words = [ClaudeStageState::Ready, ClaudeStageState::Fetching, ClaudeStageState::Failed, ClaudeStageState::Absent].map(|s| serde_json::to_string(&s).unwrap());
+        assert_eq!(words, ["\"ready\"", "\"fetching\"", "\"failed\"", "\"absent\""]);
+        assert_eq!([ClaudeSrc::Cache, ClaudeSrc::Image].map(|s| serde_json::to_string(&s).unwrap()), ["\"cache\"", "\"image\""]);
+        let empty = ClaudeCacheView { entries: Vec::new(), fetching: None, failed: BTreeMap::new(), image: None };
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{\"entries\":[]}");
+        assert_eq!(serde_json::from_str::<ClaudeCacheView>("{}").unwrap(), empty);
+        let detail: crate::wire::frame::HealthDetail = serde_json::from_value(serde_json::json!({
+            "status": "ok", "shim_version": "0.1.0", "run_hook_seen": true, "uptime_s": 1, "hook_source": "peer", "agent_guard": "on",
+            "refused_peers": {}, "hook_peers": {}, "sockets_open": 0, "sockets_authenticated": 0, "spawns": [], "has_credentials": false, "listeners": [],
+        }))
+        .unwrap();
+        assert_eq!(detail.claude_cache, None, "an S10 detail");
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(!json.contains("claude_cache") && json.ends_with(",\"listeners_omitted\":0}"), "{json}");
+        let with = crate::wire::frame::HealthDetail { claude_cache: Some(empty), ..detail };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.ends_with(",\"listeners_omitted\":0,\"claude_cache\":{\"entries\":[]}}"), "{json}");
+        assert_eq!(serde_json::from_str::<crate::wire::frame::HealthDetail>(&json).unwrap(), with);
+        // L5: only a Mac object with its sha256 may be encoded.
+        let rel = format!("{SLUG}/{ID}.jsonl");
+        let gz = |key: &str, sha: Option<&str>| PullPart { url: presigned(key, "versionId=fv3&", SIGNED_HEADERS_GET), len: 10, sha256: sha.map(str::to_string), encoding: Some(PartEncoding::Gzip) };
+        let pull = |part: PullPart| TranscriptPull { rel: rel.clone(), parts: vec![part], sha256: None, owner: "123456789012".into(), proxy: None, share: 1 };
+        assert_eq!(pull(gz(&format!("v1/{ID}/mac/{D_SEGMENT}"), Some(D_BASE))).check(), Ok(()));
+        for part in [gz(&format!("v1/{ID}/vm/g1/base"), Some(D_BASE)), gz(&format!("v1/{ID}/vm/f/{D_FILE}"), Some(D_FILE))] {
+            assert!(pull(part).check().unwrap_err().contains("names an encoded part (number 0) that is no Mac object, or without its sha256"));
+        }
+        let tail = PullPart { url: presigned(&format!("v1/{ID}/vm/g1/t/0000000000000000"), "", SIGNED_HEADERS_GET), sha256: None, ..gz(&format!("v1/{ID}/mac/{D_SEGMENT}"), None) };
+        assert!(pull(tail).check().unwrap_err().contains("encoded part (number 0)"));
     }
 
     /// S10 (§1.3): `SeedState.shallow` and `TranscriptPull.share` need no
@@ -2312,7 +2814,7 @@ mod tests {
         assert_eq!(SHALLOW_REPORT_MAX, 4096);
         let rel = format!("{SLUG}/{ID}.jsonl");
         let url = presigned(&format!("v1/{ID}/vm/g1/base"), "versionId=fv1&", SIGNED_HEADERS_GET);
-        let pull = TranscriptPull { rel, parts: vec![PullPart { url, len: 48213, sha256: Some(D_BASE.into()) }], sha256: None, owner: "123456789012".into(), proxy: None, share: 1 };
+        let pull = TranscriptPull { rel, parts: vec![PullPart { url, len: 48213, sha256: Some(D_BASE.into()), encoding: None }], sha256: None, owner: "123456789012".into(), proxy: None, share: 1 };
         let s9 = serde_json::to_string(&pull).unwrap();
         assert!(!s9.contains("share"), "share 1 is left out: {s9}");
         assert_eq!(serde_json::from_str::<TranscriptPull>(&s9).unwrap().share, 1, "a pull without it is share 1");
@@ -2415,7 +2917,7 @@ mod tests {
             assert!(e.contains(why), "{why}: {e}");
             assert!(!e.contains(&"e".repeat(64)), "never the signature: {e}");
         }
-        let part = |key: &str, extra: &str, sha: Option<&str>| PullPart { url: presigned(key, extra, SIGNED_HEADERS_GET), len: 10, sha256: sha.map(str::to_string) };
+        let part = |key: &str, extra: &str, sha: Option<&str>| PullPart { url: presigned(key, extra, SIGNED_HEADERS_GET), len: 10, sha256: sha.map(str::to_string), encoding: None };
         let pull = TranscriptPull {
             rel: rel.clone(),
             parts: vec![part(&format!("v1/{ID}/mac/{D_BASE}"), "versionId=fv1&", Some(D_BASE)), part(&seg, "versionId=fv2&", Some(D_SEGMENT)), part(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", None)],
@@ -2430,7 +2932,7 @@ mod tests {
             (TranscriptPull { parts: vec![part("v1/_egress-check/abcd1234", "", Some(D_BASE))], ..pull.clone() }, "not of the rel's session"),
             (TranscriptPull { parts: vec![part(&seg, "", None)], ..pull.clone() }, "no tail"),
             (TranscriptPull { parts: vec![part(&seg, "uploadId=fu1&", Some(D_SEGMENT))], ..pull.clone() }, "carrying uploadId"),
-            (TranscriptPull { parts: vec![PullPart { url: presigned(&seg, "", SIGNED_HEADERS_PUT), len: 1, sha256: Some(D_SEGMENT.into()) }], ..pull.clone() }, "signed over other headers"),
+            (TranscriptPull { parts: vec![PullPart { url: presigned(&seg, "", SIGNED_HEADERS_PUT), len: 1, sha256: Some(D_SEGMENT.into()), encoding: None }], ..pull.clone() }, "signed over other headers"),
             (TranscriptPull { parts: Vec::new(), ..pull.clone() }, "pulls 0 parts"),
             (TranscriptPull { parts: vec![part(&seg, "", Some(D_SEGMENT)); PULL_PARTS_MAX + 1], ..pull.clone() }, "pulls 129 parts"),
             (TranscriptPull { parts: vec![PullPart { len: PULL_MAX + 1, ..part(&seg, "", Some(D_SEGMENT)) }], ..pull.clone() }, "in all"),
@@ -2466,7 +2968,7 @@ mod tests {
             let e = bad.check().unwrap_err();
             assert!(e.contains(why), "{why}: {e}");
         }
-        let v = ViewQuery { rel: rel.clone(), n: 10 };
+        let v = ViewQuery { rel: rel.clone(), n: 10, parent: false };
         assert_eq!((v.check(), v.pairs()), (Ok(()), vec![("rel", rel.clone()), ("n", "10".to_string())]));
         for (bad, why) in [(ViewQuery { n: 0, ..v.clone() }, "0 messages"), (ViewQuery { n: 51, ..v.clone() }, "51 messages"), (ViewQuery { rel: sub, ..v.clone() }, "the view of a rel")] {
             let e = bad.check().unwrap_err();

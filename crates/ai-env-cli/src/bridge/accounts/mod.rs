@@ -2018,7 +2018,8 @@ mod tests {
         let rows = audited(&paths);
         assert_eq!(rows.iter().map(|r| r["detail"]["set"].as_str().unwrap()).collect::<Vec<_>>(), ["set", "set", "cleared", "set"]);
         for r in &rows {
-            assert_eq!((r["detail"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), r["detail"]["name"].as_str()), (vec!["name", "set"], Some("work")));
+            // S11: `actor` is every row's (audit schema v2).
+            assert_eq!((r["detail"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), r["detail"]["name"].as_str()), (vec!["actor", "name", "set"], Some("work")));
         }
         let holders: Vec<PathBuf> = snapshot(&paths.root).into_iter().filter(|(_, b)| String::from_utf8_lossy(b).contains("example.com")).map(|(p, _)| p).collect();
         assert_eq!(holders, [paths.accounts_state()], "the store alone holds it");

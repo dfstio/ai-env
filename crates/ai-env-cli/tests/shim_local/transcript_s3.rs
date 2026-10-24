@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const OWNER: &str = "123456789012";
+pub(super) const OWNER: &str = "123456789012";
 const PROXY: &str = "http://10.42.0.10:3128";
 /// curl's write-out line, as S9 §3.4 pins it.
 const WRITE_OUT: &str = r#"write-out = "%{stderr}ai-env-curl status=%{http_code} version=%header{x-amz-version-id} checksum=%header{x-amz-checksum-sha256} etag=%header{etag}\n""#;
@@ -124,7 +124,7 @@ fn push_of(from: u64, bytes: &[u8], key: &S3Key) -> TranscriptPush {
 
 /// A part of a pull: `bytes` at `key`'s version `version`.
 fn part_of(key: &S3Key, version: &str, bytes: &[u8]) -> PullPart {
-    PullPart { url: url(key, SIGNED_HEADERS_GET, Some(version)), len: bytes.len() as u64, sha256: Some(sha(bytes)) }
+    PullPart { url: url(key, SIGNED_HEADERS_GET, Some(version)), len: bytes.len() as u64, sha256: Some(sha(bytes)), encoding: None }
 }
 
 fn pull_of(parts: Vec<PullPart>, whole: Option<&[u8]>) -> TranscriptPull {
@@ -265,7 +265,7 @@ async fn pull_verifies_each_part() {
     let tail = b"{\"n\":3}\n".to_vec();
     put(&bodies.join("3"), &whole);
     put(&bodies.join("4"), &tail);
-    let tail_part = PullPart { url: url(&S3Key::Tail { session: S8_ID.into(), gen: 1, offset: whole.len() as u64 }, SIGNED_HEADERS_GET, None), len: tail.len() as u64, sha256: None };
+    let tail_part = PullPart { url: url(&S3Key::Tail { session: S8_ID.into(), gen: 1, offset: whole.len() as u64 }, SIGNED_HEADERS_GET, None), len: tail.len() as u64, sha256: None, encoding: None };
     let (st, _, body) = rig.post("/transcript/pull", &pull_of(vec![part_of(&base(1), "fv1", &whole), tail_part], None)).await;
     assert_eq!(st, 201, "{}", String::from_utf8_lossy(&body));
     assert_eq!(std::fs::read(rig.file()).unwrap(), [&whole[..], &tail[..]].concat());
@@ -520,7 +520,7 @@ async fn a_tail_url_is_kept_on_no_status_or_a_5xx() {
 async fn a_pull_is_budgeted_at_its_share() {
     let rig = Rig::new().await;
     rig.knobs(&[("S3CURL_BODIES", rig.root.join("bodies").to_str().unwrap())]);
-    let part = PullPart { url: url(&base(1), SIGNED_HEADERS_GET, Some("fv1")), len: 50_000_000, sha256: Some("ab".repeat(32)) };
+    let part = PullPart { url: url(&base(1), SIGNED_HEADERS_GET, Some("fv1")), len: 50_000_000, sha256: Some("ab".repeat(32)), encoding: None };
     for (share, low, high) in [(1, 1, 140), (4, 141, 290)] {
         let pull = TranscriptPull { share, ..pull_of(vec![part.clone()], None) };
         let (st, _, body) = rig.post("/transcript/pull", &pull).await;
@@ -557,7 +557,7 @@ async fn a_tail_of_a_subtree_file_is_refused() {
     std::fs::OpenOptions::new().append(true).open(rig.projects().join(&sub)).unwrap().write_all(b"{\"agent\":2}\n").unwrap();
     assert_eq!(hook(rig.s.hooks, "suspend", b"").await.0, 200);
     let file = S3Key::File { session: S8_ID.into(), sha256: sha(&agent) };
-    let pull = TranscriptPull { rel: sub, parts: vec![part_of(&file, "fv1", &agent), PullPart { url: url(&tail_key, SIGNED_HEADERS_GET, None), len: 12, sha256: None }], sha256: None, owner: OWNER.into(), proxy: Some(PROXY.into()), share: 1 };
+    let pull = TranscriptPull { rel: sub, parts: vec![part_of(&file, "fv1", &agent), PullPart { url: url(&tail_key, SIGNED_HEADERS_GET, None), len: 12, sha256: None, encoding: None }], sha256: None, owner: OWNER.into(), proxy: Some(PROXY.into()), share: 1 };
     let (st, _, b) = rig.post("/transcript/pull", &pull).await;
     let (code, message) = refused(&b);
     assert_eq!((st, code.as_str()), (400, "bad_request"), "{message}");

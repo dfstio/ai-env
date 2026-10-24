@@ -3,17 +3,19 @@
 //!
 //! The image bakes the Linux build of the same Claude Code version the Mac's
 //! Cursor extension bundles, so a session behaves the same on both sides. The
-//! lock is the one place that version lives: `make claude-pin` downloads the
-//! 2 KB manifest (and checks its signature when gpg can) and hands it to
+//! lock is the one place that version lives: `make claude-pin` has `ai-env
+//! claude manifest` fetch the 2 KB manifest and verify its signature
+//! (gpgv, the vendored release key, fail-closed), then hands it to
 //! `--manifest`, which extracts the `linux-arm64` entry, validates every
 //! value through `wire::pin` (the shim's `/validate` parses the same file)
 //! and rewrites the lock atomically. `--check-bundle` is the part B
-//! preflight: the lock must name the version of the highest installed
-//! `anthropic.claude-code-<v>-darwin-arm64` bundle, else the deploy would
-//! ship a claude the Mac does not run; a live Cursor window still on another
-//! extension (S9, the census's) earns a note, never another verdict.
-//! `--bundle-version` prints that bundle's version alone (`make
-//! claude-update` follows it). Nothing here downloads anything.
+//! preflight (P10): the lock against the version of the highest installed
+//! `anthropic.claude-code-<v>-darwin-arm64` bundle. S11 (A.7): VMs follow
+//! the bundle's claude with no deploy (`ai-env claude status`), so the lock
+//! is only the image's fallback: a skew is a note and exit 3, never an
+//! error; a live Cursor window still on another extension (S9, the
+//! census's) earns a note, never another verdict. `--bundle-version` prints
+//! that bundle's version alone. Nothing here downloads anything.
 use crate::bridge::doctor::{installed_extension_names, pick_bundle};
 use crate::bridge::infra::write_atomic_mode;
 use crate::errors::{CliError, Result};
@@ -141,33 +143,35 @@ pub fn cmd_pin(manifest: Option<&Path>, lock: &Path, check_bundle: bool, bundle_
             outln!("{line}");
             Ok(())
         }
-        Err(e) => Err(CliError::Msg(e)),
+        // S11: a skew is no error: VMs follow the bundle; P10 shows it as a note ([-  ], exit 3).
+        Err(line) => {
+            outln!("{line}");
+            Err(CliError::Exit(SKEW_EXIT))
+        }
     }
 }
 
+/// `--check-bundle`'s exit when the lock and the bundle differ (S11): a note, no failure (P10's `[-  ]`).
+pub const SKEW_EXIT: i32 = 3;
+
 /// `--check-bundle`'s verdict (pure): the lock (`pin`, read from `lock`)
-/// against the newest installed bundle (`bundle`), the deploy target: `Ok`
-/// with the line that says they are equal, `Err` with the one that names
-/// the fix. Then (S9) a note per live Cursor window on another extension
-/// than `bundle` (`running`: `census::running_extensions`), which never
-/// changes the verdict: the image follows the bundle, and a reload brings
-/// the window to it.
+/// against the newest installed bundle (`bundle`): `Ok` with the line that
+/// says they are equal, `Err` with the skew's note (S11: no error, exit 3:
+/// the lock is the image's fallback, VMs follow the bundle). Then (S9) a
+/// note per live Cursor window on another extension than `bundle`
+/// (`running`: `census::running_extensions`), which never changes the
+/// verdict: a reload brings the window to the bundle.
 pub fn bundle_check(pin: &ClaudePin, lock: &Path, bundle: &str, running: &[crate::bridge::census::RunningExtension]) -> (std::result::Result<String, String>, Vec<String>) {
     let notes = running
         .iter()
         .filter(|w| w.ext != bundle)
-        .map(|w| format!("note: {}; the lock follows the installed {bundle}  <- reload that window", crate::bridge::doctor::running_window_text(w)))
+        .map(|w| format!("note: {}; {bundle} is installed  <- reload that window", crate::bridge::doctor::running_window_text(w)))
         .collect();
     let verdict = if bundle == pin.version {
         Ok(format!("pin: lock {} equals the Cursor bundle", pin.version))
     } else {
-        // The pin and the test first: they always work, while make claude-update refuses before the bootstrap (no
-        // deployer key exists to ask for).
-        Err(format!(
-            "pin: lock {} ({}) differs from the Cursor bundle {bundle}  <- make claude-pin CLAUDE_VERSION={bundle} && make test-docker (once the stack has its deployer, make claude-update does both and the deploy)",
-            pin.version,
-            lock.display()
-        ))
+        let _ = lock;
+        Err(format!("pin: lock {} is the image's fallback; Cursor bundle {bundle}: VMs follow it (ai-env claude status)", pin.version))
     };
     (verdict, notes)
 }
@@ -203,9 +207,10 @@ mod tests {
     }
 
     /// S9: `--check-bundle`'s verdict stays the lock against the newest
-    /// installed bundle (the deploy target); a live Cursor window on another
-    /// extension adds a note naming it and the reload, whatever the
-    /// verdict, and a window on the bundle adds none.
+    /// installed bundle (S11: the version VMs follow; the lock is only the
+    /// image's fallback); a live Cursor window on another extension adds a
+    /// note naming it, the installed bundle and the reload (doctor's
+    /// wording), whatever the verdict, and a window on the bundle adds none.
     #[test]
     fn check_bundle_notes_a_window_on_another_extension() {
         use crate::bridge::census::RunningExtension;
@@ -214,11 +219,11 @@ mod tests {
         let on = |host: u32, ext: &str| RunningExtension { host, ext: ext.into(), started, seen: (started + 60) * 1000 };
         let pin = |v: &str| ClaudePin { version: v.into(), platform: PLATFORM.into(), sha256: "ab".repeat(32), size: 1, build_date: "2026-09-25T01:39:37Z".into() };
         let windows = [on(5101, "2.1.301"), on(5102, "2.1.302")];
-        let note = "note: a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); the lock follows the installed 2.1.302  <- reload that window".to_string();
+        let note = "note: a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); 2.1.302 is installed  <- reload that window".to_string();
         let (verdict, notes) = bundle_check(&pin("2.1.302"), lock, "2.1.302", &windows);
         assert_eq!((verdict, notes), (Ok("pin: lock 2.1.302 equals the Cursor bundle".to_string()), vec![note.clone()]), "the lock equals the bundle: the window does not change the verdict");
         let (verdict, notes) = bundle_check(&pin("2.1.301"), lock, "2.1.302", &windows);
-        assert!(verdict.as_ref().is_err_and(|e| e.starts_with("pin: lock 2.1.301 (/r/image/claude.lock) differs from the Cursor bundle 2.1.302  <- make claude-pin CLAUDE_VERSION=2.1.302")), "the lock against the bundle, never the window's version: {verdict:?}");
+        assert_eq!(verdict, Err("pin: lock 2.1.301 is the image's fallback; Cursor bundle 2.1.302: VMs follow it (ai-env claude status)".to_string()), "the lock against the bundle, never the window's version");
         assert_eq!(notes, vec![note]);
         assert_eq!(bundle_check(&pin("2.1.302"), lock, "2.1.302", &windows[1..]).1, Vec::<String>::new(), "a window on the bundle");
         assert_eq!(bundle_check(&pin("2.1.302"), lock, "2.1.302", &[]), (Ok("pin: lock 2.1.302 equals the Cursor bundle".to_string()), Vec::new()));

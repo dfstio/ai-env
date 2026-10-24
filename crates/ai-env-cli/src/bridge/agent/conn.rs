@@ -540,6 +540,7 @@ mod tests {
             deliver_secret: Deliver::Fd,
             detach_grace_s: None,
             credential: None,
+            claude: Vec::new(),
         };
         let out = Frame::Stdout { spawn_id: sid.clone(), seq: 3, data: Chunk { text: Some("private output".into()), b64: None } };
         let bin = Frame::Stdin { spawn_id: sid, seq: 4, data: Chunk { text: None, b64: Some("AP8K".into()) } };

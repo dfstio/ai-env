@@ -165,3 +165,30 @@ pub fn curl_calls(log: &Path) -> Vec<CurlCall> {
         })
         .collect()
 }
+
+/// S11: the fake claude (`tests/fakes/claude-v2.sh`), whose bytes a staged
+/// claude carries ([`fake_claude_bytes`]).
+pub const FAKE_CLAUDE_V2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/claude-v2.sh");
+
+/// claude-v2.sh's bytes with lines after its first: `FAKE_VERSION_PINNED='<version>'`, `FAKE_KNOBS_FILE='<path>'`
+/// (when given) and `NAME='value'` per default, each exported: a staged copy that reports `version`, reads the rig's
+/// knobs, and (say) dies before its init. Its sha256 is what a test stages.
+#[must_use]
+pub fn fake_claude_bytes(version: &str, knobs_file: Option<&Path>, defaults: &[(&str, &str)]) -> Vec<u8> {
+    let script = std::fs::read(FAKE_CLAUDE_V2).unwrap_or_else(|e| panic!("read {FAKE_CLAUDE_V2}: {e}"));
+    let first = script.iter().position(|b| *b == b'\n').map_or(script.len(), |at| at + 1);
+    let knobs = knobs_file.map(|p| p.display().to_string());
+    let mut vars: Vec<(&str, &str)> = vec![("FAKE_VERSION_PINNED", version)];
+    if let Some(path) = knobs.as_deref() {
+        vars.push(("FAKE_KNOBS_FILE", path));
+    }
+    vars.extend_from_slice(defaults);
+    let mut out = script[..first].to_vec();
+    for (name, value) in vars {
+        let ident = name.bytes().next().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic()) && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
+        assert!(ident, "not a shell variable name: {name:?}");
+        out.extend_from_slice(format!("export {name}='{}'\n", value.replace('\'', r"'\''")).as_bytes());
+    }
+    out.extend_from_slice(&script[first..]);
+    out
+}

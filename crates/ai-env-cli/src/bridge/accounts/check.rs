@@ -45,13 +45,15 @@
 //! the accounts done are still shown. Otherwise it exits 5 when an account
 //! was refused or could not be checked, else 1 when a run failed, else 0.
 //!
-//! LEAD (A1 merge): the parsing of the `rate_limit_event` and of the result
-//! ([`info_of`], [`limit_of`], [`LIMIT_NAMES`], [`when`], [`pct`]) is a
-//! private stand-in for slice B's `wire::ratelimit` (`parse_info`,
-//! `parse_limit_result`, `LIMIT_NAMES`, `when`, `pct`), and [`record_usage`]
-//! for its `accounts::usage::{apply, record_all}`: switch to them at the
-//! merge, keeping these lines' formats.
-use super::{audit_event, check_name, AccountFile};
+//! The lines are read and worded by `wire::ratelimit` (S11, L9: the tap's
+//! rules are the check's): the run's last `rate_limit_event` by
+//! `parse_event_line`, its result by `parse_limit_result`, then
+//! `LimitHit::or_event` (the turn's `rejected` event lends a limit the kind
+//! its result does not name, and its reset when the result names none and
+//! the kind is the event's; a hit with no kind shows `unknown`), and `kind_word`, `limit_words`, `pct` and `when`. The record
+//! is `accounts::usage::record_all`'s ([`observations`]: the run's event,
+//! then its outcome, from `check`).
+use super::{audit_event, check_name, usage, AccountFile};
 use crate::bridge::agent::credential;
 use crate::bridge::authwatch::{AuthWatch, Stream};
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -64,8 +66,9 @@ use crate::outln;
 use crate::store::Keystore;
 use crate::wire::frame::Deliver;
 use crate::wire::ndjson::LineSplitter;
+use crate::wire::ratelimit::{self, kind_word, limit_words, pct, when, LimitHit, RateLimitInfo, Window};
 use crate::wire::redact::scrub;
-use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc, unix_now};
+use crate::wire::time::{rfc3339_utc, unix_now};
 use serde_json::Value;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -96,17 +99,6 @@ const RUN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const WHERE: &str = "this Mac (creds account check)";
 /// The token's descriptor in the child.
 const TOKEN_FD: libc::c_int = 3;
-
-/// The limits by `rateLimitType`: how claude names each in "You've hit your
-/// X · resets …" (2.1.305's bundle), and the word a `limited:` line uses.
-pub const LIMIT_NAMES: [(&str, &str, &str); 6] = [
-    ("five_hour", "session limit", "5-hour"),
-    ("seven_day", "weekly limit", "weekly"),
-    ("seven_day_opus", "Opus limit", "Opus"),
-    ("seven_day_sonnet", "Sonnet limit", "Sonnet"),
-    ("seven_day_overage_included", "Fable limit", "Fable"),
-    ("overage", "usage credit limit", "usage credit"),
-];
 
 // ---- the command --------------------------------------------------------------------------
 
@@ -336,7 +328,8 @@ async fn check_one(store: &Keystore, ctx: &Ctx, turn: &Turn<'_>, p: &Planned, (n
     match &checked.outcome {
         Outcome::Refused { recorded: None } => credential::record_rejection(&ctx.paths, WHERE, &p.tag, "text"),
         Outcome::Checked(_) | Outcome::Limited(_) => {
-            if let Err(e) = record_usage(&ctx.paths, &p.name, &p.tag, &checked.outcome, now) {
+            let items = observations(&p.tag, run.info(), &checked.outcome, now);
+            if let usage::Recorded::Failed(e) = usage::record_all(&ctx.paths, &items, usage::SOURCE_CHECK, true) {
                 voice::warn(&format!("Claude account {}'s usage is not recorded: {e}", p.name));
             }
             audit_check(&ctx.paths, &checked, turn, &p.tag);
@@ -543,8 +536,10 @@ struct Run {
     /// No result came within the run's bound.
     timed_out: bool,
     ms: u128,
-    /// The last `rate_limit_event` line, and what its info said.
-    event: Option<(String, Info)>,
+    /// The last `rate_limit_event` line, and its info as `parse_event_line`
+    /// reads it (none for a line with no info object: no event, by
+    /// ratelimit's rule and the tap's, so nothing of it is recorded).
+    event: Option<(String, Option<RateLimitInfo>)>,
     /// The first `result` line, parsed.
     result: Option<(String, Value)>,
     /// The first line of what is kept of its stderr, scrubbed.
@@ -554,12 +549,19 @@ struct Run {
     rejected: bool,
 }
 
+impl Run {
+    /// Its event's info: none for no event line, or one with no info object.
+    fn info(&self) -> Option<&RateLimitInfo> {
+        self.event.as_ref().and_then(|(_, info)| info.as_ref())
+    }
+}
+
 /// The run's stdout and stderr as they come.
 struct Seen {
     split: LineSplitter,
     watch: AuthWatch,
     tail: Vec<u8>,
-    event: Option<(String, Info)>,
+    event: Option<(String, Option<RateLimitInfo>)>,
     result: Option<(String, Value)>,
     result_at: Option<tokio::time::Instant>,
 }
@@ -593,7 +595,7 @@ impl Seen {
         let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
         let text = || String::from_utf8_lossy(line).into_owned();
         match v["type"].as_str() {
-            Some("rate_limit_event") => self.event = Some((text(), info_of(&v["rate_limit_info"]))),
+            Some("rate_limit_event") => self.event = Some((text(), ratelimit::parse_event_line(line))),
             Some("result") if self.result.is_none() => {
                 self.result = Some((text(), v));
                 self.result_at = Some(tokio::time::Instant::now());
@@ -707,112 +709,14 @@ async fn read_into(mut pipe: impl tokio::io::AsyncRead + Unpin, stream: Stream, 
 
 // ---- the verdict --------------------------------------------------------------------------
 
-/// A 5-hour or weekly window: how much of it is used (a fraction, as
-/// given: past 1 when over), and when it resets (unix seconds).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Window {
-    utilization: f64,
-    resets_at: Option<u64>,
-}
-
-/// A `rate_limit_event`'s `rate_limit_info`, as far as the check reads it:
-/// its status, the windows (from `unifiedWindows`, else the top-level
-/// `utilization` and `resetsAt` for a `five_hour` or `seven_day`
-/// `rateLimitType`), the type a warning or a rejection names and its reset,
-/// and whether extra usage is in use.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Info {
-    status: Option<String>,
-    kind: Option<String>,
-    resets_at: Option<u64>,
-    five_hour: Option<Window>,
-    seven_day: Option<Window>,
-    overage: bool,
-}
-
-/// [`Info`] of a `rate_limit_info` object, leniently: a field of another
-/// type reads as absent.
-fn info_of(v: &Value) -> Info {
-    let window = |w: &Value| Some(Window { utilization: w.get("utilization")?.as_f64()?, resets_at: w.get("resetsAt").and_then(epoch) });
-    let kind = v.get("rateLimitType").and_then(Value::as_str).map(str::to_string);
-    let unified = v.get("unifiedWindows").filter(|u| u.is_object());
-    let pick = |name: &str| match unified {
-        Some(u) => u.get(name).and_then(window),
-        None => window(v).filter(|_| kind.as_deref() == Some(name)),
-    };
-    Info {
-        status: v.get("status").and_then(Value::as_str).map(str::to_string),
-        resets_at: v.get("resetsAt").and_then(epoch),
-        five_hour: pick("five_hour"),
-        seven_day: pick("seven_day"),
-        overage: v.get("isUsingOverage").and_then(Value::as_bool) == Some(true),
-        kind,
-    }
-}
-
-/// A time as claude gives it: unix seconds (a number past 10^12 is
-/// milliseconds), or RFC 3339.
-fn epoch(v: &Value) -> Option<u64> {
-    match v {
-        Value::Number(n) => {
-            let n = n.as_u64().or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))?;
-            Some(if n > 1_000_000_000_000 { n / 1000 } else { n })
-        }
-        Value::String(s) => parse_rfc3339_utc(s),
-        _ => None,
-    }
-}
-
-/// A usage limit claude's result said was hit: its text (control
-/// characters blanked, at most 300 characters), its kind (a
-/// `rateLimitType`, or `unknown`), and its reset when known.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Limit {
-    text: String,
-    kind: String,
-    resets_at: Option<u64>,
-}
-
-/// The limit a `result` says was hit: `is_error` with `api_error`
-/// `usage_limit_reached`, or HTTP 429 with a text that starts "You've hit
-/// your" (a 429 throttle is no limit). Its kind from
-/// `api_error_params.rate_limit_info.rateLimitType`, else the limit the
-/// text names ([`LIMIT_NAMES`]), else a `rejected` event's; its reset from
-/// the params, else from that event.
-fn limit_of(result: &Value, event: Option<&Info>) -> Option<Limit> {
-    if result["type"] != "result" || result["is_error"] != true {
-        return None;
-    }
-    let text = result["result"].as_str().unwrap_or_default();
-    if !(result["api_error"] == "usage_limit_reached" || (result["api_error_status"] == 429 && text.starts_with("You've hit your"))) {
-        return None;
-    }
-    let params = result.get("api_error_params").and_then(|p| p.get("rate_limit_info"));
-    let rejected = event.filter(|i| i.status.as_deref() == Some("rejected"));
-    let kind = params
-        .and_then(|p| p.get("rateLimitType")?.as_str())
-        .map(str::to_string)
-        .or_else(|| kind_of_text(text).map(str::to_string))
-        .or_else(|| rejected.and_then(|i| i.kind.clone()))
-        .unwrap_or_else(|| "unknown".into());
-    let resets_at = params.and_then(|p| p.get("resetsAt")).and_then(epoch).or_else(|| rejected.and_then(|i| i.resets_at));
-    let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).take(300).collect();
-    Some(Limit { text, kind, resets_at })
-}
-
-/// The `rateLimitType` the text "You've hit your X · …" names.
-fn kind_of_text(text: &str) -> Option<&'static str> {
-    let rest = text.strip_prefix("You've hit your ")?;
-    LIMIT_NAMES.iter().find(|(_, name, _)| rest.starts_with(name)).map(|(kind, _, _)| *kind)
-}
-
 /// What a check came to.
 #[derive(Debug, Clone, PartialEq)]
 enum Outcome {
-    /// It answered: the event's windows (none when it reported none).
-    Checked(Info),
-    /// The account is at a limit.
-    Limited(Limit),
+    /// It answered: its event's info (none of it when it reported none).
+    Checked(RateLimitInfo),
+    /// The account is at a limit: its result, lent its kind and reset by a
+    /// `rejected` event ([`LimitHit::or_event`]).
+    Limited(LimitHit),
     /// Anthropic refused the token: this run (`None`), or a refusal recorded
     /// before it (`at`, `vm`), with no Touch ID asked.
     Refused { recorded: Option<(String, String)> },
@@ -841,9 +745,9 @@ fn judge(run: &Run) -> Outcome {
     if run.rejected {
         return Outcome::Refused { recorded: None };
     }
-    let event = run.event.as_ref().map(|(_, i)| i);
-    if let Some(limit) = run.result.as_ref().and_then(|(_, v)| limit_of(v, event)) {
-        return Outcome::Limited(limit);
+    let event = run.info();
+    if let Some(hit) = run.result.as_ref().and_then(|(line, _)| ratelimit::parse_limit_result(line.as_bytes())) {
+        return Outcome::Limited(hit.or_event(event));
     }
     if run.result.as_ref().is_some_and(|(_, v)| v["is_error"] == false) {
         return Outcome::Checked(event.cloned().unwrap_or_default());
@@ -886,11 +790,11 @@ impl Checked {
     fn line(&self, version: &str, now: u64) -> String {
         let name = format!("{}{}", self.name, if self.active { " (active)" } else { "" });
         match &self.outcome {
-            Outcome::Checked(info) => format!("{name}: {}", usage_text(info, version, now)),
+            Outcome::Checked(info) => format!("{name}: {}", usage_text(info, self.event.is_some(), version, now)),
             Outcome::Limited(l) => {
                 let phrase = l.text.split_once(" · ").map_or(l.text.as_str(), |(_, rest)| rest);
                 let at = l.resets_at.map_or_else(String::new, |at| format!(" ({})", when(at, now)));
-                format!("{name}: limited: {}, {phrase:?}{at}", kind_word(&l.kind))
+                format!("{name}: limited: {}, {phrase:?}{at}", kind_word(limit_kind(l)))
             }
             Outcome::Refused { recorded: None } => {
                 format!("{name}: refused by Anthropic (HTTP 401): seal a fresh token for it (claude setup-token, then ai-env creds account add {})", self.name)
@@ -905,8 +809,11 @@ impl Checked {
     fn json(&self, version: &str, now: u64) -> Value {
         let window = |w: Option<Window>| w.map(|w| serde_json::json!({ "utilization": w.utilization, "resets_at": w.resets_at }));
         let (status, five_hour, seven_day, limited, why) = match &self.outcome {
-            Outcome::Checked(i) => (i.status.clone().or_else(|| Some("allowed".into())), window(i.five_hour), window(i.seven_day), None, None),
-            Outcome::Limited(l) => (Some("rejected".to_string()), None, None, Some(serde_json::json!({ "text": l.text, "kind": l.kind, "resets_at": l.resets_at })), None),
+            Outcome::Checked(i) => {
+                let (five, seven) = i.effective();
+                (Some(i.status.unwrap_or("allowed").to_string()), window(five), window(seven), None, None)
+            }
+            Outcome::Limited(l) => (Some("rejected".to_string()), None, None, Some(serde_json::json!({ "text": l.text, "kind": limit_kind(l), "resets_at": l.resets_at })), None),
             Outcome::Refused { recorded } => (None, None, None, None, recorded.as_ref().map(|(at, vm)| format!("refused by Anthropic on {at} ({vm})"))),
             Outcome::Failed { why } | Outcome::NotChecked { why } => (None, None, None, None, Some(why.clone())),
         };
@@ -929,126 +836,67 @@ impl Checked {
     }
 }
 
-/// An answer's usage: `5h 23% (resets 14:00Z), 7d 81% (resets Thu 10:00Z)`,
-/// then `; near its weekly limit` (`allowed_warning`) and `; using extra
-/// usage`; or that none was reported.
-fn usage_text(info: &Info, version: &str, now: u64) -> String {
-    let part = |label: &str, w: Option<Window>| w.map(|w| format!("{label} {}{}", pct(w.utilization), w.resets_at.map_or_else(String::new, |at| format!(" (resets {})", when(at, now)))));
-    let parts: Vec<String> = [part("5h", info.five_hour), part("7d", info.seven_day)].into_iter().flatten().collect();
+/// A limit's kind as shown and recorded: `unknown` when nothing named it.
+fn limit_kind(l: &LimitHit) -> &str {
+    l.kind.as_deref().unwrap_or("unknown")
+}
+
+/// An answer's usage: `5h 23% (resets 14:00Z), 7d 81% (resets Thu 10:00Z)`
+/// (its windows, `RateLimitInfo::effective`), then `; near its weekly
+/// limit` (`allowed_warning`: `limit_words` of its type, else `a limit`)
+/// and `; using extra usage`; or that none was reported, with the event's
+/// status, else whether the run had an event line (`had_event`: one whose
+/// status ai-env does not know, or with no info, is not said to be missing).
+fn usage_text(info: &RateLimitInfo, had_event: bool, version: &str, now: u64) -> String {
+    let (five, seven) = info.effective();
+    let part = |label: &str, w: Option<Window>| w.map(|w| format!("{label} {} (resets {})", pct(w.utilization), when(w.resets_at, now)));
+    let parts: Vec<String> = [part("5h", five), part("7d", seven)].into_iter().flatten().collect();
     let mut text = if parts.is_empty() {
-        let status = info.status.as_deref().map_or_else(|| "no rate_limit_event".to_string(), |s| format!("status {s}"));
+        let status = match (info.status, had_event) {
+            (Some(s), _) => format!("status {s}"),
+            (None, true) => "its rate_limit_event named no status ai-env knows".to_string(),
+            (None, false) => "no rate_limit_event".to_string(),
+        };
         format!("answered; claude {version} reported no usage windows ({status})")
     } else {
         parts.join(", ")
     };
-    if info.status.as_deref() == Some("allowed_warning") {
-        let limit = info.kind.as_deref().and_then(|k| LIMIT_NAMES.iter().find(|(kind, _, _)| *kind == k)).map_or("a limit".to_string(), |(_, name, _)| format!("its {name}"));
+    if info.status == Some("allowed_warning") {
+        let limit = info.rate_limit_type.as_deref().map_or_else(|| "a limit".to_string(), |k| format!("its {}", limit_words(k)));
         text.push_str(&format!("; near {limit}"));
     }
-    if info.overage {
+    if info.is_using_overage {
         text.push_str("; using extra usage");
     }
     text
 }
 
-/// The word a `limited:` line uses for a kind ([`LIMIT_NAMES`]), else the kind itself.
-fn kind_word(kind: &str) -> &str {
-    LIMIT_NAMES.iter().find(|(k, _, _)| *k == kind).map_or(kind, |(_, _, word)| word)
-}
-
-/// A utilization as a whole percentage: `0.23` is `23%`, `1.02` is `102%`.
-fn pct(utilization: f64) -> String {
-    format!("{:.0}%", (utilization * 100.0).max(0.0).round())
-}
-
-/// When `at` (unix seconds) is, seen at `now`, in UTC: `HH:MMZ` within 20
-/// hours, `Ddd HH:MMZ` within 6 days, else `Mon DD HH:MMZ`.
-fn when(at: u64, now: u64) -> String {
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let stamp = rfc3339_utc(at);
-    let hm = &stamp[11..16];
-    if at <= now + 20 * 3600 {
-        return format!("{hm}Z");
-    }
-    if at <= now + 6 * 86_400 {
-        let day = usize::try_from((at / 86_400 + 4) % 7).unwrap_or(0);
-        return format!("{} {hm}Z", DAYS[day]);
-    }
-    let month = stamp[5..7].parse::<usize>().ok().and_then(|m| MONTHS.get(m.wrapping_sub(1))).copied().unwrap_or("?");
-    format!("{month} {} {hm}Z", &stamp[8..10])
-}
-
-/// The record of an answer or a limit in the store's `[usage.<name>]`
-/// (source `check`): `seen_at`, `source`, `status`, the windows the event
-/// reported (one not reported is kept until its reset has passed, when it
-/// goes), and `limited` (set by a limit, cleared by an answer). Written only
-/// while the store's row of `name` still names `tag` (one sealed anew since
-/// is another seal's), never creating the store. Whether it wrote.
-///
-/// LEAD (A1 merge): slice B's `accounts::usage::{apply, record_all}`
-/// replace this; it writes their record's shape (L-3: times in unix
-/// seconds).
-fn record_usage(paths: &Paths, name: &str, tag: &str, outcome: &Outcome, now: u64) -> std::result::Result<bool, String> {
-    let int = |n: u64| toml::Value::Integer(i64::try_from(n).unwrap_or(i64::MAX));
-    let window = |w: Window| {
-        let mut t = toml::map::Map::new();
-        t.insert("utilization".into(), toml::Value::Float(w.utilization));
-        if let Some(at) = w.resets_at {
-            t.insert("resets_at".into(), int(at));
-        }
-        toml::Value::Table(t)
+/// What a run of the account sealed as `tag` saw, as the usage store's
+/// observations made `at` (the run's time, after it ended): its
+/// `rate_limit_event`'s info (when it had one), then its outcome, a limit or
+/// an answer. An answer whose event named no status ai-env knows, or that
+/// had none, is `Seen::Allowed` (A1 joint review F3): the record then says
+/// `allowed`, as the check's `--json` does, not an earlier chat's warning.
+/// A refused or failed run has none.
+fn observations(tag: &str, event: Option<&RateLimitInfo>, outcome: &Outcome, at: u64) -> Vec<(String, usage::Observed)> {
+    let outcome = match outcome {
+        Outcome::Limited(hit) => usage::Seen::Limited(hit.clone()),
+        Outcome::Checked(_) if event.is_none_or(|e| e.status.is_none()) => usage::Seen::Allowed,
+        Outcome::Checked(_) => usage::Seen::Answered,
+        _ => return Vec::new(),
     };
-    super::update(paths, |s| {
-        if !s.account.iter().any(|r| r.name == name && r.tag == tag) {
-            return false;
-        }
-        let mut rec = match s.usage.get(name) {
-            Some(toml::Value::Table(t)) => t.clone(),
-            _ => toml::map::Map::new(),
-        };
-        for key in ["five_hour", "seven_day"] {
-            let passed = rec.get(key).and_then(|w| w.get("resets_at")).and_then(toml::Value::as_integer).is_some_and(|at| u64::try_from(at).is_ok_and(|at| at <= now));
-            if passed {
-                rec.remove(key);
-            }
-        }
-        rec.insert("seen_at".into(), int(now));
-        rec.insert("source".into(), toml::Value::String("check".into()));
-        match outcome {
-            Outcome::Checked(info) => {
-                rec.insert("status".into(), toml::Value::String(info.status.clone().unwrap_or_else(|| "allowed".into())));
-                for (key, w) in [("five_hour", info.five_hour), ("seven_day", info.seven_day)] {
-                    if let Some(w) = w {
-                        rec.insert(key.into(), window(w));
-                    }
-                }
-                rec.remove("limited");
-            }
-            Outcome::Limited(l) => {
-                rec.insert("status".into(), toml::Value::String("rejected".into()));
-                let mut limited = toml::map::Map::new();
-                limited.insert("at".into(), int(now));
-                limited.insert("text".into(), toml::Value::String(l.text.clone()));
-                limited.insert("kind".into(), toml::Value::String(l.kind.clone()));
-                if let Some(at) = l.resets_at {
-                    limited.insert("resets_at".into(), int(at));
-                }
-                rec.insert("limited".into(), toml::Value::Table(limited));
-            }
-            _ => return false,
-        }
-        s.usage.insert(name.to_string(), toml::Value::Table(rec));
-        true
-    })
+    event.cloned().map(usage::Seen::Info).into_iter().chain([outcome]).map(|what| (tag.to_string(), usage::Observed { at, what })).collect()
 }
 
 /// The `account_check` audit row of an answer or a limit.
 fn audit_check(paths: &Paths, c: &Checked, turn: &Turn<'_>, tag: &str) {
     let whole = |w: Option<Window>| w.map_or_else(|| "-".to_string(), |w| pct(w.utilization));
     let (status, five_hour, seven_day, kind, resets_at) = match &c.outcome {
-        Outcome::Checked(i) => (i.status.clone().unwrap_or_else(|| "allowed".into()), whole(i.five_hour), whole(i.seven_day), i.kind.clone().unwrap_or_else(|| "-".into()), i.resets_at),
-        Outcome::Limited(l) => ("rejected".to_string(), "-".to_string(), "-".to_string(), l.kind.clone(), l.resets_at),
+        Outcome::Checked(i) => {
+            let (five, seven) = i.effective();
+            (i.status.unwrap_or("allowed").to_string(), whole(five), whole(seven), i.rate_limit_type.clone().unwrap_or_else(|| "-".into()), i.resets_at)
+        }
+        Outcome::Limited(l) => ("rejected".to_string(), "-".to_string(), "-".to_string(), limit_kind(l).to_string(), l.resets_at),
         _ => return,
     };
     audit_row(
@@ -1146,64 +994,10 @@ mod tests {
         assert_eq!((c.json("2.1.305", NOW)["tag"].clone(), c.json("2.1.305", NOW)["outcome"].clone()), (Value::Null, Value::from("not_checked")));
     }
 
-    /// The constructed full event (B's schema: both unified windows, the
-    /// top-level fields beside), the trimmed one of B16 (a status alone),
-    /// the top-level fallback for a `five_hour` or `seven_day` type when
-    /// `unifiedWindows` is absent, and wrong types read as absent.
-    #[test]
-    fn the_rate_limit_info_is_read_leniently() {
-        let full = json(r#"{"status":"allowed_warning","resetsAt":1792605600,"rateLimitType":"seven_day","utilization":0.81,"unifiedWindows":{"five_hour":{"utilization":0.23,"resetsAt":1792591200},"seven_day":{"utilization":0.81,"resetsAt":1792836000}},"isUsingOverage":false,"surpassedThreshold":0.75}"#);
-        let i = info_of(&full);
-        assert_eq!(i.status.as_deref(), Some("allowed_warning"));
-        assert_eq!(i.five_hour, Some(Window { utilization: 0.23, resets_at: Some(1_792_591_200) }));
-        assert_eq!(i.seven_day, Some(Window { utilization: 0.81, resets_at: Some(1_792_836_000) }));
-        assert_eq!(info_of(&json(r#"{"status":"allowed"}"#)), Info { status: Some("allowed".into()), ..Info::default() });
-        let top = info_of(&json(r#"{"status":"allowed","rateLimitType":"five_hour","utilization":0.4,"resetsAt":"2026-10-21T14:00:00Z"}"#));
-        assert_eq!((top.five_hour, top.seven_day), (Some(Window { utilization: 0.4, resets_at: Some(1_792_591_200) }), None));
-        let odd = info_of(&json(r#"{"status":5,"unifiedWindows":{"five_hour":{"utilization":"x"},"seven_day":{"utilization":1,"resetsAt":1792836000000}},"isUsingOverage":"yes"}"#));
-        assert_eq!(odd, Info { seven_day: Some(Window { utilization: 1.0, resets_at: Some(1_792_836_000) }), ..Info::default() }, "an integer utilization, a reset in ms");
-    }
-
-    /// The usage-limit result (B2's shape, keys alphabetical: `api_error`
-    /// `usage_limit_reached`, 429) is a limit whose kind the text names;
-    /// the params' type and reset win; a `rejected` event gives them when
-    /// the result does not; a 429 throttle, B7's 401 and an answer are none.
-    #[test]
-    fn a_usage_limit_result_is_a_limit_and_nothing_else_is() {
-        let b2 = json(r#"{"api_error":"usage_limit_reached","api_error_status":429,"duration_api_ms":0,"duration_ms":1361,"is_error":true,"num_turns":1,"result":"You've hit your weekly limit · resets 10am (UTC)","session_id":"0a403528-1afc-4bdf-97a7-d9a67c42d89a","subtype":"success","type":"result"}"#);
-        assert_eq!(limit_of(&b2, None), Some(Limit { text: "You've hit your weekly limit · resets 10am (UTC)".into(), kind: "seven_day".into(), resets_at: None }));
-        let mut with = b2.clone();
-        with["api_error_params"] = json(r#"{"rate_limit_info":{"rateLimitType":"seven_day_opus","resetsAt":1792836000}}"#);
-        assert_eq!(limit_of(&with, None).map(|l| (l.kind, l.resets_at)), Some(("seven_day_opus".into(), Some(1_792_836_000))));
-        let mut bare = b2.clone();
-        bare["result"] = json(r#""limit reached""#);
-        let rejected = Info { status: Some("rejected".into()), kind: Some("five_hour".into()), resets_at: Some(1_792_591_200), ..Info::default() };
-        assert_eq!(limit_of(&bare, Some(&rejected)).map(|l| (l.kind, l.resets_at)), Some(("five_hour".into(), Some(1_792_591_200))));
-        let throttle = json(r#"{"type":"result","is_error":true,"api_error":"rate_limit","api_error_status":429,"result":"Rate limited"}"#);
-        let refused = json(r#"{"type":"result","is_error":true,"api_error_status":401,"result":"Failed to authenticate. API Error: 401"}"#);
-        let answered = json(r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#);
-        for v in [throttle, refused, answered] {
-            assert_eq!(limit_of(&v, None), None, "{v}");
-        }
-        for (kind, name, _) in LIMIT_NAMES {
-            assert_eq!(kind_of_text(&format!("You've hit your {name} · resets 3pm")), Some(kind));
-        }
-        assert_eq!(kind_of_text("You've hit your lunch limit"), None);
-    }
-
-    /// The times and percentages of the lines, at a fixed now (a Wednesday).
-    #[test]
-    fn when_and_pct_say_it_shortly() {
-        assert_eq!(when(NOW + 2 * 3600, NOW), "14:00Z");
-        assert_eq!(when(NOW + 22 * 3600, NOW), "Thu 10:00Z");
-        assert_eq!(when(NOW + 8 * 86_400, NOW), "Oct 29 12:00Z");
-        assert_eq!((pct(0.23), pct(0.805), pct(1.02), pct(0.0)), ("23%".into(), "81%".into(), "102%".into(), "0%".into()));
-    }
-
     fn run(code: Option<i32>, event: Option<&str>, result: Option<&str>) -> Run {
         Run {
             code,
-            event: event.map(|e| (e.to_string(), info_of(&json(e)["rate_limit_info"]))),
+            event: event.map(|e| (e.to_string(), ratelimit::parse_event_line(e.as_bytes()))),
             result: result.map(|r| (r.to_string(), json(r))),
             ..Run::default()
         }
@@ -1233,31 +1027,140 @@ mod tests {
         assert_eq!(line(judge(&run(Some(1), None, Some(error)))), "work (active): check failed: claude's result was error_during_execution (HTTP 500): Internal");
     }
 
-    /// The record keeps its shape (L-3): an answer sets the windows it
-    /// carries and clears `limited`, keeps a window it does not carry until
-    /// its reset passed; a limit sets `limited`; nothing is written for a
-    /// name whose row names another seal, nor into an absent store.
+    /// L9: the `limited:` word is ratelimit's `kind_word` (`Opus weekly`,
+    /// once `Opus`), from the params' type or the text's name; a hit nothing
+    /// names shows `unknown` (`--json` too) until a `rejected` event lends
+    /// its kind and reset, never another event; a warning names its type's
+    /// `limit_words`, else `a limit`; a status ratelimit does not know reads
+    /// as absent (`--json`: `allowed`), its event line still said to be there.
     #[test]
-    fn the_usage_record_follows_what_the_check_saw() {
+    fn a_limited_line_says_opus_weekly() {
+        let p = Planned { name: "work".into(), active: false, path: PathBuf::new(), tag: "t".into(), pre: None };
+        // The run's event line kept, as `check_one` keeps it.
+        let checked = |r: &Run| Checked { event: r.event.as_ref().map(|(line, _)| line.clone()), ..Checked::of(&p, judge(r)) };
+        let opus = r#"{"type":"result","is_error":true,"api_error":"usage_limit_reached","api_error_status":429,"result":"You've hit your Opus limit · resets Sat 10am","api_error_params":{"rate_limit_info":{"status":"rejected","rateLimitType":"seven_day_opus","resetsAt":1792836000}}}"#;
+        assert_eq!(checked(&run(Some(1), None, Some(opus))).line("2.1.306", NOW), "work: limited: Opus weekly, \"resets Sat 10am\" (Sat 10:00Z)");
+        for (name, word) in [("Sonnet limit", "Sonnet weekly"), ("Fable limit", "Fable weekly"), ("weekly limit", "weekly"), ("session limit", "5-hour")] {
+            let text = format!(r#"{{"type":"result","is_error":true,"api_error":"usage_limit_reached","result":"You've hit your {name} · resets 3pm"}}"#);
+            assert_eq!(checked(&run(Some(1), None, Some(&text))).line("2.1.306", NOW), format!("work: limited: {word}, \"resets 3pm\""));
+        }
+        let bare = r#"{"type":"result","is_error":true,"api_error":"usage_limit_reached","result":"limit reached"}"#;
+        let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1792591200}}"#;
+        for event in [None, Some(allowed)] {
+            let c = checked(&run(Some(1), event, Some(bare)));
+            assert_eq!(c.line("2.1.306", NOW), "work: limited: unknown, \"limit reached\"", "{event:?}");
+            assert_eq!((c.json("2.1.306", NOW)["limited"]["kind"].as_str(), c.json("2.1.306", NOW)["status"].as_str()), (Some("unknown"), Some("rejected")));
+        }
+        let real = include_str!("../../../tests/fixtures/claude/rate-limit-event-2.1.306.jsonl");
+        let c = checked(&run(Some(1), real.lines().nth(1), Some(bare)));
+        assert_eq!(c.line("2.1.306", NOW), "work: limited: weekly, \"limit reached\" (Thu 10:00Z)", "the real rejected event lends its kind and reset");
+        assert_eq!((c.json("2.1.306", NOW)["limited"]["kind"].as_str(), c.json("2.1.306", NOW)["limited"]["resets_at"].as_u64()), (Some("seven_day"), Some(1_792_663_200)));
+        let opus_text = r#"{"type":"result","is_error":true,"api_error":"usage_limit_reached","result":"You've hit your Opus limit · resets Sat 10am"}"#;
+        assert_eq!(checked(&run(Some(1), real.lines().nth(1), Some(opus_text))).line("2.1.306", NOW), "work: limited: Opus weekly, \"resets Sat 10am\"", "the weekly event's reset is not the Opus limit's");
+        let answered = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#;
+        let warning = |kind: &str| format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning"{kind}}}}}"#);
+        assert_eq!(checked(&run(Some(0), Some(&warning(r#","rateLimitType":"seven_day_opus""#)), Some(answered))).line("2.1.306", NOW), "work: answered; claude 2.1.306 reported no usage windows (status allowed_warning); near its Opus limit");
+        assert_eq!(checked(&run(Some(0), Some(&warning(r#","rateLimitType":"monthly""#)), Some(answered))).line("2.1.306", NOW), "work: answered; claude 2.1.306 reported no usage windows (status allowed_warning); near its usage limit");
+        assert_eq!(checked(&run(Some(0), Some(&warning("")), Some(answered))).line("2.1.306", NOW), "work: answered; claude 2.1.306 reported no usage windows (status allowed_warning); near a limit");
+        let odd = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"maybe","unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":1792591200},"seven_day":{"utilization":-0.2,"resetsAt":1792663200000}}}}"#;
+        let c = checked(&run(Some(0), Some(odd), Some(answered)));
+        assert_eq!(c.line("2.1.306", NOW), "work: 5h 50% (resets 14:00Z), 7d ?% (resets Thu 10:00Z)", "a reset in milliseconds; a negative utilization");
+        assert_eq!((c.json("2.1.306", NOW)["status"].as_str(), c.json("2.1.306", NOW)["seven_day"]["resets_at"].as_u64()), (Some("allowed"), Some(1_792_663_200)));
+        // A status ai-env does not know, or no info at all, with no windows: the event line was there.
+        for event in [r#"{"type":"rate_limit_event","rate_limit_info":{"status":"maybe"}}"#, r#"{"type":"rate_limit_event"}"#] {
+            let c = checked(&run(Some(0), Some(event), Some(answered)));
+            assert_eq!(c.line("2.1.306", NOW), "work: answered; claude 2.1.306 reported no usage windows (its rate_limit_event named no status ai-env knows)", "{event}");
+            assert_eq!(c.json("2.1.306", NOW)["status"].as_str(), Some("allowed"));
+        }
+        assert_eq!(checked(&run(Some(0), None, Some(answered))).line("2.1.306", NOW), "work: answered; claude 2.1.306 reported no usage windows (no rate_limit_event)");
+    }
+
+    /// The record goes through `usage::record_all` (L9): the run's event,
+    /// then its outcome, both at the run's time, from `check`: a limit keeps
+    /// its text with the kind and reset its `rejected` event lent; a later
+    /// answer sets its windows and clears the limit; a refused or failed run
+    /// has nothing to record; a seal no row names, or no store, writes
+    /// nothing (none created).
+    #[test]
+    fn the_usage_record_is_the_runs_event_then_its_outcome() {
         let d = tempfile::tempdir().unwrap();
         let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
-        let limit = Outcome::Limited(Limit { text: "You've hit your weekly limit · resets 10am (UTC)".into(), kind: "seven_day".into(), resets_at: Some(NOW + 3600) });
-        assert_eq!(record_usage(&paths, "work", "t1", &limit, NOW), Ok(false));
+        let now = unix_now();
+        let rejected = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"seven_day","resetsAt":{}}}}}"#, now + 86_400);
+        let limited = r#"{"api_error":"usage_limit_reached","api_error_status":429,"is_error":true,"result":"You've hit your weekly limit · resets 10am (UTC)","type":"result"}"#;
+        let ran = run(Some(1), Some(&rejected), Some(limited));
+        let items = observations("t1", ran.info(), &judge(&ran), now);
+        let shape: Vec<(&str, u64, bool)> = items.iter().map(|(tag, o)| (tag.as_str(), o.at, matches!(o.what, usage::Seen::Info(_)))).collect();
+        assert_eq!(shape, [("t1", now, true), ("t1", now, false)], "the event, then the outcome");
+        assert_eq!(usage::record_all(&paths, &items, usage::SOURCE_CHECK, true), usage::Recorded::NoStore);
         assert!(!paths.accounts_state().exists(), "no store, none created");
         super::super::update(&paths, |s| s.account.push(super::super::AccountRow { name: "work".into(), tag: "t1".into(), ..Default::default() })).unwrap();
-        assert_eq!(record_usage(&paths, "work", "t1", &limit, NOW), Ok(true));
-        let rec = |paths: &Paths| super::super::read(paths).unwrap().unwrap().usage["work"].clone();
+        assert_eq!(usage::record_all(&paths, &items, usage::SOURCE_CHECK, true), usage::Recorded::Written);
+        let rec = |paths: &Paths| usage::read_record(&super::super::read(paths).unwrap().unwrap().usage["work"]);
         let r = rec(&paths);
-        assert_eq!((r["source"].as_str(), r["status"].as_str(), r["limited"]["kind"].as_str(), r["limited"]["resets_at"].as_integer()), (Some("check"), Some("rejected"), Some("seven_day"), Some(i64::try_from(NOW + 3600).unwrap())));
-        let both = Info { status: Some("allowed".into()), five_hour: Some(Window { utilization: 0.2, resets_at: Some(NOW + 60) }), seven_day: Some(Window { utilization: 0.5, resets_at: Some(NOW + 86_400) }), ..Info::default() };
-        assert_eq!(record_usage(&paths, "work", "t1", &Outcome::Checked(both), NOW), Ok(true));
-        let only = Info { status: Some("allowed".into()), seven_day: Some(Window { utilization: 0.6, resets_at: Some(NOW + 86_400) }), ..Info::default() };
-        assert_eq!(record_usage(&paths, "work", "t1", &Outcome::Checked(only.clone()), NOW + 30), Ok(true));
+        let limit = usage::LimitedRecord { at: now, text: "You've hit your weekly limit · resets 10am (UTC)".into(), kind: "seven_day".into(), resets_at: Some(now + 86_400) };
+        assert_eq!((r.source.as_deref(), r.status.as_deref(), r.limited), (Some("check"), Some("rejected"), Some(limit)));
+        let allowed = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","unifiedWindows":{{"five_hour":{{"utilization":0.2,"resetsAt":{}}},"seven_day":{{"utilization":0.5,"resetsAt":{}}}}}}}}}"#, now + 3600, now + 86_400);
+        let answered = run(Some(0), Some(&allowed), Some(r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#));
+        let items = observations("t1", answered.info(), &judge(&answered), now + 1);
+        assert_eq!(usage::record_all(&paths, &items, usage::SOURCE_CHECK, true), usage::Recorded::Written);
         let r = rec(&paths);
-        assert!(r.get("limited").is_none() && r["five_hour"]["utilization"].as_float() == Some(0.2) && r["seven_day"]["utilization"].as_float() == Some(0.6), "{r}");
-        assert_eq!(record_usage(&paths, "work", "t1", &Outcome::Checked(only.clone()), NOW + 120), Ok(true));
-        assert!(rec(&paths).get("five_hour").is_none(), "its reset passed");
-        assert_eq!(record_usage(&paths, "work", "t2", &Outcome::Checked(only), NOW), Ok(false), "sealed anew since");
+        assert_eq!((r.status.as_deref(), r.limited, r.five_hour.map(|w| w.utilization), r.seven_day.map(|w| w.utilization)), (Some("allowed"), None, Some(0.2), Some(0.5)));
+        assert!(observations("t1", None, &Outcome::Refused { recorded: None }, now).is_empty() && observations("t1", None, &Outcome::Failed { why: "x".into() }, now).is_empty());
+        assert_eq!(usage::record_all(&paths, &observations("t2", None, &judge(&answered), now + 2), usage::SOURCE_CHECK, true), usage::Recorded::UnknownTag, "sealed anew since");
+        // An event line with no info object is no event (ratelimit's rule, the tap's): the answer
+        // alone is recorded, and an overage recorded before stands.
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#;
+        let over = run(Some(0), Some(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","isUsingOverage":true}}"#), Some(ok));
+        assert_eq!(usage::record_all(&paths, &observations("t1", over.info(), &judge(&over), now + 3), usage::SOURCE_CHECK, true), usage::Recorded::Written);
+        assert_eq!(rec(&paths).overage, Some(true));
+        let infoless = run(Some(0), Some(r#"{"type":"rate_limit_event"}"#), Some(ok));
+        let items = observations("t1", infoless.info(), &judge(&infoless), now + 4);
+        assert!(matches!(&items[..], [(tag, usage::Observed { at, what: usage::Seen::Allowed })] if tag == "t1" && *at == now + 4), "the answer alone (no status known: allowed)");
+        assert_eq!(usage::record_all(&paths, &items, usage::SOURCE_CHECK, true), usage::Recorded::Written);
+        let r = rec(&paths);
+        assert_eq!((r.overage, r.seen_at, r.status.as_deref()), (Some(true), Some(now + 4), Some("allowed")), "the overage stands");
+    }
+
+    /// A1 joint review (F3, F4): a check overrides what an earlier chat
+    /// recorded. Its event's `allowed_warning` for `five_hour` with
+    /// `isUsingOverage: false` turns a chat's `seven_day` warning and
+    /// overage into `five_hour` and none (F4); an answer whose event names
+    /// no status ai-env knows, or that had none, reads `allowed`, its
+    /// warning gone (F3), as the check's `--json` says.
+    #[test]
+    fn a_check_overrides_a_chats_warning_and_overage() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let now = unix_now();
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK"}"#;
+        let chat = |paths: &Paths| {
+            super::super::update(paths, |s| {
+                if s.account.is_empty() {
+                    s.account.push(super::super::AccountRow { name: "work".into(), tag: "t1".into(), ..Default::default() });
+                }
+                let rec = usage::UsageRecord { seen_at: Some(now - 60), status: Some("allowed_warning".into()), warning: Some("seven_day".into()), overage: Some(true), source: Some(usage::SOURCE_CHAT.into()), ..Default::default() };
+                s.usage.insert("work".into(), usage::to_value(&rec));
+            })
+            .unwrap();
+        };
+        let rec = |paths: &Paths| usage::read_record(&super::super::read(paths).unwrap().unwrap().usage["work"]);
+        chat(&paths);
+        let warning = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","isUsingOverage":false}}"#;
+        let ran = run(Some(0), Some(warning), Some(ok));
+        assert_eq!(usage::record_all(&paths, &observations("t1", ran.info(), &judge(&ran), now), usage::SOURCE_CHECK, true), usage::Recorded::Written);
+        let r = rec(&paths);
+        assert_eq!((r.status.as_deref(), r.warning.as_deref(), r.overage, r.source.as_deref()), (Some("allowed_warning"), Some("five_hour"), Some(false), Some("check")), "F4");
+        for event in [Some(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"maybe"}}"#), None] {
+            chat(&paths);
+            let ran = run(Some(0), event, Some(ok));
+            let p = Planned { name: "work".into(), active: true, path: PathBuf::new(), tag: "t1".into(), pre: None };
+            let c = Checked { event: ran.event.as_ref().map(|(line, _)| line.clone()), ..Checked::of(&p, judge(&ran)) };
+            assert_eq!(c.json("2.1.306", now)["status"].as_str(), Some("allowed"), "{event:?}");
+            assert_eq!(usage::record_all(&paths, &observations("t1", ran.info(), &judge(&ran), now), usage::SOURCE_CHECK, true), usage::Recorded::Written);
+            let r = rec(&paths);
+            assert_eq!((r.status.as_deref(), r.warning.as_deref(), r.source.as_deref()), (Some("allowed"), None, Some("check")), "F3: {event:?}");
+        }
     }
 
     /// A hanging claude is ended at the run's bound, its group with it (a

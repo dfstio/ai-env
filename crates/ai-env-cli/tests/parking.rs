@@ -219,7 +219,7 @@ impl Pump {
 
 /// `cat`, under a name the test picks (the reaper's `stop_spawn` names it).
 fn cat(id: &SpawnId) -> SpawnSpec {
-    SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(id.clone()) }
+    SpawnSpec { argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), detach_grace_s: Some(60), id: Some(id.clone()), claude: Vec::new() }
 }
 
 /// What the session told its consumer, as it came.

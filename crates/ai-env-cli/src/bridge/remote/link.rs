@@ -51,7 +51,7 @@
 use crate::bridge::accounts::Seal;
 use crate::bridge::agent::{spawn_channels, Consumed, ConsumerIo, DeliveryReport, RemoteExit, SpawnEvent, SpawnInput, SpawnIo, SpawnOutcome};
 use crate::bridge::audit::{self, AuditRow};
-use crate::bridge::authwatch::{AuthWatch, Stream as WatchStream, Verdict, AUTH_TIMERS, RETRY_LIMIT};
+use crate::bridge::authwatch::{AuthWatch, Stream as WatchStream, Verdict, RETRY_LIMIT};
 use crate::bridge::codeout::{CodeoutTrigger, FetchReport, BOX_REFS, CLOSE_WAIT};
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
@@ -329,11 +329,15 @@ impl LinkFactory for RemoteLinks {
         let (events_tx, events) = mpsc::channel(CHANNEL_CAP);
         // A retry once the host's `initialize` was answered comes after `init_ms`: its steps are no census legs; nor
         // are a move's (S10: the census counts it in `moves` and `move_ms`).
-        let counts_legs = !matches!(req.why, StartWhy::ResumeRetry { init_answered: true, .. } | StartWhy::Move(_));
+        // S11: a start-up respawn's (an argv or a claude retry) counts as a resume miss's retry does.
+        let counts_legs = !matches!(
+            req.why,
+            StartWhy::ResumeRetry { init_answered: true, .. } | StartWhy::ArgvRetry { init_answered: true, .. } | StartWhy::ClaudeRetry { init_answered: true, .. } | StartWhy::Move(_)
+        );
         // S10: a move's generation reports its failures as the move's (`Failure::Move`, `session_move_end`).
         let moving = match &req.why {
             StartWhy::Move(why) => Some(why.clone()),
-            StartWhy::First | StartWhy::ResumeRetry { .. } => None,
+            StartWhy::First | StartWhy::ResumeRetry { .. } | StartWhy::ArgvRetry { .. } | StartWhy::ClaudeRetry { .. } => None,
         };
         match moving.as_ref().map(|m| m.kind) {
             // S10 §B: a loss's move takes the chat to a new VM: the migration off the old one is over (the pump says so).
@@ -725,6 +729,11 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         s = ends.signal.recv() => Pending::Stopped(s.is_some()),
         r = &mut run => Pending::Done(Box::new(r)),
     };
+    // S11 (A.5): the flags dropped so far are the session's, whatever this start's outcome: an `ArgvRetry` adds its
+    // flag before its same-VM respawn, which may fail or be stopped, and the census then says it as the audit does.
+    if let Some(p) = &plan {
+        shared.borrow_mut().snap.argv_dropped = p.dropped.borrow().clone();
+    }
     let end = match pending {
         Pending::Stopped(asked) => {
             // Dropped before the spawn went out: an unseal's age group, and its dialog, die with it.
@@ -754,7 +763,8 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
             Ok(end) => end,
         },
     };
-    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started, seal } = end;
+    // S11 (A.4): what P4 asked (the census's `claude_src` at `Started`) and V's fetch after the first output.
+    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started, seal, claude, after_output } = end;
     let handed = tokio::time::Instant::now();
     if moving.as_ref().is_some_and(|m| m.kind == MoveKind::Migrate) {
         // S10 §B: the switch is over; one that fell back to the old VM counts against `MIGRATE_PREP_TRIES`.
@@ -785,6 +795,11 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         // A new spawn: nothing of the last one's (its pid, claude, marks, link, control) is this one's.
         s.snap.vm_pid = None;
         s.snap.claude = None;
+        // S11: what ran, its census word and what its CLI refused are the new spawn's (set again at its
+        // `Started`); the flags dropped so far are the session's (taken above).
+        s.snap.claude_src = None;
+        s.snap.claude_sha256 = None;
+        s.snap.start_refusal = None;
         s.snap.auth_timers = None;
         s.snap.last_acked_seq = 0;
         s.snap.link_up = false;
@@ -823,6 +838,9 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
     let mut adapter = Adapter::new(gen, vm, paths, shared, ends, consumer);
     adapter.moving = move_fail;
     adapter.after_started = after_started;
+    adapter.claude = claude;
+    adapter.after_output = after_output;
+    adapter.argv_now = plan.as_ref().map(|p| p.argv_now());
     adapter.run(session, handed, started_by, counts_legs).await;
 }
 
@@ -898,6 +916,8 @@ enum Wake {
     Signal(Option<Sig>),
     /// The generation's deadline passed before `Started`.
     Deadline,
+    /// S11: `AFTER_OUTPUT_FALLBACK` passed after `Started` with no stdout: V's fetch starts.
+    AfterOutput,
     Ended(Result<SpawnOutcome, BridgeError>),
     Delivered,
     PumpGone,
@@ -974,6 +994,20 @@ struct Adapter {
     moving: Option<MoveFail>,
     /// S10: what the pipeline left to run once the spawn started (`PipelineEnd::after_started`), run at the first `Started`.
     after_started: Option<pipeline::AfterStarted>,
+    /// S11 (A.4): what P4 asked of the VM (`PipelineEnd::claude`), judged against what ran at `Started` (`claude_src`).
+    claude: Option<crate::bridge::claude::ClaudeAsk>,
+    /// S11 (A.4, LD-6): V's fetch for the next generation (`PipelineEnd::after_output`), started at the CLI's first
+    /// stdout chunk or `remote::AFTER_OUTPUT_FALLBACK` after `Started` ([`Adapter::after_output_at`]); dropped at
+    /// `Started` when V ran.
+    after_output: Option<pipeline::AfterOutput>,
+    after_output_at: Option<tokio::time::Instant>,
+    /// S11 (A.5): the CLI's stderr before its first stdout chunk, at most `remote::START_STDERR_MAX` bytes: what
+    /// `RemoteSnapshot::start_refusal` reads at the exit.
+    stderr_head: Vec<u8>,
+    stdout_seen: bool,
+    /// P0's argv less the dropped flags (`SessionPlan::argv_now`): whether a refused flag can go; `None` with a
+    /// test's own pipeline (never droppable).
+    argv_now: Option<Vec<String>>,
 }
 
 impl Adapter {
@@ -1018,6 +1052,12 @@ impl Adapter {
             gave_up: false,
             moving: None,
             after_started: None,
+            claude: None,
+            after_output: None,
+            after_output_at: None,
+            stderr_head: Vec::new(),
+            stdout_seen: false,
+            argv_now: None,
         }
     }
 
@@ -1050,6 +1090,7 @@ impl Adapter {
                 biased;
                 s = self.signal.recv(), if self.signal_open => Wake::Signal(s),
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => Wake::Deadline,
+                () = tokio::time::sleep_until(self.after_output_at.unwrap_or_else(tokio::time::Instant::now)), if self.after_output_at.is_some() => Wake::AfterOutput,
                 r = &mut session, if ended.is_none() => Wake::Ended(joined(r)),
                 p = self.events.reserve(), if !self.out.is_empty() && !self.pump_gone => match p {
                     Ok(p) => {
@@ -1082,6 +1123,7 @@ impl Adapter {
             match wake {
                 Wake::Signal(s) => self.on_signal(s),
                 Wake::Deadline => self.give_up(),
+                Wake::AfterOutput => self.start_after_output("fallback"),
                 Wake::Ended(r) => {
                     match &r {
                         Ok(o) => tracing::info!(gen = self.gen, spawn = %o.spawn_id, "the remote session ended with its exit"),
@@ -1235,8 +1277,14 @@ impl Adapter {
 
     async fn on_session(&mut self, ev: SpawnEvent) {
         match ev {
-            SpawnEvent::Started { spawn_id, pid, claude_version, .. } => self.on_started(spawn_id, pid, claude_version),
+            SpawnEvent::Started { spawn_id, pid, claude_version, claude_sha256, .. } => self.on_started(spawn_id, pid, claude_version, claude_sha256),
             SpawnEvent::Stdout { seq, bytes } => {
+                if !self.stdout_seen {
+                    // S11: the CLI is past its start: what it said on stderr so far is its start-up's, and V's fetch
+                    // for the next generation starts.
+                    self.stdout_seen = true;
+                    self.start_after_output("first_output");
+                }
                 self.unsplit += bytes.len();
                 // Only a chunk with a newline can end a line (or one past the cap end the discard): the
                 // splitter is asked for lines then, so a long line is not scanned again at every chunk.
@@ -1252,6 +1300,10 @@ impl Adapter {
                 self.out.push_back(Out::Mark(seq));
             }
             SpawnEvent::Stderr { seq, bytes, .. } => {
+                if !self.stdout_seen {
+                    let room = crate::bridge::remote::START_STDERR_MAX.saturating_sub(self.stderr_head.len());
+                    self.stderr_head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+                }
                 self.watch(WatchStream::Stderr, &bytes);
                 let len = bytes.len() as u64;
                 let refused = match &self.stderr {
@@ -1331,16 +1383,37 @@ impl Adapter {
     }
 
     /// `spawned` (or the reattach that found the spawn running): the VM's
-    /// pid and claude (the VM's row when the frame named none), compared
-    /// with `AUTH_TIMERS` for the refusal watch.
-    fn on_started(&mut self, spawn_id: SpawnId, pid: u32, claude_version: Option<String>) {
+    /// pid and claude (the VM's row when the frame named none, unless the
+    /// spawn named staged claudes: then unknown, and no `claude_src`), compared
+    /// with the reviewed timers (S11: `authwatch::timers_for`) for the
+    /// refusal watch. S11 (A.4): what ran (its version and, for a cached
+    /// one, `claude_sha256`) against what P4 asked is the census's
+    /// `claude_src` (the image's version the VM row's); V's fetch for the
+    /// next generation is dropped when V ran (LD-6), else armed for
+    /// `AFTER_OUTPUT_FALLBACK` unless the first output starts it sooner.
+    fn on_started(&mut self, spawn_id: SpawnId, pid: u32, claude_version: Option<String>, claude_sha256: Option<String>) {
         if self.gave_up {
             return;
         }
         let first = !self.started;
         self.started = true;
-        let claude = claude_version.or_else(|| crate::bridge::vm::registry::read_row(&self.paths, &self.vm).ok().flatten().and_then(|r| r.claude_version));
-        let measured = claude.as_deref() == Some(AUTH_TIMERS.claude);
+        let image = crate::bridge::vm::registry::read_row(&self.paths, &self.vm).ok().flatten().and_then(|r| r.claude_version);
+        // S11 (W1): a spawn that named staged claudes (the reattach that found it running after `spawned` was lost
+        // reports none) ran what is unknown, never the image's: unmeasured, no census word.
+        let unknown = claude_version.is_none() && self.claude.as_ref().is_some_and(|ask| !ask.sent.is_empty());
+        let claude = if unknown { None } else { claude_version.or_else(|| image.clone()) };
+        let measured = claude.as_deref().is_some_and(|v| crate::bridge::authwatch::timers_for(v).is_some());
+        let src = self.claude.as_ref().filter(|_| !unknown).map(|ask| crate::bridge::claude::claude_src_of(ask, image.as_deref(), claude.as_deref(), claude_sha256.as_deref()));
+        if first {
+            match src.as_deref() {
+                Some("cached" | "image") => {
+                    // V ran: nothing to fetch for the next generation.
+                    self.after_output = None;
+                }
+                _ if self.after_output.is_some() && !self.stdout_seen => self.after_output_at = Some(tokio::time::Instant::now() + crate::bridge::remote::AFTER_OUTPUT_FALLBACK),
+                _ => {}
+            }
+        }
         self.watch = Some(AuthWatch::for_session(measured));
         let timers = if measured { "match".to_string() } else { format!("unmeasured({})", claude.as_deref().unwrap_or("unknown")) };
         tracing::info!(gen = self.gen, spawn = %spawn_id, vm_pid = pid, claude = claude.as_deref().unwrap_or("unknown"), auth_timers = %timers, "the remote spawn started");
@@ -1350,6 +1423,12 @@ impl Adapter {
             s.snap.vm_pid = Some(pid);
             s.snap.claude.clone_from(&claude);
             s.snap.auth_timers = Some(timers);
+            if first {
+                s.snap.claude_sha256.clone_from(&claude_sha256);
+                if src.is_some() {
+                    s.snap.claude_src.clone_from(&src);
+                }
+            }
             s.snap.link_up = true;
             s.control = Some(self.control.clone());
             // S10 §B: a migration's phase A reports on the live generation's events.
@@ -1374,6 +1453,15 @@ impl Adapter {
         if let Some(ev) = unsent {
             tracing::info!(gen = self.gen, event = ev.kind(), "a migration's event kept while no generation was live: handed on");
             self.push(ev);
+        }
+    }
+
+    /// S11 (A.4): V's fetch for the next generation, as a task the process drops at its exit (once; `why` for the log).
+    fn start_after_output(&mut self, why: &'static str) {
+        self.after_output_at = None;
+        if let Some(task) = self.after_output.take() {
+            tracing::info!(gen = self.gen, why, "claude: V's fetch into the VM starts");
+            tokio::task::spawn_local(task.0);
         }
     }
 
@@ -1402,6 +1490,15 @@ impl Adapter {
             return;
         }
         self.exit = Some(exit);
+        // S11 (A.5): what the CLI refused on stderr before its first stdout, for the pump's start-up respawns.
+        let refusal = crate::wire::claude::unknown_option(&String::from_utf8_lossy(&self.stderr_head)).map(|flag| {
+            let droppable = self.argv_now.as_ref().is_some_and(|argv| crate::wire::argv::drop_option(argv, &flag).is_some());
+            StartRefusal::UnknownOption { flag, droppable }
+        });
+        if refusal.is_some() {
+            tracing::info!(gen = self.gen, ?refusal, "the CLI refused an option at its start");
+            self.shared.borrow_mut().snap.start_refusal = refusal;
+        }
         self.release_control();
         if let Some(r) = self.split.finish() {
             self.push(pump::line_event(r));
@@ -1530,6 +1627,19 @@ pub enum StartWhy {
     ResumeRetry { session_id: String, init_answered: bool },
     /// S10: a move of the session to a new generation (plan §A, §B).
     Move(MoveWhy),
+    /// S11: generation 1 (or a start-up respawn of it) ended before its init with `error: unknown option '<flag>'`:
+    /// the same VM, `flag` dropped from then on (`SessionPlan::argv_now`), no Touch ID.
+    ArgvRetry { flag: String, init_answered: bool },
+    /// S11: a cached claude (`bad_sha256`) ended before its init: the same VM, the next best claude, no Touch ID.
+    ClaudeRetry { bad_sha256: String, init_answered: bool },
+}
+
+/// S11 (A.5): what a generation's CLI said on stderr before its first stdout line, as the pump's start-up respawns
+/// read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartRefusal {
+    /// `wire::claude::unknown_option`'s flag, and whether `drop_option` takes it from `argv_now()`.
+    UnknownOption { flag: String, droppable: bool },
 }
 
 /// What kind of move (`word()`: `readdress`, `respawn`, `migrate`).
@@ -2072,6 +2182,15 @@ pub struct RemoteSnapshot {
     /// A1: the Claude accounts the session's generations ran as, in order, each once in a row: the census's
     /// `account` part.
     pub accounts: Vec<String>,
+    /// S11 (A.4): the census's `claude_src` (`cached`, `image`, `older(<why>)`, `image(<why>)`): the latest
+    /// generation's, from `claude::claude_src_of` at `Started` (A3).
+    pub claude_src: Option<String>,
+    /// S11 (A.5): the flags dropped by start-up respawns, in drop order (`SessionPlan.dropped`; A3).
+    pub argv_dropped: Vec<String>,
+    /// S11: the sha256 of the cached claude that ran (`Started.claude_sha256`); `None` for the image's.
+    pub claude_sha256: Option<String>,
+    /// S11 (A.5): what the CLI refused on stderr before its first stdout line (A3); reset at each hand-over.
+    pub start_refusal: Option<StartRefusal>,
 }
 
 impl RemoteSnapshot {
@@ -2099,6 +2218,7 @@ impl RemoteSnapshot {
     /// `unpark_resumed` when above 0; `close_parked:1`; a reopen's carry,
     /// `carried:readdress` (its VM was gone) or `carried:migrate` (near its wall).
     /// A1: `account:<a>[,<b>…]`, the accounts its generations ran as, once one is known.
+    /// S11: right after `claude`, `claude_src` when known and `argv_dropped:<flag>[,<flag>]` once a flag was dropped.
     #[must_use]
     pub fn census_parts(&self) -> Vec<String> {
         let mut parts = Vec::new();
@@ -2112,6 +2232,8 @@ impl RemoteSnapshot {
         put(census_part::SPAWN, self.spawn.as_ref().map(ToString::to_string));
         put(census_part::VM_PID, self.vm_pid.map(|p| p.to_string()));
         put(census_part::CLAUDE, self.claude.clone());
+        put(census_part::CLAUDE_SRC, self.claude_src.clone());
+        put(census_part::ARGV_DROPPED, (!self.argv_dropped.is_empty()).then(|| self.argv_dropped.join(",")));
         put(census_part::LEGS, (!self.legs.is_empty()).then(|| self.legs.iter().map(|(leg, ms)| format!("{leg}={ms}")).collect::<Vec<_>>().join(",")));
         put(census_part::SEED, self.seed.map(str::to_string));
         put(census_part::TRANSCRIPT, self.transcript.map(str::to_string));
@@ -2139,6 +2261,7 @@ impl RemoteSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::authwatch::AUTH_TIMERS;
     use crate::bridge::remote::{LEG_NAMES, VM_HOW_WORDS};
 
     /// The local ladder is the S2 one; the remote one sends no TERM after
@@ -2215,6 +2338,20 @@ mod tests {
             "park:0".into(),
         ];
         assert_eq!(full.census_parts(), want, "in census_part::ALL's order");
+        // S11 (A.4, A.5): `claude_src` and `argv_dropped` right after `claude`; the sha256 and the refusal are no parts.
+        let s11 = RemoteSnapshot {
+            claude_src: Some("older(not_cached)".into()),
+            argv_dropped: vec!["--x".into(), "--y".into()],
+            claude_sha256: Some("b".repeat(64)),
+            start_refusal: Some(StartRefusal::UnknownOption { flag: "--x".into(), droppable: true }),
+            ..full.clone()
+        };
+        let mut want11: Vec<String> = want.to_vec();
+        want11.splice(5..5, ["claude_src:older(not_cached)".to_string(), "argv_dropped:--x,--y".to_string()]);
+        assert_eq!(s11.census_parts(), want11);
+        let image = RemoteSnapshot { claude_src: Some("image".into()), ..full.clone() };
+        assert_eq!(image.census_parts()[5], "claude_src:image", "no argv_dropped part while none was dropped");
+        assert!(!image.census_parts().iter().any(|p| p.starts_with("argv_dropped:")));
     }
 
     /// A1: each generation's seal is the live one; its account joins the
@@ -2358,6 +2495,8 @@ mod tests {
             moved: None,
             after_started: None,
             seal: None,
+            claude: None,
+            after_output: None,
         }
     }
 
@@ -2419,7 +2558,7 @@ mod tests {
     }
 
     fn started_event(claude: Option<&str>) -> SpawnEvent {
-        SpawnEvent::Started { spawn_id: SpawnId::new_v7(), pid: 4242, pgid: 4242, claude_version: claude.map(str::to_string) }
+        SpawnEvent::Started { spawn_id: SpawnId::new_v7(), pid: 4242, pgid: 4242, claude_version: claude.map(str::to_string), claude_sha256: None }
     }
 
     fn exited(code: Option<i32>, signal: Option<i32>) -> RemoteExit {
@@ -2458,14 +2597,105 @@ mod tests {
         })
     }
 
+    /// S11 (A.4, LD-6): V's fetch for the next generation (`PipelineEnd::after_output`) starts at the CLI's first
+    /// stdout chunk, never before (nor at `Started`); `claude_src` is judged at `Started` from what ran; when V ran
+    /// (`cached`), the fetch never starts. The CLI's stderr before its first stdout is what the exit reads as a
+    /// start-up refusal (a test's pipeline names no argv: never droppable).
+    #[test]
+    fn the_fetch_waits_for_the_first_output() {
+        use crate::bridge::claude::{ClaudeAsk, ClaudePlan};
+        use crate::wire::workspace::ClaudeRef;
+        let v = ClaudeRef { version: "2.1.310".into(), sha256: "b".repeat(64) };
+        let ask = ClaudeAsk { plan: ClaudePlan { ext: Some("2.1.310".into()), phase: Some("staged".into()), why_not: None, prefs: vec![v.clone()], ..ClaudePlan::default() }, cap: true, sent: vec![v.clone()], after_start_failed: false };
+        // W1: no claude named (the reattach after a lost `spawned`) by a spawn that named staged claudes: what ran is
+        // unknown, never the VM row's image claude; unmeasured, no `claude_src`, V's fetch armed.
+        for (ran, sha, want_src, fetches) in [(Some("2.1.305"), None, Some("image(not_cached)"), true), (Some("2.1.310"), Some(v.sha256.clone()), Some("cached"), false), (None, None, None, true)] {
+            let d = tempfile::tempdir().unwrap();
+            let image_row = crate::bridge::vm::registry::VmRow { id: "microvm-1".into(), claude_version: Some("2.1.305".into()), ..Default::default() };
+            crate::bridge::vm::registry::write_row(&Paths::from_root_and_env(d.path().join("bridge"), None), &image_row).unwrap();
+            on_local(async {
+                let fetched = Rc::new(Cell::new(false));
+                let before_output = Rc::new(Cell::new(None::<bool>));
+                let (flag, seen) = (Rc::clone(&fetched), Rc::clone(&before_output));
+                let script: Script = Box::new(move |io: SpawnIo| {
+                    Box::pin(async move {
+                        let _ = io.events.send(SpawnEvent::Started { spawn_id: SpawnId::new_v7(), pid: 4242, pgid: 4242, claude_version: ran.map(str::to_string), claude_sha256: sha });
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        seen.set(Some(flag.get()));
+                        let _ = io.events.send(SpawnEvent::Stdout { seq: 1, bytes: b"{}\n".to_vec() });
+                        let until = tokio::time::Instant::now() + Duration::from_millis(if fetches { 5_000 } else { 300 });
+                        while !flag.get() && tokio::time::Instant::now() < until {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        let exit = exited(Some(0), None);
+                        let _ = io.events.send(SpawnEvent::Exit(exit));
+                        wait_marked(&io, 1, 0).await?;
+                        Ok(SpawnOutcome { spawn_id: SpawnId::new_v7(), exit, parked_close: false })
+                    })
+                });
+                let root = d.path().to_path_buf();
+                let mut script = Some(script);
+                let (ask, task_flag) = (ask.clone(), Rc::clone(&fetched));
+                let mut links = RemoteLinks::with_pipeline(
+                    Paths::from_root_and_env(d.path().join("bridge"), None),
+                    Box::new(move |_gen, _why, io| {
+                        let (root, script, ask, task_flag) = (root.clone(), script.take().expect("one generation"), ask.clone(), Rc::clone(&task_flag));
+                        Box::pin(async move {
+                            let session = tokio::task::spawn_local(script(io));
+                            let after = pipeline::AfterOutput(Box::pin(async move { task_flag.set(true) }));
+                            Ok(PipelineEnd { claude: Some(ask), after_output: Some(after), ..end_with(&root, session) })
+                        })
+                    }),
+                );
+                let mut link = start(&mut links);
+                let events = to_the_end(&mut link).await;
+                assert!(matches!(events.last(), Some(ChildEvent::Exit(Some(s))) if s.code() == Some(0)), "{events:?}");
+                assert_eq!(before_output.get(), Some(false), "{want_src:?}: nothing fetched before the first output");
+                assert_eq!(fetched.get(), fetches, "{want_src:?}");
+                let snap = links.snapshot().unwrap();
+                assert_eq!((snap.claude_src.as_deref(), snap.claude_sha256.is_some(), snap.start_refusal.as_ref()), (want_src, !fetches, None));
+                assert_eq!(snap.claude.as_deref(), ran, "what ran, never the row's image claude in its stead");
+                if ran.is_none() {
+                    assert_eq!(snap.auth_timers.as_deref(), Some("unmeasured(unknown)"));
+                }
+                links.close(Duration::from_secs(5)).await;
+            });
+        }
+        // A CLI that refuses an option on stderr before any stdout, and exits.
+        let d = tempfile::tempdir().unwrap();
+        on_local(async {
+            let refusing: Script = Box::new(|io: SpawnIo| {
+                Box::pin(async move {
+                    let _ = io.events.send(started_event(Some("2.1.305")));
+                    let _ = io.events.send(SpawnEvent::Stderr { seq: 1, bytes: b"error: unknown option '--from-the-future'\n(Did you mean --verbose?)\n".to_vec(), dropped: 0 });
+                    let exit = exited(Some(1), None);
+                    let _ = io.events.send(SpawnEvent::Exit(exit));
+                    wait_marked(&io, 0, 1).await?;
+                    Ok(SpawnOutcome { spawn_id: SpawnId::new_v7(), exit, parked_close: false })
+                })
+            });
+            let mut links = remote_links(d.path(), vec![Gen::Session(Duration::ZERO, refusing)]);
+            let mut link = start(&mut links);
+            let _ = to_the_end(&mut link).await;
+            let refusal = links.snapshot().unwrap().start_refusal;
+            assert_eq!(refusal, Some(StartRefusal::UnknownOption { flag: "--from-the-future".into(), droppable: false }));
+            links.close(Duration::from_secs(5)).await;
+        });
+    }
+
     /// A pipeline's refusal is the link's first and only event, as it came;
-    /// the snapshot names the VM it reached.
+    /// the snapshot names the VM it reached. S11 (A.5): and the flags the
+    /// session dropped so far (an `ArgvRetry` whose respawn failed), as the
+    /// pump audited them; a stopped start says them too.
     #[test]
     fn a_pipeline_refusal_is_the_links_first_and_only_event() {
         let d = tempfile::tempdir().unwrap();
         on_local(async {
             let failure = SpawnFailure::from_failure(StartStep::Workspace, &Failure::Finding { finding: "untracked .env: rule env-file-plaintext".into() }, Some("microvm-1".into()));
             let mut links = remote_links(d.path(), vec![Gen::Refuse(failure.clone())]);
+            let plan = Rc::new(SessionPlan::sample(d.path()));
+            plan.dropped.borrow_mut().push("--from-the-future".into());
+            links.plan = Some(Rc::clone(&plan));
             assert_eq!((links.kind(), links.timings()), (LinkKind::Remote, CloseTimings::REMOTE));
             let mut link = start(&mut links);
             assert_eq!(link.pid, None, "the VM's pid comes with Started");
@@ -2475,6 +2705,19 @@ mod tests {
             }
             assert!(next(&mut link).await.is_none(), "nothing after it");
             assert_eq!(links.snapshot().and_then(|s| s.vm).as_deref(), Some("microvm-1"));
+            let snap = links.snapshot().unwrap();
+            assert_eq!(snap.argv_dropped, ["--from-the-future"]);
+            assert!(snap.census_parts().iter().any(|p| p == "argv_dropped:--from-the-future"), "{:?}", snap.census_parts());
+            // A start stopped while its pipeline ran says them too.
+            let dropped = Rc::new(Cell::new(false));
+            let mut links = remote_links(d.path(), vec![Gen::Hang(Rc::clone(&dropped))]);
+            plan.dropped.borrow_mut().push("--two".into());
+            links.plan = Some(Rc::clone(&plan));
+            let mut link = start(&mut links);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            link.signal.send(Sig::Term).unwrap();
+            assert!(matches!(next(&mut link).await, Some(ChildEvent::SpawnFailed(f)) if f.cancelled), "a cancelled start");
+            assert_eq!(links.snapshot().unwrap().argv_dropped, ["--from-the-future", "--two"]);
         });
     }
 
@@ -3176,7 +3419,7 @@ mod tests {
             let second: Script = Box::new(move |io: SpawnIo| {
                 Box::pin(async move {
                     let _ = start_rx.await;
-                    let _ = io.events.send(SpawnEvent::Started { spawn_id: SpawnId::new_v7(), pid: 5151, pgid: 5151, claude_version: Some("2.1.297".into()) });
+                    let _ = io.events.send(SpawnEvent::Started { spawn_id: SpawnId::new_v7(), pid: 5151, pgid: 5151, claude_version: Some("2.1.297".into()), claude_sha256: None });
                     let _ = io.events.send(SpawnEvent::Stdout { seq: 1, bytes: b"d\n".to_vec() });
                     let exit = exited(Some(0), None);
                     let _ = io.events.send(SpawnEvent::Exit(exit));
@@ -3410,7 +3653,7 @@ mod tests {
                 Box::pin(async move {
                     let _ = io.events.send(started_event(Some(AUTH_TIMERS.claude)));
                     let _ = io.events.send(SpawnEvent::Park(ParkReport::Parked { why: "idle", quiet_ms: 300_000 }));
-                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     Err(BridgeError::Terminated("microvm-1 is TERMINATED".into()))
                 })
             });
@@ -3425,9 +3668,10 @@ mod tests {
             let first = links.snapshot().unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             let later = links.snapshot().unwrap();
-            // The 30 ms the park stayed open, less the link's lag in reading its report under load (a full run once
-            // read 29): counted to the generation's end, and no further.
-            assert!(first.park.parked_ms >= 20 && later.park.parked_ms == first.park.parked_ms, "the park counts to its generation's end: {:?}, then {:?}", first.park, later.park);
+            // The 100 ms the park stayed open, less the link's lag in reading its report under load (a full run once
+            // read 29 of 30, and S11's gate 18 of 30 at a load average near 20): counted to the generation's end, and
+            // no further.
+            assert!(first.park.parked_ms >= 50 && later.park.parked_ms == first.park.parked_ms, "the park counts to its generation's end: {:?}, then {:?}", first.park, later.park);
             assert!(later.census_parts().contains(&"park:1".to_string()), "{:?}", later.census_parts());
             let mut link = links.start(3, StartReq { why: StartWhy::First, credential: None }).unwrap();
             let _ = to_the_end(&mut link).await;
@@ -3720,7 +3964,7 @@ mod p0_tests {
         assert_eq!((throttled.code, throttled.cause), (7, LossCause::Unreachable));
         let s9 = LinkLoss::from_failure(&Failure::LinkLost { vm: "microvm-2".into() });
         assert_eq!((s9.code, s9.cause, s9.vm.as_str(), s9.spawn), (8, LossCause::NotMovable, "microvm-2", None));
-        assert_eq!(LinkLoss::from_failure(&Failure::TokenRefused).vm, "", "a failure that names no VM");
+        assert_eq!(LinkLoss::from_failure(&Failure::TokenRefused { account: None, installed: true }).vm, "", "a failure that names no VM");
     }
 
     /// S10: a move's start counts no census legs; the factory's four new

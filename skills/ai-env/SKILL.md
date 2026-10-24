@@ -1,6 +1,6 @@
 ---
 name: ai-env
-description: Work with ai-env encrypted .env files, ai-env MicroVM sessions and ai-env's AWS side — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env), or before a make target, aws call or ai-env command reaches ai-env's AWS account (make deploy, ai-env as, ai-env egress).
+description: Work with ai-env encrypted .env files, ai-env MicroVM sessions and ai-env's AWS side — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env), or before a make target, aws call or ai-env command reaches ai-env's AWS account (make deploy, ai-env as, ai-env egress, ai-env claude stage).
 ---
 
 # ai-env — encrypted .env files
@@ -101,6 +101,8 @@ ai-env session show UUID           # one chat's VM, and in vms every VM it ran o
 ai-env box fetch WORKSPACE --wip   # the VM's commits and uncommitted files into refs/remotes/box/*
 ai-env box review BRANCH           # what a push of BRANCH would carry (no AWS, no Touch ID; exit 9 on a finding)
 ai-env vm list                     # the VMs that run or are suspended (then the registry reconciled, locally)
+ai-env claude status               # which Claude Code versions the VMs can run (no AWS, no Touch ID)
+ai-env audit tail --session UUID   # one chat's audit rows, and its VMs' (no AWS, no Touch ID)
 ```
 
 A move to a new VM costs the user one Touch ID, for the setup token, in a dialog the wrapper
@@ -121,6 +123,21 @@ chat on the Mac again. `ai-env wrapper status` is read-only (no AWS, no Touch ID
 whether Cursor's wrapper is set and where the chats Cursor starts next will run (it cannot see a
 chat already running). `ai-env wrapper uninstall` and `ai-env wrapper install`
 change where every later Cursor chat runs: they are the user's to run, never yours.
+
+**Claude Code versions.** Cursor updates its Claude Code extension by itself, and the VMs follow it
+with no deploy: ai-env admits a new version (its release signature against a vendored key, then
+Docker tests), stages it in S3, and VMs fetch it; until then chats run an older admitted version or
+the image's own claude (a chat's census row says which: `claude_src:`). Never suggest turning
+Cursor's Auto Update off. `ai-env claude status` shows each version's phase (no AWS, no Touch ID).
+`ai-env claude admit` runs this checkout's Docker tests on a new version for minutes (the user's to
+start; in remote mode the wrapper starts it by itself): while one runs, do not edit the ai-env
+checkout (it tests the working tree, and an edit fails it). `ai-env claude stage`, `update`, `forget` and `gc --yes` change
+S3 and ask for Touch IDs: the user's to run, never yours.
+
+**The audit, the cost and the panel.** `ai-env audit tail`, `ai-env audit grep` and `ai-env cost`
+read this Mac's files only (no AWS, no Touch ID): you may run them. `ai-env panel serve` is the
+user's: the URL it prints holds a bearer that acts on the VMs. Never ask for it, copy it into a
+chat, a file or notes, or open or fetch it.
 
 **Before a push**, `ai-env box review BRANCH` checks what it would carry (the tripwires, the
 settings policy, the dotenv rule, the Cargo.lock rules, the pre-push hook's own path): read-only,
@@ -178,10 +195,11 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   with the user's Touch ID, in the user's terminal. Never put a passphrase on a command line or in
   a file.
 - Never start a deployer-tier target (`make deploy`, `make preview`, `make runtime-key`,
-  `make ops-key`, `make deployer-key`, `make image-activate`, …), `ai-env as deployer …`,
-  `ai-env egress allow` or `make claude-update` yourself: give the user the exact command to run in a
-  terminal of their own, and wait for its result. The deployer's key is pasted at a no-echo prompt on
-  `/dev/tty` only: from a shell without a terminal the command stops there with
+  `make ops-key`, `make deployer-key`, `make image-activate`, …), `ai-env as deployer …` or
+  `ai-env egress allow` yourself: give the user the exact command to run in a terminal of their own,
+  and wait for its result. (`make claude-update` is retired: VMs follow Cursor's Claude Code with no
+  deploy, through `ai-env claude update`, the user's command and Touch ID.) The deployer's key is
+  pasted at a no-echo prompt on `/dev/tty` only: from a shell without a terminal the command stops there with
   `as deployer: no terminal to paste the key into …` (the runner's exit 5); started from your shell,
   the paste would put the key into a process tree you control, and in a terminal you share it could
   land in your own input. Never type, pipe or paste anything into it. `ai-env egress allow` widens

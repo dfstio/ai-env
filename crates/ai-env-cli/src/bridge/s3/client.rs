@@ -20,11 +20,15 @@
 //! 503, its 409 `OperationAborted` or `ConditionalRequestConflict`
 //! ([`RETRY_409`]), or its 400 `RequestTimeout` ([`RETRY_400`]), goes again
 //! ([`PART_TRIES`]); a request with no answer names its cause, never its
-//! URL.
+//! URL. S11 (L5): an encoded object's PutObject and CreateMultipartUpload
+//! send and sign `content-encoding` ([`encoding_header`]); an UploadPart
+//! and a CompleteMultipartUpload never do (S3 checks each part's signed
+//! sha256 of the stored bytes).
 use super::presign::{request, write_headers};
 use super::{PresignReq, S3Endpoint, S3Method, S3Sign, S3Target};
 use crate::bridge::errors::BridgeError;
 use crate::wire::s3::{PresignedUrl, PRESIGN_EXPIRY};
+use crate::wire::workspace::PartEncoding;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -425,10 +429,14 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
 
     /// PutObject of `body` (`len` bytes, `sha256` its digest) at `key`, new
     /// only (`If-None-Match: *`): stored with its version, or `Exists` (412).
-    /// Up to [`PART_TRIES`] tries.
-    pub async fn put_object(&self, key: &str, body: Body, len: u64, sha256: &str) -> Result<Written, BridgeError> {
+    /// Up to [`PART_TRIES`] tries. S11 (L5): `encoding` is how `body` is
+    /// stored (its `content-encoding`, sent and signed); `len` and `sha256`
+    /// are the stored bytes'.
+    pub async fn put_object(&self, key: &str, body: Body, len: u64, sha256: &str, encoding: Option<PartEncoding>) -> Result<Written, BridgeError> {
         const OP: &str = "s3 put";
-        let reply = self.send(OP, S3Method::Put, Some(key), Vec::new(), write_headers(len, sha256, true)?, body, PART_TRIES).await?;
+        let mut headers = write_headers(len, sha256, true)?;
+        headers.extend(encoding_header(encoding));
+        let reply = self.send(OP, S3Method::Put, Some(key), Vec::new(), headers, body, PART_TRIES).await?;
         match reply.status {
             200 => Ok(Written::Stored(reply.version_id.unwrap_or_default())),
             412 => Ok(Written::Exists),
@@ -436,10 +444,13 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
         }
     }
 
-    /// CreateMultipartUpload of `key` with SHA-256 part checksums: its upload id.
-    pub async fn create_multipart(&self, key: &str) -> Result<String, BridgeError> {
+    /// CreateMultipartUpload of `key` with SHA-256 part checksums: its upload
+    /// id. S11 (L5): `encoding` is how the object is stored (its
+    /// `content-encoding`, sent and signed here, the object's once complete).
+    pub async fn create_multipart(&self, key: &str, encoding: Option<PartEncoding>) -> Result<String, BridgeError> {
         const OP: &str = "s3 create multipart upload";
-        let headers = vec![("x-amz-checksum-algorithm".to_string(), "SHA256".to_string())];
+        let mut headers = vec![("x-amz-checksum-algorithm".to_string(), "SHA256".to_string())];
+        headers.extend(encoding_header(encoding));
         let reply = self.send(OP, S3Method::Post, Some(key), vec![("uploads".into(), String::new())], headers, Body::None, 1).await?;
         if reply.status != 200 || reply.has_error() {
             return Err(reply.error("create multipart upload", reply.status));
@@ -570,6 +581,13 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
             s => Err(reply.error("delete", s)),
         }
     }
+}
+
+/// S11 (L5): the `content-encoding` header an encoded object's PutObject
+/// or CreateMultipartUpload sends and signs (`gzip`); none for identity.
+#[must_use]
+pub fn encoding_header(encoding: Option<PartEncoding>) -> Option<(String, String)> {
+    encoding.map(|e| ("content-encoding".to_string(), e.word().to_string()))
 }
 
 /// Query pairs in `presign::SIGNABLE_QUERY`'s order.
@@ -900,7 +918,7 @@ mod tests {
         let (addr, task) = server(4096, None).await;
         let slow_stall = Waits { stall: Duration::from_secs(10), head: Duration::from_millis(500), ..waits };
         let t = std::time::Instant::now();
-        let e = S3Client::new(&signer, &target(addr)).unwrap().with_waits(slow_stall).put_object(&key, Body::File { path: small, offset: 0, len: 4096 }, 4096, &sha).await.unwrap_err().to_string();
+        let e = S3Client::new(&signer, &target(addr)).unwrap().with_waits(slow_stall).put_object(&key, Body::File { path: small, offset: 0, len: 4096 }, 4096, &sha, None).await.unwrap_err().to_string();
         task.abort();
         assert_eq!(e, format!("aws s3 put: {key}: no answer in 3 tries: the request sent, no answer within 500 ms"));
         assert!(t.elapsed() < Duration::from_secs(8), "three head waits and the waits between, no stall's: {:?}", t.elapsed());
@@ -954,7 +972,7 @@ mod tests {
         let waits = Waits { stall: Duration::from_millis(1500), head: Duration::from_secs(30), chunk: Duration::from_secs(30) };
         let client = S3Client::new(&signer, &target).unwrap().with_waits(waits);
         let t = std::time::Instant::now();
-        let stored = client.put_object(&key, Body::File { path: file, offset: 0, len }, len, &sha).await;
+        let stored = client.put_object(&key, Body::File { path: file, offset: 0, len }, len, &sha, None).await;
         task.abort();
         assert_eq!(stored.unwrap(), Written::Stored("v7".into()));
         assert!(t.elapsed() > waits.stall * 2, "a transfer longer than the stall wait: {:?}", t.elapsed());

@@ -1944,7 +1944,7 @@ fn audit_as(identity: &str, tail: Option<&str>, account: Option<&str>, command: 
         pairs.push(("account", account.to_string()));
     }
     pairs.push(("command", word));
-    let row = crate::bridge::audit::AuditRow::new("as_identity", None, crate::bridge::audit::detail(&pairs));
+    let row = crate::bridge::audit::AuditRow::new(crate::bridge::audit::event::AS_IDENTITY, None, crate::bridge::audit::detail(&pairs));
     let written = Paths::resolve().map_err(|e| e.to_string()).and_then(|paths| crate::bridge::audit::append(&paths.audit(), &row).map_err(|e| e.to_string()));
     if let Err(e) = written {
         voice::warn(&format!("the audit row was not written: {e}"));

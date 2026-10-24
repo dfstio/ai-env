@@ -29,13 +29,13 @@ use ai_env_cli::bridge::scan::Rules;
 use ai_env_cli::bridge::view::ViewOutcome;
 use ai_env_cli::bridge::workspace::transcript::digest_file;
 use ai_env_cli::bridge::workspace::{EnsureCtx, Head, SeedLimits, TranscriptOutcome, WorkspaceRef, WsKind};
-use ai_env_cli::wire::frame::CAP_TRANSCRIPT_S3_V1;
+use ai_env_cli::wire::frame::{CAP_TRANSCRIPT_GZIP_V1, CAP_TRANSCRIPT_S3_V1};
 use ai_env_cli::wire::redact::Secret;
 use ai_env_cli::wire::s3::{sha256_b64, PresignedUrl, S3Key, FP_SPAN, MULTIPART_PART};
 use ai_env_cli::wire::view::{TranscriptViewReply, VIEW_MARK_PREFIX};
 use ai_env_cli::wire::workspace::{
-    CodeoutRequest, ObjectFormat, PullPartReport, SeedQuery, SeedReply, SeedState, SettingsCapture, StatQuery, SubtreeFile, TranscriptPull, TranscriptPullReply, TranscriptPush,
-    TranscriptPushReply, TranscriptStat, TranscriptTail, ViewQuery, APP_PORT,
+    CodeoutRequest, ObjectFormat, PartEncoding, PullPartReport, SeedQuery, SeedReply, SeedState, SettingsCapture, StatQuery, SubtreeFile, TranscriptPull, TranscriptPullReply,
+    TranscriptPush, TranscriptPushReply, TranscriptStat, TranscriptTail, ViewQuery, APP_PORT,
 };
 use fake_s3::{FakeS3, S3Action};
 use sha2::{Digest, Sha256};
@@ -134,6 +134,53 @@ fn line(tag: &str, n: usize) -> Vec<u8> {
     }
     l.push_str("\"}\n");
     l.into_bytes()
+}
+
+/// S11 (L5): a transcript line of `n` bytes whose pad is seeded noise of
+/// `[A-Za-z0-9]` (xorshift64*): gzip keeps some three quarters of it, so a
+/// chat of such lines stays multipart once stored; no tripwire's literal can
+/// form in it.
+fn noise_line(seed: u64, n: usize) -> Vec<u8> {
+    const ALPHABET: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut l = format!("{{\"type\":\"user\",\"message\":{{\"content\":\"noise {seed}\"}},\"pad\":\"").into_bytes();
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    while l.len() < n - 3 {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        l.push(ALPHABET[(x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 58) as usize % ALPHABET.len()]);
+    }
+    l.extend_from_slice(b"\"}\n");
+    l
+}
+
+/// `/usr/bin/gzip` with `args` over `input`: its stdout, `None` when it failed.
+fn gzip_pipe(args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("/usr/bin/gzip").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let (mut stdin, input) = (child.stdin.take()?, input.to_vec());
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    out.status.success().then_some(out.stdout)
+}
+
+/// S11 (L5): what a gzip stage stores of `bytes` (`/usr/bin/gzip -n -6 -c`:
+/// deterministic, so the stage's key is computed here alike).
+fn gz(bytes: &[u8]) -> Vec<u8> {
+    gzip_pipe(&["-n", "-6", "-c"], bytes).expect("/usr/bin/gzip")
+}
+
+/// The decoded bytes of a gzip stream (`/usr/bin/gzip -dc`, as curl's `compressed` decodes), `None` for no stream.
+fn gunzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    gzip_pipe(&["-dc"], bytes)
+}
+
+/// The key a gzip stage stores `bytes` under: `v1/<SID>/mac/<the stored bytes' sha256>`.
+fn gz_key(bytes: &[u8]) -> String {
+    S3Key::Mac { session: SID.into(), sha256: sha(&gz(bytes)) }.render()
 }
 
 /// plans/s9-contracts.md §6.1's example view reply (tests/fixtures/view/reply.json).
@@ -274,13 +321,17 @@ mod stage {
         }
     }
 
-    /// A chat of four 1 MiB parts (the last a few bytes) whose transcript
-    /// records the world's repository; its sha256 key.
-    fn four_parts(w: &World, repo: &Path) -> (Vec<u8>, String) {
-        let bytes = [cwd_line(repo), line("turn 0", 1 << 20), line("turn 1", 1 << 20), line("turn 2", 1 << 20)].concat();
+    /// A chat whose transcript records the world's repository and which
+    /// `session stage` stores (S11: gzip) in four 1 MiB parts, the last a
+    /// part one: its bytes, the stored bytes, their key (the stored bytes'
+    /// sha256).
+    fn four_parts(w: &World, repo: &Path) -> (Vec<u8>, Vec<u8>, String) {
+        let bytes = [cwd_line(repo), noise_line(0, 1_630_000), noise_line(1, 1_630_000), noise_line(2, 1_630_000)].concat();
         w.plant(&format!("{SID}.jsonl"), &bytes);
-        let key = S3Key::Mac { session: SID.into(), sha256: sha(&bytes) }.render();
-        (bytes, key)
+        let stored = gz(&bytes);
+        assert_eq!(stored.len().div_ceil(1 << 20), 4, "four 1 MiB parts once stored: {} bytes", stored.len());
+        let key = S3Key::Mac { session: SID.into(), sha256: sha(&stored) }.render();
+        (bytes, stored, key)
     }
 
     /// B6 (a): a part that gets no answer (its connection closed unanswered,
@@ -290,14 +341,15 @@ mod stage {
     #[test]
     fn a_part_with_no_answer_is_sent_again_and_the_stage_completes() {
         let (w, repo) = World::new(FakeS3::start()).with_workspace();
-        let (bytes, key) = four_parts(&w, &repo);
+        let (bytes, stored, key) = four_parts(&w, &repo);
         w.s3.script_part(2, vec![S3Action::CutAfter { bytes: 0 }]);
         w.s3.script_part(3, vec![S3Action::Status { status: 503, code: "SlowDown" }]);
         let presigned = std::sync::Arc::new(Mutex::new(Vec::new()));
         let signer = Counting { api: FakeMicrovmApi::new(), parts: presigned.clone() };
         let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, move || async move { Ok(signer) })).unwrap();
         assert_eq!((report.outcome, report.parts, report.key.as_str()), ("staged", 4, key.as_str()));
-        assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()), "S3 holds the chat's bytes");
+        assert_eq!(w.s3.get(&key).as_deref(), Some(stored.as_slice()), "S3 holds the chat's stored bytes");
+        assert_eq!(gunzip(&stored).as_deref(), Some(bytes.as_slice()), "which decode to the chat's");
         let tries = |n: u32| w.s3.requests().iter().filter(|r| r.part == Some(n)).map(|r| r.status).collect::<Vec<_>>();
         assert_eq!((tries(1), tries(2), tries(3), tries(4)), (vec![200], vec![0, 200], vec![503, 200], vec![200]), "{:?}", w.s3.requests());
         let mut signed = presigned.lock().unwrap().clone();
@@ -314,7 +366,7 @@ mod stage {
     #[test]
     fn a_part_with_no_answer_at_every_try_ends_the_stage_naming_the_cause() {
         let (w, repo) = World::new(FakeS3::start()).with_workspace();
-        let (bytes, key) = four_parts(&w, &repo);
+        let (bytes, stored, key) = four_parts(&w, &repo);
         w.s3.script_part(2, vec![S3Action::CutAfter { bytes: 0 }; 3]);
         let presigned = std::sync::Arc::new(Mutex::new(Vec::new()));
         let signer = Counting { api: FakeMicrovmApi::new(), parts: presigned.clone() };
@@ -337,7 +389,7 @@ mod stage {
         let again = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap();
         assert_eq!(again.outcome, "resumed");
         assert_eq!(w.s3.requests()[from..].iter().filter_map(|r| r.part).collect::<Vec<_>>(), [2]);
-        assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()));
+        assert_eq!(w.s3.get(&key).as_deref(), Some(stored.as_slice()));
     }
 
     /// A part S3 answers 503 `SlowDown` and then not at all (two connections
@@ -346,7 +398,7 @@ mod stage {
     #[test]
     fn a_part_answered_503_and_then_not_at_all_names_both() {
         let (w, repo) = World::new(FakeS3::start()).with_workspace();
-        let (_, key) = four_parts(&w, &repo);
+        let (_, _, key) = four_parts(&w, &repo);
         w.s3.script_part(2, vec![S3Action::Status { status: 503, code: "SlowDown" }, S3Action::CutAfter { bytes: 0 }, S3Action::CutAfter { bytes: 0 }]);
         let err = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap_err();
         let text = err.to_string();
@@ -458,11 +510,12 @@ fn stage_uploads_the_chat_and_leaves_its_view() {
     w.plant(&format!("{SID}/subagents/agent-a1.jsonl"), &sub);
     let unseal = || async { Ok(FakeMicrovmApi::new()) };
     let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, MULTIPART_PART, &builder, unseal)).unwrap();
-    let main_key = S3Key::Mac { session: SID.into(), sha256: sha(&main_bytes) }.render();
+    // S11 (L5): stored gzip, each file by its stored bytes' sha256.
+    let main_key = gz_key(&main_bytes);
     assert_eq!((report.outcome, report.key.as_str(), report.bytes, report.parts), ("staged", main_key.as_str(), (main_bytes.len() + sub.len()) as u64, 1));
-    assert_eq!(w.s3.get(&main_key).as_deref(), Some(main_bytes.as_slice()));
-    let sub_key = S3Key::Mac { session: SID.into(), sha256: sha(&sub) }.render();
-    assert_eq!(w.s3.get(&sub_key).as_deref(), Some(sub.as_slice()), "the subagent file by its own sha256");
+    assert_eq!(w.s3.get(&main_key).as_deref(), Some(gz(&main_bytes).as_slice()));
+    let sub_key = gz_key(&sub);
+    assert_eq!(w.s3.get(&sub_key).as_deref(), Some(gz(&sub).as_slice()), "the subagent file by its own stored bytes' sha256");
     let m = w.manifest().expect("the manifest");
     assert_eq!((m.origin.as_str(), m.gen, m.committed, m.parts.len(), m.files.len()), (manifest::ORIGIN_MAC, 0, main_bytes.len() as u64, 1, 1));
     assert_eq!((m.parts[0].key.as_str(), m.fp.as_str()), (main_key.as_str(), sha(&main_bytes).as_str()), "a file under FP_SPAN: its fingerprint is its sha256");
@@ -560,7 +613,7 @@ fn an_upload_cut_after_an_object_never_sends_it_again() {
     let main_key = S3Key::Mac { session: SID.into(), sha256: digests[0].sha256.clone() }.render();
     w.s3.put(&main_key, &std::fs::read(chat.main_path(SID)).unwrap());
     let client = w.client();
-    let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-18T09:00:00.000Z")).unwrap();
+    let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-18T09:00:00.000Z", None)).unwrap();
     assert!(up.existed && w.paths.transcript_dir(SID).is_dir(), "{up:?}");
     let puts: Vec<String> = w.s3.requests().iter().filter(|r| r.method == "PUT").map(|r| r.key.clone()).collect();
     assert_eq!(puts, vec![S3Key::Mac { session: SID.into(), sha256: digests[1].sha256.clone() }.render()], "only the subtree file went up");
@@ -585,7 +638,7 @@ fn a_subtree_file_over_the_part_length_goes_up_in_its_digested_parts() {
     let digests = s3stage::scan_chat(&Rules::defaults(), &chat, part).unwrap();
     assert_eq!(digests[1].parts.len(), 4, "four parts of at most 1 MiB");
     let client = w.client();
-    let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-18T09:00:00.000Z")).unwrap();
+    let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-18T09:00:00.000Z", None)).unwrap();
     let key = S3Key::Mac { session: SID.into(), sha256: sha(&big) }.render();
     assert_eq!(w.s3.get(&key).as_deref(), Some(big.as_slice()), "the big file's bytes, whole");
     assert_eq!(up.manifest.files[0].key, key);
@@ -599,7 +652,7 @@ fn closed_mac_chat(w: &World) -> String {
     let key = S3Key::Mac { session: SID.into(), sha256: "a".repeat(64) }.render();
     w.s3.put(&key, b"the chat");
     let mut m = Manifest::new(SID, &w.target, manifest::ORIGIN_MAC, &format!("{SLUG}/{SID}.jsonl"), "2026-01-01T00:00:00Z");
-    m.parts.push(manifest::ManifestPart { key: key.clone(), version_id: "fv1".into(), from: 0, len: 8, sha256: "a".repeat(64) });
+    m.parts.push(manifest::ManifestPart { key: key.clone(), version_id: "fv1".into(), from: 0, len: 8, sha256: "a".repeat(64), encoding: None, stored_len: None, stored_sha256: None });
     m.committed = 8;
     w.rt().block_on(async {
         let _h = manifest::lock(&w.paths, SID).await.unwrap();
@@ -718,7 +771,7 @@ fn migrate_s9_never_takes_an_s9_chat_for_a_mirror() {
     assert_eq!(mirrors(&w.paths, &w.projects).unwrap().len(), 1, "an S8 mirror");
     // A manifest of a Mac-begun chat (staged, its view not built): no mirror, and never migrated.
     let mut m = Manifest::new(SID, &w.target, manifest::ORIGIN_MAC, &format!("{SLUG}/{SID}.jsonl"), "2026-10-18T09:00:00.000Z");
-    m.parts.push(manifest::ManifestPart { key: S3Key::Mac { session: SID.into(), sha256: sha(&file) }.render(), version_id: "fv1".into(), from: 0, len: file.len() as u64, sha256: sha(&file) });
+    m.parts.push(manifest::ManifestPart { key: S3Key::Mac { session: SID.into(), sha256: sha(&file) }.render(), version_id: "fv1".into(), from: 0, len: file.len() as u64, sha256: sha(&file), encoding: None, stored_len: None, stored_sha256: None });
     m.committed = file.len() as u64;
     manifest::write(&w.paths, &m).unwrap();
     assert!(mirrors(&w.paths, &w.projects).unwrap().is_empty(), "a manifest: not a mirror");
@@ -745,19 +798,74 @@ fn put_object_is_immutable_and_checked() {
     std::fs::write(&tmp, &bytes).unwrap();
     let client = w.client();
     let body = || Body::File { path: tmp.clone(), offset: 0, len: bytes.len() as u64 };
-    let w1 = w.rt().block_on(client.put_object(&key, body(), bytes.len() as u64, &sha)).unwrap();
+    let w1 = w.rt().block_on(client.put_object(&key, body(), bytes.len() as u64, &sha, None)).unwrap();
     assert!(matches!(w1, Written::Stored(ref v) if !v.is_empty()), "{w1:?}");
     assert_eq!(w.s3.get(&key).as_deref(), Some(bytes.as_slice()));
-    let again = w.rt().block_on(client.put_object(&key, body(), bytes.len() as u64, &sha)).unwrap();
+    let again = w.rt().block_on(client.put_object(&key, body(), bytes.len() as u64, &sha, None)).unwrap();
     assert_eq!(again, Written::Exists, "If-None-Match: * over a current version is 412");
     let bad = S3Key::Base { session: SID.into(), gen: 2 }.render();
-    let err = w.rt().block_on(client.put_object(&bad, body(), bytes.len() as u64, &"b".repeat(64))).unwrap_err();
+    let err = w.rt().block_on(client.put_object(&bad, body(), bytes.len() as u64, &"b".repeat(64), None)).unwrap_err();
     match err {
         BridgeError::S3 { op: "put", status: 400, code } => assert_eq!(code.as_deref(), Some("BadDigest")),
         other => panic!("not a BadDigest: {other:?}"),
     }
     // The requests the fake S3 recorded carry the signed owner header, never a credential value.
     assert!(w.s3.requests().iter().all(|r| r.signed_headers.iter().any(|h| h == "x-amz-expected-bucket-owner")));
+}
+
+/// S11 (L5): the fake S3 keeps a PutObject's `content-encoding` with its
+/// version and a CreateMultipartUpload's with the version its Complete
+/// makes, and a GET answers it (the bytes as stored); `NoContentEncoding`
+/// takes the next GET's away (a PUT before it leaves it queued); an object
+/// stored without one is answered without one.
+#[tokio::test]
+async fn the_fake_s3_keeps_and_serves_content_encoding() {
+    let s3 = FakeS3::start();
+    let gz = b"\x1f\x8b stored as gzip".to_vec();
+    let owner = || ("x-amz-expected-bucket-owner", LAB_OWNER.to_string());
+    let put = |key: &str| s3.presign("PUT", key, &[], &[], std::time::Duration::from_secs(300));
+    let get = |key: &str| s3.presign("GET", key, &[], &[], std::time::Duration::from_secs(300));
+    let encoded = |hs: &[(String, String)]| hs.iter().find(|(k, _)| k == "content-encoding").map(|(_, v)| v.clone());
+    // A PutObject with its content-encoding, and one without.
+    let (st, _, _) = http("PUT", &put("v1/enc/one"), &[owner(), ("content-length", gz.len().to_string()), ("content-encoding", "gzip".into())], &gz).await;
+    assert_eq!(st, 200);
+    let (st, _, _) = http("PUT", &put("v1/enc/plain"), &[owner(), ("content-length", "5".into())], b"plain").await;
+    assert_eq!(st, 200);
+    let (st, hs, body) = http("GET", &get("v1/enc/one"), &[owner()], b"").await;
+    assert_eq!((st, encoded(&hs).as_deref(), body.as_slice()), (200, Some("gzip"), gz.as_slice()), "served as stored, with its encoding");
+    let (st, hs, _) = http("GET", &get("v1/enc/plain"), &[owner()], b"").await;
+    assert_eq!((st, encoded(&hs)), (200, None));
+    // A multipart upload: the encoding of its CreateMultipartUpload.
+    let create = s3.presign("POST", "v1/enc/multi", &[("uploads", "")], &[], std::time::Duration::from_secs(300));
+    let (st, _, body) = http("POST", &create, &[owner(), ("content-length", "0".into()), ("content-encoding", "gzip".into())], b"").await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let id = text.split_once("<UploadId>").and_then(|(_, r)| r.split_once("</UploadId>")).map(|(v, _)| v.to_string()).expect("an upload id");
+    let part = s3.presign("PUT", "v1/enc/multi", &[("partNumber", "1"), ("uploadId", id.as_str())], &[], std::time::Duration::from_secs(300));
+    let (st, hs, _) = http("PUT", &part, &[owner(), ("content-length", gz.len().to_string())], &gz).await;
+    assert_eq!(st, 200);
+    let tag = hs.iter().find(|(k, _)| k == "etag").map(|(_, v)| v.clone()).expect("an etag");
+    let done = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{tag}</ETag></Part></CompleteMultipartUpload>");
+    let complete = s3.presign("POST", "v1/enc/multi", &[("uploadId", id.as_str())], &[], std::time::Duration::from_secs(300));
+    let (st, _, body) = http("POST", &complete, &[owner(), ("content-length", done.len().to_string())], done.as_bytes()).await;
+    assert_eq!(st, 200, "{}", String::from_utf8_lossy(&body));
+    let (st, hs, body) = http("GET", &get("v1/enc/multi"), &[owner()], b"").await;
+    assert_eq!((st, encoded(&hs).as_deref(), body.as_slice()), (200, Some("gzip"), gz.as_slice()));
+    let objects = s3.objects();
+    let of = |key: &str| objects.iter().find(|o| o.key == key).and_then(|o| o.content_encoding.clone());
+    assert_eq!((of("v1/enc/one").as_deref(), of("v1/enc/plain"), of("v1/enc/multi").as_deref()), (Some("gzip"), None, Some("gzip")));
+    // NoContentEncoding: a PUT leaves it queued, the next GET answers without the header, the one after with it.
+    s3.script(vec![S3Action::NoContentEncoding]);
+    let (st, _, _) = http("PUT", &put("v1/enc/two"), &[owner(), ("content-length", "3".into())], b"two").await;
+    assert_eq!(st, 200);
+    let (st, hs, body) = http("GET", &get("v1/enc/one"), &[owner()], b"").await;
+    assert_eq!((st, encoded(&hs), body.as_slice()), (200, None, gz.as_slice()), "the header dropped, the bytes as stored");
+    let (st, hs, _) = http("GET", &get("v1/enc/one"), &[owner()], b"").await;
+    assert_eq!((st, encoded(&hs).as_deref()), (200, Some("gzip")));
+    // A planted encoded object is answered the same way.
+    s3.put_encoded("v1/enc/planted", &gz, "gzip");
+    let (_, hs, _) = http("GET", &get("v1/enc/planted"), &[owner()], b"").await;
+    assert_eq!(encoded(&hs).as_deref(), Some("gzip"));
 }
 
 // ---- the VM in miniature: the transcript routes as G5's shim answers them ----
@@ -786,13 +894,19 @@ struct VmSt {
     subtree_too_large: bool,
     /// A push of this rel is refused by S3 (403 AccessDenied), as a file push that fails.
     refused_rel: Option<String>,
+    /// S11: each pulled part's `encoding`, in order.
+    pull_encodings: Vec<Option<PartEncoding>>,
 }
 
 /// G5's shim as the Mac sees it: every request checked as the shim checks
 /// it; a push PUTs the asked range to its presigned URL as curl does (its
 /// length, its signed checksum, `If-None-Match: *`, the owner) and relays
 /// S3's status, `<Code>` and version; a pull GETs each part (the owner),
-/// checks its length and sha256 and writes nothing unless all passed.
+/// checks its length and sha256 and writes nothing unless all passed. S11
+/// (L5, a 13.0 shim): a part whose `encoding` is `gzip` is decoded when S3
+/// answered `Content-Encoding: gzip` (`/usr/bin/gzip -dc`, as the image's
+/// curl with `compressed`; without the header it is not decoded, as curl),
+/// and its checks and report are the decoded bytes'.
 struct FakeVm {
     rel: String,
     st: Mutex<VmSt>,
@@ -906,7 +1020,11 @@ impl DataPlane for FakeVm {
         let old_size = old.as_ref().map_or(0, |b| b.len() as u64);
         let (mut out, mut reports) = (Vec::new(), Vec::new());
         for p in &req.parts {
-            let (status, _, body) = http("GET", p.url.expose(), &[("x-amz-expected-bucket-owner", req.owner.clone())], &[]).await;
+            self.st.lock().unwrap().pull_encodings.push(p.encoding);
+            let (status, hs, body) = http("GET", p.url.expose(), &[("x-amz-expected-bucket-owner", req.owner.clone())], &[]).await;
+            let encoded = hs.iter().any(|(k, v)| k == "content-encoding" && v == "gzip");
+            // curl's `compressed`: a stream it cannot decode fails the part (nothing written).
+            let body = if status == 200 && encoded && p.encoding == Some(PartEncoding::Gzip) { gunzip(&body).unwrap_or_default() } else { body };
             let got = sha(&body);
             let ok = status == 200 && body.len() as u64 == p.len && p.sha256.as_ref().is_none_or(|s| *s == got);
             reports.push(PullPartReport { s3_status: status, len: body.len() as u64, sha256: got, ok });
@@ -1000,9 +1118,17 @@ impl Remote {
     }
 
     /// [`Remote::restore`] under `deadline`: generation 1's P3 has one (T0 + 50 s), a resume miss's retry and
-    /// `session stage --warm` none.
+    /// `session stage --warm` none. S11 (L5): on a VM that names `transcript_gzip_v1` beside `transcript_s3_v1` for a
+    /// gzip-staged chat (its manifest encoded: P0's `caps_required` picks such a VM), else `transcript_s3_v1` alone.
     fn restore_within(&self, build: s3stage::ViewBuilder<'_>, deadline: Option<tokio::time::Instant>) -> Result<TranscriptOutcome, BridgeError> {
-        let caps = vec![CAP_TRANSCRIPT_S3_V1.to_string()];
+        let gzip = manifest::read(&self.w.paths, SID).ok().flatten().is_some_and(|m| m.encoded());
+        let caps: Vec<String> = if gzip { vec![CAP_TRANSCRIPT_S3_V1.into(), CAP_TRANSCRIPT_GZIP_V1.into()] } else { vec![CAP_TRANSCRIPT_S3_V1.into()] };
+        self.restore_on(build, deadline, &caps)
+    }
+
+    /// [`Remote::restore_within`] on a VM whose caps are `caps`.
+    fn restore_on(&self, build: s3stage::ViewBuilder<'_>, deadline: Option<tokio::time::Instant>, caps: &[String]) -> Result<TranscriptOutcome, BridgeError> {
+        let caps = caps.to_vec();
         let progress = |_| {};
         let ctx = EnsureCtx {
             api: &self.api,
@@ -1458,7 +1584,7 @@ fn a_reopen_pulls_at_most_the_inline_cap_and_the_retry_any_size() {
     let base_key = r.key_of(S3Key::Base { session: SID.into(), gen: 1 });
     let manifest = |len: u64, version: &str, sha256: &str, fp: &str| {
         let mut m = Manifest::new(SID, &r.w.target, manifest::ORIGIN_VM, &format!("{SLUG}/{SID}.jsonl"), "2026-10-18T09:00:00.000Z");
-        m.parts.push(manifest::ManifestPart { key: base_key.clone(), version_id: version.into(), from: 0, len, sha256: sha256.into() });
+        m.parts.push(manifest::ManifestPart { key: base_key.clone(), version_id: version.into(), from: 0, len, sha256: sha256.into(), encoding: None, stored_len: None, stored_sha256: None });
         (m.gen, m.committed, m.fp) = (1, len, fp.into());
         manifest::write(&r.w.paths, &m).unwrap();
     };
@@ -1781,11 +1907,11 @@ async fn the_five_transfer_requests_go_as_the_shim_reads_them() {
     assert_eq!((got.status, got.body), (200, Some(push_reply)));
     // POST /transcript/pull (201)
     let get = presign(ai_env_cli::bridge::s3::S3Method::Get, S3Key::Base { session: SID.into(), gen: 1 }.render(), Vec::new());
-    let pull = TranscriptPull { rel: rel.clone(), parts: vec![ai_env_cli::wire::workspace::PullPart { url: get, len: 3787, sha256: Some("b".repeat(64)) }], sha256: None, owner: LAB_OWNER.into(), proxy: None, share: 1 };
+    let pull = TranscriptPull { rel: rel.clone(), parts: vec![ai_env_cli::wire::workspace::PullPart { url: get, len: 3787, sha256: Some("b".repeat(64)), encoding: None }], sha256: None, owner: LAB_OWNER.into(), proxy: None, share: 1 };
     let got = dp.transcript_pull(&agent, &token, &pull).await.unwrap();
     assert_eq!((got.status, got.body), (201, Some(pull_reply)));
     // GET /transcript/view?rel=&n=
-    let got = dp.transcript_view(&agent, &token, &ViewQuery { rel: rel.clone(), n: 10 }).await.unwrap();
+    let got = dp.transcript_view(&agent, &token, &ViewQuery { rel: rel.clone(), n: 10, parent: false }).await.unwrap();
     assert_eq!((got.status, got.body), (200, Some(example())));
     // POST /transcript/tail: 204, nothing to parse.
     let tail_key = S3Key::Tail { session: SID.into(), gen: 1, offset: 52000 }.render();
@@ -1794,7 +1920,7 @@ async fn the_five_transfer_requests_go_as_the_shim_reads_them() {
     let got = dp.transcript_tail(&agent, &token, &tail).await.unwrap();
     assert_eq!((got.status, got.body), (204, None));
     // A 404: the image lacks transcript_s3_v1 (exit 7).
-    let got = dp.transcript_view(&agent, &token, &ViewQuery { rel: rel.clone(), n: 10 }).await.unwrap();
+    let got = dp.transcript_view(&agent, &token, &ViewQuery { rel: rel.clone(), n: 10, parent: false }).await.unwrap();
     assert_eq!(got.status, 404);
     match verdict_cap("GET /transcript/view", APP_PORT, CAP_TRANSCRIPT_S3_V1, &got) {
         Verdict::Fail(e @ BridgeError::NoCapability { .. }) => assert_eq!(ai_env_cli::errors::CliError::from(e).exit_code(), 7),
@@ -1852,7 +1978,7 @@ async fn a_subtree_files_tail_is_refused_before_any_request() {
     let m = config(dp.transcript_tail(&agent, &token, &tail).await.err());
     assert!(m.starts_with("POST /transcript/tail: the request") && m.contains("a tail is only ever the session's main transcript"), "{m}");
     let file = S3Key::File { session: SID.into(), sha256: "d".repeat(64) };
-    let parts = vec![PullPart { url: presign(S3Method::Get, file, Vec::new()), len: 4096, sha256: Some("d".repeat(64)) }, PullPart { url: presign(S3Method::Get, tail_key, Vec::new()), len: 10, sha256: None }];
+    let parts = vec![PullPart { url: presign(S3Method::Get, file, Vec::new()), len: 4096, sha256: Some("d".repeat(64)), encoding: None }, PullPart { url: presign(S3Method::Get, tail_key, Vec::new()), len: 10, sha256: None, encoding: None }];
     let pull = TranscriptPull { rel: sub, parts, sha256: None, owner: LAB_OWNER.into(), proxy: None, share: 1 };
     let m = config(dp.transcript_pull(&agent, &token, &pull).await.err());
     assert!(m.starts_with("POST /transcript/pull: the request") && m.contains("a tail (part number 1)"), "{m}");
@@ -2207,8 +2333,11 @@ mod followups {
 
     /// The stall wait of these tests (the contract's is a minute); the
     /// answer's waits stay the contract's, which no answer of the fake S3
-    /// (a debug build hashing what it stores) ever nears.
-    const STALL: Waits = Waits { stall: Duration::from_millis(500), ..Waits::DEFAULT };
+    /// (a debug build hashing what it stores) ever nears. Two seconds: the
+    /// other part (16 MiB through that debug build) is stored while the
+    /// stalled one's three tries run, even on a loaded machine (S11's gate
+    /// once saw it still in flight after three tries of 500 ms).
+    const STALL: Waits = Waits { stall: Duration::from_secs(2), ..Waits::DEFAULT };
 
     /// A transcript of `n` lines of 1 MiB at `<SLUG>/<SID>.jsonl`, digested in `part`-byte parts: its path, digest and key.
     fn chat_of(w: &World, n: usize, part: u64) -> (PathBuf, FileDigest, String) {
@@ -2251,7 +2380,7 @@ mod followups {
         let text = e.to_string();
         let sent = text.strip_prefix(&format!("aws s3 upload part: part 1 of {key}: no answer in 3 tries: sent ")).unwrap_or_else(|| panic!("{text}"));
         let (n, rest) = sent.split_once(' ').unwrap();
-        assert!(n.parse::<u64>().is_ok_and(|n| n < part) && rest == format!("of {part} bytes, no progress for 500 ms"), "{text}");
+        assert!(n.parse::<u64>().is_ok_and(|n| n < part) && rest == format!("of {part} bytes, no progress for 2 s"), "{text}");
         for never in ["http", &w.s3.addr().to_string(), LAB_BUCKET, "X-Amz", "redacted"] {
             assert!(!text.contains(never), "{never:?} in {text}");
         }
@@ -2278,7 +2407,7 @@ mod followups {
         let body = line("one turn", 4096);
         let file = w._tmp.path().join("body");
         std::fs::write(&file, &body).unwrap();
-        let put = |key: &str| w.rt().block_on(client.put_object(key, Body::File { path: file.clone(), offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body)));
+        let put = |key: &str| w.rt().block_on(client.put_object(key, Body::File { path: file.clone(), offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body), None));
         let base = S3Key::Base { session: SID.into(), gen: 1 }.render();
         w.s3.script_put(vec![S3Action::Status { status: 409, code: "OperationAborted" }, S3Action::Status { status: 409, code: "ConditionalRequestConflict" }]);
         assert!(matches!(put(&base).unwrap(), Written::Stored(_)));
@@ -2314,7 +2443,7 @@ mod followups {
         let key = S3Key::Base { session: SID.into(), gen: 1 }.render();
         w.s3.script_put(vec![S3Action::Silent]);
         let t = std::time::Instant::now();
-        let stored = w.rt().block_on(client.put_object(&key, Body::File { path: file, offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body))).unwrap();
+        let stored = w.rt().block_on(client.put_object(&key, Body::File { path: file, offset: 0, len: body.len() as u64 }, body.len() as u64, &sha(&body), None)).unwrap();
         assert!(matches!(stored, Written::Stored(_)) && t.elapsed() >= Duration::from_secs(1), "{stored:?} in {:?}", t.elapsed());
         assert_eq!(statuses(&w, |r| r.method == "PUT"), [0, 200]);
         assert_eq!(w.s3.get(&key).as_deref(), Some(body.as_slice()));
@@ -2372,14 +2501,14 @@ mod followups {
         let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
         let digests = s3stage::scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
         let client = w.client();
-        let fast = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z")).unwrap();
+        let fast = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z", None)).unwrap();
         assert!(!fast.slow && fast.sent == main.len() as u64, "{fast:?}");
         let w = World::new(FakeS3::start());
         w.plant(&format!("{SID}.jsonl"), &main);
         let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
         w.s3.script_put(vec![S3Action::Delay(Duration::from_millis(2600))]);
         let client = w.client();
-        let slow = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z")).unwrap();
+        let slow = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-20T09:00:00.000Z", None)).unwrap();
         assert!(slow.slow && slow.ms >= 2600 && slow.rate() < ai_env_cli::bridge::dataplane::MIN_RATE, "{slow:?}");
         assert_eq!(slow.rate(), slow.sent * 1000 / slow.ms);
     }
@@ -2404,7 +2533,7 @@ mod followups {
             w.s3.script_part(n, vec![S3Action::Throttle { per_s: 256 << 10 }]);
         }
         let client = w.client();
-        let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-20T09:00:00.000Z")).unwrap();
+        let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-20T09:00:00.000Z", None)).unwrap();
         assert!(up.ms > 3000 && up.sent == bytes.len() as u64 && up.parts == 8, "{up:?}");
         assert!(!up.slow && up.rate() > ai_env_cli::bridge::dataplane::MIN_RATE, "{up:?}");
         assert_eq!(w.s3.get(&up.key).as_deref(), Some(bytes.as_slice()));
@@ -2419,7 +2548,8 @@ mod followups {
         let (w, repo) = World::new(FakeS3::start()).with_workspace();
         let main = [cwd_line(&repo), line("turn 0", 300)].concat();
         w.plant(&format!("{SID}.jsonl"), &main);
-        w.s3.put(&S3Key::Mac { session: SID.into(), sha256: sha(&main) }.render(), &main);
+        // S11: what the stage would store, held already.
+        w.s3.put_encoded(&gz_key(&main), &gz(&main), "gzip");
         let unseal = || async { Ok(FakeMicrovmApi::new()) };
         let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, MULTIPART_PART, &builder, unseal)).unwrap();
         assert_eq!((report.outcome, report.rate), ("staged", None));
@@ -2432,7 +2562,7 @@ mod followups {
     /// workspace (`<HOME>/.claude/projects/<slug>/<sid>.jsonl`, three user
     /// lines naming the work directory) and `subagents` subagent files: the
     /// chat's bytes.
-    fn rig_chat(p: &common::Prepared, sid: &str, subagents: usize) -> Vec<u8> {
+    pub(super) fn rig_chat(p: &common::Prepared, sid: &str, subagents: usize) -> Vec<u8> {
         let cwd = p.work();
         let lines: Vec<String> = (0..3).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0xa110 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("turn {i}")}}).to_string()).collect();
         let main = p.plant_transcript(sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
@@ -2515,7 +2645,7 @@ mod followups {
             let key = S3Key::Mac { session: sid.clone(), sha256: sha(sid.as_bytes()) }.render();
             rig.s3().put(&key, sid.as_bytes());
             let mut m = Manifest::new(sid, &target, manifest::ORIGIN_MAC, &format!("{SLUG}/{sid}.jsonl"), "2026-10-01T00:00:00Z");
-            m.parts.push(manifest::ManifestPart { key: key.clone(), version_id: "fv1".into(), from: 0, len: 36, sha256: sha(sid.as_bytes()) });
+            m.parts.push(manifest::ManifestPart { key: key.clone(), version_id: "fv1".into(), from: 0, len: 36, sha256: sha(sid.as_bytes()), encoding: None, stored_len: None, stored_sha256: None });
             m.committed = 36;
             rt.block_on(async {
                 let _h = manifest::lock(&paths, sid).await.unwrap();
@@ -2922,5 +3052,402 @@ mod moved_chats {
         assert_eq!(h.audit_events("transcript_push").len(), pushes, "nothing pushed from the first VM: {:?}", h.audit_events("transcript_push"));
         assert_eq!(manifest::read(&paths, &sid).unwrap().expect("the manifest"), moved, "S3's manifest as the second VM left it");
         assert!(rig.s3().get(&S3Key::Base { session: sid.clone(), gen: moved.gen + 1 }.render()).is_none(), "no new base from the first VM's shorter copy");
+    }
+}
+
+// ---- S11 (L5, plans/s11-contracts-C.md §C.3, C4): the compressed stage ----
+
+mod gzip_stage {
+    use super::*;
+    use ai_env_cli::bridge::s3::manifest::{ManifestFile, ManifestPart};
+    use std::time::Duration;
+
+    /// A `with_workspace` world's chat: its main transcript (the cwd line,
+    /// then two turns) and one subagent file: their bytes.
+    fn chat(w: &World, repo: &Path) -> (Vec<u8>, Vec<u8>) {
+        let main = [cwd_line(repo), line("turn 0", 3000), line("turn 1", 3000)].concat();
+        w.plant(&format!("{SID}.jsonl"), &main);
+        let sub = line("subagent", 2000);
+        w.plant(&format!("{SID}/subagents/agent-a1.jsonl"), &sub);
+        (main, sub)
+    }
+
+    /// C.3.4: `session stage` stores every file gzip-encoded, by its stored
+    /// bytes' sha256: each PutObject, and the CreateMultipartUpload of a file
+    /// whose stored bytes need multipart, send and sign `content-encoding`;
+    /// its UploadParts and its Complete never do. S3 keeps the encoding with
+    /// each object, which holds the file's gzip (decoding to the file). The
+    /// manifest's entries keep the decoded `len` and `sha256` beside
+    /// `encoding`, `stored_len` and `stored_sha256`, and `committed` and `fp`
+    /// are the decoded bytes'; no spool is left.
+    #[test]
+    fn an_encoded_object_is_put_with_its_content_encoding() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (main, sub) = chat(&w, &repo);
+        let big = [noise_line(7, 900_000), noise_line(8, 900_000)].concat();
+        w.plant(&format!("{SID}/tool-results/big.txt"), &big);
+        assert!(gz(&big).len() > 1 << 20, "the big file needs multipart once stored");
+        let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap();
+        assert_eq!((report.outcome, report.key.clone()), ("staged", gz_key(&main)));
+        let objects = w.s3.objects();
+        for bytes in [&main, &sub, &big] {
+            let key = gz_key(bytes);
+            let o = objects.iter().find(|o| o.key == key && o.current).unwrap_or_else(|| panic!("{key}: {objects:?}"));
+            assert_eq!((o.content_encoding.as_deref(), o.sha256.clone()), (Some("gzip"), sha(&gz(bytes))), "{key}");
+            assert_eq!(gunzip(&w.s3.get(&key).unwrap()).as_deref(), Some(bytes.as_slice()), "{key} decodes to the file");
+        }
+        let signs = |r: &&fake_s3::S3Request| r.signed_headers.iter().any(|h| h == "content-encoding");
+        let reqs = w.s3.requests();
+        let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT" && r.part.is_none()).collect();
+        let parts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT" && r.part.is_some()).collect();
+        let creates: Vec<_> = reqs.iter().filter(|r| r.method == "POST" && r.query_names.iter().any(|n| n == "uploads")).collect();
+        let completes: Vec<_> = reqs.iter().filter(|r| r.method == "POST" && r.query_names.iter().any(|n| n == "uploadId")).collect();
+        assert_eq!((puts.len(), parts.len(), creates.len(), completes.len()), (2, 2, 1, 1), "{reqs:?}");
+        assert!(puts.iter().chain(&creates).all(|r| signs(r) && r.status == 200), "{reqs:?}");
+        assert!(parts.iter().chain(&completes).all(|r| !signs(r) && r.status == 200), "{reqs:?}");
+        let m = w.manifest().unwrap();
+        let p = &m.parts[0];
+        let stored = gz(&main);
+        assert_eq!((p.key.clone(), p.len, p.sha256.clone(), p.encoding, p.stored_len, p.stored_sha256.clone()), (gz_key(&main), main.len() as u64, sha(&main), Some(PartEncoding::Gzip), Some(stored.len() as u64), Some(sha(&stored))));
+        for (bytes, rel) in [(&sub, "subagents/agent-a1.jsonl"), (&big, "tool-results/big.txt")] {
+            let f = m.files.iter().find(|f| f.rel == format!("{SLUG}/{SID}/{rel}")).unwrap_or_else(|| panic!("{rel}: {m:?}"));
+            let stored = gz(bytes);
+            assert_eq!((f.key.clone(), f.len, f.sha256.clone(), f.encoding, f.stored_len, f.stored_sha256.clone()), (gz_key(bytes), bytes.len() as u64, sha(bytes), Some(PartEncoding::Gzip), Some(stored.len() as u64), Some(sha(&stored))), "{rel}");
+        }
+        assert_eq!((m.committed, m.fp.clone()), (main.len() as u64, manifest::fp_of(&main)), "the decoded bytes'");
+        assert!(!w.paths.transcript_spool(SID).exists(), "no spool left");
+    }
+
+    /// C.3.4: a gzip stage cut mid-upload resumes with the same key. Its
+    /// `stage.toml` names the stored bytes (their key, length and sha256),
+    /// and its spool went with the failed run; the next run makes the spool
+    /// again (a leftover of that name, a cut run's, is never trusted): the
+    /// same bytes, the same key, the same upload (no second
+    /// CreateMultipartUpload), only the part S3 lacked sent again.
+    #[test]
+    fn a_cut_gzip_stage_resumes_with_the_same_key() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let bytes = [cwd_line(&repo), noise_line(3, 1_630_000), noise_line(4, 1_630_000), noise_line(5, 1_630_000)].concat();
+        w.plant(&format!("{SID}.jsonl"), &bytes);
+        let (stored, key) = (gz(&bytes), gz_key(&bytes));
+        assert_eq!(stored.len().div_ceil(1 << 20), 4, "four parts once stored");
+        w.s3.script_part(2, vec![S3Action::Status { status: 500, code: "InternalError" }; 3]);
+        let stage = || w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, || async { Ok(FakeMicrovmApi::new()) }));
+        let first = stage();
+        assert!(matches!(first, Err(BridgeError::S3 { status: 500, .. })), "{first:?}");
+        let saved = s3stage::read_stage(&w.paths, SID).unwrap().expect("the stage file");
+        assert_eq!((saved.key.as_str(), saved.len, saved.sha256.as_str()), (key.as_str(), stored.len() as u64, sha(&stored).as_str()), "the stored bytes'");
+        assert_eq!(saved.parts.iter().map(|p| p.number).collect::<Vec<_>>(), [1, 3, 4]);
+        let spool = w.paths.transcript_spool(SID).join("0.gz");
+        assert!(!spool.exists(), "the failed run's spool went with it");
+        std::fs::write(&spool, b"a cut run's spool, never trusted").unwrap();
+        let from = w.s3.requests().len();
+        let again = stage().unwrap();
+        assert_eq!((again.outcome, again.key.as_str(), again.parts), ("resumed", key.as_str(), 4));
+        let run2 = w.s3.requests()[from..].to_vec();
+        assert_eq!(run2.iter().filter_map(|r| r.part).collect::<Vec<_>>(), [2], "the part S3 lacked, alone: {run2:?}");
+        assert_eq!(w.s3.requests().iter().filter(|r| r.method == "POST" && r.query_names.iter().any(|n| n == "uploads")).count(), 1, "one upload across both runs");
+        assert_eq!(w.s3.get(&key).as_deref(), Some(stored.as_slice()), "S3 holds the chat's gzip");
+        assert!(w.s3.objects().iter().any(|o| o.key == key && o.content_encoding.as_deref() == Some("gzip")));
+        assert!(!w.paths.transcript_spool(SID).exists(), "no spool left");
+        assert_eq!(w.manifest().unwrap().parts[0].stored_sha256.as_deref(), Some(sha(&stored).as_str()));
+    }
+
+    /// C.3.4: the bytes gzip is fed are the scan's or nothing goes. A main
+    /// transcript one byte other since the scan is refused before any write
+    /// (`changed`, exit 1); a subtree file shorter since, after the main
+    /// went up, with nothing of that file sent. No spool is left.
+    #[test]
+    fn a_file_changed_between_the_scan_and_gzip_is_refused() {
+        let w = World::new(FakeS3::start());
+        let main = [line("turn 0", 4000), line("turn 1", 4000)].concat();
+        let main_path = w.plant(&format!("{SID}.jsonl"), &main);
+        let sub = line("subagent", 3000);
+        let sub_path = w.plant(&format!("{SID}/subagents/agent-a1.jsonl"), &sub);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        let digests = s3stage::scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
+        let client = w.client();
+        let upload = || w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-23T10:00:00.000Z", Some(PartEncoding::Gzip)));
+        let refused = |rel: &str| format!("workspace failed (changed): the chat changed while it was staged: {rel} is not the bytes the scan read; nothing of it was sent (ai-env session stage {SID} again once the chat is closed)");
+        let mut other = main.clone();
+        other[100] = b'y';
+        std::fs::write(&main_path, &other).unwrap();
+        let e = upload().unwrap_err();
+        assert_eq!(e.to_string(), refused(&format!("{SID}.jsonl")));
+        assert_eq!(ai_env_cli::errors::CliError::from(e).exit_code(), 1);
+        assert!(w.s3.requests().iter().all(|r| r.method == "GET"), "nothing written: {:?}", w.s3.requests());
+        std::fs::write(&main_path, &main).unwrap();
+        std::fs::write(&sub_path, &sub[..1000]).unwrap();
+        let e = upload().unwrap_err();
+        assert_eq!(e.to_string(), refused(&format!("{SID}/subagents/agent-a1.jsonl")));
+        let puts: Vec<String> = w.s3.requests().iter().filter(|r| r.method != "GET").map(|r| r.key.clone()).collect();
+        assert_eq!(puts, [gz_key(&main)], "the main went, nothing of the subagent file");
+        assert!(w.s3.objects().iter().all(|o| o.key == gz_key(&main)));
+        assert!(std::fs::read_dir(w.paths.transcript_spool(SID)).map_or(true, |d| d.count() == 0), "no spool left");
+    }
+
+    /// One upload of a session at a time (its spools, `<n>.gz`, and its
+    /// `stage.toml` are the session's): while another holds the session's
+    /// upload lock, an upload is refused (`Busy`, exit 1) before any write
+    /// and leaves no spool; once it is let go, the upload runs.
+    #[test]
+    fn a_second_upload_of_a_session_is_refused_while_one_runs() {
+        let w = World::new(FakeS3::start());
+        let main = line("turn 0", 4000);
+        w.plant(&format!("{SID}.jsonl"), &main);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        let digests = s3stage::scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
+        let client = w.client();
+        let upload = || w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-23T10:00:00.000Z", Some(PartEncoding::Gzip)));
+        let lock = s3stage::upload_lock(&w.paths, SID);
+        assert_eq!(lock, w.paths.transcript_dir(SID).join("upload.lock"));
+        let held = ai_env_cli::bridge::vm::lock::try_lock_exclusive(&lock).unwrap().expect("nobody holds it");
+        let e = upload().unwrap_err();
+        assert_eq!(e.to_string(), format!("busy: another upload of {SID} is under way (it holds {}); nothing was sent", lock.display()));
+        assert_eq!(ai_env_cli::errors::CliError::from(e).exit_code(), 1);
+        assert!(w.s3.requests().iter().all(|r| r.method == "GET"), "nothing written: {:?}", w.s3.requests());
+        assert!(!w.paths.transcript_spool(SID).exists(), "no spool made");
+        drop(held);
+        let up = upload().unwrap();
+        assert_eq!((up.key, w.s3.get(&gz_key(&main))), (gz_key(&main), Some(gz(&main))));
+        assert!(ai_env_cli::bridge::vm::lock::try_lock_exclusive(&lock).unwrap().is_some(), "let go once the upload ended");
+    }
+
+    /// C.3.4 step 6: the main goes alone, first; then the subtree's files go
+    /// up `SUBTREE_PARALLEL` (8) at a time, gzip or identity alike (the fake
+    /// S3 holds each PutObject 300 ms, so those in flight overlap: never more
+    /// than 8); a file whose stored bytes need multipart goes alone, nothing
+    /// else in flight beside its parts. The manifest lists the files in the
+    /// chat's order.
+    #[test]
+    fn subtree_files_go_up_eight_at_a_time() {
+        use ai_env_cli::bridge::s3::stage::SUBTREE_PARALLEL;
+        assert_eq!(SUBTREE_PARALLEL, ai_env_cli::wire::s3::MULTIPART_PARALLEL);
+        for encoding in [Some(PartEncoding::Gzip), None] {
+            let w = World::new(FakeS3::start());
+            w.plant(&format!("{SID}.jsonl"), &line("main", 3000));
+            for i in 0..20 {
+                w.plant(&format!("{SID}/subagents/agent-{i:02}.jsonl"), &line(&format!("subagent {i}"), 2000 + i));
+            }
+            w.plant(&format!("{SID}/tool-results/big.txt"), &[noise_line(9, 900_000), noise_line(10, 900_000)].concat());
+            let part = 1u64 << 20;
+            let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+            let digests = s3stage::scan_chat(&Rules::defaults(), &chat, part).unwrap();
+            w.s3.script_put(vec![S3Action::Delay(Duration::from_millis(300)); 21]);
+            for n in 1..=2 {
+                w.s3.script_part(n, vec![S3Action::Delay(Duration::from_millis(300))]);
+            }
+            let client = w.client();
+            let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, part, "2026-10-23T10:00:00.000Z", encoding)).unwrap();
+            assert_eq!(w.s3.max_in_flight(), SUBTREE_PARALLEL, "{encoding:?}");
+            let flights = w.s3.flights();
+            assert_eq!(flights[..2], [(true, up.key.clone()), (false, up.key.clone())], "{encoding:?}: the main alone, first: {flights:?}");
+            let big = up.manifest.files.iter().find(|f| f.rel.ends_with("/tool-results/big.txt")).expect("the big file").key.clone();
+            let mut now: Vec<&str> = Vec::new();
+            for (start, key) in &flights {
+                if *start {
+                    now.push(key);
+                } else {
+                    now.remove(now.iter().position(|k| k == key).expect("a start before its end"));
+                }
+                assert!(!now.contains(&big.as_str()) || now.iter().all(|k| *k == big), "{encoding:?}: the multipart file goes alone: {now:?}");
+            }
+            assert_eq!(flights.iter().filter(|(start, key)| *start && *key == big).count(), 2, "{encoding:?}: its two parts");
+            let rels: Vec<String> = chat.files[1..].iter().map(|(rel, _)| format!("{SLUG}/{rel}")).collect();
+            assert_eq!(up.manifest.files.iter().map(|f| f.rel.clone()).collect::<Vec<_>>(), rels, "{encoding:?}: the chat's order");
+            assert!(up.manifest.files.iter().all(|f| f.encoding == encoding && f.version_id.is_some()), "{encoding:?}: {:?}", up.manifest.files);
+        }
+    }
+
+    /// C.3.7: P3's inline upload stores gzip only on a VM that decodes it. On
+    /// a VM of an older image (no `transcript_gzip_v1`) the chat goes as
+    /// S10's: identity objects, no encoded entry, the parts pulled with no
+    /// encoding, `transcript_stage` without `stored`. On one naming the cap
+    /// the objects are gzip with their `Content-Encoding`, the manifest
+    /// encoded, the VM's copy the decoded bytes (its subtree file too, after
+    /// the spawn), `transcript_stage` with `stored`; its reopen (the cap
+    /// named for a gzip-staged chat) keeps what the VM holds, and a VM that
+    /// holds nothing pulls it decoded.
+    #[test]
+    fn an_inline_upload_to_a_vm_without_the_cap_goes_as_identity() {
+        let chat = [line("mac 0", 3000), line("mac 1", 3000)].concat();
+        let sub = line("mac subagent", 2000);
+        let sub_rel = format!("{SLUG}/{SID}/subagents/a.jsonl");
+        let raw = (chat.len() + sub.len()) as u64;
+        let plant = |r: &Remote| {
+            r.w.plant(&format!("{SID}.jsonl"), &chat);
+            r.w.plant(&format!("{SID}/subagents/a.jsonl"), &sub);
+        };
+        // An older image's VM: identity.
+        let r = Remote::new();
+        plant(&r);
+        assert_eq!(r.restore_on(&builder, None, &[CAP_TRANSCRIPT_S3_V1.into()]).unwrap(), TranscriptOutcome::Staged { bytes: raw });
+        let m = r.w.manifest().unwrap();
+        assert!(!m.encoded(), "{m:?}");
+        assert_eq!((m.parts[0].key.clone(), r.w.s3.get(&m.parts[0].key)), (S3Key::Mac { session: SID.into(), sha256: sha(&chat) }.render(), Some(chat.clone())));
+        assert!(r.w.s3.objects().iter().all(|o| o.content_encoding.is_none()), "{:?}", r.w.s3.objects());
+        assert_eq!((r.vm.file().unwrap(), r.vm.st.lock().unwrap().pull_encodings.clone()), (chat.clone(), vec![None]));
+        let row = r.w.rows("transcript_stage")[0]["detail"].clone();
+        assert!(row.get("stored").is_none() && row["bytes"].as_str().and_then(|b| b.parse::<u64>().ok()) == Some(raw), "{row}");
+        // A VM naming the cap: gzip, pulled decoded.
+        let r = Remote::new();
+        plant(&r);
+        let caps = [CAP_TRANSCRIPT_S3_V1.to_string(), CAP_TRANSCRIPT_GZIP_V1.to_string()];
+        assert_eq!(r.restore_on(&builder, None, &caps).unwrap(), TranscriptOutcome::Staged { bytes: raw });
+        let m = r.w.manifest().unwrap();
+        assert!(m.encoded(), "{m:?}");
+        assert_eq!((m.parts[0].key.clone(), m.parts[0].len, m.parts[0].sha256.clone()), (gz_key(&chat), chat.len() as u64, sha(&chat)));
+        assert_eq!(r.w.s3.get(&m.parts[0].key), Some(gz(&chat)));
+        assert!(r.w.s3.objects().iter().all(|o| o.content_encoding.as_deref() == Some("gzip")), "{:?}", r.w.s3.objects());
+        assert_eq!((r.vm.file().unwrap(), r.vm.st.lock().unwrap().pull_encodings.clone()), (chat.clone(), vec![Some(PartEncoding::Gzip)]), "the decoded bytes");
+        let row = r.w.rows("transcript_stage")[0]["detail"].clone();
+        assert_eq!((row["bytes"].as_str(), row["stored"].as_str()), (Some(raw.to_string().as_str()), Some((gz(&chat).len() + gz(&sub).len()).to_string().as_str())), "{row}");
+        assert_eq!(r.restore_subtree().unwrap().pulled, 1);
+        assert_eq!(r.vm.st.lock().unwrap().subtree, vec![(sub_rel, sub.clone())], "the subtree file decoded");
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::KeptOnVm);
+        r.vm.set(|s| s.file = None);
+        assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1, bytes: chat.len() as u64 });
+        assert_eq!(r.vm.file().unwrap(), chat);
+        assert!(r.vm.st.lock().unwrap().pull_encodings.iter().all(|e| *e == Some(PartEncoding::Gzip)));
+    }
+
+    /// C.3.3, C.3.11: an S10 manifest (no encoded entry) reads and writes back
+    /// byte for byte, no `encoding` or `stored_` key in it (an S10 build
+    /// reads it), requires no capability of the VM, and restores on a VM
+    /// without `transcript_gzip_v1` as S10's did: its parts and its subtree
+    /// file pulled with no encoding, the VM holding their bytes.
+    #[test]
+    fn an_s10_manifest_round_trips_unchanged() {
+        let r = Remote::new();
+        let (base, seg, sub) = (line("turn 0", 3000), line("turn 1", 1000), line("sub", 500));
+        let base_key = S3Key::Base { session: SID.into(), gen: 1 }.render();
+        let seg_key = S3Key::Segment { session: SID.into(), gen: 1, offset: base.len() as u64 }.render();
+        let file_key = S3Key::File { session: SID.into(), sha256: sha(&sub) }.render();
+        let (v1, v2, v3) = (r.w.s3.put(&base_key, &base), r.w.s3.put(&seg_key, &seg), r.w.s3.put(&file_key, &sub));
+        let whole = [base.clone(), seg.clone()].concat();
+        let mut m = Manifest::new(SID, &r.w.target, manifest::ORIGIN_VM, &format!("{SLUG}/{SID}.jsonl"), "2026-10-20T10:00:00.000Z");
+        m.parts.push(ManifestPart { key: base_key, version_id: v1, from: 0, len: base.len() as u64, sha256: sha(&base), encoding: None, stored_len: None, stored_sha256: None });
+        m.parts.push(ManifestPart { key: seg_key, version_id: v2, from: base.len() as u64, len: seg.len() as u64, sha256: sha(&seg), encoding: None, stored_len: None, stored_sha256: None });
+        let sub_rel = format!("{SLUG}/{SID}/subagents/a.jsonl");
+        m.files.push(ManifestFile { rel: sub_rel.clone(), key: file_key, version_id: Some(v3), len: sub.len() as u64, sha256: sha(&sub), encoding: None, stored_len: None, stored_sha256: None });
+        (m.gen, m.committed, m.fp) = (1, whole.len() as u64, manifest::fp_of(&whole));
+        manifest::write(&r.w.paths, &m).unwrap();
+        let text = std::fs::read_to_string(r.w.paths.transcript_manifest(SID)).unwrap();
+        assert!(!text.contains("encoding") && !text.contains("stored_"), "S10's keys only: {text}");
+        let back = r.w.manifest().unwrap();
+        assert_eq!(back, m);
+        assert!(!back.encoded() && manifest::caps_required(&r.w.paths, SID).is_empty() && back.stored_bytes() == (whole.len() + sub.len()) as u64);
+        manifest::write(&r.w.paths, &back).unwrap();
+        assert_eq!(std::fs::read_to_string(r.w.paths.transcript_manifest(SID)).unwrap(), text, "written back byte for byte");
+        assert_eq!(r.restore_on(&builder, None, &[CAP_TRANSCRIPT_S3_V1.into()]).unwrap(), TranscriptOutcome::Restored { parts: 2, bytes: whole.len() as u64 });
+        assert_eq!(r.vm.file().unwrap(), whole);
+        assert_eq!(r.restore_subtree().unwrap().pulled, 1);
+        let st = r.vm.st.lock().unwrap();
+        assert_eq!((st.subtree.clone(), st.pull_encodings.clone()), (vec![(sub_rel, sub)], vec![None, None, None]), "pulled as S10's");
+    }
+
+    /// C.3.7: `session stage` reports its stored bytes (every file's gzip,
+    /// summed) beside the raw ones: the report's `stored`, the
+    /// `transcript_stage` row's `stored` (`bytes` the raw bytes, `rate` the
+    /// stored bytes'); staged again, `already` finds the encoded manifest
+    /// and reports the same `stored`. An identity upload's `stored` is its
+    /// raw bytes, no encoding.
+    #[test]
+    fn the_stage_reports_its_stored_bytes() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (main, sub) = chat(&w, &repo);
+        let (raw, stored) = ((main.len() + sub.len()) as u64, (gz(&main).len() + gz(&sub).len()) as u64);
+        assert!(stored < raw / 2, "{stored} of {raw}");
+        let stage = || w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, MULTIPART_PART, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap();
+        let report = stage();
+        assert_eq!((report.outcome, report.bytes, report.stored), ("staged", raw, Some(stored)));
+        let rows = w.rows("transcript_stage");
+        let d = &rows[0]["detail"];
+        assert_eq!((d["bytes"].as_str(), d["stored"].as_str()), (Some(raw.to_string().as_str()), Some(stored.to_string().as_str())), "{d}");
+        assert!(d["rate"].as_str().is_some_and(|r| r.parse::<u64>().is_ok()), "{d}");
+        let again = stage();
+        assert_eq!((again.outcome, again.bytes, again.stored), ("already", raw, Some(stored)));
+        assert_eq!(w.rows("transcript_stage")[1]["detail"]["stored"].as_str(), Some(stored.to_string().as_str()));
+        // Identity: the raw bytes are what S3 stores.
+        let w = World::new(FakeS3::start());
+        w.plant(&format!("{SID}.jsonl"), &main);
+        w.plant(&format!("{SID}/subagents/agent-a1.jsonl"), &sub);
+        let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+        let digests = s3stage::scan_chat(&Rules::defaults(), &chat, MULTIPART_PART).unwrap();
+        let client = w.client();
+        let up = w.rt().block_on(s3stage::upload_chat(&client, &w.paths, SID, &chat, &digests, MULTIPART_PART, "2026-10-23T10:00:00.000Z", None)).unwrap();
+        assert_eq!((up.bytes, up.stored, up.encoding, up.sent), (raw, raw, None, raw));
+        assert!(!up.manifest.encoded());
+    }
+
+    /// The dagger (C.3.12): a gzip-staged chat restores byte for byte, end
+    /// to end through the remote rig (as §11's round trip): `session stage`
+    /// stores the chat gzip-encoded (its manifest encoded, S3 holding each
+    /// file's gzip, `--json`'s `stored`), then its reopen (`--resume`) takes
+    /// a VM naming `transcript_gzip_v1` (P0's `caps_required`), whose shim
+    /// pulls the main transcript with curl's `compressed`: the VM holds it
+    /// byte for byte (`transcript:restored`) and the CLI resumes from it.
+    #[test]
+    fn a_gzip_staged_chat_restores_byte_identical() {
+        use super::common::{is_init, is_response_to, Link};
+        const T: Duration = Duration::from_secs(30);
+        let mut p = common::Harness::prepare();
+        let sid = common::uuid(0xc4a1);
+        let bytes = super::followups::rig_chat(&p, &sid, 2);
+        {
+            let rig = p.rig();
+            let o = rig.run(&["session", "stage", &sid, "--json"], None);
+            assert!(o.status.success(), "session stage: {}", String::from_utf8_lossy(&o.stderr));
+            let doc: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("one JSON document ({e}): {}", String::from_utf8_lossy(&o.stdout)));
+            let m = manifest::read(&Paths::from_root_and_env(rig.bridge(), None), &sid).unwrap().expect("the manifest");
+            assert!(m.encoded() && m.parts[0].len == bytes.len() as u64, "{m:?}");
+            assert_eq!(doc["stored"].as_u64(), Some(m.stored_bytes()), "{doc}");
+            assert_eq!(rig.s3().get(&m.parts[0].key).and_then(|b| gunzip(&b)).as_deref(), Some(bytes.as_slice()), "S3 holds the chat's gzip");
+        }
+        let resume = format!("--resume={sid}");
+        let mut h = p.spawn_on(Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+        let init = h.send_initialize();
+        h.expect_out(|v| is_response_to(v, &init), T);
+        let started = h.expect_out(is_init, T);
+        assert_eq!(started["session_id"].as_str(), Some(sid.as_str()), "{started}");
+        h.close_stdin();
+        let (status, _) = h.wait(T);
+        assert_eq!(status.code(), Some(0), "{}", h.transcript());
+        let held = std::fs::read(h.vm_projects().join(h.slug()).join(format!("{sid}.jsonl"))).expect("the VM's copy");
+        assert_eq!(held, bytes, "the VM holds the chat byte for byte");
+        let note = h.end_note();
+        assert!(note.split("; ").any(|p| p == "transcript:restored"), "{note}");
+        assert!(h.env_log().iter().any(|l| l == "gen 1 resumed lines=3"), "the CLI resumed from the restored copy: {:?}", h.env_log());
+    }
+
+    /// GZ-1 (C.3.4), end to end: a chat that goes on while it is staged (here a
+    /// subagent file that appears once the scan is done, as the unseal runs)
+    /// is refused after its manifest is written and before its view: exit 1
+    /// naming `forget --purge`, the manifest kept (S3 holds the scanned
+    /// bytes), the original left in place with the new file beside it, and no
+    /// view nor origin written.
+    #[test]
+    fn a_chat_that_went_on_while_it_was_staged_keeps_its_original() {
+        let (w, repo) = World::new(FakeS3::start()).with_workspace();
+        let (main, _) = chat(&w, &repo);
+        let late = line("a subagent that started meanwhile", 300);
+        let (world, planted) = (&w, &late);
+        let err = w
+            .rt()
+            .block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, 1 << 20, &builder, move || async move {
+                world.plant(&format!("{SID}/subagents/agent-b2.jsonl"), planted);
+                Ok(FakeMicrovmApi::new())
+            }))
+            .expect_err("the chat went on while it was staged");
+        let text = err.to_string();
+        assert!(text.contains("(the chat went on here while it was staged)") && text.contains(&format!("ai-env session forget {SID} --purge, then ai-env session stage {SID}")), "{text}");
+        assert_eq!(ai_env_cli::errors::CliError::from(err).exit_code(), 1);
+        let m = manifest::read(&w.paths, SID).unwrap().expect("the manifest kept");
+        assert!(m.encoded(), "{m:?}");
+        assert_eq!(gunzip(&w.s3.get(&m.parts[0].key).expect("the main's object")).as_deref(), Some(main.as_slice()), "S3 holds the scanned bytes");
+        let at = w.projects.join(SLUG);
+        assert_eq!(std::fs::read(at.join(format!("{SID}.jsonl"))).unwrap(), main, "the original in place");
+        assert_eq!(std::fs::read(at.join(SID).join("subagents").join("agent-b2.jsonl")).unwrap(), late);
+        assert!(!w.paths.transcript_origin(SID).exists(), "no origin: no view was written");
     }
 }

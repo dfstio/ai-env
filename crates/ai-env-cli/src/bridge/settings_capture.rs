@@ -1055,8 +1055,9 @@ fn section(out: &mut Vec<String>, head: String, lines: Vec<String>) {
 }
 
 /// The text rendering of a shown diff, one line per change: the union of
-/// the rules added, then each VM's other changes, per scope.
-fn diff_lines(d: &SettingsDiff) -> Vec<String> {
+/// the rules added, then each VM's other changes, per scope (S11: the
+/// panel renders the same lines).
+pub(crate) fn diff_lines(d: &SettingsDiff) -> Vec<String> {
     let start_vm = d.start_vm.as_deref().map(|vm| format!(" in {vm}")).unwrap_or_default();
     let mut out = vec![format!("settings of session {} in its VMs ({}): start {}{start_vm}", d.session, d.path, d.start)];
     if d.vms.is_empty() {
@@ -1098,18 +1099,34 @@ fn diff_lines(d: &SettingsDiff) -> Vec<String> {
     out
 }
 
+/// The diff `session show --settings-diff` prints (S11, B.1: the panel's
+/// too), shown through the tripwires, never written: `cmd_settings_diff` is
+/// `diff_of` plus the write of `diff.json` and the print. `Ok(None)`: the
+/// session has no start capture. Exit 2 for a non-uuid. It never creates
+/// the quarantine directories (`private_settings_dir`): only the CLI's
+/// write does.
+pub fn diff_of(paths: &Paths, uuid: &str) -> Result<Option<SettingsDiff>> {
+    if !is_uuid(uuid) {
+        return Err(CliError::Usage(format!("not a session id: {uuid}")));
+    }
+    if read_capture(&capture_path(paths, uuid, CapturePhase::Start)?)?.is_none() {
+        return Ok(None);
+    }
+    let rules = tripwires(paths)?;
+    Ok(Some(diff(uuid, &read_captures(paths, uuid)?).shown(&rules)))
+}
+
 /// `ai-env session show UUID --settings-diff [--json]` (T8.7): each VM's
 /// last capture against the session's start, the rules they added first
 /// (their union), then each VM's other changes per scope, as text or one
 /// JSON document; written to `quarantine/UUID/settings/diff.json` (0600).
 /// Exit 2 for a non-uuid, 1 without a start capture.
 pub fn cmd_settings_diff(uuid: &str, json: bool) -> Result<()> {
-    if !is_uuid(uuid) {
-        return Err(CliError::Usage(format!("not a session id: {uuid}")));
-    }
     let paths = Paths::resolve()?;
-    let rules = tripwires(&paths)?;
-    let shown = diff(uuid, &read_captures(&paths, uuid)?).shown(&rules);
+    let Some(shown) = diff_of(&paths, uuid)? else {
+        let start_path = capture_path(&paths, uuid, CapturePhase::Start)?;
+        bail!("no settings captured for session {uuid} ({} is missing): a remote session captures them once its id is known", start_path.display());
+    };
     let mut text = serde_json::to_string_pretty(&shown).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))?;
     let dir = private_settings_dir(&paths, uuid)?;
     let file = dir.join(DIFF_FILE);

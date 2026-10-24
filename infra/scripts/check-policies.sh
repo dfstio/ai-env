@@ -13,7 +13,8 @@
 # Deny narrows ec2:CreateNetworkInterface on the subnet and the security groups only, so any change there stops the
 # deploy until the Deny is reviewed. The Deny's own shape (one statement, no condition) is asserted before its
 # simulations, which a negated condition would pass. S8 operators adds the operator identities: section 6 simulates
-# ai-env-ops' policy (the proxy's start, stop and three documents, the suspended list, the status reads allowed; every
+# ai-env-ops' policy (the proxy's start, stop and three documents, the suspended list, the status reads, S11's view of
+# the stack's one budget (L8: doctor's budget row; never another budget's) allowed; every
 # "never" of plans/s8-operators-plan.md §1 implicitly denied: any other document, another account's of the same name
 # included, instance or session, parameter write, every EC2 write but the proxy's start and stop (a launch, an
 # interface, an address, a NACL, the proxy's role or disks), every IAM write and PassRole, image, VM and connector
@@ -29,7 +30,10 @@
 # endpoint's as RESOURCE_POLICY, the bucket's as AWS::S3::Bucket); section 9 simulates the principal × endpoint matrix
 # of the transcript store: the runtime user, the VM's execution role (ai-env-vm-exec, whose credentials IMDS hands uid
 # 1000) and an anonymous caller, through the S3 gateway endpoint and outside it, against the endpoint's policy and the
-# bucket's beside each principal's own; and ai-env-ops' bucket reads (never an object). The caller's account id only
+# bucket's beside each principal's own; and ai-env-ops' bucket reads (never an object). S11 (part A) adds the claude
+# objects, v1/_claude/mac/<v>/<sha256>, to section 9 with no policy change: a VM's fetch through the endpoint, the
+# stager's single PUT from outside it, the Mac's list and delete allowed; a PUT through the endpoint and a GET outside
+# it denied (the bucket's DenyMacWritesThroughTheEndpoint covers their /mac/ segment). The caller's account id only
 # lives in shell variables: nothing here writes it to a file. Read-only against AWS; region always $REGION.
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, POLICIES_OUT.
@@ -419,6 +423,7 @@ for g in "$image_group" "$squid_group" "$dns_group"; do
 done
 sim allowed "ops: the MicroVM memory quota" "$quota_arn:lambda/L-CD1C0CC4" - servicequotas:GetServiceQuota
 sim allowed "ops: the VPC quota" "$quota_arn:vpc/L-F678F1CE" - servicequotas:GetServiceQuota
+sim allowed "ops: view the budget" "$budget_arn" - budgets:ViewBudget
 for u in "${stack_users[@]}"; do
     sim allowed "ops: ${u##*:} (G7, doctor, creds)" "$u" - iam:SimulatePrincipalPolicy iam:ListAccessKeys iam:ListAttachedUserPolicies iam:ListUserPolicies iam:ListGroupsForUser
 done
@@ -472,6 +477,7 @@ sim implicitDeny "ops: a route table" "$rt_arn" - ec2:CreateRoute ec2:ReplaceRou
 sim implicitDeny "ops: a VPC" "$vpc_arn" - ec2:ModifyVpcAttribute ec2:AssociateDhcpOptions
 sim implicitDeny "ops: the image zip" "$zip_arn" - s3:PutObject s3:GetObject s3:DeleteObject
 sim implicitDeny "ops: the budget" "$budget_arn" - budgets:ModifyBudget
+sim implicitDeny "ops: view another budget" "arn:aws:budgets::$acct:budget/not-ai-env" - budgets:ViewBudget
 sim implicitDeny "ops: the squid log group's settings" "$squid_group" - logs:CreateLogGroup logs:DeleteLogGroup logs:PutRetentionPolicy
 sim implicitDeny "ops: another log group" "arn:aws:logs:$region:$acct:log-group:/not-ai-env" - logs:FilterLogEvents logs:StartLiveTail
 sim implicitDeny "ops: another quota" "$quota_arn:lambda/L-00000000" - servicequotas:GetServiceQuota
@@ -660,7 +666,21 @@ sim allowed "ops: the transcripts bucket's settings" "$t_bucket" - s3:GetBucketP
 sim allowed "ops: the VPC endpoints" "*" - ec2:DescribeVpcEndpoints
 sim implicitDeny "ops: transcript objects" "$t_vm" - s3:GetObject s3:PutObject s3:DeleteObject
 sim implicitDeny "ops: list or change the bucket" "$t_bucket" - s3:ListBucket s3:PutBucketPolicy s3:DeleteBucket
-test "$failed" -eq 0 || { echo "check-policies: the transcript store's policies do not match plans/s9-contracts.md §7.3 to §7.5 (above)" >&2; exit 1; }
+# S11 (part A, A.2): a claude object, v1/_claude/mac/<v>/<sha256>: a VM fetches it through the endpoint (GET); the
+# stager's single presigned PUT comes from a credential-less internet VM, outside the endpoint; the Mac lists and
+# deletes. Its /mac/ segment puts it under the bucket's DenyMacWritesThroughTheEndpoint: no VM writes it through the
+# endpoint. No policy changes for it.
+t_claude=$(pp --arn transcripts-claude-object)
+docs=("$endpoint_doc")
+sim allowed "endpoint: a VM's claude fetch" "$t_claude" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject
+docs=("$runtime" "$bucket_doc")
+sim allowed "bucket: a VM's claude fetch via the endpoint" "$t_claude" "$(s3ctx "$runtime_user" endpoint)" s3:GetObject
+sim explicitDeny "bucket: a claude PUT via the endpoint" "$t_claude" "$(s3ctx "$runtime_user" endpoint)" s3:PutObject
+sim allowed "bucket: the stager's claude PUT outside it" "$t_claude" "$(s3ctx "$runtime_user" outside)" s3:PutObject
+sim explicitDeny "bucket: a claude GET outside the endpoint" "$t_claude" "$(s3ctx "$runtime_user" outside)" s3:GetObject
+sim allowed "bucket: a claude delete" "$t_claude" "$(s3ctx "$runtime_user" outside)" s3:DeleteObject
+sim allowed "bucket: runtime lists v1/_claude/mac/" "$t_bucket" "$(s3ctx "$runtime_user" outside true "v1/_claude/mac/")" s3:ListBucket
+test "$failed" -eq 0 || { echo "check-policies: the transcript store's policies do not match plans/s9-contracts.md §7.3 to §7.5 and plans/s11-contracts-A.md §7.3 (above)" >&2; exit 1; }
 
 # ---- 8. every action a deny row names exists ----
 # simulate-custom-policy accepts invented names, so a deny row naming a misspelled action passes without proving

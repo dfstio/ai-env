@@ -1,0 +1,145 @@
+{
+  "v": 2,
+  "session_id": "11111111-1111-4111-8111-111111111111",
+  "slug": "-w-project",
+  "cwd": "/w/project",
+  "transcript_rel": "-w-project/11111111-1111-4111-8111-111111111111.jsonl",
+  "created": "2026-10-22T09:00:00Z",
+  "last_seen": "2026-10-22T11:00:00Z",
+  "status": "parked",
+  "mode": "remote",
+  "route": "remote",
+  "ext": "anthropic.claude-code-2.1.305",
+  "pid": 1,
+  "child_pid": null,
+  "exit": null,
+  "argv_hash": "fixture",
+  "respawns": 0,
+  "child_config_dir": null,
+  "mirror_root": null,
+  "scratch_dir": null,
+  "host_state": {
+    "initialize_sha256": null,
+    "initialize_bytes": null,
+    "permission_mode": null,
+    "model": null,
+    "max_thinking_tokens": null,
+    "mcp_server_names": [],
+    "flag_keys": [],
+    "recorded": {}
+  },
+  "microvm_id": "microvm-0be03000-0000-4000-8000-00000000000b",
+  "spawn_id": null,
+  "last_acked_seq": null,
+  "seeded_head": null,
+  "last_wip_fetch": null,
+  "vms": [
+    {
+      "end": "moved",
+      "from": "2026-10-22T09:00:00Z",
+      "gen": 1,
+      "pid": 4200,
+      "spawn": "spawn-s2",
+      "to": "2026-10-22T10:21:08Z",
+      "vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "why": "first"
+    },
+    {
+      "from": "2026-10-22T10:21:05Z",
+      "gen": 2,
+      "pid": 4200,
+      "spawn": "spawn-s4",
+      "vm": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "why": "migrate:command"
+    }
+  ],
+  "transcript_home": null,
+  "origin": null,
+  "view": null,
+  "migrating_pid": null,
+  "generations": [
+    {
+      "gen": 1,
+      "vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "spawn": "spawn-s2",
+      "from": "2026-10-22T09:00:00Z",
+      "to": "2026-10-22T10:21:08Z",
+      "why": "first",
+      "end": "moved",
+      "pid": 4200
+    },
+    {
+      "gen": 2,
+      "vm": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "spawn": "spawn-s4",
+      "from": "2026-10-22T10:21:05Z",
+      "why": "migrate:command",
+      "pid": 4200
+    }
+  ],
+  "moves": [
+    {
+      "at": "2026-10-22T10:20:00Z",
+      "gen": 1,
+      "kind": "migrate",
+      "why": "command",
+      "from_vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "to_vm": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "outcome": "done",
+      "ms": 60000,
+      "touchid": "yes",
+      "request": "0199f000-0000-7000-8000-000000000001",
+      "actor": "wrapper"
+    }
+  ],
+  "timeline": [
+    {
+      "vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "phase": "running",
+      "from": "2026-10-22T09:00:00Z",
+      "to": "2026-10-22T09:25:00Z",
+      "inferred": true
+    },
+    {
+      "vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "phase": "suspended",
+      "from": "2026-10-22T09:25:00Z",
+      "to": "2026-10-22T10:00:00Z",
+      "inferred": false
+    },
+    {
+      "vm": "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "phase": "running",
+      "from": "2026-10-22T10:00:00Z",
+      "to": "2026-10-22T10:21:08Z",
+      "inferred": false
+    },
+    {
+      "vm": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "phase": "running",
+      "from": "2026-10-22T10:21:05Z",
+      "to": "2026-10-22T11:00:00Z",
+      "inferred": false
+    },
+    {
+      "vm": "microvm-0be03000-0000-4000-8000-00000000000b",
+      "phase": "suspended",
+      "from": "2026-10-22T11:00:00Z",
+      "to": "2026-10-22T12:00:00Z",
+      "inferred": true
+    }
+  ],
+  "cost": {
+    "usd": 0.254132,
+    "low_usd": 0.240876,
+    "high_usd": 0.267389,
+    "running_s": 5103,
+    "suspended_s": 5700,
+    "vms": [
+      "microvm-0a5fc800-0000-4000-8000-00000000000a",
+      "microvm-0be03000-0000-4000-8000-00000000000b"
+    ]
+  },
+  "wrapper_live": false,
+  "settings_captures": 0
+}

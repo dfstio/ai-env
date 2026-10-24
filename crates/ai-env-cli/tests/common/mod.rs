@@ -86,13 +86,15 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// transcript knob and the knobs of the remote session's fakes; the S8
 /// operators' `ai-env as` marker and the pasteboard's osascript knob; S9's
 /// fake S3 address, the code token's minutes, the fake claude's api-request
-/// lines and the fake git's whole environment);
+/// lines and the fake git's whole environment; S11's release curl, gpgv and
+/// admission make, the views' clock, and the fake claude's start-up and
+/// compaction knobs);
 /// removed from every harness run before the test's own `envs`. Every
 /// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 98] = [
+pub const REMOVED_ENV: [&str; 109] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -120,6 +122,11 @@ pub const REMOVED_ENV: [&str; 98] = [
     "AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES",
     // S10: the park's quiet (debug builds).
     "AI_ENV_BRIDGE_LAB_PARK_AFTER_MS",
+    // S11: the release's curl, gpgv and admission make (part A), and the views' clock (part B; debug builds).
+    "AI_ENV_BRIDGE_LAB_RELEASE_CURL",
+    "AI_ENV_BRIDGE_LAB_GPGV",
+    "AI_ENV_BRIDGE_LAB_ADMIT_MAKE",
+    "AI_ENV_BRIDGE_LAB_NOW",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -180,12 +187,22 @@ pub const REMOVED_ENV: [&str; 98] = [
     "FAKE_SUBTREE_LOG",
     "FAKE_TURN_MS",
     "FAKE_TURN_MARK",
+    // S10 part B (22 Oct): a line the resumed transcript holds runs no turn, and a miss reads its stdin to the end.
+    "FAKE_DEDUP_RESUMED",
+    "FAKE_MISS_WAITS_FOR_EOF",
     // A1: the fake claude's usage of an account: its events, a refused turn.
     "FAKE_RATE_LIMIT_INFO",
     "FAKE_USAGE_LIMIT",
     "FAKE_USAGE_LIMIT_TEXT",
     "FAKE_USAGE_LIMIT_PARAMS",
     "FAKE_USAGE_LIMIT_EVENT",
+    // S11: the fake claude's unknown option, its death before init, a staged copy's knobs file and pinned version
+    // (part A), and its compaction (part C).
+    "FAKE_REJECT_OPTION",
+    "FAKE_DIE_BEFORE_INIT",
+    "FAKE_KNOBS_FILE",
+    "FAKE_VERSION_PINNED",
+    "FAKE_COMPACT_BEFORE_TURN",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",
@@ -1500,6 +1517,21 @@ pub fn fake_tool_use_uuid(turn: u64, gen: u64) -> String {
 #[must_use]
 pub fn fake_tool_result_uuid(turn: u64, gen: u64) -> String {
     format!("{turn:08x}-0000-4000-c000-{gen:012x}")
+}
+
+/// The uuid of the `compact_boundary` entry `FAKE_COMPACT_BEFORE_TURN` writes
+/// before turn `turn` of the fake's generation `gen` (S11, C-4), `…-7000-…`.
+#[must_use]
+pub fn fake_compact_boundary_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-7000-{gen:012x}")
+}
+
+/// The uuid of that compaction's summary entry (S11, C-4), `…-6000-…`: the
+/// parent of the turn's user entry, and what a cut after the compaction
+/// names.
+#[must_use]
+pub fn fake_compact_summary_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-6000-{gen:012x}")
 }
 
 /// The session id of the fake's generation `gen` when neither

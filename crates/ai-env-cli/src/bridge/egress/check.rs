@@ -30,8 +30,8 @@
 //! live, as RunMicrovm does) already has such a pass, bound to that build and
 //! to the connector's live facts, and judged by the current DNS and egress
 //! rules (`egress::DNS_RULE`, `egress::EGRESS_RULE`: a pass recorded before
-//! either never counts, and the check runs again, saying why) (`make
-//! claude-update`).
+//! either never counts, and the check runs again, saying why) (run it after
+//! every deploy).
 //!
 //! **Allowlisted hosts.** github.com (`proxy-github`, [`ALLOWLISTABLE`]) is
 //! a host the proxy refuses until an operator allowlists it (`ai-env egress
@@ -1914,7 +1914,7 @@ fn already_verified(ctx: &Ctx, plan: &run::RunPlan, connector: &str) -> Option<(
     let created = crate::wire::time::parse_rfc3339(live.created_at.as_deref()?)?;
     let rec = EgressVerified::load(&ctx.paths).ok()?.find(image_arn, &version, connector)?.clone();
     if rec.dns_rule < DNS_RULE {
-        // Said, because the first `make claude-update` after an install that raised the rule starts a VM for a
+        // Said, because the first `--if-needed` run after an install that raised the rule starts a VM for a
         // version that has a recorded pass.
         eprintln!("egress check: the recorded pass of image version {version} was judged by an earlier DNS rule ({}, now {DNS_RULE}): checking again", rec.dns_rule);
         return None;
@@ -2117,7 +2117,7 @@ fn early_failure(ctx: &Ctx, connector: &str, early: Early) -> CliError {
         ("reason", reason),
         ("revoked", revoked.as_ref().map_or_else(|_| "error".to_string(), ToString::to_string)),
     ];
-    audit_event(&ctx.paths, "egress_check", &pairs);
+    audit_event(&ctx.paths, crate::bridge::audit::event::EGRESS_CHECK, &pairs);
     let note = match revoked {
         Ok(n) => format!("egress check FAILED: revoked {n} earlier pass{} of this connector", if n == 1 { "" } else { "es" }),
         Err(e) => format!("egress check FAILED and COULD NOT REVOKE the earlier passes of this connector: {e} (fix or remove {})", ctx.paths.egress_verified().display()),
@@ -2483,7 +2483,7 @@ fn report(ctx: &Ctx, connector: &str, ev: &Evidence, json: bool) -> Result<()> {
     if !ev.own {
         pairs.push(("report_only", "true".to_string()));
     }
-    audit_event(&ctx.paths, "egress_check", &pairs);
+    audit_event(&ctx.paths, crate::bridge::audit::event::EGRESS_CHECK, &pairs);
     let revoked_text = match &revoked {
         Some(Ok(n)) => format!("revoked {n} earlier pass{} of this connector", if *n == 1 { "" } else { "es" }),
         Some(Err(e)) => format!("COULD NOT REVOKE the earlier passes of this connector: {e} (the credential gate cannot read the file either; fix or remove {})", ctx.paths.egress_verified().display()),

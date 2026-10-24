@@ -164,8 +164,13 @@ impl World {
     /// spawns set them (`Prepared::spawn`): a developer's exported
     /// `ARGV_LOG` never reaches a fake here (S9; S8's X1 open point 4).
     fn wrapper(&self, args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> Command {
+        self.wrapper_of(&self.root.join("claude"), args, cwd, envs)
+    }
+
+    /// [`World::wrapper`] handed `claude` as argv[1] (S11: a bundle's path names V).
+    fn wrapper_of(&self, claude: &Path, args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(self.root.join("bin").join("ai-env-claude"));
-        cmd.arg(self.root.join("claude")).args(args).current_dir(cwd);
+        cmd.arg(claude).args(args).current_dir(cwd);
         for k in common::REMOVED_ENV {
             cmd.env_remove(k);
         }
@@ -456,6 +461,24 @@ fn prewarm_is_skipped_when_the_vm_already_holds_the_token_or_a_reusable_vm_exist
     always.run(&AUTH_STATUS, &work, &[]);
     let r = always.record();
     assert_eq!(always.prewarm_note(), Some(format!("prewarm:spawned({})", r.pid)), "always: warmed though the VM holds the token");
+}
+
+/// S11 (§4.6, LD-9): a wrapper whose argv[1] is a Cursor bundle's claude passes that bundle's version (V) to the
+/// prewarm's `vm warm` (`--claude-version V`), which fetches it into the warmed VM; without a bundle path nothing is
+/// added. (`[claude].auto_admit` off: the automatic admission would start this fake sibling too.)
+#[test]
+fn the_prewarm_passes_the_claude_version() {
+    let w = World::new(true, "[claude]\nauto_admit = false\n");
+    let work = w.root.join("work");
+    let bundle = w.root.join("extensions").join("anthropic.claude-code-2.1.310-darwin-arm64").join("resources").join("native-binary");
+    std::fs::create_dir_all(&bundle).unwrap();
+    common::install_fake_v1(&bundle.join("claude"));
+    let cmd = w.wrapper_of(&bundle.join("claude"), &AUTH_STATUS, &work, &[]);
+    let o = common::bounded::run_within(cmd, None, LIMIT, "the wrapper");
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o.stderr));
+    let r = w.record();
+    assert_eq!(r.args, ["vm", "warm", work.to_str().unwrap(), "--prewarm", "--claude-version", "2.1.310"]);
+    assert_eq!(w.prewarm_note(), Some(format!("prewarm:spawned({})", r.pid)));
 }
 
 /// Without the sibling next to the wrapper: one stderr line naming it, no

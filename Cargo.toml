@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ai-env-age", "crates/ai-env-cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.88" # consumed by crates/ai-env-age only; ai-env-cli pins 1.94.1 itself
 license = "Apache-2.0"
@@ -40,7 +40,7 @@ subtle = "=2.6.1"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 unicode-normalization = "=0.1.25"
-# --- shim (VM) only ---
+# --- shim (VM); axum also the bridge's panel (S11) ---
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path", "tracing"] } # never "ws"
 hyper = { version = "=1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "=0.1.20", features = ["tokio"] }

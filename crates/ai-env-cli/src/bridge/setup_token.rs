@@ -535,6 +535,10 @@ pub struct Holder {
     /// A1: the seal it received, when its row records one: which Claude
     /// account it holds ([`received`]).
     pub tag: Option<String>,
+    /// A1 joint review (J2): every seal its row says it was sent, oldest
+    /// first, `tag` among them (`VmRow::held_tags`): a chat still running
+    /// on an earlier seal holds that one too until the VM is terminated.
+    pub tags: Vec<String>,
 }
 
 /// Every seal a Claude account holds or held, to its name and whether it is
@@ -547,15 +551,39 @@ type SealIndex = std::result::Result<BTreeMap<String, (String, bool)>, String>;
 /// with no account (or for a row that records no seal); else `Claude
 /// account work's token (seal T)`, `a token no Claude account holds (seal
 /// T)`, or, while the accounts cannot be read, `a token of an unknown Claude
-/// account (seal T)`.
+/// account (seal T)`. A1 joint review (J2): each seal of [`held_seals`],
+/// oldest first, joined by ` and `.
 fn received(h: &Holder, index: Option<&SealIndex>) -> String {
-    match (index, h.tag.as_deref()) {
-        (Some(Ok(index)), Some(tag)) => match index.get(tag) {
+    let one = |tag: &str| match index {
+        Some(Ok(index)) => match index.get(tag) {
             Some((name, _)) => format!("Claude account {name}'s token (seal {tag})"),
             None => format!("a token no Claude account holds (seal {tag})"),
         },
-        (Some(Err(_)), Some(tag)) => format!("a token of an unknown Claude account (seal {tag})"),
-        _ => "the token".to_string(),
+        Some(Err(_)) => format!("a token of an unknown Claude account (seal {tag})"),
+        None => "the token".to_string(),
+    };
+    let tags = held_seals(h);
+    if index.is_none() || tags.is_empty() {
+        return "the token".to_string();
+    }
+    tags.iter().map(|t| one(t)).collect::<Vec<_>>().join(" and ")
+}
+
+/// Every seal `h` may hold, oldest first: its `tags`, else its one `tag`.
+fn held_seals(h: &Holder) -> Vec<String> {
+    if h.tags.is_empty() {
+        h.tag.iter().cloned().collect()
+    } else {
+        h.tags.clone()
+    }
+}
+
+/// The account `tag` is by `index`, for `--json` (as [`holder_account`]).
+fn tag_account(tag: &str, index: Option<&SealIndex>) -> Option<String> {
+    match index {
+        Some(Ok(index)) => Some(index.get(tag).map_or_else(|| accounts::UNKNOWN.to_string(), |(name, _)| name.clone())),
+        Some(Err(_)) => Some(accounts::UNKNOWN.to_string()),
+        None => None,
     }
 }
 
@@ -581,7 +609,7 @@ pub(crate) fn holders(paths: &Paths) -> std::result::Result<(Vec<Holder>, Vec<St
     let held: Vec<Holder> = rows
         .into_iter()
         .filter(|r| !r.id.is_empty() && r.status != RowStatus::Terminated && r.terminated_at.is_none())
-        .filter_map(|r| Some(Holder { credential_at: r.credential_at?, status: r.status.as_str(), id: r.id, tag: r.credential_tag }))
+        .filter_map(|r| Some(Holder { credential_at: r.credential_at?, status: r.status.as_str(), tags: r.held_tags(), id: r.id, tag: r.credential_tag }))
         .collect();
     Ok((held, unread))
 }
@@ -954,7 +982,7 @@ fn report_combined(paths: &Paths, outcome: &CombinedOutcome, by: &str, target: O
     if let Some(t) = target {
         pairs.push(("account", t.account.clone()));
     }
-    let row = audit::AuditRow::new("creds_combined", None, audit::detail(&pairs));
+    let row = audit::AuditRow::new(crate::bridge::audit::event::CREDS_COMBINED, None, audit::detail(&pairs));
     if let Err(e) = audit::append(&paths.audit(), &row) {
         eprintln!("warning: the audit row creds_combined was not written: {e}");
     }
@@ -1196,7 +1224,7 @@ pub(crate) fn seal_account(store: &Keystore, paths: &Paths, key: &str, name: &st
         Some(Err(_)) => "failed",
     };
     let row = audit::AuditRow::new(
-        "creds_setup_token",
+        crate::bridge::audit::event::CREDS_SETUP_TOKEN,
         None,
         audit::detail(&[
             ("key", key.to_string()),
@@ -1663,7 +1691,12 @@ pub fn cmd_status(store: &Keystore, json: bool, unseal: bool) -> Result<()> {
             })
         };
         let n = &ops.key_notes;
-        let holder = |h: &Holder| serde_json::json!({"id": h.id, "status": h.status, "credential_at": rfc3339_utc(h.credential_at), "tag": h.tag, "account": holder_account(h, index.as_ref())});
+        // A1 joint review (J2): `tag` and `account` the latest seal's; `tags` and `accounts` every seal it was sent.
+        let holder = |h: &Holder| {
+            let tags = held_seals(h);
+            let accounts: Vec<Option<String>> = tags.iter().map(|t| tag_account(t, index.as_ref())).collect();
+            serde_json::json!({"id": h.id, "status": h.status, "credential_at": rfc3339_utc(h.credential_at), "tag": h.tag, "account": holder_account(h, index.as_ref()), "tags": tags, "accounts": accounts})
+        };
         let doc = serde_json::json!({
             "creds": { "key": cfg.creds.key, "mode": cfg.creds.mode, "deliver": cfg.creds.deliver, "unseal_timeout_s": cfg.creds.unseal_timeout_s, "valid": creds_ok.as_ref().err() },
             "aws_credentials": cfg.aws.credentials,
@@ -1886,7 +1919,7 @@ pub fn cmd_forget(yes: bool) -> Result<()> {
     }
     drop(held_lock);
     let row = audit::AuditRow::new(
-        "creds_forget",
+        crate::bridge::audit::event::CREDS_FORGET,
         None,
         audit::detail(&[
             ("files", files.len().to_string()),
@@ -1964,7 +1997,7 @@ pub fn cmd_forget_ops(yes: bool) -> Result<()> {
             }
         }
     }
-    let row = audit::AuditRow::new("creds_forget", None, audit::detail(&[("ops", "true".to_string()), ("files", files.len().to_string()), ("failed", failed.len().to_string())]));
+    let row = audit::AuditRow::new(crate::bridge::audit::event::CREDS_FORGET, None, audit::detail(&[("ops", "true".to_string()), ("files", files.len().to_string()), ("failed", failed.len().to_string())]));
     if let Err(e) = audit::append(&paths.audit(), &row) {
         crate::bridge::voice::warn(&format!("the audit row was not written: {e}"));
     }
@@ -2363,7 +2396,7 @@ mod tests {
     /// token of an unknown account.
     #[test]
     fn a_holder_names_the_account_it_received() {
-        let h = |tag: Option<&str>| Holder { id: "microvm-1".into(), status: "running", credential_at: 1_790_000_000, tag: tag.map(Into::into) };
+        let h = |tag: Option<&str>| Holder { id: "microvm-1".into(), status: "running", credential_at: 1_790_000_000, tag: tag.map(Into::into), tags: Vec::new() };
         let index: SealIndex = Ok(BTreeMap::from([("aaaaaaaaaaaaaaaa".to_string(), ("work".to_string(), true)), ("bbbbbbbbbbbbbbbb".to_string(), ("work".to_string(), false))]));
         let unreadable: SealIndex = Err("state/accounts.toml cannot be parsed (x)".into());
         let says = |h: &Holder, index: Option<&SealIndex>| (received(h, index), holder_account(h, index));
@@ -2373,6 +2406,11 @@ mod tests {
         assert_eq!(says(&h(Some("cccccccccccccccc")), Some(&index)), ("a token no Claude account holds (seal cccccccccccccccc)".into(), Some(accounts::UNKNOWN.into())));
         assert_eq!(says(&h(Some("aaaaaaaaaaaaaaaa")), Some(&unreadable)), ("a token of an unknown Claude account (seal aaaaaaaaaaaaaaaa)".into(), Some(accounts::UNKNOWN.into())));
         assert_eq!(says(&h(None), Some(&index)), ("the token".into(), None), "a row that records no seal");
+        // A1 joint review (J2): a VM sent two accounts' seals names both, oldest first; `account` is the latest's.
+        let two = Holder { tags: vec!["cccccccccccccccc".into(), "aaaaaaaaaaaaaaaa".into()], ..h(Some("aaaaaaaaaaaaaaaa")) };
+        assert_eq!(says(&two, Some(&index)), ("a token no Claude account holds (seal cccccccccccccccc) and Claude account work's token (seal aaaaaaaaaaaaaaaa)".into(), Some("work".into())));
+        assert_eq!(says(&two, None), ("the token".into(), None), "a tree with no account");
+        assert_eq!((tag_account("cccccccccccccccc", Some(&index)), tag_account("aaaaaaaaaaaaaaaa", Some(&unreadable))), (Some(accounts::UNKNOWN.into()), Some(accounts::UNKNOWN.into())));
     }
 
     /// A1: a link in place of `credentials/accounts/` is never listed

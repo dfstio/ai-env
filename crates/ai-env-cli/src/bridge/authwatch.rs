@@ -127,7 +127,7 @@ pub const RETRY_LIMIT: u32 = 3;
 /// and S12's refresh relay read them: S8 is to compare `claude` with the
 /// version of the CLI it runs, a different version being unmeasured until
 /// `oauth-t1` runs again. No test ties `claude` to `image/claude.lock`:
-/// `make claude-update` moves that pin often.
+/// `make claude-pin` moves that pin (S11), and chats may run a newer one.
 /// Measured, run as `claude-vscode` with `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1`
 /// and a token Anthropic refuses: the CLI asked for a refresh at the first
 /// 401, 0.96-1.44 s after the spawn (its start-up and that request: no wait
@@ -158,6 +158,18 @@ pub const RETRY_LIMIT: u32 = 3;
 /// and retries after a 401 is 2.1.302's (the two bundles compared), and no
 /// field here rests on that run.
 pub const AUTH_TIMERS: AuthTimers = AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false };
+/// S11 (L3): every claude version a reviewed `oauth-t1` run measured, oldest first; `AUTH_TIMERS` is the last. An
+/// unmeasured version runs on the retry rule; nothing is measured or inherited automatically.
+pub const AUTH_TIMERS_REVIEWED: [AuthTimers; 2] = [
+    AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false },
+    AUTH_TIMERS,
+];
+
+/// The reviewed timers of `claude` (a version), when a reviewed run measured it.
+#[must_use]
+pub fn timers_for(claude: &str) -> Option<&'static AuthTimers> {
+    AUTH_TIMERS_REVIEWED.iter().find(|t| t.claude == claude)
+}
 /// How long a turn whose model requests all fail without a refusal (an
 /// egress that blocks api.anthropic.com, an outage) may take before the CLI
 /// gives up by itself, measured on [`AUTH_FAIL_BUDGET_CLAUDE`]: S7 B10
@@ -1137,6 +1149,27 @@ mod tests {
     #[test]
     fn auth_timers_are_what_oauth_t1_measured() {
         assert_eq!(AUTH_TIMERS, AuthTimers { claude: "2.1.305", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false });
+        // S11 (L3): the reviewed table, S8 part B's 2.1.302 then AUTH_TIMERS.
+        assert_eq!(
+            AUTH_TIMERS_REVIEWED,
+            [AuthTimers { claude: "2.1.302", oauth_401_wait_ms: 0, refresh_answer_timeout_ms: 30_000, exits_while_stdin_open: false }, AUTH_TIMERS]
+        );
+    }
+
+    /// S11 (L3): the reviewed versions are sorted oldest first, each once, the last `AUTH_TIMERS`; `timers_for`
+    /// finds exactly them.
+    #[test]
+    fn the_reviewed_timers_are_sorted_unique_and_end_in_auth_timers() {
+        let key = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap()).collect::<Vec<_>>();
+        assert!(AUTH_TIMERS_REVIEWED.windows(2).all(|w| key(w[0].claude) < key(w[1].claude)), "sorted and unique");
+        assert_eq!(AUTH_TIMERS_REVIEWED.last(), Some(&AUTH_TIMERS));
+        for t in &AUTH_TIMERS_REVIEWED {
+            assert!(crate::wire::pin::is_version(t.claude), "{}", t.claude);
+            assert_eq!(timers_for(t.claude), Some(t));
+        }
+        for unmeasured in ["2.1.296", "2.1.308", "", "2.1"] {
+            assert_eq!(timers_for(unmeasured), None, "{unmeasured}");
+        }
     }
 
     /// AUTH_FAIL_BUDGET_MS covers what S7 B10 measured on the same claude
