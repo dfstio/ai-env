@@ -30,9 +30,19 @@ pub fn gc_plan(staged: &[String], bundle: Option<&str>, windows: &[String]) -> V
     out
 }
 
-/// The live windows' versions (`doctor::running_windows`), each once.
+/// The live windows (`doctor::running_windows`): one entry per extension host, so a version two windows run is
+/// here twice. `forget` names a window's host from it; gc lists versions through [`windows_of`].
 fn window_versions() -> Vec<crate::bridge::census::RunningExtension> {
     crate::bridge::doctor::running_windows()
+}
+
+/// S12 (V1): the versions the live windows `running` run (pure), as gc's kept line and its JSON `windows` name
+/// them: the `N.N.N` ones, newest first, each once ([`super::newest_first_once`]). A window on an unrecognised
+/// extension names none. Only the list changes: [`gc_plan`] tests membership, so the same objects go
+/// (plans/s12-contracts.md §V1.2 rules 1 to 4).
+#[must_use]
+pub fn windows_of(running: &[crate::bridge::census::RunningExtension]) -> Vec<String> {
+    super::newest_first_once(running.iter().map(|w| w.ext.as_str()))
 }
 
 /// The versions the records say are staged.
@@ -165,7 +175,7 @@ pub fn cmd_gc(store: &Keystore, yes: bool, json: bool) -> crate::errors::Result<
     let paths = Paths::resolve()?;
     let staged = staged_by_records(&paths);
     let bundle = admit::installed_bundle();
-    let windows: Vec<String> = window_versions().into_iter().map(|w| w.ext).filter(|v| crate::wire::pin::is_version(v)).collect();
+    let windows = windows_of(&window_versions());
     if !yes {
         let plan = gc_plan(&staged, bundle.as_deref(), &windows);
         let local = local_plan(&paths);
@@ -252,5 +262,19 @@ mod tests {
         assert_eq!(gc_plan(&staged, None, &[]), v(&["2.1.10", "2.1.300", "2.1.301", "2.1.302", "2.1.303"]));
         assert_eq!(gc_plan(&v(&["2.1.1", "2.1.2", "2.1.3"]), None, &[]), Vec::<String>::new(), "three staged: nothing goes");
         assert_eq!(gc_plan(&[], Some("2.1.1"), &v(&["2.1.2"])), Vec::<String>::new());
+    }
+
+    /// S12 (V1): gc names each running `N.N.N` version once, newest first, whatever the hosts' order (the census's,
+    /// by when each started): two windows on 2.1.302 name it once, an unrecognised extension names none, 2.1.10 sits
+    /// between 2.1.302 and 2.1.9; no window, no version.
+    #[test]
+    fn windows_of_names_each_version_once_newest_first() {
+        let running: Vec<crate::bridge::census::RunningExtension> = ["2.1.302", "2.1.310", "2.1.302", "unrecognised", "2.1.9", "2.1.10"]
+            .into_iter()
+            .zip(1u32..)
+            .map(|(ext, host)| crate::bridge::census::RunningExtension { host, ext: ext.into(), started: 1_700_000_000 + u64::from(host), seen: 1_700_000_060_000 })
+            .collect();
+        assert_eq!(windows_of(&running), v(&["2.1.310", "2.1.302", "2.1.10", "2.1.9"]));
+        assert_eq!(windows_of(&[]), Vec::<String>::new());
     }
 }

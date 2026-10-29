@@ -7,6 +7,14 @@
 //! Feature matrix: `default = ["bridge", "shim"]`; the VM image is built with
 //! `--no-default-features --features shim`. Gating happens by module, clap
 //! variant and doctor row only — never `cfg(feature)` inside function bodies.
+
+// S12 (I1): the default world's unit-test binary outgrew ld's 16 MB `__eh_frame` limit for the DWARF offsets of the
+// compact unwind table once S12's six slices met (16.8 MB; phase 0's gate printed no such warning). ld then warns
+// that a panic's unwinding may be slower; the tests run as before. The lint that forwards the linker's messages is
+// allowed for the lib's unit-test link on macOS alone (`cfg(test)`), so `make test` prints no warning line; every
+// other build keeps it.
+#![cfg_attr(all(test, target_os = "macos"), allow(linker_messages))]
+
 pub mod age_cmd;
 pub mod ceremony;
 pub mod commands;

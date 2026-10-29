@@ -2,6 +2,7 @@
 //! rebuilt from the audit (`audit::read`), the VM rows and `[vm]`, with the
 //! idle suspends the platform made inferred (the cost estimate's and the
 //! views' input). Phase 0 declared it; S11 wave 1's B2 built it.
+//! S12 (C3): a wrapper's reconnect that measured a sleep infers the idle suspend its open span hid (rule 11).
 use crate::bridge::audit::read::Read;
 use crate::bridge::audit::schema::{self, event, Effect, When};
 use crate::bridge::vm::registry::{RowStatus, VmRow};
@@ -483,9 +484,52 @@ impl Machine {
         }
     }
 
+    /// Rule 11 (S12, B-COST-3): a wrapper's reconnect that measured a sleep, on a VM its own open span
+    /// held running: the platform suspended the VM `max_idle_s` after the lid closed (inferred, with
+    /// its range); the row's own activity step (rule 4) resumes it at the row. The spans stay open.
+    ///
+    /// A sleeping Mac writes no row, and the chat's open keep-alive span turns rule 1 off, so S11 priced
+    /// the whole sleep as running. The wrapper measures it: its tick ends the socket with
+    /// `woke after <s> s asleep` (`agent::session::woke_reason`), and the reattach writes that reason
+    /// with `ms`, the time from the detection to the reattach. So (all saturating) the wake is
+    /// `at - ceil(ms / 1000)`, the lid closed at `wake - <s>`, and the platform's idle suspend came at
+    /// `point = closed + max_idle_s`. Only when the machine is running, the row's `spawn` is one of its
+    /// open spans, `asleep_of` reads the reason and `ms` parses (§C4.2 rule 1); and only when
+    /// `from < point` (a second chat's reconnect after the same sleep finds the stretch the first one
+    /// opened), `point < wake` (a sleep shorter than `max_idle_s` infers nothing) and `point < wall`
+    /// (§C4.2 rule 3). As rule 1 does, the running stretch closes at `point`, inferred, its range `low =
+    /// max(closed, from)` to `high = min(wake, closed + 2 × max_idle_s, wall)`, and a suspended stretch
+    /// opens there; the open spans are kept (LD-C9, §C4.2 rule 4): after the reconnect the chat's
+    /// keep-alive holds the VM again. The wall terms never bind (`build` advances to the row first, and
+    /// rule 7 has ended a VM whose wall passed); they stay as a guard. It reads `reason`, `ms` and `spawn`
+    /// of `agent_reconnect` rows only (plans/s12-contracts.md §C4.2).
+    fn slept(&mut self, r: &Read, span: &str) {
+        if self.st != St::Running || !self.spans.contains(span) {
+            return;
+        }
+        let Some(asleep) = r.detail.get("reason").map(String::as_str).and_then(crate::bridge::agent::session::asleep_of) else { return };
+        let Some(ms) = r.detail.get("ms").and_then(|ms| ms.parse::<u64>().ok()) else { return };
+        let idle = u64::from(self.p.max_idle_s);
+        let wake = r.at.saturating_sub(ms.div_ceil(1000));
+        let closed = wake.saturating_sub(asleep);
+        let point = closed.saturating_add(idle);
+        let fires = self.from < point && point < wake && point < self.wall;
+        if !fires {
+            return;
+        }
+        let high = wake.min(closed.saturating_add(idle.saturating_mul(2))).min(self.wall);
+        self.close(point, true, closed.max(self.from), high, "-");
+        self.open(St::Suspended, point, "-");
+        self.susp_high = high;
+        self.inferred_suspends.push(point);
+    }
+
     fn on(&mut self, r: &Read, effects: &[Effect]) {
         let (at, by) = (r.at, r.event.as_str());
         let span = r.detail.get("spawn").cloned().unwrap_or_default();
+        if r.event == event::AGENT_RECONNECT {
+            self.slept(r, &span);
+        }
         if effects.contains(&Effect::Start) {
             self.start(at, by);
         }
@@ -887,5 +931,125 @@ mod tests {
         let rows = [row(t0, "vm_run", &[("id", X)]), start("s1", t0 + 10), row(t0 + 100, "vm_suspend", &[("id", X)]), end("s1", t0 + 105)];
         let t = build(&rows, &[], defaults(), 0, t0 + 1000);
         assert_eq!(vm(&t, X).intervals.iter().map(|i| i.phase).collect::<Vec<_>>(), [Running, Suspended]);
+    }
+
+    // ---- S12 (C3): rule 11, the measured sleep (plans/s12-contracts.md §C4.2) ----
+
+    /// S12: a keep-alive span `spawn` of X opened at `t`.
+    fn span(spawn: &str, t: u64) -> Read {
+        row(t, "session_remote_start", &[("id", X), ("spawn", spawn), ("gen", "1"), ("why", "first")])
+    }
+
+    /// S12: a wrapper's `agent_reconnect` of X's `spawn` at `t`: its `reason` and `ms`.
+    fn reconnect(t: u64, spawn: &str, reason: &str, ms: &str) -> Read {
+        row(t, "agent_reconnect", &[("id", X), ("spawn", spawn), ("reason", reason), ("ms", ms)])
+    }
+
+    /// S12 (C3, §C4.3): X runs, its chat's span open, the Mac sleeps 1800 s and the wrapper reconnects 2.5 s
+    /// after the wake: rule 11 suspends X `max_idle_s` after the lid closed (inferred, its range from the
+    /// close to twice the idle time), and the reconnect auto-resumes it; the span stays open, so the VM runs
+    /// on until the chat's park (M-C9, M-C15, M-C16, M-C17).
+    #[test]
+    fn a_measured_sleep_infers_the_idle_suspend_an_open_span_hid() {
+        use Phase::{Running, Suspended};
+        let t0 = at(7, 0, 0);
+        let rows = [
+            row(t0, "vm_run", &[("id", X)]),
+            span("s1", t0 + 10),
+            row(t0 + 100, "transcript_push", &[("vm", X), ("session", "-")]),
+            reconnect(t0 + 2003, "s1", "woke after 1800.0 s asleep", "2500"),
+            row(t0 + 2400, "session_park", &[("vm", X), ("spawn", "s1"), ("why", "suspended"), ("quiet_ms", "0")]),
+        ];
+        let t = build(&rows, &[], defaults(), 0, t0 + 3000);
+        let x = vm(&t, X);
+        assert_eq!(
+            shape(x),
+            [
+                (Running, t0, t0 + 500, true, t0 + 200, t0 + 800, "vm_run", "-"),
+                (Suspended, t0 + 500, t0 + 2003, false, t0 + 2003, t0 + 2003, "-", "agent_reconnect"),
+                (Running, t0 + 2003, t0 + 2400, false, t0 + 2400, t0 + 2400, "agent_reconnect", "session_park"),
+                (Suspended, t0 + 2400, t0 + 3000, false, t0 + 3000, t0 + 3000, "session_park", "-"),
+            ]
+        );
+        assert_eq!((x.inferred_suspends, x.inferred_resumes, x.suspends, x.anomalies), (1, 1, 1, 0));
+    }
+
+    /// S12 (C3): rule 11's guards. A sleep shorter than `max_idle_s` (M-C11), another reason (M-C12), an
+    /// unreadable `ms` (M-C12b: as 0, the point would be `t0 + 503`, before the wake) and a reconnect of a
+    /// spawn no span holds (M-C10) infer nothing: the open span holds X running, as S11 priced it. A control.
+    #[test]
+    fn a_reconnect_infers_nothing_without_a_measured_sleep_longer_than_idle() {
+        use Phase::Running;
+        let t0 = at(8, 0, 0);
+        for (reason, ms, spawn) in [("woke after 200.0 s asleep", "2500", "s1"), ("no frame for 1800.0 s", "2500", "s1"), ("woke after 1800.0 s asleep", "x", "s1"), ("woke after 1800.0 s asleep", "2500", "s2")] {
+            let rows = [row(t0, "vm_run", &[("id", X)]), span("s1", t0 + 10), row(t0 + 100, "transcript_push", &[("vm", X), ("session", "-")]), reconnect(t0 + 2003, spawn, reason, ms)];
+            let t = build(&rows, &[], defaults(), 0, t0 + 2500);
+            let x = vm(&t, X);
+            assert_eq!(shape(x), [(Running, t0, t0 + 2500, false, t0 + 2500, t0 + 2500, "vm_run", "-")], "{reason:?} ms={ms} spawn={spawn}");
+            assert_eq!((x.inferred_suspends, x.inferred_resumes, x.suspends, x.anomalies), (0, 0, 0, 0), "{reason:?} ms={ms} spawn={spawn}");
+        }
+    }
+
+    /// S12 (C3): the reconnect's token (`agent_remint`) lands between the wake and the reconnect, activity
+    /// on the running stretch; rule 11 still fires, since it compares the point with the stretch's start,
+    /// never with the last activity (M-C13), and the suspended stretch ends at the reconnect.
+    #[test]
+    fn an_agent_remint_after_the_wake_leaves_the_inferred_suspend() {
+        use Phase::{Running, Suspended};
+        let t0 = at(9, 0, 0);
+        let rows = [
+            row(t0, "vm_run", &[("id", X)]),
+            span("s1", t0 + 10),
+            row(t0 + 100, "transcript_push", &[("vm", X), ("session", "-")]),
+            row(t0 + 2001, "agent_remint", &[("id", X), ("spawn", "s1"), ("reason", "expiring")]),
+            reconnect(t0 + 2003, "s1", "woke after 1800.0 s asleep", "2500"),
+        ];
+        let t = build(&rows, &[], defaults(), 0, t0 + 3000);
+        let x = vm(&t, X);
+        assert_eq!(
+            shape(x)[..2],
+            [(Running, t0, t0 + 500, true, t0 + 200, t0 + 800, "vm_run", "-"), (Suspended, t0 + 500, t0 + 2003, false, t0 + 2003, t0 + 2003, "-", "agent_reconnect")]
+        );
+        assert_eq!((x.inferred_suspends, x.inferred_resumes, x.anomalies), (1, 1, 0));
+    }
+
+    /// S12 (C3): two chats on X reconnect after one sleep. The first infers the suspend and resumes X at its
+    /// row; the second's point lies before the stretch the first opened, so it infers nothing (M-C14).
+    #[test]
+    fn two_chats_reconnecting_after_one_sleep_infer_one_suspend() {
+        use Phase::{Running, Suspended};
+        let t0 = at(11, 0, 0);
+        let rows = [
+            row(t0, "vm_run", &[("id", X)]),
+            span("s1", t0 + 10),
+            span("s2", t0 + 20),
+            reconnect(t0 + 2003, "s1", "woke after 1800.0 s asleep", "2500"),
+            reconnect(t0 + 2005, "s2", "woke after 1800.0 s asleep", "4500"),
+        ];
+        let t = build(&rows, &[], defaults(), 0, t0 + 3000);
+        let x = vm(&t, X);
+        assert_eq!((x.inferred_suspends, x.inferred_resumes, x.suspends, x.anomalies), (1, 1, 0, 0), "{x:#?}");
+        assert_eq!(
+            shape(x),
+            [
+                (Running, t0, t0 + 500, true, t0 + 200, t0 + 800, "vm_run", "-"),
+                (Suspended, t0 + 500, t0 + 2003, false, t0 + 2003, t0 + 2003, "-", "agent_reconnect"),
+                (Running, t0 + 2003, t0 + 3000, false, t0 + 3000, t0 + 3000, "agent_reconnect", "-"),
+            ]
+        );
+    }
+
+    /// S12 (C3): a VM whose wall passed while the Mac slept ended at its wall (rule 7, before the reconnect's
+    /// row is read), so rule 11 infers nothing and it is priced as running to that end: CAVEATS[7]'s
+    /// residual (Q-C5). A control: it passes with and without rule 11.
+    #[test]
+    fn a_wall_passed_during_the_sleep_ends_the_vm_at_its_wall() {
+        use Phase::Running;
+        let t0 = at(12, 0, 0);
+        let rows = [row(t0, "vm_run", &[("id", X), ("max_duration_s", "1000")]), span("s1", t0 + 10), reconnect(t0 + 2003, "s1", "woke after 1800.0 s asleep", "2500")];
+        let t = build(&rows, &[], defaults(), 0, t0 + 3000);
+        let x = vm(&t, X);
+        assert_eq!(shape(x), [(Running, t0, t0 + 1000, false, t0 + 1000, t0 + 1000, "vm_run", "wall")]);
+        assert_eq!((x.end.as_deref(), x.inferred_suspends, x.inferred_resumes, x.anomalies), (Some("wall"), 0, 0, 0));
     }
 }

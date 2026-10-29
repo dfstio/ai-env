@@ -1373,7 +1373,7 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
                     let asleep = wall_now().saturating_sub(clock.1).saturating_sub(clock.0.elapsed());
                     clock = (Instant::now(), wall_now());
                     if asleep > p.dead_after && !quiet {
-                        return Ok(End::Lost(format!("woke after {} asleep", secs(asleep))));
+                        return Ok(End::Lost(woke_reason(asleep)));
                     }
                     let idle = link.activity.idle();
                     if idle > p.dead_after && !quiet {
@@ -2218,6 +2218,35 @@ fn units(p: &RunPolicy, n: u64) -> Duration {
 
 fn secs(d: Duration) -> String {
     format!("{:.1} s", d.as_secs_f64())
+}
+
+/// S12 (C3): the `agent_reconnect` reason of a socket a sleep ended (`woke after <s.s> s asleep`),
+/// which `asleep_of` reads back for the cost timeline.
+#[must_use]
+pub(crate) fn woke_reason(asleep: Duration) -> String {
+    format!("woke after {} asleep", secs(asleep))
+}
+
+/// The whole seconds of a `woke_reason` (`woke after <n> s asleep` or `woke after <n>.<d…> s asleep`,
+/// the fraction dropped); `None` for any other text.
+///
+/// LD-C10: exactly `woke after `, then 1 or more ASCII digits that parse as a `u64`, optionally `.`
+/// and 1 or more ASCII digits, then ` s asleep`. A sign, an exponent, a space more, `inf`, an empty
+/// part or anything after `asleep` is `None`, so no other reason (`no frame for 30.0 s`) is read as a
+/// sleep. The integer form is `tests/cursor_live.rs`' (`woke after 181 s asleep`); the timeline's
+/// rule 11 reads it (plans/s12-contracts.md §C4).
+#[must_use]
+pub(crate) fn asleep_of(reason: &str) -> Option<u64> {
+    let n = reason.strip_prefix("woke after ")?.strip_suffix(" s asleep")?;
+    let (whole, fraction) = match n.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (n, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || fraction.is_some_and(|f| !digits(f)) {
+        return None;
+    }
+    whole.parse().ok()
 }
 
 /// The wire spelling of a code (`bad_request`, …).
@@ -6179,6 +6208,38 @@ mod tests {
                 assert!(stopped.unwrap(), "not on the VM: gone");
             })
             .await;
+        }
+    }
+
+    /// S12 (C3, LD-C10): the reason a sleep ends a socket with keeps S10's bytes, and `asleep_of` reads
+    /// its whole seconds back (the fraction dropped, never rounded up), the integer form too, and no
+    /// other text (M-C12, M-C18).
+    #[test]
+    fn the_woke_reason_round_trips_through_asleep_of() {
+        let t10_2 = woke_reason(Duration::from_millis(235_900));
+        assert_eq!(t10_2, "woke after 235.9 s asleep", "S10 T10.2's line");
+        assert_eq!(asleep_of(&t10_2), Some(235));
+        assert_eq!(asleep_of("woke after 181 s asleep"), Some(181), "tests/cursor_live.rs' integer form");
+        assert_eq!(asleep_of(&woke_reason(Duration::from_secs(1800))), Some(1800));
+        assert_eq!(asleep_of("woke after 45.99 s asleep"), Some(45), "the fraction dropped, never rounded");
+        let long = format!("woke after {} s asleep", "9".repeat(21));
+        for other in [
+            "no frame for 30.0 s",
+            "woke after  s asleep",
+            "woke after -5.0 s asleep",
+            "woke after +5.0 s asleep",
+            "woke after 1e3 s asleep",
+            "woke after 5. s asleep",
+            "woke after .5 s asleep",
+            "woke after inf s asleep",
+            "woke after  60.0 s asleep",
+            "woke after 60.0 s asleep (late)",
+            "woke after 60.0.5 s asleep",
+            "Woke after 60.0 s asleep",
+            "woke after 60.0s asleep",
+            long.as_str(),
+        ] {
+            assert_eq!(asleep_of(other), None, "{other:?}");
         }
     }
 }

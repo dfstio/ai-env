@@ -558,6 +558,14 @@ impl HostState {
         self.pending.len()
     }
 
+    /// S12 (T): the subtype of the host's request `id` while it is pending (no child answered it, the host did
+    /// not withdraw it, no respawn failed it): what the pump reads before [`HostState::on_child_frame`] takes it
+    /// out (`hoststate.rs:359`). Only the subtype `on_host_frame` recorded; never the request's body.
+    #[must_use]
+    pub fn pending_subtype(&self, id: &str) -> Option<&str> {
+        self.pending.get(id).map(String::as_str)
+    }
+
     /// The recorded requests in replay order (initialize first).
     #[must_use]
     pub fn recorded(&self) -> Vec<&Recorded> {
@@ -884,6 +892,28 @@ mod tests {
         st.begin_gen(2);
         let lines = texts(&st.replay_lines(&mut ids()));
         assert!(lines[0].ends_with(r#""request":{"subtype":"apply_flag_settings","settings":{"z":1,"a":2.50,"s":"x\"y"}}}"#), "{}", lines[0]);
+    }
+
+    /// S12 (T, §T1.3): a host request's subtype is readable while it is pending, until the child's answer
+    /// takes it out, the host withdraws it or a respawn fails it; an unknown id has none; neither request
+    /// (a `generate_session_title`'s `description` is the user's prompt) is recorded.
+    #[test]
+    fn pending_subtype_follows_a_host_request_to_its_end() {
+        let mut st = HostState::new();
+        host(&mut st, r#"{"type":"control_request","request_id":"g1","request":{"subtype":"generate_session_title","description":"Harbour prompt words","persist":true}}"#);
+        host(&mut st, r#"{"type":"control_request","request_id":"r2","request":{"subtype":"rename_session","title":"Harbour-s12 named"}}"#);
+        assert_eq!((st.pending_subtype("g1"), st.pending_subtype("r2")), (Some("generate_session_title"), Some("rename_session")));
+        assert_eq!(child(&mut st, &resp("g1")), ChildVerdict::Forward);
+        assert_eq!((st.pending_subtype("g1"), st.pending_subtype("r2")), (None, Some("rename_session")), "the answer took g1 out");
+        host(&mut st, r#"{"type":"control_cancel_request","request_id":"r2"}"#);
+        assert_eq!(st.pending_subtype("r2"), None, "withdrawn by the host");
+        host(&mut st, r#"{"type":"control_request","request_id":"g3","request":{"subtype":"generate_session_title","description":"more words"}}"#);
+        assert_eq!(st.pending_subtype("g3"), Some("generate_session_title"));
+        assert_eq!(st.fail_in_flight().len(), 1, "a respawn fails it");
+        assert_eq!(st.pending_subtype("g3"), None);
+        assert_eq!(st.pending_subtype("nobody"), None);
+        assert!(st.recorded().is_empty(), "no body kept: {:?}", st.recorded());
+        assert!(!format!("{:?}", st.snapshot()).contains("Harbour prompt words"));
     }
 }
 

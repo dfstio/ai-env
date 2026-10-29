@@ -348,11 +348,31 @@ impl Record {
 
     /// When [`Record::auto_retry`] holds: the Unix time its retry may start, [`ADMIT_COOLDOWN`] after the failure's
     /// `at` (a failure by hand writes no `finished_at` into the lock, so its own time counts too); `None` when it does
-    /// not hold or that time does not read (then the lock's `finished_at` alone spaces the tries).
+    /// not hold or that time does not read (then the lock's `finished_at` alone spaces the tries). S12 (V2): the
+    /// trigger's and `--auto`'s own check; the views use [`Record::retry_from`], which also counts the lock's
+    /// `finished_at`.
     #[must_use]
     pub fn auto_retry_from(&self) -> Option<u64> {
         let at = self.admission.as_ref().filter(|_| self.auto_retry()).and_then(|a| crate::wire::time::parse_rfc3339_utc(&a.at))?;
         Some(at.saturating_add(ADMIT_COOLDOWN.as_secs()))
+    }
+
+    /// S12 (V2): when [`Record::auto_retry`] holds, the Unix time the views name for its retry: [`ADMIT_COOLDOWN`]
+    /// after the later of the failure's `at` and the version lock's `finished_at` (`clock.finished`), or after
+    /// whichever of the two reads. That is the first second D5's trigger lets the retry start, both its gates past
+    /// (plans/s12-contracts.md §V2.4 rules 1 and 2: `auto_retry_from() <= now`, and `cooldown_lock`'s `now - F` of at
+    /// least the cooldown). `None` when it does not hold, or neither reads. The trigger keeps
+    /// [`Record::auto_retry_from`] and the lock's own read (`prewarm::cooldown_lock`).
+    #[must_use]
+    pub fn retry_from(&self, clock: &RetryClock) -> Option<u64> {
+        if !self.auto_retry() {
+            return None;
+        }
+        let failed = self.admission.as_ref().and_then(|a| crate::wire::time::parse_rfc3339_utc(&a.at));
+        let finished = clock.finished.get(&self.version).copied();
+        // The later of the two that read; with one, that one.
+        let from = failed.into_iter().chain(finished).max()?;
+        Some(from.saturating_add(ADMIT_COOLDOWN.as_secs()))
     }
 }
 
@@ -367,10 +387,68 @@ pub fn attempt_words(n: u32) -> String {
     }
 }
 
-/// When an automatic retry of `r` may start, as the views say it: ` from <RFC 3339 UTC>` (empty when its time does
-/// not read).
-fn retry_when(r: &Record) -> String {
-    r.auto_retry_from().map(|t| format!(" from {}", crate::wire::time::rfc3339_utc(t))).unwrap_or_default()
+/// S12 (V2): what the views judge an automatic retry's time by (plain data, so the views stay pure): now, and the
+/// `finished_at=` of `state/claude/<v>.lock` for each record whose Docker failure the automatic admission runs
+/// again ([`Record::auto_retry`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryClock {
+    /// Unix seconds.
+    pub now: u64,
+    /// [`lock_finished_at`] by version, for those records only; a lock that does not read is absent.
+    pub finished: std::collections::BTreeMap<String, u64>,
+}
+
+impl RetryClock {
+    /// [`crate::wire::time::unix_now`], and the lock of each of `records` that [`Record::auto_retry`] holds for:
+    /// file reads only, no lock taken, nothing written, never a wait. Now is read first, so a lock's end written
+    /// meanwhile is later than it and the view says ` from` (plans/s12-contracts.md §V2.4 rules 10 and 12: one clock
+    /// a command run, one open and at most 4 KiB per such record, no other lock opened, LD-V9).
+    #[must_use]
+    pub fn read(paths: &Paths, records: &[Record]) -> RetryClock {
+        let now = crate::wire::time::unix_now();
+        let finished = records.iter().filter(|r| r.auto_retry()).filter_map(|r| lock_finished_at(paths, &r.version).map(|f| (r.version.clone(), f))).collect();
+        RetryClock { now, finished }
+    }
+
+    /// `now`, and no lock read: the tests, and [`rows::rows_claude`] (S11's text).
+    #[must_use]
+    pub fn at(now: u64) -> RetryClock {
+        RetryClock { now, finished: std::collections::BTreeMap::new() }
+    }
+}
+
+/// S12 (V2): `state/claude/<v>.lock`'s `finished_at=` as the views read it
+/// ([`crate::bridge::remote::prewarm::finished_at_in`]): opened read-only with `O_NOFOLLOW`, `O_NONBLOCK` and
+/// `O_CLOEXEC`, a regular file only, at most [`crate::bridge::remote::prewarm::FINISHED_AT_READ_MAX`] bytes as
+/// UTF-8. Never created, written or locked: an admission holding the flock is read past, never waited for. `None`
+/// for a version that is not `N.N.N`, a missing, symlinked, non-regular or unreadable file, text that is not
+/// UTF-8, or no such line. It opens the file itself, `registry::read_regular_file`'s flags with the bound (LD-V11):
+/// every failure is `None`, never an error or a log line, so a view never fails over a lock (§V2.4 rule 13).
+#[must_use]
+pub(crate) fn lock_finished_at(paths: &Paths, version: &str) -> Option<u64> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if !crate::wire::pin::is_version(version) {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC).open(paths.claude_lock(version)).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(crate::bridge::remote::prewarm::FINISHED_AT_READ_MAX).read_to_string(&mut text).ok()?;
+    crate::bridge::remote::prewarm::finished_at_in(&text)
+}
+
+/// When an automatic retry of `r` may start, as the views say it: ` from <T>` (RFC 3339 UTC) while
+/// [`Record::retry_from`] is after `clock.now`, ` is due now` once it is not (at that second too: the trigger's first,
+/// LD-V5), empty when it does not read (S12, V2: plans/s12-contracts.md §V2.4 rule 3, the words §12.1's Q-V4).
+fn retry_when(r: &Record, clock: &RetryClock) -> String {
+    match r.retry_from(clock) {
+        Some(t) if t > clock.now => format!(" from {}", crate::wire::time::rfc3339_utc(t)),
+        Some(_) => " is due now".into(),
+        None => String::new(),
+    }
 }
 
 /// `N.N.N` as numbers, for ordering versions part by part.
@@ -379,6 +457,17 @@ pub fn version_key(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
     let key = (parts.next()??, parts.next()??, parts.next()??);
     parts.next().is_none().then_some(key)
+}
+
+/// S12 (V1): the `N.N.N` ones of `versions` (`wire::pin::is_version`), newest first (numbers part by part,
+/// [`version_key`]; equal numbers by text, so the order is total and a repeat sits next to its twin), each once:
+/// how the views list versions (gc's kept line and its JSON `windows`, `status`' `windows`: LD-V1, LD-V2).
+#[must_use]
+pub fn newest_first_once<'a>(versions: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<&str> = versions.into_iter().filter(|v| crate::wire::pin::is_version(v)).collect();
+    out.sort_by_key(|v| std::cmp::Reverse((version_key(v), *v)));
+    out.dedup();
+    out.into_iter().map(str::to_string).collect()
 }
 
 /// Every record that reads (others logged and skipped), by version, oldest first.
@@ -605,9 +694,12 @@ pub fn failed_why(r: &Record) -> Option<String> {
 /// newest first, with its phase, ref, size, staging state, admission time and why it failed (absent values `null`),
 /// its Docker failures since it was last admitted (`docker_failures`, 0 without one) and, for a Docker failure the
 /// automatic admission runs again (`auto_admit` on and the wrapper's mode `remote`, doctor's T6: in passthrough no
-/// wrapper starts it; tries left), the time that retry may start (`retry_from`, RFC 3339 UTC, else `null`).
+/// wrapper starts it; tries left), the time that retry may start (`retry_from`, RFC 3339 UTC, else `null`). S12
+/// (V2): that time is [`Record::retry_from`] by `clock` (the later of the failure and the lock's `finished_at`, plus
+/// the cooldown), even when it is past (§V2.4 rule 4, LD-V6: [`status_lines`] says `is due now` from it); the
+/// windows are each `N.N.N` one once, newest first ([`newest_first_once`]).
 #[must_use]
-pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], image: Option<&str>, auto_admit: bool, remote: bool) -> serde_json::Value {
+pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], image: Option<&str>, auto_admit: bool, remote: bool, clock: &RetryClock) -> serde_json::Value {
     let mut versions: Vec<String> = records.iter().map(|r| r.version.clone()).chain(bundle.map(str::to_string)).chain(windows.iter().cloned()).filter(|v| crate::wire::pin::is_version(v)).collect();
     versions.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
     versions.dedup();
@@ -624,21 +716,21 @@ pub fn status_doc(records: &[Record], bundle: Option<&str>, windows: &[String], 
                 "admitted_at": r.and_then(|r| r.admission.as_ref()).filter(|a| a.outcome == "admitted").map(|a| a.at.clone()),
                 "why": r.and_then(failed_why),
                 "docker_failures": r.map_or(0, Record::docker_failures),
-                "retry_from": r.filter(|_| auto_admit && remote).and_then(Record::auto_retry_from).map(crate::wire::time::rfc3339_utc),
+                "retry_from": r.filter(|_| auto_admit && remote).and_then(|r| r.retry_from(clock)).map(crate::wire::time::rfc3339_utc),
             })
         })
         .collect();
-    let mut win: Vec<&String> = windows.iter().collect();
-    win.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
-    win.dedup();
+    let win = newest_first_once(windows.iter().map(String::as_str));
     serde_json::json!({ "versions": rows, "bundle": bundle, "windows": win, "image": image, "auto_admit": auto_admit })
 }
 
 /// `status`'s text lines from its document: one per version (its phase, who runs it, why it failed; a Docker
 /// failure's attempt and whether an automatic retry follows, from when, or that its tries are spent), then the
-/// image's fallback and the automatic admission's setting.
+/// image's fallback and the automatic admission's setting. S12 (V2): a retry whose `retry_from` is at or before
+/// `now` (Unix seconds: the `now` of the clock `status_doc` was given) is said to be due now, its time kept in the
+/// document only (LD-V6).
 #[must_use]
-pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
+pub fn status_lines(doc: &serde_json::Value, now: u64) -> Vec<String> {
     let s = |v: &serde_json::Value| v.as_str().map(str::to_string);
     let bundle = s(&doc["bundle"]);
     let windows: Vec<String> = doc["windows"].as_array().map(|a| a.iter().filter_map(s).collect()).unwrap_or_default();
@@ -656,7 +748,7 @@ pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
         let phase = s(&v["phase"]).unwrap_or_default();
         let mut line = format!("claude {version}: {phase}");
         if let Some(why) = s(&v["why"]) {
-            let docker = if phase == "failed(docker)" { docker_status(&version, v) } else { String::new() };
+            let docker = if phase == "failed(docker)" { docker_status(&version, v, now) } else { String::new() };
             line.push_str(&format!(" ({why}{docker})"));
         }
         if !runs.is_empty() {
@@ -675,15 +767,21 @@ pub fn status_lines(doc: &serde_json::Value) -> Vec<String> {
 
 /// A Docker failure's part of `status`' parenthetical, from its row: `; attempt N of 3`, then whether the automatic
 /// admission runs it again (`; an automatic retry from <T> (the next remote wrapper starts it)`, the row's
-/// `retry_from`: `auto_admit` on in remote mode) or its tries are spent (`, no automatic retry left: fix it, then
-/// ai-env claude admit <v> --redo`).
-fn docker_status(version: &str, row: &serde_json::Value) -> String {
+/// `retry_from`: `auto_admit` on in remote mode; S12, V2: `; an automatic retry is due now (the next remote wrapper
+/// starts it)` once that time is at or before `now`, §V2.4 rule 5) or its tries are spent (`, no automatic retry
+/// left: fix it, then ai-env claude admit <v> --redo`). A `retry_from` that does not parse keeps S11's ` from` form
+/// (`status_doc` writes none).
+fn docker_status(version: &str, row: &serde_json::Value, now: u64) -> String {
     let n = row["docker_failures"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
     let attempt = attempt_words(n);
     if n >= ADMIT_DOCKER_TRIES {
         format!("; {attempt}, no automatic retry left: fix it, then ai-env claude admit {version} --redo")
     } else if let Some(from) = row["retry_from"].as_str() {
-        format!("; {attempt}; an automatic retry from {from} (the next remote wrapper starts it)")
+        if crate::wire::time::parse_rfc3339_utc(from).is_some_and(|t| t <= now) {
+            format!("; {attempt}; an automatic retry is due now (the next remote wrapper starts it)")
+        } else {
+            format!("; {attempt}; an automatic retry from {from} (the next remote wrapper starts it)")
+        }
     } else {
         format!("; {attempt}")
     }
@@ -691,19 +789,22 @@ fn docker_status(version: &str, row: &serde_json::Value) -> String {
 
 /// `ai-env claude status [--json]` (§7.1): local reads only, no Touch ID: the records, the installed bundle, the live
 /// windows (the census), the deployed image's claude (`state/infra.toml`), `[claude].auto_admit` and `[wrapper].mode`
-/// (a Docker failure's retry promised only in remote mode, as doctor's T6 rule).
+/// (a Docker failure's retry promised only in remote mode, as doctor's T6 rule). S12 (V2): one [`RetryClock`] a run,
+/// read after the records (now, and the locks of the Docker failures the automatic admission runs again), so every
+/// row is judged against one now (§V2.4 rule 10).
 pub fn cmd_status(json: bool) -> crate::errors::Result<()> {
     let paths = Paths::resolve()?;
     let cfg = BridgeConfig::load(&paths).ok().flatten().unwrap_or_default();
     let remote = matches!(cfg.wrapper.wrapper_mode(), Ok(crate::bridge::config::WrapperMode::Remote));
     let records = load_all(&paths);
+    let clock = RetryClock::read(&paths, &records);
     let windows: Vec<String> = crate::bridge::doctor::running_windows().into_iter().map(|w| w.ext).filter(|e| crate::wire::pin::is_version(e)).collect();
     let image = crate::bridge::infra::read_infra_state(&paths).ok().flatten().and_then(|s| s.claude_version);
-    let doc = status_doc(&records, installed_bundle().as_deref(), &windows, image.as_deref(), cfg.claude.auto_admit, remote);
+    let doc = status_doc(&records, installed_bundle().as_deref(), &windows, image.as_deref(), cfg.claude.auto_admit, remote, &clock);
     if json {
         crate::outln!("{}", serde_json::to_string_pretty(&doc).map_err(|e| crate::errors::CliError::Msg(format!("cannot render JSON: {e}")))?);
     } else {
-        for line in status_lines(&doc) {
+        for line in status_lines(&doc, clock.now) {
             crate::outln!("{line}");
         }
     }
@@ -914,7 +1015,7 @@ pub(crate) mod tests {
         for (v, c, phase) in [("2.1.306", 'a', "seen"), ("2.1.307", 'b', "signed"), ("2.1.308", 'c', "admitted"), ("2.1.309", 'd', "failed"), ("2.1.310", 'e', "staged"), ("2.1.311", 'f', "stale")] {
             put(&p, v, c, phase);
         }
-        let doc = status_doc(&load_all(&p), Some("2.1.320"), &["2.1.310".to_string(), "2.1.310".to_string()], Some("2.1.305"), true, true);
+        let doc = status_doc(&load_all(&p), Some("2.1.320"), &["2.1.310".to_string(), "2.1.310".to_string()], Some("2.1.305"), true, true, &RetryClock::at(0));
         let phases: Vec<(String, String)> = doc["versions"].as_array().unwrap().iter().map(|v| (v["version"].as_str().unwrap().to_string(), v["phase"].as_str().unwrap().to_string())).collect();
         let want = [("2.1.320", "seen"), ("2.1.311", "stale"), ("2.1.310", "staged"), ("2.1.309", "failed(markers)"), ("2.1.308", "admitted"), ("2.1.307", "signed"), ("2.1.306", "seen")];
         assert_eq!(phases, want.map(|(v, p)| (v.to_string(), p.to_string())));
@@ -924,12 +1025,12 @@ pub(crate) mod tests {
         assert_eq!(row("2.1.309")["why"], "missing:auto_mode");
         assert_eq!((doc["bundle"].as_str(), doc["image"].as_str(), doc["auto_admit"].as_bool()), (Some("2.1.320"), Some("2.1.305"), Some(true)));
         assert_eq!(doc["windows"], serde_json::json!(["2.1.310"]));
-        let lines = status_lines(&doc);
+        let lines = status_lines(&doc, 0);
         for want in ["claude 2.1.320: seen; run by the Cursor bundle", "claude 2.1.310: staged; run by a live Cursor window", "claude 2.1.309: failed(markers) (missing:auto_mode)", "claude 2.1.311: stale", "the image's claude 2.1.305 runs where no staged version can"] {
             assert!(lines.iter().any(|l| l == want), "{want}: {lines:?}");
         }
         assert!(lines.last().unwrap().starts_with("automatic admission ([claude].auto_admit): on"), "{lines:?}");
-        let none = status_lines(&status_doc(&[], None, &[], None, false, false));
+        let none = status_lines(&status_doc(&[], None, &[], None, false, false, &RetryClock::at(0)), 0);
         assert_eq!(none.len(), 3, "{none:?}");
         assert!(none[1].contains("unknown") && none[2].contains(": off"), "{none:?}");
     }
@@ -1136,13 +1237,13 @@ pub(crate) mod tests {
         put_docker(&p, "2.1.321", 'b', 3, "2026-10-24T13:50:00Z");
         put_docker(&p, "2.1.322", 'c', 0, "2026-10-24T13:50:00Z");
         put(&p, "2.1.323", 'd', "failed");
-        let doc = status_doc(&load_all(&p), None, &[], Some("2.1.305"), true, true);
+        let doc = status_doc(&load_all(&p), None, &[], Some("2.1.305"), true, true, &RetryClock::at(0));
         let row = |v: &str| doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == v).unwrap().clone();
         assert_eq!((row("2.1.320")["why"].as_str(), row("2.1.320")["docker_failures"].as_u64(), row("2.1.320")["retry_from"].as_str()), (Some("test l2_x failed"), Some(1), Some("2026-10-24T14:05:00Z")));
         assert_eq!((row("2.1.321")["docker_failures"].as_u64(), row("2.1.321")["retry_from"].clone()), (Some(3), serde_json::Value::Null), "spent: no retry");
         assert_eq!((row("2.1.322")["docker_failures"].as_u64(), row("2.1.322")["retry_from"].as_str()), (Some(1), Some("2026-10-24T14:05:00Z")), "a record from before the count");
         assert_eq!((row("2.1.323")["docker_failures"].as_u64(), row("2.1.323")["retry_from"].clone()), (Some(0), serde_json::Value::Null), "markers: final");
-        let lines = status_lines(&doc);
+        let lines = status_lines(&doc, 0);
         for want in [
             "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it))",
             "claude 2.1.321: failed(docker) (test l2_x failed; attempt 3 of 3, no automatic retry left: fix it, then ai-env claude admit 2.1.321 --redo)",
@@ -1153,15 +1254,153 @@ pub(crate) mod tests {
         }
         // The automatic admission off, or on in passthrough: the attempt only, no retry promised.
         for (auto_admit, remote) in [(false, true), (true, false)] {
-            let off = status_doc(&load_all(&p), None, &[], Some("2.1.305"), auto_admit, remote);
+            let off = status_doc(&load_all(&p), None, &[], Some("2.1.305"), auto_admit, remote, &RetryClock::at(0));
             assert_eq!(off["versions"].as_array().unwrap().iter().find(|r| r["version"] == "2.1.320").unwrap()["retry_from"], serde_json::Value::Null, "{auto_admit} {remote}");
-            let lines = status_lines(&off);
+            let lines = status_lines(&off, 0);
             assert!(lines.iter().any(|l| l == "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3)"), "{lines:?}");
             assert!(lines.iter().any(|l| l.starts_with("claude 2.1.321: failed(docker) (test l2_x failed; attempt 3 of 3, no automatic retry left: ")), "{lines:?}");
         }
         // Past the tries by --redo: the attempt alone.
         put_docker(&p, "2.1.321", 'b', 4, "2026-10-24T13:50:00Z");
-        let lines = status_lines(&status_doc(&load_all(&p), None, &[], None, true, true));
+        let lines = status_lines(&status_doc(&load_all(&p), None, &[], None, true, true, &RetryClock::at(0)), 0);
         assert!(lines.iter().any(|l| l.starts_with("claude 2.1.321: failed(docker) (test l2_x failed; attempt 4, no automatic retry left: ")), "{lines:?}");
+    }
+
+    /// S12 (V1, LD-V1): how the views list versions: the `N.N.N` ones only, newest first by number part by part
+    /// (2.1.10 after 2.1.302 and before 2.1.9, which a text sort would put first), each once.
+    #[test]
+    fn newest_first_once_orders_by_number_and_names_each_once() {
+        assert_eq!(newest_first_once(["2.1.302", "2.1.310", "2.1.9", "2.1.302", "unrecognised", "2.1.10", ""]), ["2.1.310", "2.1.302", "2.1.10", "2.1.9"]);
+        assert!(newest_first_once(Vec::<&str>::new()).is_empty());
+    }
+
+    /// S12 (V2, §V2.4 rules 1 to 3): the views' retry time is the cooldown after the later of the failure's `at` and
+    /// the version lock's `finished_at` (the last automatic try's end), after either alone when the other does not
+    /// read, and none when neither reads or the automatic admission does not run the record again (its tries spent,
+    /// another failed step, admitted), whatever its lock says. It is ` from <T>` until `T`, then ` is due now`, from
+    /// that very second (LD-V5, the words §12.1's Q-V4). `RetryClock::read` opens the locks of the records the
+    /// automatic admission runs again and no other, though each holds an end (rule 12, LD-V9).
+    #[test]
+    fn the_retry_counts_from_the_later_of_the_failure_and_the_last_auto_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let a = crate::wire::time::parse_rfc3339_utc("2026-10-24T13:50:00Z").unwrap();
+        let cooldown = ADMIT_COOLDOWN.as_secs();
+        let r = put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        let clock = |v: &str, now: u64, finished: Option<u64>| RetryClock { now, finished: finished.map(|f| (v.to_string(), f)).into_iter().collect() };
+        // The last automatic try ended after the failure: its end counts.
+        let later = clock("2.1.320", a + 60, Some(a + 600));
+        assert_eq!(r.retry_from(&later), Some(a + 1500));
+        assert_eq!(retry_when(&r, &later), " from 2026-10-24T14:15:00Z");
+        // It ended before the failure: the failure's own time.
+        let earlier = clock("2.1.320", a + 60, Some(a - 600));
+        assert_eq!((r.retry_from(&earlier), retry_when(&r, &earlier).as_str()), (Some(a + cooldown), " from 2026-10-24T14:05:00Z"));
+        // No end in the lock, or only another version's: S11's time.
+        assert_eq!((r.retry_from(&clock("2.1.320", a + 60, None)), r.auto_retry_from()), (Some(a + cooldown), Some(a + cooldown)));
+        assert_eq!(r.retry_from(&clock("2.1.399", a + 60, Some(a + 600))), Some(a + cooldown));
+        // A failure's time that does not read: the lock's end alone; neither: no time, and nothing said.
+        let odd = put_docker(&p, "2.1.321", 'b', 1, "t");
+        assert_eq!(odd.retry_from(&clock("2.1.321", a + 60, Some(a + 600))), Some(a + 600 + cooldown));
+        assert_eq!((odd.retry_from(&RetryClock::at(a + 60)), retry_when(&odd, &RetryClock::at(a + 60))), (None, String::new()));
+        // Due at `T` itself and after it; one second before, still from `T`.
+        let t = a + 1500;
+        assert_eq!(retry_when(&r, &clock("2.1.320", t, Some(a + 600))), " is due now");
+        assert_eq!(retry_when(&r, &clock("2.1.320", t + 3600, Some(a + 600))), " is due now");
+        assert_eq!(retry_when(&r, &clock("2.1.320", t - 1, Some(a + 600))), " from 2026-10-24T14:15:00Z");
+        // No automatic retry, so no time, whatever the lock says: 3 failures, a failed marker, an admitted version.
+        let spent = put_docker(&p, "2.1.322", 'c', 3, "2026-10-24T13:50:00Z");
+        let markers = put(&p, "2.1.323", 'd', "failed");
+        let admitted = put(&p, "2.1.324", 'e', "admitted");
+        for rec in [spent, markers, admitted] {
+            let c = clock(&rec.version, a + 60, Some(a + 600));
+            assert_eq!((rec.retry_from(&c), retry_when(&rec, &c)), (None, String::new()), "{}", rec.version);
+        }
+        // Every one of the five holds an end; the clock reads those of the two Docker failures with tries left (the
+        // one whose time does not read too), never the spent, the markers' or the admitted version's.
+        for v in ["2.1.320", "2.1.321", "2.1.322", "2.1.323", "2.1.324"] {
+            std::fs::write(p.claude_lock(v), format!("finished_at={}\n", a + 600)).unwrap();
+        }
+        assert_eq!(RetryClock::read(&p, &load_all(&p)).finished, std::collections::BTreeMap::from([("2.1.320".to_string(), a + 600), ("2.1.321".to_string(), a + 600)]), "only the locks of Docker failures with tries left are read");
+    }
+
+    /// S12 (V2, §V4 items 1 and 2, LD-V11): the views read a lock's `finished_at=` past an admission's flock, never
+    /// wait (a FIFO opens at once), never create the file, and take only a regular file's first
+    /// `FINISHED_AT_READ_MAX` bytes as UTF-8: the prewarm's form reads, and a line ending right at the bound; a
+    /// missing file (which stays missing), a symlink (its target holding a time), a directory, a FIFO, a line whose
+    /// last digit lies one byte past the bound, bytes that are no UTF-8 and a name that is no version (`../x` would
+    /// name a file holding a time) read as none. Every case on a thread bounded at 5 s: a wait fails the test, never
+    /// hangs it.
+    #[test]
+    fn lock_finished_at_reads_without_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        std::fs::create_dir_all(p.claude_dir()).unwrap();
+        let lock = |v: &str| p.claude_lock(v);
+        std::fs::write(lock("2.1.301"), "finished_at=123\noutcome=failed(docker)\n").unwrap();
+        std::fs::write(lock("2.1.302"), "pid=1\nstarted_at=5\nfinished_at=7\n").unwrap();
+        let elsewhere = dir.path().join("elsewhere.lock");
+        std::fs::write(&elsewhere, "finished_at=5\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lock("2.1.304")).unwrap();
+        std::fs::create_dir(lock("2.1.305")).unwrap();
+        let fifo = std::ffi::CString::new(lock("2.1.306").into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // The line's last byte one past the bound (4097 bytes), then right at it (4096): only a bound of exactly 4096
+        // bytes (`FINISHED_AT_READ_MAX`) cuts the one's digit and reads the other's. No newline at the end: `lines()`
+        // still yields the last line.
+        std::fs::write(lock("2.1.307"), format!("{}\nfinished_at=9", "x".repeat(4083))).unwrap();
+        std::fs::write(lock("2.1.308"), format!("{}\nfinished_at=9", "x".repeat(4082))).unwrap();
+        assert_eq!([lock("2.1.307"), lock("2.1.308")].map(|l| std::fs::metadata(l).unwrap().len()), [4097, 4096]);
+        std::fs::write(lock("2.1.309"), [b"finished_at=9\n".as_slice(), &[0xff, 0xfe, b'\n']].concat()).unwrap();
+        std::fs::write(p.claude_dir().join("..").join("x.lock"), "finished_at=5\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let q = p.clone();
+        std::thread::spawn(move || {
+            // An admission of 2.1.301 holds its lock while the views read.
+            let held = admit::VersionLock::take(&q, "2.1.301").unwrap().expect("the lock is free");
+            let got: Vec<(&str, Option<u64>)> = ["2.1.301", "2.1.302", "2.1.303", "2.1.304", "2.1.305", "2.1.306", "2.1.307", "2.1.308", "2.1.309", "../x", "2.1"].into_iter().map(|v| (v, lock_finished_at(&q, v))).collect();
+            drop(held);
+            let _ = tx.send(got);
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("lock_finished_at waited (on the flock, or on a FIFO without a writer)");
+        let want: [(&str, Option<u64>); 11] = [
+            ("2.1.301", Some(123)),
+            ("2.1.302", Some(7)),
+            ("2.1.303", None),
+            ("2.1.304", None),
+            ("2.1.305", None),
+            ("2.1.306", None),
+            ("2.1.307", None),
+            ("2.1.308", Some(9)),
+            ("2.1.309", None),
+            ("../x", None),
+            ("2.1", None),
+        ];
+        assert_eq!(got, want);
+        assert!(std::fs::symlink_metadata(lock("2.1.303")).is_err(), "a missing lock stays missing");
+        assert_eq!(std::fs::read_to_string(lock("2.1.301")).unwrap(), "finished_at=123\noutcome=failed(docker)\n", "read, never written");
+    }
+
+    /// S12 (V2, §V2.5): `status` names the retry from the later time, and says it is due now once that has passed
+    /// (judged by the `now` its lines are given, at that second too), while `--json` keeps the time itself; in
+    /// passthrough no retry is promised, whatever the lock says.
+    #[test]
+    fn status_says_the_retry_from_the_later_time_or_due_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        let a = crate::wire::time::parse_rfc3339_utc("2026-10-24T13:50:00Z").unwrap();
+        put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        let clock = RetryClock { now: a + 60, finished: [("2.1.320".to_string(), a + 600)].into() };
+        let doc = status_doc(&load_all(&p), None, &[], Some("2.1.305"), true, true, &clock);
+        let row = |doc: &serde_json::Value| doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == "2.1.320").unwrap().clone();
+        let line = |doc: &serde_json::Value, now: u64| status_lines(doc, now).into_iter().find(|l| l.starts_with("claude 2.1.320: ")).unwrap_or_default();
+        assert_eq!(row(&doc)["retry_from"].as_str(), Some("2026-10-24T14:15:00Z"));
+        assert_eq!(line(&doc, a + 60), "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from 2026-10-24T14:15:00Z (the next remote wrapper starts it))");
+        assert_eq!(line(&doc, a + 1500), "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry is due now (the next remote wrapper starts it))");
+        assert_eq!(row(&doc)["retry_from"].as_str(), Some("2026-10-24T14:15:00Z"), "the document keeps the time, past or not");
+        // Passthrough: no wrapper starts it.
+        let off = status_doc(&load_all(&p), None, &[], Some("2.1.305"), true, false, &clock);
+        assert_eq!(row(&off)["retry_from"], serde_json::Value::Null);
+        assert_eq!(line(&off, a + 1500), "claude 2.1.320: failed(docker) (test l2_x failed; attempt 1 of 3)");
     }
 }

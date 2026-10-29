@@ -538,6 +538,39 @@ fn stage_uploads_the_chat_and_leaves_its_view() {
     assert_eq!(again.outcome, "already");
 }
 
+/// S12 (T): the CLI's `custom-title` line of `name` (its key order: `customTitle` first), with its newline.
+fn cli_rename(name: &str) -> String {
+    format!("{{\"type\":\"custom-title\",\"customTitle\":{},\"sessionId\":\"{SID}\"}}\n", serde_json::to_string(name).unwrap())
+}
+
+/// S12 (T): Cursor's `custom-title` line of `name` (the extension's key order: `sessionId` first), with its newline.
+fn cursor_rename(name: &str) -> String {
+    format!("{{\"type\":\"custom-title\",\"sessionId\":\"{SID}\",\"customTitle\":{}}}\n", serde_json::to_string(name).unwrap())
+}
+
+/// S12 (T, Bug 2, plans/s12-contracts.md §T3 S1, S5): a staged chat keeps its name. Its transcript holds a turn,
+/// a rename naming a key shape the scrub masks (no tripwire hits it, so the stage takes the chat), the CLI's line
+/// twice (the CLI re-appends it) and Cursor's line: once the original is under `origin/` (byte for byte as
+/// planted), its view ends with the CLI's line once, then Cursor's, byte for byte, and no view line holds the key.
+#[test]
+fn stage_keeps_the_chats_name() {
+    let (w, repo) = World::new(FakeS3::start()).with_workspace();
+    let key = format!("{}{}", "ASIA", "Q".repeat(16));
+    assert!(Rules::defaults().scan_bytes(key.as_bytes()).is_empty() && ai_env_cli::wire::redact::scrub(&key) != key.as_str(), "the scrub's alone");
+    let (cli, cursor) = (cli_rename("Harbour-s11 word memory"), cursor_rename("Harbour-s11 word memory"));
+    let main_bytes = [cwd_line(&repo), line("turn 0", 300), cli_rename(&format!("leak {key}")).into_bytes(), cli.clone().into_bytes(), cli.clone().into_bytes(), cursor.clone().into_bytes()].concat();
+    w.plant(&format!("{SID}.jsonl"), &main_bytes);
+    let report = w.rt().block_on(s3stage::stage(&w.paths, &w.cfg, &w.target, &w.projects, SID, MULTIPART_PART, &builder, || async { Ok(FakeMicrovmApi::new()) })).unwrap();
+    assert_eq!(report.outcome, "staged");
+    assert_eq!(std::fs::read(w.paths.transcript_origin(SID).join(format!("{SID}.jsonl"))).unwrap(), main_bytes, "the original under origin/, as planted");
+    let view = std::fs::read_to_string(w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX), "{view}");
+    assert!(view.ends_with(&format!("{cli}{cursor}")), "the CLI's line once, then Cursor's: {view}");
+    assert_eq!(view.matches("\"type\":\"custom-title\"").count(), 2, "{view}");
+    assert!(!view.contains(&key), "no view line holds the key: {view}");
+    assert_eq!(ai_env_cli::bridge::view::view_rename(&w.view_path()).as_deref(), Some("Harbour-s11 word memory"), "the picker's name");
+}
+
 /// The lead's phase-4 items (T7): `session stage` refuses, before any
 /// request or Touch ID and before anything moves, a chat that could never
 /// reopen once its original is a view: the cwd its transcript records
@@ -752,6 +785,659 @@ fn a_session_without_a_manifest_is_still_purged_and_collected() {
     assert!(commands::gc_candidates(&w.paths, 1, now + 10 * 86_400).unwrap().is_empty());
 }
 
+// ---- S12 (P): the batch purge (plans/s12-contracts.md §P11, tests 9 to 15 and 18) ----
+
+/// S12 (P): a purge sends DeleteObjects (up to 1000 keys a request, quiet,
+/// its body's SHA-256 signed), sends again only the keys S3 refused for a
+/// moment, lists the prefix again after each pass (three listings at most),
+/// and falls back to one DeleteObject each when S3 refuses the batch's form;
+/// a key left is exit 7 with the session's manifest and state kept. And the
+/// fake S3's DeleteObjects, against S3's rules.
+mod batch_purge {
+    use super::*;
+    use ai_env_cli::bridge::s3::client::{Deleted, KeyError, DELETE_PARALLEL};
+    use ai_env_cli::bridge::s3::commands;
+    use ai_env_cli::errors::CliError;
+    use fake_s3::S3Request;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    /// Another session, whose object no purge of `SID` touches.
+    const OTHER: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+    /// The target of the client's log lines (P-R23: P's warnings and `send`'s).
+    const CLIENT: &str = "ai_env_cli::bridge::s3::client";
+
+    /// What `run` gave, and every line it logged through the bridge's own log
+    /// stack (`bridge::logging`, `ai_env_cli` at warn, scrubbed as the
+    /// wrapper's log is): each line's `<level> <target>: <message>`, its time
+    /// cut. `run` blocks on a current-thread runtime, so every line its
+    /// futures log is this thread's. While at most one dispatch is
+    /// registered, tracing-core asks only the registering thread's own
+    /// subscriber about a callsite that thread meets first, and keeps the
+    /// answer: a line another test's thread reached first (`send`'s retry
+    /// warning, say) would stay off here. A second, empty dispatch held
+    /// alongside makes it ask every live one, this one among them.
+    fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let sink = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let capture = tracing::Dispatch::new(ai_env_cli::bridge::logging::build_subscriber_for_test(sink.clone(), "ai_env_cli=warn"));
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let out = tracing::dispatcher::with_default(&capture, run);
+        let text = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        (out, text.lines().map(|l| l.split_once(' ').map_or(l, |(_, rest)| rest).trim_start().to_string()).collect())
+    }
+
+    /// `closed_mac_chat` (the manifest's object, the session's state, its
+    /// lock and its view) and `n - 1` more objects under `v1/<SID>/` of every
+    /// kind the store writes (a base, a tail, segments, Mac objects, subtree
+    /// files): every key, in the listing's order.
+    fn planted(w: &World, n: usize) -> Vec<String> {
+        let mut keys = vec![closed_mac_chat(w)];
+        let mut more = vec![S3Key::Base { session: SID.into(), gen: 1 }.render(), S3Key::Tail { session: SID.into(), gen: 1, offset: 8 }.render()];
+        for i in 0..n.saturating_sub(3) {
+            more.push(match i % 3 {
+                0 => S3Key::Segment { session: SID.into(), gen: 1, offset: 8 + i as u64 }.render(),
+                1 => S3Key::Mac { session: SID.into(), sha256: sha(format!("mac {i}").as_bytes()) }.render(),
+                _ => S3Key::File { session: SID.into(), sha256: sha(format!("file {i}").as_bytes()) }.render(),
+            });
+        }
+        more.truncate(n.saturating_sub(1));
+        for key in &more {
+            w.s3.put(key, key.as_bytes());
+        }
+        keys.extend(more);
+        keys.sort();
+        keys
+    }
+
+    /// The DeleteObjects the fake S3 took, in order.
+    fn batches(s3: &FakeS3) -> Vec<S3Request> {
+        s3.requests().into_iter().filter(|r| r.method == "POST" && r.key.is_empty() && r.query_names.first().is_some_and(|n| n == "delete")).collect()
+    }
+
+    /// Each key's newest version: whether it is a delete marker.
+    fn markers(s3: &FakeS3) -> BTreeMap<String, bool> {
+        s3.objects().into_iter().filter(|o| o.current).map(|o| (o.key, o.delete_marker)).collect()
+    }
+
+    /// Whether every key of `keys` is behind a current delete marker.
+    fn all_gone(s3: &FakeS3, keys: &[String]) -> bool {
+        let m = markers(s3);
+        keys.iter().all(|k| m.get(k) == Some(&true))
+    }
+
+    /// Whether the session's manifest, `state/transcripts/<SID>/` (`origin/` with it) and its lock are all there.
+    fn state_kept(w: &World) -> bool {
+        w.manifest().is_some() && w.paths.transcript_origin(SID).exists() && w.paths.transcript_lock(SID).exists()
+    }
+
+    /// The text of error A or B (P-R15).
+    fn left(n: usize, m: usize, first: &str, why: &str) -> String {
+        format!("aws s3 delete objects: {n} of {m} objects under v1/{SID}/ were not deleted (first: {first}: {why}); its manifest and state are kept: run the command again")
+    }
+
+    /// §P11 test 9: a purge of 2500 objects of every kind is three listing
+    /// pages, three DeleteObjects of 1000, 1000 and 500 keys (together every
+    /// planted key once, in the listing's order), each a POST of the bucket
+    /// with `delete` first, signed over exactly its checksum pair and the
+    /// owner and answered 200, then one verify listing, and no DeleteObject
+    /// at all; every key behind a current delete marker, another session's
+    /// object as it was, the session's manifest, state and lock gone.
+    #[test]
+    fn a_purge_of_2500_objects_takes_three_batches_and_a_verify_listing() {
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 2500);
+        let other = S3Key::Base { session: OTHER.into(), gen: 1 }.render();
+        w.s3.put(&other, b"another session");
+        let client = w.client();
+        assert!(w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap());
+        let sent = w.s3.requests();
+        assert_eq!(sent.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(), ["GET", "GET", "GET", "POST", "POST", "POST", "GET"], "three pages, three batches, the verify listing");
+        let posts = batches(&w.s3);
+        assert_eq!(posts.iter().map(|r| r.delete_keys.len()).collect::<Vec<_>>(), [1000, 1000, 500]);
+        for p in &posts {
+            assert_eq!((p.status, p.query_names[0].as_str()), (200, "delete"), "{p:?}");
+            assert_eq!(p.signed_headers, ["host", "x-amz-checksum-sha256", "x-amz-expected-bucket-owner", "x-amz-sdk-checksum-algorithm"]);
+        }
+        assert_eq!(posts.iter().flat_map(|r| r.delete_keys.clone()).collect::<Vec<_>>(), keys, "every planted key once, in the listing's order");
+        assert_eq!((sent[6].method.as_str(), sent[6].status), ("GET", 200), "the verify listing");
+        assert!(!sent.iter().any(|r| r.method == "DELETE"), "no DeleteObject");
+        assert!(all_gone(&w.s3, &keys), "every planted key behind a current delete marker");
+        assert_eq!(w.s3.get(&other).as_deref(), Some(&b"another session"[..]), "another session's object keeps its bytes");
+        assert!(w.manifest().is_none() && !w.paths.transcript_dir(SID).exists() && !w.paths.transcript_lock(SID).exists(), "the manifest, the state and the lock are gone");
+    }
+
+    /// §P11 test 10: (a) of 2500 keys, one of the first batch refused
+    /// `InternalError` and one of the third `SlowDown` once go again alone,
+    /// in the listing's order, in a fourth DeleteObjects, and the purge
+    /// succeeds, logging P-R8's line exactly once and nothing else (its count,
+    /// its codes in the keys' order, its round; PC-3: no key, body or URL);
+    /// (b) a key refused `InternalError` at each of the three rounds is error
+    /// A, sent in all three after the rounds' two waits.
+    #[test]
+    fn keys_refused_with_a_retry_code_alone_go_again() {
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 2500);
+        let (first, third) = (keys[17].clone(), keys[2222].clone());
+        w.s3.script_key_errors(&first, &["InternalError"]);
+        w.s3.script_key_errors(&third, &["SlowDown"]);
+        let client = w.client();
+        let (purged, lines) = logged(|| w.rt().block_on(commands::purge_with(&client, &w.paths, SID)));
+        assert!(purged.unwrap());
+        assert_eq!(lines, [format!("WARN {CLIENT}: s3 delete objects: S3 refused 2 key(s) for now (InternalError, SlowDown); sent again (round 2 of 3)")], "P-R8's line, and nothing else");
+        let posts = batches(&w.s3);
+        assert_eq!(posts.len(), 4, "three batches, then the two keys refused for now");
+        assert_eq!(posts[3].delete_keys, [first.clone(), third.clone()], "only the refused keys, in the listing's order");
+        assert!(all_gone(&w.s3, &keys));
+        // (b) One key refused InternalError at every round.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        let stuck = keys[1].clone();
+        w.s3.script_key_errors(&stuck, &["InternalError"; 3]);
+        let client = w.client();
+        let t = Instant::now();
+        let e = w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap_err();
+        let took = t.elapsed();
+        assert_eq!(e.to_string(), left(1, 3, &stuck, "InternalError"));
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        let posts = batches(&w.s3);
+        assert!(posts.len() == 3 && posts.iter().all(|p| p.delete_keys.contains(&stuck)), "three rounds name it: {posts:?}");
+        assert!(took >= Duration::from_millis(1500), "the rounds' two waits (500 ms, then 1 s): {took:?}");
+        assert!(state_kept(&w));
+    }
+
+    /// §P11 test 11: a key S3 refuses `AccessDenied` (the manifest's own) is
+    /// error A at once, exit 7: one DeleteObjects naming the three, the
+    /// purge's last request (no verify listing after a key left), the other
+    /// two behind markers, that key current, the manifest, the state
+    /// (`origin/` with it) and the lock kept. A rerun deletes that key alone,
+    /// lists the prefix empty and removes the state. (b) Two keys left are
+    /// counted, and error A names the first left in the listing's order
+    /// (P-R9: `failed` keeps the given order), not the first S3 refused: the
+    /// first key, refused `InternalError` at each round, before the third,
+    /// refused `AccessDenied` at round 1.
+    #[test]
+    fn a_key_s3_refuses_fails_the_purge_and_keeps_its_state() {
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        let manifests = S3Key::Mac { session: SID.into(), sha256: "a".repeat(64) }.render();
+        assert!(keys.contains(&manifests));
+        w.s3.script_key_errors(&manifests, &["AccessDenied"]);
+        let client = w.client();
+        let e = w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap_err();
+        assert_eq!(e.to_string(), left(1, 3, &manifests, "AccessDenied"));
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        let sent = w.s3.requests();
+        let posts = batches(&w.s3);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].delete_keys, keys);
+        assert_eq!((sent.last().unwrap().method.as_str(), sent.last().unwrap().query_names[0].as_str()), ("POST", "delete"), "no listing after a key left: {sent:?}");
+        let m = markers(&w.s3);
+        assert!(keys.iter().all(|k| m.get(k) == Some(&(*k != manifests))), "the other two behind markers, that key current: {m:?}");
+        assert!(state_kept(&w), "the manifest, the state and the lock are kept");
+        // The rerun takes what is left.
+        let before = sent.len();
+        assert!(w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap());
+        let rerun: Vec<S3Request> = w.s3.requests()[before..].to_vec();
+        assert_eq!(rerun.iter().map(|r| (r.method.as_str(), r.delete_keys.clone())).collect::<Vec<_>>(), [("GET", vec![]), ("POST", vec![manifests.clone()]), ("GET", vec![])]);
+        assert!(all_gone(&w.s3, &keys));
+        assert!(w.manifest().is_none() && !w.paths.transcript_dir(SID).exists() && !w.paths.transcript_lock(SID).exists());
+        // (b) Two keys left: the first in the listing's order is named, though S3 refused the other for good first.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_key_errors(&keys[0], &["InternalError"; 3]);
+        w.s3.script_key_errors(&keys[2], &["AccessDenied"]);
+        let client = w.client();
+        let e = w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap_err();
+        assert_eq!(e.to_string(), left(2, 3, &keys[0], "InternalError"));
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        assert_eq!(batches(&w.s3).iter().map(|p| p.delete_keys.clone()).collect::<Vec<_>>(), [keys.clone(), vec![keys[0].clone()], vec![keys[0].clone()]], "three rounds, the last two of the first key alone");
+        assert!(state_kept(&w));
+    }
+
+    /// §P11 test 12: a DeleteObjects S3 answers 503, or 200 with an
+    /// `InternalError` document, or whose answer is lost, is sent again whole
+    /// (S3 deletes again: a marker more); three 200 error documents are the
+    /// error, `s3 delete objects: HTTP 200 (InternalError)`.
+    #[test]
+    fn a_batch_answered_503_or_an_error_document_or_lost_is_sent_again() {
+        // (a) 503, then a 200 error document, then the answer.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_delete(vec![S3Action::Status { status: 503, code: "SlowDown" }, S3Action::Status { status: 200, code: "InternalError" }]);
+        let client = w.client();
+        assert!(w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap());
+        let posts = batches(&w.s3);
+        assert_eq!(posts.iter().map(|p| (p.status, p.code.as_deref())).collect::<Vec<_>>(), [(503, Some("SlowDown")), (200, Some("InternalError")), (200, None)]);
+        assert!(posts.iter().all(|p| p.delete_keys == keys));
+        assert!(all_gone(&w.s3, &keys));
+        // (b) The first answer lost: the batch goes again, a second marker each.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_delete(vec![S3Action::Drop]);
+        let client = w.client();
+        assert!(w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap());
+        assert_eq!(batches(&w.s3).len(), 2);
+        let objects = w.s3.objects();
+        for key in &keys {
+            let versions: Vec<&fake_s3::S3Object> = objects.iter().filter(|o| o.key == *key).collect();
+            assert_eq!(versions.iter().map(|o| (o.delete_marker, o.current)).collect::<Vec<_>>(), [(false, false), (true, false), (true, true)], "{key}");
+        }
+        // (c) Three error documents: the error, the keys as they were.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_delete(vec![S3Action::Status { status: 200, code: "InternalError" }; 3]);
+        let client = w.client();
+        let e = w.rt().block_on(client.delete_batch(&keys)).unwrap_err();
+        assert!(matches!(&e, BridgeError::S3 { op: "delete objects", status: 200, code: Some(c) } if c == "InternalError"), "{e:?}");
+        assert_eq!(e.to_string(), "s3 delete objects: HTTP 200 (InternalError)");
+        assert_eq!(batches(&w.s3).len(), 3);
+        let m = markers(&w.s3);
+        assert!(keys.iter().all(|k| m.get(k) == Some(&false)), "the keys current: {m:?}");
+    }
+
+    /// §P11 test 13: S3 refusing the batch's form at the first DeleteObjects
+    /// (400 `InvalidRequest`, 405, 400 `MissingContentMD5`, 501
+    /// `NotImplemented`) deletes every key as its own DeleteObject, 16 at a
+    /// time, each sent again as `send` does (a 503 among them), logging P-R10's
+    /// line once (and `send`'s for the 503) and nothing else; a later batch's
+    /// refusal, or a 403, is the error, no single sent. Then (P-R10, LD-P6) a
+    /// single S3 refuses is a key left with its code, or `HTTP <status>`
+    /// without one, never the error (f); a single with no answer at its last
+    /// try is the error, never a key left (g); a first batch's 400 or 501 of
+    /// another code (a broken checksum or body) is the error, a 405 of any
+    /// code the fallback (h); a form refusal in round 2 is the error (P-R11),
+    /// round 1's deletes standing (i); and the singles go at most
+    /// `DELETE_PARALLEL` at once, and that many side by side (j).
+    #[test]
+    fn a_batch_form_s3_refuses_falls_back_to_single_deletes() {
+        // (a) InvalidRequest, and one single answered 503 first.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 20);
+        w.s3.script_delete(vec![S3Action::Status { status: 400, code: "InvalidRequest" }]);
+        w.s3.script(vec![S3Action::Status { status: 503, code: "SlowDown" }]);
+        let client = w.client();
+        let (done, lines) = logged(|| w.rt().block_on(client.delete_keys(&keys)));
+        assert_eq!(done.unwrap(), Deleted { deleted: 20, failed: Vec::new(), one_by_one: true });
+        let sent = w.s3.requests();
+        assert_eq!((sent[0].method.as_str(), sent[0].status), ("POST", 400));
+        let singles: Vec<&S3Request> = sent[1..].iter().collect();
+        assert!(singles.len() == 21 && singles.iter().all(|r| r.method == "DELETE"), "{sent:?}");
+        assert_eq!(singles.iter().filter(|r| r.status == 503).count(), 1);
+        let mut named: Vec<String> = singles.iter().map(|r| r.key.clone()).collect();
+        named.sort();
+        named.dedup();
+        assert_eq!(named, keys, "every key, one of them twice");
+        assert!(all_gone(&w.s3, &keys));
+        let again = &singles.iter().find(|r| r.status == 503).unwrap().key;
+        assert_eq!(
+            lines,
+            [
+                format!("WARN {CLIENT}: s3 delete objects: S3 refused the batch's form (s3 delete objects: HTTP 400 (InvalidRequest)); 20 object(s) deleted one by one, 16 at a time"),
+                format!("WARN {CLIENT}: s3 delete: {again}: HTTP 503 (SlowDown); sent again (try 2 of 3)"),
+            ],
+            "P-R10's line once, then send's for the single answered 503, and nothing else"
+        );
+        // (b), (c) The other refusals of the form.
+        for (status, code) in [(405, "MethodNotAllowed"), (400, "MissingContentMD5"), (501, "NotImplemented")] {
+            let w = World::new(FakeS3::start());
+            let keys = planted(&w, 20);
+            w.s3.script_delete(vec![S3Action::Status { status, code }]);
+            let client = w.client();
+            assert_eq!(w.rt().block_on(client.delete_keys(&keys)).unwrap(), Deleted { deleted: 20, failed: Vec::new(), one_by_one: true }, "{status} {code}");
+            assert_eq!(w.s3.requests().iter().filter(|r| r.method == "DELETE").count(), 20, "{status} {code}");
+            assert!(all_gone(&w.s3, &keys), "{status} {code}");
+        }
+        // (d) A later batch's refusal of the form is the error: what the first deleted stays deleted.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 1001);
+        w.s3.script_delete(vec![S3Action::Delay(Duration::ZERO), S3Action::Status { status: 400, code: "InvalidRequest" }]);
+        let client = w.client();
+        let e = w.rt().block_on(client.delete_keys(&keys)).unwrap_err();
+        assert_eq!(e.to_string(), "s3 delete objects: HTTP 400 (InvalidRequest)");
+        assert!(!w.s3.requests().iter().any(|r| r.method == "DELETE"), "no single");
+        let m = markers(&w.s3);
+        assert!(keys[..1000].iter().all(|k| m.get(k) == Some(&true)) && m.get(&keys[1000]) == Some(&false), "the first batch's keys deleted, the last current");
+        // (e) A 403 is no refusal of the form.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_delete(vec![S3Action::Status { status: 403, code: "AccessDenied" }]);
+        let client = w.client();
+        let e = w.rt().block_on(client.delete_keys(&keys)).unwrap_err();
+        assert_eq!(e.to_string(), "s3 delete objects: HTTP 403 (AccessDenied)");
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        assert!(!w.s3.requests().iter().any(|r| r.method == "DELETE"), "no single");
+        // (f) A single S3 refuses (one key: the generic script reaches it) is a key left with its code, or `HTTP <status>`
+        // without one; never the error, never sent again, the key current.
+        for (code, kept_as) in [("AccessDenied", "AccessDenied"), ("", "HTTP 403")] {
+            let w = World::new(FakeS3::start());
+            let keys = planted(&w, 1);
+            w.s3.script_delete(vec![S3Action::Status { status: 400, code: "InvalidRequest" }]);
+            w.s3.script(vec![S3Action::Status { status: 403, code }]);
+            let client = w.client();
+            let done = w.rt().block_on(client.delete_keys(&keys)).unwrap();
+            assert_eq!(done, Deleted { deleted: 0, failed: vec![KeyError { key: keys[0].clone(), code: kept_as.into() }], one_by_one: true }, "{code:?}");
+            assert_eq!(w.s3.requests().iter().filter(|r| r.method == "DELETE").count(), 1, "{code:?}: a 403 is not sent again");
+            assert!(w.s3.get(&keys[0]).is_some(), "{code:?}: the key current");
+        }
+        // (g) A single that gets no answer at its last try ends `delete_keys` with that error (`try_collect`): no key left.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 1);
+        w.s3.script_delete(vec![S3Action::Status { status: 400, code: "InvalidRequest" }]);
+        w.s3.script(vec![S3Action::Drop; 3]);
+        let client = w.client();
+        let e = w.rt().block_on(client.delete_keys(&keys)).unwrap_err();
+        assert!(matches!(&e, BridgeError::Sdk { op: "s3 delete", .. }), "{e:?}");
+        let text = e.to_string();
+        assert!(text.starts_with(&format!("aws s3 delete: {}: no answer in 3 tries: ", keys[0])), "{text}");
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        assert_eq!(w.s3.requests().iter().filter(|r| r.method == "DELETE").count(), 3, "its three tries");
+        // (h) A first batch's 400 or 501 of a code outside BATCH_REFUSED (a broken checksum, a malformed body) is the
+        // error, one POST each and no single; a 405 is the fallback whatever its code.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        let client = w.client();
+        for (status, code) in [(400, "BadDigest"), (400, "MalformedXML"), (501, "Other")] {
+            w.s3.script_delete(vec![S3Action::Status { status, code }]);
+            let e = w.rt().block_on(client.delete_keys(&keys)).unwrap_err();
+            assert_eq!(e.to_string(), format!("s3 delete objects: HTTP {status} ({code})"));
+            assert_eq!(CliError::from(e).exit_code(), 7, "{status} {code}");
+        }
+        assert_eq!((batches(&w.s3).len(), w.s3.requests().iter().filter(|r| r.method == "DELETE").count()), (3, 0), "one DeleteObjects each, no single");
+        assert!(keys.iter().all(|k| w.s3.get(k).is_some()), "nothing deleted");
+        w.s3.script_delete(vec![S3Action::Status { status: 405, code: "InvalidRequest" }]);
+        assert_eq!(w.rt().block_on(client.delete_keys(&keys)).unwrap(), Deleted { deleted: 3, failed: Vec::new(), one_by_one: true }, "a 405 of another code");
+        assert!(all_gone(&w.s3, &keys));
+        // (i) A form refusal of round 2's batch is the error (P-R11): round 1's deletes stand, no single.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.script_key_errors(&keys[1], &["InternalError"]);
+        w.s3.script_delete(vec![S3Action::Delay(Duration::ZERO), S3Action::Status { status: 400, code: "InvalidRequest" }]);
+        let client = w.client();
+        let e = w.rt().block_on(client.delete_keys(&keys)).unwrap_err();
+        assert_eq!(e.to_string(), "s3 delete objects: HTTP 400 (InvalidRequest)");
+        assert_eq!(batches(&w.s3).iter().map(|p| p.delete_keys.clone()).collect::<Vec<_>>(), [keys.clone(), vec![keys[1].clone()]], "round 1, then round 2's one key");
+        assert!(!w.s3.requests().iter().any(|r| r.method == "DELETE"), "no single");
+        let m = markers(&w.s3);
+        assert!(m.get(&keys[0]) == Some(&true) && m.get(&keys[1]) == Some(&false) && m.get(&keys[2]) == Some(&true), "round 1's deletes stand, the refused key current: {m:?}");
+        // (j) The bound: 40 singles, each held 250 ms by the fake, go DELETE_PARALLEL at a time, side by side.
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 40);
+        w.s3.script_delete(vec![S3Action::Status { status: 400, code: "InvalidRequest" }]);
+        w.s3.script(vec![S3Action::Delay(Duration::from_millis(250)); 40]);
+        let client = w.client();
+        assert_eq!(w.rt().block_on(client.delete_keys(&keys)).unwrap(), Deleted { deleted: 40, failed: Vec::new(), one_by_one: true });
+        assert_eq!(w.s3.max_deletes_in_flight(), DELETE_PARALLEL, "the singles in flight at once: 16, never more, and never one at a time");
+        assert!(all_gone(&w.s3, &keys));
+    }
+
+    /// §P11 test 18 (P-R7, LD-P2): a key given twice to `delete_keys` is
+    /// sent once, at its first place: one DeleteObjects naming each key once
+    /// in that order, two keys deleted (a `delete_keys` that kept the second
+    /// would hand `delete_batch` a key twice, which it refuses).
+    #[test]
+    fn a_key_given_twice_is_sent_once_at_its_first_place() {
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 2);
+        let client = w.client();
+        let twice = [keys[1].clone(), keys[0].clone(), keys[1].clone()];
+        assert_eq!(w.rt().block_on(client.delete_keys(&twice)).unwrap(), Deleted { deleted: 2, failed: Vec::new(), one_by_one: false });
+        assert_eq!(batches(&w.s3).iter().map(|p| p.delete_keys.clone()).collect::<Vec<_>>(), [vec![keys[1].clone(), keys[0].clone()]], "one DeleteObjects, each key once at its first place");
+        assert!(all_gone(&w.s3, &keys));
+    }
+
+    /// §P11 test 14: (a) an object written under the prefix once the first
+    /// DeleteObjects was answered (a `/terminate` tail) is listed and
+    /// deleted by the second pass, the third listing empty; (b) one written
+    /// after the second pass too is still listed at the third listing:
+    /// error B, the state kept; (c) what the purge returns, the count
+    /// `session gc --remote` prints and audits (P-R22), is every pass's sum:
+    /// the three keys, then the tail.
+    #[test]
+    fn a_purge_deletes_what_lands_after_its_listing_and_stops_after_three() {
+        let tail = |offset: u64| S3Key::Tail { session: SID.into(), gen: 1, offset }.render();
+        let w = World::new(FakeS3::start());
+        let keys = planted(&w, 3);
+        w.s3.plant_after_delete(&tail(4096), b"a tail /terminate pushed");
+        let client = w.client();
+        assert!(w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap());
+        let sent = w.s3.requests();
+        assert_eq!(sent.iter().map(|r| (r.method.as_str(), r.delete_keys.clone())).collect::<Vec<_>>(), [("GET", vec![]), ("POST", keys.clone()), ("GET", vec![]), ("POST", vec![tail(4096)]), ("GET", vec![])]);
+        assert!(all_gone(&w.s3, &[keys, vec![tail(4096)]].concat()));
+        // (b) A tail after each pass: the third listing still names one.
+        let w = World::new(FakeS3::start());
+        planted(&w, 2);
+        w.s3.plant_after_delete(&tail(4096), b"a tail");
+        w.s3.plant_after_delete(&tail(8192), b"another tail");
+        let client = w.client();
+        let e = w.rt().block_on(commands::purge_with(&client, &w.paths, SID)).unwrap_err();
+        assert_eq!(e.to_string(), left(1, 4, &tail(8192), "still listed"));
+        assert_eq!(CliError::from(e).exit_code(), 7);
+        let sent = w.s3.requests();
+        assert_eq!((sent.iter().filter(|r| r.method == "GET").count(), batches(&w.s3).len()), (3, 2), "three listings, two passes");
+        assert!(state_kept(&w));
+        // (c) Two passes: the purge's count is their sum (P-R14).
+        let w = World::new(FakeS3::start());
+        planted(&w, 3);
+        w.s3.plant_after_delete(&tail(4096), b"a tail /terminate pushed");
+        let client = w.client();
+        assert_eq!(w.rt().block_on(commands::delete_session_objects(&client, SID)).unwrap(), 4, "the three keys, then the tail");
+        assert_eq!(batches(&w.s3).len(), 2);
+    }
+
+    /// §P11 test 15: the fake S3 takes DeleteObjects as S3 does, each case
+    /// against three objects planted for it: no checksum, the SDK header
+    /// alone or other than `SHA256`: 400 `InvalidRequest`; a wrong checksum:
+    /// 400 `BadDigest`; 1001 objects, none, another root, an object without
+    /// its key or with a `VersionId`: 400 `MalformedXML`; the checksum alone,
+    /// verbose: each key's `<Deleted>` with its marker's version; quiet with
+    /// one key's scripted `AccessDenied`: that key's `<Error>` alone; the
+    /// checksum unsigned: 403; a POST of a key with `delete`: 405. Nothing is
+    /// deleted by a refused request, and every DeleteObjects records its
+    /// body's keys in order.
+    #[tokio::test]
+    async fn the_fake_s3_takes_delete_objects_as_s3_does() {
+        let s3 = FakeS3::start();
+        let sum = |body: &str| sha256_b64(&sha(body.as_bytes())).unwrap();
+        let doc = |keys: &[String], quiet: Option<&str>| {
+            let objects: String = keys.iter().map(|k| format!("<Object><Key>{k}</Key></Object>")).collect();
+            format!("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{objects}{}</Delete>", quiet.map_or_else(String::new, |q| format!("<Quiet>{q}</Quiet>")))
+        };
+        // Three fresh objects for case `n`.
+        let three = |n: u64| -> Vec<String> {
+            (0..3)
+                .map(|i| {
+                    let key = S3Key::Segment { session: SID.into(), gen: 1, offset: n * 16 + i }.render();
+                    s3.put(&key, b"planted");
+                    key
+                })
+                .collect()
+        };
+        // A DeleteObjects of `body` signing `signed` (besides the owner), sending them and `unsigned` too.
+        let post = |signed: Vec<(&'static str, String)>, unsigned: Vec<(&'static str, String)>, body: String| {
+            let pairs: Vec<(&str, &str)> = signed.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let url = s3.presign("POST", "", &[("delete", "")], &pairs, Duration::from_secs(300));
+            let mut headers = vec![("x-amz-expected-bucket-owner", LAB_OWNER.to_string()), ("content-length", body.len().to_string())];
+            headers.extend(signed);
+            headers.extend(unsigned);
+            async move { http("POST", &url, &headers, body.as_bytes()).await }
+        };
+        let current = |keys: &[String]| keys.iter().all(|k| s3.get(k).is_some());
+        let mut sent_bodies: Vec<Vec<String>> = Vec::new();
+        let sdk = |a: &str| ("x-amz-sdk-checksum-algorithm", a.to_string());
+        // No checksum, the SDK header alone, the SDK header CRC32 beside the right checksum: InvalidRequest.
+        for (n, case) in ["no checksum", "the SDK header alone", "CRC32"].into_iter().enumerate() {
+            let keys = three(n as u64);
+            let body = doc(&keys, Some("true"));
+            let signed = match case {
+                "no checksum" => Vec::new(),
+                "the SDK header alone" => vec![sdk("SHA256")],
+                _ => vec![sdk("CRC32"), ("x-amz-checksum-sha256", sum(&body))],
+            };
+            let (status, _, answer) = post(signed, Vec::new(), body).await;
+            assert_eq!((status, code_of(&answer).as_deref()), (400, Some("InvalidRequest")), "{case}");
+            assert!(current(&keys), "{case}: nothing deleted");
+            sent_bodies.push(keys);
+        }
+        // A wrong checksum: BadDigest.
+        let keys = three(3);
+        let body = doc(&keys, Some("true"));
+        let (status, _, answer) = post(vec![sdk("SHA256"), ("x-amz-checksum-sha256", sum("other bytes"))], Vec::new(), body).await;
+        assert_eq!((status, code_of(&answer).as_deref()), (400, Some("BadDigest")));
+        assert!(current(&keys));
+        sent_bodies.push(keys);
+        // MalformedXML: 1001 objects, none, another root, an object without its key, one with a VersionId.
+        let keys = three(4);
+        let many: Vec<String> = keys.iter().cloned().chain((0..998).map(|i| S3Key::Segment { session: SID.into(), gen: 2, offset: i }.render())).collect();
+        let bodies = [
+            (doc(&many, Some("true")), many.clone()),
+            (doc(&[], Some("true")), Vec::new()),
+            (doc(&keys, Some("true")).replace("<Delete ", "<Remove ").replace("</Delete>", "</Remove>"), keys.clone()),
+            (doc(&keys, None).replacen(&format!("<Key>{}</Key>", keys[1]), "", 1), vec![keys[0].clone(), keys[2].clone()]),
+            (doc(&keys, None).replacen("</Key></Object>", "</Key><VersionId>fv1</VersionId></Object>", 1), keys.clone()),
+        ];
+        for (body, named) in bodies {
+            let (status, _, answer) = post(vec![sdk("SHA256"), ("x-amz-checksum-sha256", sum(&body))], Vec::new(), body.clone()).await;
+            assert_eq!((status, code_of(&answer).as_deref()), (400, Some("MalformedXML")), "{}", &body[..body.len().min(200)]);
+            assert!(current(&keys), "nothing deleted");
+            sent_bodies.push(named);
+        }
+        // The checksum alone, verbose: each key's Deleted, its marker's version.
+        let keys = three(5);
+        let body = doc(&keys, None);
+        let (status, _, answer) = post(vec![("x-amz-checksum-sha256", sum(&body))], Vec::new(), body).await;
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        assert_eq!(status, 200, "{text}");
+        assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">") && text.ends_with("</DeleteResult>"), "{text}");
+        let objects = s3.objects();
+        let deleted: Vec<String> = keys
+            .iter()
+            .map(|k| {
+                let marker = objects.iter().find(|o| o.key == *k && o.current && o.delete_marker).unwrap_or_else(|| panic!("{k}: no marker"));
+                format!("<Deleted><Key>{k}</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>{}</DeleteMarkerVersionId></Deleted>", marker.version_id)
+            })
+            .collect();
+        assert!(text.contains(&deleted.concat()) && !text.contains("<Error>"), "{text}");
+        sent_bodies.push(keys);
+        // Quiet, one key scripted AccessDenied: its Error alone, that key as it was.
+        let keys = three(6);
+        s3.script_key_errors(&keys[1], &["AccessDenied"]);
+        let body = doc(&keys, Some("true"));
+        let (status, _, answer) = post(vec![sdk("SHA256"), ("x-amz-checksum-sha256", sum(&body))], Vec::new(), body).await;
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        assert_eq!(status, 200, "{text}");
+        assert_eq!((text.matches("<Error>").count(), text.contains("<Deleted>")), (1, false), "{text}");
+        assert!(text.contains(&format!("<Error><Key>{}</Key><Code>AccessDenied</Code>", keys[1])), "{text}");
+        assert!(s3.get(&keys[1]).is_some() && s3.get(&keys[0]).is_none() && s3.get(&keys[2]).is_none(), "that key current, the others deleted");
+        sent_bodies.push(keys);
+        // The checksum sent but not signed: AccessDenied, as for every request.
+        let keys = three(7);
+        let body = doc(&keys, Some("true"));
+        let (status, _, answer) = post(Vec::new(), vec![("x-amz-checksum-sha256", sum(&body))], body).await;
+        assert_eq!((status, code_of(&answer).as_deref()), (403, Some("AccessDenied")));
+        assert!(current(&keys));
+        sent_bodies.push(keys);
+        // A POST of a key with delete: 405, no DeleteObjects.
+        let keys = three(8);
+        let body = doc(&keys, Some("true"));
+        let pair = [("x-amz-sdk-checksum-algorithm", "SHA256".to_string()), ("x-amz-checksum-sha256", sum(&body))];
+        let url = s3.presign("POST", &keys[0], &[("delete", "")], &pair.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>(), Duration::from_secs(300));
+        let mut headers = vec![("x-amz-expected-bucket-owner", LAB_OWNER.to_string()), ("content-length", body.len().to_string())];
+        headers.extend(pair);
+        let (status, _, answer) = http("POST", &url, &headers, body.as_bytes()).await;
+        assert_eq!((status, code_of(&answer).as_deref()), (405, Some("MethodNotAllowed")));
+        assert!(current(&keys));
+        // Every DeleteObjects recorded its body's keys in order; the POST of a key is none.
+        let sent = s3.requests();
+        assert_eq!(batches(&s3).into_iter().map(|r| r.delete_keys).collect::<Vec<_>>(), sent_bodies);
+        let last = sent.last().unwrap();
+        assert_eq!((last.key.as_str(), last.delete_keys.len()), (keys[0].as_str(), 0));
+    }
+}
+
+// ---- S12 I2 (the lead): a renamed chat's purge (plans/s12-contracts.md §10.1, X-11) ----
+
+/// S12 I2 (plans/s12-contracts.md §10.1; T §T3 S1, §T4 items 1 and 6; P §P6 P-R14, P-R16, P-R22): a renamed chat's
+/// purge leaves nothing of its name. A chat begun on the rig's Mac and renamed there (the CLI's `custom-title`
+/// line, which the CLI appends twice, then Cursor's) is staged (`session stage`): its view carries the renames,
+/// byte for byte (§T3 S1, Bug 2), its original keeps them under `origin/`, and its closed row holds the name, as
+/// its wrapper wrote it. `session forget <sid> --purge`, through the rig's fake S3, lists the chat's prefix, sends
+/// one DeleteObjects naming every object listed there (no DeleteObject), lists the prefix again, empty, and
+/// removes the row, the view, `state/transcripts/<sid>/` (its `origin/` with it), the manifest and the lock: no
+/// file under the rig's root (the bridge root and the Mac's projects directory among them) holds the name.
+#[test]
+fn i2_a_renamed_chats_purge_leaves_nothing_of_its_name() {
+    use ai_env_cli::bridge::registry::{self, SessionRow};
+    use ai_env_cli::bridge::title::{set_row, SessionTitle, TitleSource};
+    const NAME: &str = "Harbour-s12 purged name";
+    /// Every regular file under `dir` whose bytes hold `needle`, sorted.
+    fn holding(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = e.path();
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => dirs.push(path),
+                    Ok(t) if t.is_file() && std::fs::read(&path).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes())) => out.push(path),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    let mut p = common::Harness::prepare();
+    let sid = common::uuid(0xa3f1);
+    let (cwd, view) = (p.work(), p.mac_projects().join(p.slug()).join(format!("{sid}.jsonl")));
+    let cli = format!("{{\"type\":\"custom-title\",\"customTitle\":\"{NAME}\",\"sessionId\":\"{sid}\"}}");
+    let cursor = format!("{{\"type\":\"custom-title\",\"sessionId\":\"{sid}\",\"customTitle\":\"{NAME}\"}}");
+    let mut lines: Vec<String> = (0..3u64).map(|i| serde_json::json!({"type": "user", "uuid": common::uuid(0xa3f2 + i), "sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": format!("turn {i}")}}).to_string()).collect();
+    lines.extend([cli.clone(), cli.clone(), cursor.clone()]);
+    assert_eq!(p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>()), view);
+    p.plant_project_file(&format!("{sid}/subagents/agent-0.jsonl"), "{\"type\":\"user\",\"isSidechain\":true}\n");
+    let rig = p.rig();
+    let paths = Paths::from_root_and_env(rig.bridge(), None);
+    let o = rig.run(&["session", "stage", &sid], None);
+    assert!(o.status.success(), "session stage: {}", String::from_utf8_lossy(&o.stderr));
+    // Staged with its name (§T3 S1): the view ends with the CLI's line once, then Cursor's, byte for byte.
+    let text = std::fs::read_to_string(&view).unwrap();
+    assert!(text.starts_with(VIEW_MARK_PREFIX) && text.ends_with(&format!("{cli}\n{cursor}\n")), "the view carries the renames: {text}");
+    let origin = paths.transcript_origin(&sid).join(format!("{sid}.jsonl"));
+    assert!(std::fs::read_to_string(&origin).unwrap().contains(NAME), "the original keeps them under origin/");
+    // Its closed row holds the name, as its wrapper wrote it.
+    let mut row = SessionRow { session_id: sid.clone(), mode: "local".into(), status: "closed".into(), ..SessionRow::default() };
+    set_row(&mut row, Some(&SessionTitle { text: NAME.into(), source: TitleSource::Custom }));
+    registry::write(&paths, &row).unwrap();
+    let root = rig.root().to_path_buf();
+    let named = holding(&root, NAME);
+    for file in [paths.sessions().join(format!("{sid}.toml")), view.clone(), origin.clone()] {
+        assert!(named.contains(&file), "{} holds the name before the purge: {named:?}", file.display());
+    }
+    let prefix = format!("v1/{sid}/");
+    let mut listed: Vec<String> = rig.s3().objects().into_iter().filter(|o| o.current && !o.delete_marker && o.key.starts_with(&prefix)).map(|o| o.key).collect();
+    listed.sort();
+    assert_eq!(listed.len(), 2, "the chat and its subagent file in S3: {listed:?}");
+    let from = rig.s3().requests().len();
+    let o = rig.run(&["session", "forget", &sid, "--purge"], None);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(out.starts_with(&format!("forgot {sid}")) && out.trim_end().ends_with("and purged its transcript") && out.lines().count() == 1, "{out}");
+    // P: the listing, one DeleteObjects naming every object listed, the verify listing; no DeleteObject.
+    let sent = rig.s3().requests().split_off(from);
+    assert_eq!(sent.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(), ["GET", "POST", "GET"], "the listing, one DeleteObjects, the verify listing: {sent:?}");
+    let batch = &sent[1];
+    assert!(batch.key.is_empty() && batch.query_names.first().is_some_and(|n| n == "delete") && batch.status == 200, "{batch:?}");
+    let mut deleted = batch.delete_keys.clone();
+    deleted.sort();
+    assert_eq!(deleted, listed, "every object under the chat's prefix, once");
+    assert!(listed.iter().all(|k| rig.s3().get(k).is_none()), "each behind a delete marker");
+    // The row, the view, the state: gone, and nothing of the name with them.
+    assert!(registry::read(&paths, &sid).unwrap().is_none(), "the row is gone");
+    assert!(!view.exists(), "the view is gone");
+    assert!(!paths.transcript_dir(&sid).exists() && !paths.transcript_lock(&sid).exists() && manifest::read(&paths, &sid).unwrap().is_none(), "the state, the manifest and the lock are gone");
+    assert_eq!(holding(&root, NAME), Vec::<PathBuf>::new(), "nothing of the name is left under the rig's root");
+}
+
 /// T5: `migrate-s9` takes only S8's mirrors (`origin_of`'s `s8_mirror`: a
 /// remote row with no manifest and no `transcript_home`). An S9 chat whose
 /// Mac file is no view (its view could not be built) is no mirror, and
@@ -881,6 +1567,8 @@ struct VmSt {
     view: Option<TranscriptViewReply>,
     /// The view's answer does not parse (`reply_of`'s error for a 200).
     view_unparseable: bool,
+    /// S12 (T, phase 4): `GET /transcript/view` answers HTTP 500 (the shim failed it).
+    view_fails: bool,
     /// Answers a push gives instead of PUTting (taken first).
     replies: VecDeque<TranscriptPushReply>,
     /// An edit of every stat's answer.
@@ -1059,6 +1747,9 @@ impl DataPlane for FakeVm {
         q.check().map_err(BridgeError::Config)?;
         let mut st = self.st.lock().unwrap();
         st.routes.push("GET /transcript/view".into());
+        if st.view_fails {
+            return Ok(DpReply::status(500));
+        }
         if st.view_unparseable {
             return Err(BridgeError::Http { status: 200, body: "GET http://x/transcript/view: unparseable answer: unknown field `isMeta`".into() });
         }
@@ -1486,7 +2177,9 @@ fn restore_never_appends_a_tail_to_another_file() {
 #[test]
 fn restore_sends_a_mac_begun_chat_up_inline() {
     let r = Remote::new();
-    let chat = [line("mac 0", 300), line("mac 1", 300)].concat();
+    // S12 (T, Bug 2, §T3 S1): the chat's rename (Cursor's line) is carried into its view.
+    let rename = cursor_rename("Harbour-s11 word memory");
+    let chat = [line("mac 0", 300), line("mac 1", 300), rename.clone().into_bytes()].concat();
     let sub = line("mac subagent", 100);
     r.w.plant(&format!("{SID}.jsonl"), &chat);
     r.w.plant(&format!("{SID}/subagents/a.jsonl"), &sub);
@@ -1496,7 +2189,9 @@ fn restore_sends_a_mac_begun_chat_up_inline() {
     assert_eq!((m.origin.as_str(), m.gen, m.parts.len()), (manifest::ORIGIN_MAC, 0, 1));
     assert_eq!(r.w.s3.get(&m.parts[0].key).as_deref(), Some(chat.as_slice()));
     assert_eq!(std::fs::read(r.w.paths.transcript_origin(SID).join(format!("{SID}.jsonl"))).unwrap(), chat, "the original under origin/");
-    assert!(std::fs::read_to_string(r.w.view_path()).unwrap().starts_with(VIEW_MARK_PREFIX), "its view in its place");
+    let view = std::fs::read_to_string(r.w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX), "its view in its place");
+    assert!(view.ends_with(&rename), "its view keeps the chat's name: {view}");
     assert_eq!(r.vm.file().unwrap(), chat);
     assert!(r.vm.st.lock().unwrap().subtree.is_empty(), "the subtree follows after the spawn");
     assert_eq!(r.restore_subtree().unwrap().pulled, 1);
@@ -1533,6 +2228,25 @@ fn restore_sends_an_s8_mirror_up_in_migrate_s9s_gone_vm_form() {
     let rows = r.w.rows("transcript_migrate");
     assert_eq!((rows[0]["detail"]["from"].as_str(), rows[0]["detail"]["outcome"].as_str()), (Some("gone_vm"), Some("migrated")));
     assert!(r.w.rows("transcript_stage").is_empty());
+}
+
+/// S12 (T, Bug 2, §T3 S2): the S8 mirror of
+/// `restore_sends_an_s8_mirror_up_in_migrate_s9s_gone_vm_form`, holding the
+/// CLI's rename line: the view that replaced it (`replace_mirror`) ends with
+/// it, byte for byte; S3 and the VM hold the mirror as it was.
+#[test]
+fn restore_keeps_an_s8_mirrors_name() {
+    let r = Remote::new();
+    let row = ai_env_cli::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), slug: Some(SLUG.into()), ..ai_env_cli::bridge::registry::SessionRow::default() };
+    ai_env_cli::bridge::registry::write(&r.w.paths, &row).unwrap();
+    let rename = cli_rename("Harbour-s11 word memory");
+    let mirror = [line("vm-begun", 400), rename.clone().into_bytes()].concat();
+    r.w.plant(&format!("{SID}.jsonl"), &mirror);
+    assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Staged { bytes: mirror.len() as u64 });
+    let view = std::fs::read_to_string(r.w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX) && view.ends_with(&rename), "the view that replaced the mirror keeps its name: {view}");
+    assert_eq!(r.vm.file().unwrap(), mirror);
+    assert_eq!(r.w.s3.get(&r.w.manifest().unwrap().parts[0].key).as_deref(), Some(mirror.as_slice()));
 }
 
 /// A stage cut after its manifest and before its view (here: no view could
@@ -2035,6 +2749,86 @@ fn migrate_s9_sends_a_gone_vms_mirror_to_s3_and_leaves_its_view() {
     assert!(std::fs::read_to_string(w2.view_path()).unwrap().starts_with(VIEW_MARK_PREFIX));
 }
 
+/// S12 (T, Bug 2, §T3 S3): `session migrate-s9 --yes` of a gone VM's mirror
+/// holding the CLI's rename line: its view, built here once the mirror went
+/// (`view_from_mirror`), ends with that line; S3 holds the mirror as it was.
+#[test]
+fn migrate_s9_keeps_the_mirrors_name() {
+    use ai_env_cli::bridge::s3::commands::{migrate_one, Mirror};
+    use ai_env_cli::bridge::vm::cmd::Ctx;
+    let w = World::new(FakeS3::start());
+    let ctx = Ctx { paths: w.paths.clone(), cfg: w.cfg.clone(), knobs: VmKnobs::default() };
+    let row = ai_env_cli::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), slug: Some(SLUG.into()), cwd: Some("/Users/mike/Documents/DeFi/ai-env".into()), ..ai_env_cli::bridge::registry::SessionRow::default() };
+    let rename = cli_rename("Harbour-s11 word memory");
+    let mirror = [line("vm turn 0", 300), rename.clone().into_bytes(), line("vm turn 1", 300)].concat();
+    w.plant(&format!("{SID}.jsonl"), &mirror);
+    let chat = s3stage::locate(&w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+    let done = w.rt().block_on(migrate_one(&ctx, &FakeMicrovmApi::new(), &w.target, &Mirror { row, chat, vm: None }, &w.projects, &Rules::defaults(), &builder));
+    assert_eq!((done.from, done.outcome, done.why.as_deref()), ("gone_vm", "migrated", None), "{done:?}");
+    let view = std::fs::read_to_string(w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX) && view.ends_with(&rename), "the view keeps the mirror's name: {view}");
+    assert_eq!(w.s3.get(&w.manifest().unwrap().parts[0].key).as_deref(), Some(mirror.as_slice()));
+}
+
+/// S12 (T, Bug 2, §T3 S4, M-T44): `SyncCtx::write_view_carrying` against
+/// the VM in miniature's view: the view ends with the rename it was given,
+/// audited `transcript_view` `written`; with none it is `write_view`'s. Since
+/// phase 4 `session migrate-s9`'s live-VM path calls its two halves
+/// (`view_reply`, then `write_view_reply`) through `commands::migrate_live`,
+/// the view in hand before the mirror goes (§T3 S4 as amended; the next test).
+#[test]
+fn write_view_carrying_keeps_the_renames() {
+    let r = Remote::new();
+    let rename = cli_rename("Harbour-s11 word memory");
+    let rel = format!("{SLUG}/{SID}.jsonl");
+    let out = r.w.rt().block_on(r.ctx().write_view_carrying(SID, &rel, &[rename.clone().into_bytes()])).unwrap();
+    assert!(matches!(out, ViewOutcome::Written { messages: 2, .. }), "{out:?}");
+    let view = std::fs::read_to_string(r.w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX) && view.ends_with(&rename), "{view}");
+    let rows = r.w.rows("transcript_view");
+    assert_eq!((rows.len(), rows[0]["detail"]["outcome"].as_str(), rows[0]["detail"]["session"].as_str()), (1, Some("written"), Some(SID)));
+    // No renames given: the view's own line is carried as `write_view` carries it.
+    let again = r.w.rt().block_on(r.ctx().write_view_carrying(SID, &rel, &[])).unwrap();
+    assert!(matches!(again, ViewOutcome::Unchanged { .. }), "{again:?}");
+    assert!(std::fs::read_to_string(r.w.view_path()).unwrap().ends_with(&rename));
+}
+
+/// S12 (T, Bug 2, §T3 S4 as amended in phase 4, M-T44b): `session migrate-s9`'s live-VM path
+/// (`commands::migrate_live`, here on the VM in miniature) has the VM's view in
+/// hand, its render checked, before it changes anything: a view request that
+/// fails (HTTP 500), a 200 that does not parse, and a reply that renders no
+/// line each fail the migration with the mirror byte for byte as it was (its
+/// renames with it), nothing synced (no manifest, nothing pushed) and no view
+/// written, so a next run takes it again: with the VM's view in hand it is
+/// synced, the mirror deleted, and the view written carrying the mirror's
+/// rename, audited `written`.
+#[test]
+fn a_live_migration_keeps_the_mirror_until_the_vms_view_is_in_hand() {
+    use ai_env_cli::bridge::s3::commands::migrate_live;
+    let r = Remote::new();
+    let rename = cli_rename("Harbour-s11 word memory");
+    let mirror = [line("vm turn 0", 300), rename.clone().into_bytes(), line("vm turn 1", 300)].concat();
+    let path = r.w.plant(&format!("{SID}.jsonl"), &mirror);
+    r.vm.set(|st| st.file = Some(mirror.clone()));
+    let chat = s3stage::locate(&r.w.projects, &[SLUG], SID, s3stage::STAGE_MAX).unwrap().unwrap();
+    let empty = TranscriptViewReply { title: None, entries: Vec::new(), first_parent: None, ..example() };
+    for (what, case) in [("an HTTP 500", 0), ("a 200 that does not parse", 1), ("a reply of no line", 2)] {
+        r.vm.set(|st| (st.view_fails, st.view_unparseable, st.view) = (case == 0, case == 1, (case == 2).then(|| empty.clone())));
+        let e = r.w.rt().block_on(migrate_live(&r.ctx(), &chat, SID)).expect_err(what);
+        assert_eq!(std::fs::read(&path).unwrap(), mirror, "{what} ({e}): the mirror as it was");
+        assert!(r.w.manifest().is_none() && r.w.s3.requests().is_empty(), "{what}: nothing synced");
+        assert!(r.w.rows("transcript_view").iter().all(|row| row["detail"]["outcome"] != "written"), "{what}: no view written");
+    }
+    assert_eq!(r.w.rows("transcript_view").iter().filter(|row| row["detail"]["outcome"] == "refused").count(), 2, "the unparsed 200 and the reply of no line, refused");
+    r.vm.set(|st| (st.view_fails, st.view_unparseable, st.view) = (false, false, None));
+    let out = r.w.rt().block_on(migrate_live(&r.ctx(), &chat, SID)).unwrap();
+    assert!(matches!(out, ViewOutcome::Written { messages: 2, .. }), "{out:?}");
+    let view = std::fs::read_to_string(r.w.view_path()).unwrap();
+    assert!(view.starts_with(VIEW_MARK_PREFIX) && view.ends_with(&rename), "the VM's view, the mirror's rename last: {view}");
+    assert!(r.w.manifest().is_some_and(|m| m.origin == manifest::ORIGIN_VM), "synced");
+    assert_eq!(r.w.rows("transcript_view").last().map(|row| row["detail"]["outcome"].clone()), Some(serde_json::json!("written")));
+}
+
 // ---- the lead's S3 round trip (plans/s9-contracts.md §10 step 8, §11) ----------------------
 
 /// The S3 round trip end to end, offline: the real `ai-env-claude` in remote
@@ -2207,6 +3001,8 @@ mod round_trip {
     /// holds the whole conversation; each Mac keeps only the view.
     #[test]
     fn s3_a_reopen_in_a_new_vm_restores_from_the_fake_s3() {
+        // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+        let _alone = super::common::remote::alone();
         let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "400")];
         let mut a = Harness::prepare().spawn_on(Link::Remote, "", &[], &knobs);
         let sid = open(&mut a);
@@ -2683,6 +3479,11 @@ mod followups {
         for sid in [&a, &b, &c] {
             assert!(ai_env_cli::bridge::registry::read(&paths, sid).unwrap().is_none() && !paths.transcript_dir(sid).exists(), "{sid}");
         }
+        // S12 (P, plans/s12-contracts.md §P11 test 16): one DeleteObjects per session with a trace (A's, then B's), no DeleteObject.
+        let sent = rig.s3().requests();
+        let batches: Vec<Vec<String>> = sent.iter().filter(|r| r.method == "POST" && r.key.is_empty() && r.query_names.first().is_some_and(|n| n == "delete")).map(|r| r.delete_keys.clone()).collect();
+        assert_eq!(batches, [vec![keys[0].clone()], vec![keys[1].clone()]], "{sent:?}");
+        assert!(!sent.iter().any(|r| r.method == "DELETE"), "no DeleteObject: {sent:?}");
     }
 }
 

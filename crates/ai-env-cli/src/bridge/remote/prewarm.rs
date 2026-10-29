@@ -304,6 +304,21 @@ fn warm_lock(paths: &Paths, slug: &str) -> Result<File, &'static str> {
     cooldown_lock(&paths.workspace_warm_lock(slug), COOLDOWN, "warming")
 }
 
+/// S12 (V2): the most of a cooldown lock any reader reads. Its `finished_at=` line lies within its first three
+/// lines: the first in `state/claude/<v>.lock` (`claude::admit::VersionLock::finish`), the third in a warm lock
+/// (`vm::cmd`'s `WarmRecord`). [`cooldown_lock`] and the claude views' `claude::lock_finished_at` both read this
+/// much (LD-V10), so the trigger and the views judge the same bytes.
+pub(crate) const FINISHED_AT_READ_MAX: u64 = 4096;
+
+/// S12 (V2): the time a cooldown lock's text records (pure): the value of its first line that starts
+/// `finished_at=`, trimmed, as Unix seconds; `None` when no line starts so, or that first one does not read (a
+/// later one is never taken: the first decides, for [`cooldown_lock`] and the views alike, plans/s12-contracts.md
+/// §V2.1).
+#[must_use]
+pub(crate) fn finished_at_in(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix("finished_at=")).and_then(|v| v.trim().parse::<u64>().ok())
+}
+
 /// A detached child's lock (the prewarm's, S11's automatic admission's
 /// `state/claude/<v>.lock`): `path` (0600, its directory made private)
 /// locked without waiting: the open file (close-on-exec), never unlocked
@@ -329,8 +344,8 @@ pub(crate) fn cooldown_lock(path: &Path, cooldown: Duration, busy: &'static str)
         return Err(busy);
     }
     let mut text = String::new();
-    let _ = file.seek(SeekFrom::Start(0)).and_then(|_| Read::by_ref(&mut file).take(4096).read_to_string(&mut text));
-    let finished = text.lines().find_map(|l| l.strip_prefix("finished_at=")).and_then(|v| v.trim().parse::<u64>().ok());
+    let _ = file.seek(SeekFrom::Start(0)).and_then(|_| Read::by_ref(&mut file).take(FINISHED_AT_READ_MAX).read_to_string(&mut text));
+    let finished = finished_at_in(&text);
     if finished.is_some_and(|at| crate::wire::time::unix_now().saturating_sub(at) < cooldown.as_secs()) {
         // Dropped: the close releases the lock (nobody else holds this open file).
         return Err("recent");
@@ -717,6 +732,18 @@ mod tests {
         std::fs::write(&path, format!("pid=1\nstarted_at={}\nfinished_at={}\n", now - 400, now - 300)).unwrap();
         let mut lock = warm_lock(&w.paths, "-w").unwrap();
         assert_eq!(lock.stream_position().unwrap(), 0, "read, then rewound");
+    }
+
+    /// S12 (V2, plans/s12-contracts.md §V2.1): a cooldown lock's time is its first `finished_at=` line's, trimmed:
+    /// the third line of a warm lock, the first of a version lock; a first such line that does not read decides (no
+    /// later one is taken, as the cooldown reads it); no such line, or no text, is no time.
+    #[test]
+    fn finished_at_in_reads_the_first_finished_at_line() {
+        assert_eq!(finished_at_in("pid=1\nstarted_at=5\nfinished_at=7\n"), Some(7), "the warm lock's form");
+        assert_eq!(finished_at_in("finished_at= 8 \n"), Some(8), "trimmed");
+        assert_eq!(finished_at_in("finished_at=x\nfinished_at=9\n"), None, "the first such line decides");
+        assert_eq!(finished_at_in("outcome=admitted\n"), None);
+        assert_eq!(finished_at_in(""), None);
     }
 
     /// Nothing that looks like a credential reaches the prewarm's environment.

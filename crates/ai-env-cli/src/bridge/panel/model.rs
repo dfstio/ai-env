@@ -39,13 +39,31 @@ impl PageErr {
 pub struct Sessions {
     pub rows: Vec<SessionRow>,
     pub extras: Vec<ListExtra>,
+    /// S12 (T): the search as asked (`?q=`, `None` when absent or empty), and how many rows there were before it.
+    pub q: Option<String>,
+    pub total: usize,
 }
 
-/// `/`'s model; its document is `session list --json`'s (the plain array of rows).
-pub fn sessions(paths: &Paths, now: u64) -> Result<Sessions, PageErr> {
-    let rows = registry::list(paths).map_err(PageErr::failed)?;
+/// S12 (T): the 400 line of a `q` over `title::TITLE_MAX` characters.
+pub const Q_TOO_LONG: &str = "bad request: a search of more than 200 characters";
+
+/// `/`'s model: the rows `q` matches (`title::matches`, names and ids), newest first, and their S11 cells; its
+/// document is `session list --title <q> --json`'s for a `q` no session id holds. A `q` over `title::TITLE_MAX`
+/// characters is `PageErr::Bad(Q_TOO_LONG)`.
+///
+/// S12 (T, §T3 U5): a `q` of spaces alone is no search (`title::needle` finds nothing in it): every row, as
+/// with none. The rows are filtered before their cost cells are read, so the audit is read for those alone.
+pub fn sessions(paths: &Paths, now: u64, q: Option<&str>) -> Result<Sessions, PageErr> {
+    if q.is_some_and(|q| q.chars().count() > crate::bridge::title::TITLE_MAX) {
+        return Err(PageErr::Bad(Q_TOO_LONG));
+    }
+    let mut rows = registry::list(paths).map_err(PageErr::failed)?;
+    let total = rows.len();
+    if let Some(needle) = q.and_then(crate::bridge::title::needle) {
+        rows.retain(|r| crate::bridge::title::matches(r, &needle, true));
+    }
     let extras = registry::list_extras(paths, &rows, now).map_err(PageErr::failed)?;
-    Ok(Sessions { rows, extras })
+    Ok(Sessions { rows, extras, q: q.filter(|q| !q.is_empty()).map(str::to_string), total })
 }
 
 /// `/session/<sid>`: `session show <sid> --json`'s view; 400 not a uuid, 404 no row.

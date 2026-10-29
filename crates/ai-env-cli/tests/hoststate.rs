@@ -970,3 +970,57 @@ on_links!(
         h.assert_remote_end(link);
     }
 );
+
+on_links!(
+    /// S12 (T, plans/s12-contracts.md §T8.2): a named session's CLI announces its name at its start
+    /// (`FAKE_TITLE`, the CLI's `session_title_changed`): the host gets the frame byte for byte, before the
+    /// init, and the row takes it, `custom`. The host's `generate_session_title` (its `description` the user's
+    /// prompt) gets the fake's answer byte for byte, which does not replace the rename, and no file under the
+    /// bridge root holds the prompt. On the remote link the chat's view on this Mac also ends with ai-env's own
+    /// `custom-title` line naming it (the code-out trigger's title step), so a reload keeps the name (Bug 1).
+    a_session_title_reaches_the_row,
+    |link| {
+        let p = Harness::prepare();
+        let mut h = p.spawn_on(link, "local-child", &[], &[("FAKE_TITLE", "Harbour-s12 named"), ("FAKE_AI_TITLE", "Generated name")]);
+        h.send_initialize();
+        let init = h.expect_out(is_init, T);
+        let sid = init["session_id"].as_str().expect("the session id").to_string();
+        let gen: u64 = h.env_log().iter().find_map(|l| l.strip_prefix("gen ").and_then(|r| r.strip_suffix(" title startup")).and_then(|g| g.parse().ok())).unwrap_or_else(|| panic!("the fake's startup title: {:?}", h.env_log()));
+        let frame = common::fake_title_frame("Harbour-s12 named", 0, gen, &sid);
+        let frame_at = h.seen_out.iter().position(|l| *l == frame).unwrap_or_else(|| panic!("the title frame byte for byte\n{}", h.transcript()));
+        let init_at = h.seen_out.iter().position(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| is_init(&v))).expect("the init line");
+        assert!(frame_at < init_at, "the frame before the init\n{}", h.transcript());
+        let u = h.send_user("name the chat");
+        h.expect_out(|v| is_result_for(v, &u), T);
+        // The remote link: the trigger's first transcript step writes the chat's (placeholder) view, then the title.
+        let view = h.prepared.mac_projects().join(h.slug()).join(format!("{sid}.jsonl"));
+        let line = ai_env_cli::bridge::title::custom_title_line(&sid, "Harbour-s12 named");
+        if link.is_remote() {
+            h.wait_until("the view ends with ai-env's line", T, |_| std::fs::read(&view).is_ok_and(|b| b.ends_with(&line)));
+        }
+        let id = h.send_control("generate_session_title", r#"{"description":"Harbour prompt words","persist":true}"#);
+        h.expect_out(|v| is_response_to(v, &id), T);
+        let answer = format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"title":"Generated name"}}}}}}"#);
+        assert!(h.seen_out.contains(&answer), "the fake's answer byte for byte\n{}", h.transcript());
+        // The pump writes the row before the answer reaches the host: the rename still names it then, on either link
+        // (on the remote one before the view's title could restore it, P9).
+        let rows = h.registry_rows();
+        let row = rows.iter().find(|r| r.get("session_id").and_then(toml::Value::as_str) == Some(sid.as_str())).unwrap_or_else(|| panic!("the session's row: {rows:#?}"));
+        assert_eq!((toml_str(row, "title"), toml_str(row, "title_source")), ("Harbour-s12 named", "custom"), "the answer left the rename");
+        h.close_stdin();
+        let (status, _) = h.wait(EXIT);
+        assert_eq!(status.code(), Some(0), "{}", h.transcript());
+        let rows = h.registry_rows();
+        let row = rows.iter().find(|r| r.get("session_id").and_then(toml::Value::as_str) == Some(sid.as_str())).unwrap_or_else(|| panic!("the session's row: {rows:#?}"));
+        assert_eq!((toml_str(row, "title"), toml_str(row, "title_source"), toml_str(row, "status")), ("Harbour-s12 named", "custom", "closed"), "the answer did not replace the rename");
+        let holding: Vec<PathBuf> = all_files(&h.bridge()).into_iter().filter(|f| String::from_utf8_lossy(&std::fs::read(f).unwrap_or_default()).contains("Harbour prompt words")).collect();
+        assert!(holding.is_empty(), "the prompt reached {holding:?}");
+        if link.is_remote() {
+            let bytes = std::fs::read(&view).unwrap_or_else(|e| panic!("the chat's view {}: {e}", view.display()));
+            assert!(bytes.starts_with(ai_env_cli::wire::view::VIEW_MARK_PREFIX.as_bytes()), "a marked view");
+            assert!(bytes.ends_with(&line), "the view still ends with ai-env's line: {}", String::from_utf8_lossy(&bytes));
+            assert_eq!(ai_env_cli::bridge::view::custom_titles(&bytes), std::slice::from_ref(&line), "one rename line");
+        }
+        h.assert_remote_end(link);
+    }
+);

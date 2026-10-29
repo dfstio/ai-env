@@ -256,6 +256,35 @@
 #                             chains to the summary; with --session-mirror one transcript_mirror
 #                             frame carries the two; FAKE_ENV_LOG gets "gen <g> turn <t> compacted
 #                             summary=<summary>". Without FAKE_WRITE_TRANSCRIPT=1 it does nothing
+# S12 (T, chat names; plans/s12-contracts.md §3.11). Each value is a JSON string's body, printed
+# verbatim (its escapes reach the pump as the CLI prints them):
+#   FAKE_TITLE                <json>: once, right after this process answers initialize and before
+#                             its init frame, in either init mode (a process that misses after the
+#                             answer exits first and sends none), the CLI's startup frame of a named
+#                             session: {"type":"system","subtype":"session_title_changed","title":
+#                             "<json>","uuid":"<turn 0, %08x>-0000-4000-5000-<gen, %012x>",
+#                             "session_id":"<sid>"}; FAKE_ENV_LOG gets "gen <g> title startup"
+#   FAKE_RENAME_AT_TURN       <n>:<json>: in this process's turn n (each process counts its own), after
+#                             the dedup and usage-limit returns and before the turn's compaction, tool
+#                             and reply, the CLI's /rename: with FAKE_WRITE_TRANSCRIPT=1
+#                             {"type":"custom-title","customTitle":"<json>","sessionId":"<sid>"}
+#                             appended to the transcript (no mirror frame), then the frame above with
+#                             the turn's number; FAKE_ENV_LOG gets "gen <g> turn <t> renamed"
+#   FAKE_AI_TITLE             <json>: a generate_session_title request is answered {"title":"<json>"}
+#                             (without the knob, {} as every request), whatever the session's name (the
+#                             CLI answers its rename first: a test that needs that sets the name), and
+#                             with FAKE_WRITE_TRANSCRIPT=1 {"type":"ai-title","aiTitle":"<json>",
+#                             "sessionId":"<sid>"} appended to the transcript first; FAKE_ENV_LOG gets
+#                             "gen <g> ai_title"
+# S12 (R2: the extension's session state; plans/s12-contracts.md §7):
+#   CLAUDE_CODE_SDK_READS_SESSION_STATE  1 (the real CLI's variable, not a knob: the extension sets
+#                             it and the wrapper forwards it): the CLI's state frames,
+#                             {"type":"system","subtype":"session_state_changed","state":<s>,
+#                             "sdk_host_only":true,"uuid":<uuid>,"session_id":<sid>} (uuid kind 3000):
+#                             running after a turn's echo (none for a FAKE_DEDUP_RESUMED duplicate),
+#                             requires_action before FAKE_ASK's can_use_tool and running once it is
+#                             answered, idle after every result (answered, interrupted, usage-limited);
+#                             none for a miss, an EOF while a prompt is held, or FAKE_ONBOARDING
 
 # The remote link's knobs (see above), before anything reads one. S11: a
 # staged copy's embedded FAKE_KNOBS_FILE names the file in place of
@@ -603,6 +632,11 @@ stream() {
 }
 
 init_done=0
+# S12 (T): the CLI's session_title_changed for $1 (a JSON string's body), its uuid of kind 5000 at this turn.
+title_done=0
+title_frame() {
+  printf '{"type":"system","subtype":"session_title_changed","title":"%s","uuid":"%s","session_id":"%s"}\n' "$1" "$(printf '%08x-0000-4000-5000-%012x' "$turns" "$gen")" "$sid"
+}
 emit_init() {
   if [ "$init_done" = "1" ]; then
     return
@@ -652,8 +686,31 @@ on_control_request() {
         fi
         "$fail_after_ack"
       fi
+      if [ -n "${FAKE_TITLE:-}" ] && [ "$title_done" = "0" ]; then
+        title_done=1
+        title_frame "$FAKE_TITLE"
+        if [ -n "${FAKE_ENV_LOG:-}" ]; then
+          printf 'gen %s title startup\n' "$gen" >> "$FAKE_ENV_LOG"
+        fi
+      fi
       if [ "${FAKE_INIT_AT_TURN:-0}" != "1" ]; then
         emit_init
+      fi
+      ;;
+    *'"subtype":"generate_session_title"'*)
+      if [ -n "${FAKE_AI_TITLE:-}" ]; then
+        if [ "${FAKE_WRITE_TRANSCRIPT:-0}" = "1" ]; then
+          file=$(transcript)
+          mkdir -p "${file%/*}"
+          fork_history "$file"
+          printf '{"type":"ai-title","aiTitle":"%s","sessionId":"%s"}\n' "$FAKE_AI_TITLE" "$sid" >> "$file"
+        fi
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"title":"%s"}}}\n' "$id" "$FAKE_AI_TITLE"
+        if [ -n "${FAKE_ENV_LOG:-}" ]; then
+          printf 'gen %s ai_title\n' "$gen" >> "$FAKE_ENV_LOG"
+        fi
+      else
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       fi
       ;;
     *)
@@ -868,6 +925,20 @@ rate_limit_event() {
   printf '{"type":"rate_limit_event","rate_limit_info":%s,"uuid":"%s","session_id":"%s"}\n' "$1" "$(printf '%08x-0000-4000-9100-%012x' "$turns" "$gen")" "$sid"
 }
 
+# S12 (R2): the CLI's session state frame, as claude 2.1.310 emits it with
+# CLAUDE_CODE_SDK_READS_SESSION_STATE=1 (the extension sets it, the wrapper
+# forwards it): $1 the state (running, requires_action, idle). Nothing
+# without the variable. Its uuid's kind is 3000 (T's title frames take
+# 5000), its first part this process's count of state frames.
+states=0
+state_frame() {
+  if [ "${CLAUDE_CODE_SDK_READS_SESSION_STATE:-}" != "1" ]; then
+    return
+  fi
+  states=$((states + 1))
+  printf '{"type":"system","subtype":"session_state_changed","state":"%s","sdk_host_only":true,"uuid":"%s","session_id":"%s"}\n' "$1" "$(printf '%08x-0000-4000-3000-%012x' "$states" "$gen")" "$sid"
+}
+
 # A1: FAKE_USAGE_LIMIT, whether this turn is refused for the account's usage limit.
 usage_limited_turn() {
   case "${FAKE_USAGE_LIMIT:-}" in
@@ -913,6 +984,7 @@ json_text() {
 # control requests are answered, user lines queued for after the turn.
 ask_permission() {
   perm="perm-$gen-$turns"
+  state_frame requires_action
   printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"%s","input":%s,"tool_use_id":"%s","permission_suggestions":[]}}\n' "$perm" "$tool_name" "$tool_input" "$tid"
   outcome=""
   while [ -z "$outcome" ]; do
@@ -962,6 +1034,9 @@ run_tool() {
   fi
   if [ "$asked" = "1" ]; then
     ask_permission
+    case "$outcome" in
+      allow|deny|error) state_frame running ;;
+    esac
   fi
   case "$outcome" in
     allow)
@@ -1082,11 +1157,27 @@ on_user() {
   if [ "${FAKE_DEDUP_RESUMED:-0}" = "1" ] && [ -n "$u" ] && [ -n "${resumed:-}" ] && [ -f "$resumed" ] && grep -q "\"uuid\":\"$u\"" "$resumed"; then
     return
   fi
+  state_frame running
   # A1: a turn refused for the account's usage limit ends here: no reply, no effects.
   if usage_limited_turn; then
     outcome=allow
     usage_limit
+    state_frame idle
     return
+  fi
+  # S12 (T): the CLI's /rename in this turn (FAKE_RENAME_AT_TURN).
+  if [ -n "${FAKE_RENAME_AT_TURN:-}" ] && [ "$turns" -eq "${FAKE_RENAME_AT_TURN%%:*}" ]; then
+    rename_to=${FAKE_RENAME_AT_TURN#*:}
+    if [ "${FAKE_WRITE_TRANSCRIPT:-0}" = "1" ]; then
+      file=$(transcript)
+      mkdir -p "${file%/*}"
+      fork_history "$file"
+      printf '{"type":"custom-title","customTitle":"%s","sessionId":"%s"}\n' "$rename_to" "$sid" >> "$file"
+    fi
+    title_frame "$rename_to"
+    if [ -n "${FAKE_ENV_LOG:-}" ]; then
+      printf 'gen %s turn %s renamed\n' "$gen" "$turns" >> "$FAKE_ENV_LOG"
+    fi
   fi
   # S11: a compaction before this turn's user entry (FAKE_COMPACT_BEFORE_TURN).
   if [ -n "${FAKE_COMPACT_BEFORE_TURN:-}" ] && [ "${FAKE_WRITE_TRANSCRIPT:-0}" = "1" ] && [ "$turns" -eq "$FAKE_COMPACT_BEFORE_TURN" ]; then
@@ -1123,6 +1214,7 @@ on_user() {
         else
           printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"session_id":"%s","errors":["interrupted"]}\n' "$sid"
         fi
+        state_frame idle
         return
         ;;
     esac
@@ -1134,6 +1226,7 @@ on_user() {
   else
     printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"%s"}\n' "$sid"
   fi
+  state_frame idle
 }
 
 # S10: the user lines a held turn queued, each a turn of its own after it, asking nothing.

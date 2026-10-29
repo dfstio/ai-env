@@ -204,7 +204,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
-    /// What the MicroVMs and the egress proxy cost over a window, rebuilt from the audit at S10 B5 (d)'s rates: an estimate with a range; no AWS call, no Touch ID; --compare FILE judges it against Cost Explorer's
+    /// What the MicroVMs and the egress proxy cost over a window, rebuilt from the audit at S10 B5 (d)'s rates, the live tests' VMs counted and labelled (S12; --no-tests leaves them out): an estimate with a range; no AWS call, no Touch ID; --compare FILE judges it against Cost Explorer's
     #[cfg(feature = "bridge")]
     Cost {
         /// The window's start (default 24h): 90s, 30m, 1h, 2d before now; an RFC 3339 UTC time; a UTC date YYYY-MM-DD
@@ -219,9 +219,12 @@ pub enum Cmd {
         /// One JSON document
         #[arg(long)]
         json: bool,
-        /// Cost Explorer's figures to judge the estimate against: the JSON of aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE, or the console's CSV of costs by usage type, daily; over the file's days, or only those within --since/--until
+        /// Cost Explorer's figures to judge the estimate against: the JSON of aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE, or the console's CSV of costs by usage type, daily; over the file's days, or only those within --since/--until; the MicroVM total sets the exit, while the proxy's lines and (from the JSON's quantities) the billed rates are evidence only (S12)
         #[arg(long, value_name = "FILE")]
         compare: Option<PathBuf>,
+        /// Leave out the live tests' VMs (each live test keeps its VMs' rows under state/test-runs; merged by default)
+        #[arg(long)]
+        no_tests: bool,
     },
     /// A local control panel on 127.0.0.1: sessions, VMs, the audit, settings diffs and cost; suspend, resume, migrate, terminate and refresh (one Touch ID each)
     #[cfg(feature = "bridge")]
@@ -1345,17 +1348,20 @@ pub enum WrapperCmd {
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum SessionCmd {
-    /// List registered sessions, newest first
+    /// List registered sessions, newest first, each with its chat name last
     List {
         /// Pretty JSON array instead of text
         #[arg(long)]
         json: bool,
+        /// Only the chats whose name (as Cursor shows it) holds TEXT, case-insensitive, its runs of spaces as one; names only, never ids (none: a line saying so, exit 0)
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
     },
-    /// Print one session row
+    /// Show one session: its row (the chat's name on the second line), its generations, moves, timeline and cost
     Show {
         /// Session id (a uuid)
         uuid: String,
-        /// Pretty JSON instead of TOML
+        /// Pretty JSON instead of text
         #[arg(long)]
         json: bool,
         /// The settings the session's claude changed in its VMs: the rules added in any VM's last capture, then each VM's other changes against the start, per scope (env values masked); written to quarantine/UUID/settings/diff.json
@@ -1641,7 +1647,7 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         #[cfg(feature = "bridge")]
         Cmd::Session { cmd } => match cmd {
-            SessionCmd::List { json } => crate::bridge::registry::cmd_list(json),
+            SessionCmd::List { json, title } => crate::bridge::registry::cmd_list(json, title.as_deref()),
             SessionCmd::Show { uuid, json, settings_diff: false } => crate::bridge::registry::cmd_show(&uuid, json),
             SessionCmd::Show { uuid, json, settings_diff: true } => crate::bridge::settings_capture::cmd_settings_diff(&uuid, json),
             SessionCmd::Forget { uuids, purge } => crate::bridge::registry::cmd_forget(&store, &uuids, purge),
@@ -1678,7 +1684,7 @@ pub fn run(cli: Cli) -> Result<()> {
             AuditCmd::Grep { pattern, ignore_case, filter, json } => crate::bridge::audit::read::cmd_grep(&pattern, ignore_case, &filter, json),
         },
         #[cfg(feature = "bridge")]
-        Cmd::Cost { since, until, by, json, compare } => crate::bridge::cost::cmd_cost(since.as_deref(), until.as_deref(), by.is_some(), json, compare.as_deref()),
+        Cmd::Cost { since, until, by, json, compare, no_tests } => crate::bridge::cost::cmd_cost(since.as_deref(), until.as_deref(), by.is_some(), json, compare.as_deref(), if no_tests { crate::bridge::cost::Tests::Exclude } else { crate::bridge::cost::Tests::Merge }),
         #[cfg(feature = "bridge")]
         Cmd::Panel { cmd: PanelCmd::Serve { port, bind } } => crate::bridge::panel::cmd_serve(&store, port, bind.as_deref()),
         #[cfg(feature = "bridge")]
@@ -2211,13 +2217,14 @@ mod s11_tests {
         assert_eq!((pattern.as_str(), filter), ("x", AuditFilterArgs::default()));
         let Cmd::Audit { cmd: AuditCmd::Grep { ignore_case: true, filter, .. } } = cmd(&["audit", "grep", "vm_run", "--ignore-case", "--actor", "wrapper"]) else { panic!("audit grep --ignore-case") };
         assert_eq!(filter.actor, Some(ActorArg::Wrapper));
-        let Cmd::Cost { since, until, by: Some(CostBy::Day), json: true, compare: None } = cmd(&["cost", "--since", "7d", "--until", "2026-10-23", "--by", "day", "--json"]) else { panic!("cost") };
+        let Cmd::Cost { since, until, by: Some(CostBy::Day), json: true, compare: None, no_tests: false } = cmd(&["cost", "--since", "7d", "--until", "2026-10-23", "--by", "day", "--json"]) else { panic!("cost") };
         assert_eq!((since.as_deref(), until.as_deref()), (Some("7d"), Some("2026-10-23")));
-        let Cmd::Cost { since: None, until: None, by: None, json: false, compare: Some(file) } = cmd(&["cost", "--compare", "ce.json"]) else { panic!("cost --compare") };
+        let Cmd::Cost { since: None, until: None, by: None, json: false, compare: Some(file), no_tests: false } = cmd(&["cost", "--compare", "ce.json"]) else { panic!("cost --compare") };
         assert_eq!(file, std::path::PathBuf::from("ce.json"));
         // --since/--until narrow a --compare file to their days (one day of a longer console CSV).
         let Cmd::Cost { since: Some(s), until: Some(u), compare: Some(_), .. } = cmd(&["cost", "--compare", "costs.csv", "--since", "2026-10-22", "--until", "2026-10-23"]) else { panic!("cost --compare --since --until") };
         assert_eq!((s.as_str(), u.as_str()), ("2026-10-22", "2026-10-23"));
+        let Cmd::Cost { no_tests: true, .. } = cmd(&["cost", "--no-tests"]) else { panic!("cost --no-tests") };
         let Cmd::Panel { cmd: PanelCmd::Serve { port: Some(0), bind: Some(bind) } } = cmd(&["panel", "serve", "--port", "0", "--bind", "127.0.0.1"]) else { panic!("panel serve") };
         assert_eq!(bind, "127.0.0.1");
         let Cmd::Panel { cmd: PanelCmd::Serve { port: None, bind: None } } = cmd(&["panel", "serve"]) else { panic!("panel serve's defaults") };

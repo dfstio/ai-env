@@ -648,37 +648,60 @@ impl<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource> SyncCtx<'_, A, D, T> 
     /// that fails its check is (plans/s9-contracts.md §6.3 rule 1): the old
     /// view stays, the row says `refused`.
     pub async fn write_view(&self, sid: &str, rel: &str) -> Result<ViewOutcome, BridgeError> {
+        self.write_view_carrying(sid, rel, &[]).await
+    }
+
+    /// S12 (T): [`SyncCtx::write_view`] carrying `renames` (`view::renames_of`'s, read before the mirror went:
+    /// `session migrate-s9`'s live-VM path) through `view::write_view_carrying`; audited as `write_view` is.
+    ///
+    /// §T3 S4, Bug 2: the VM's view builder skips `custom-title` lines, so a mirror's renames reach the view only
+    /// from the Mac's copy, read before it is deleted. With none it is [`SyncCtx::write_view`], byte for byte.
+    /// Since phase 4 (§T3 S4 as amended) it is [`SyncCtx::view_reply`], then `SyncCtx::write_view_reply`, and the
+    /// live-VM path calls the two itself (`commands::migrate_live`), the view in hand before the mirror goes.
+    pub async fn write_view_carrying(&self, sid: &str, rel: &str, renames: &[Vec<u8>]) -> Result<ViewOutcome, BridgeError> {
+        match self.view_reply(sid, rel).await? {
+            Ok(reply) => self.write_view_reply(sid, &reply, renames),
+            Err(why) => Ok(ViewOutcome::Refused(why)),
+        }
+    }
+
+    /// S12 (T, phase 4): [`SyncCtx::write_view`]'s `GET /transcript/view` of `rel` and its checks, nothing written:
+    /// the VM's reply; `Ok(Err(why))` for a 200 whose answer does not parse as a view, refused whole and audited
+    /// `transcript_view` `refused` as `write_view` audits it; a transport error, a timeout, another status or an
+    /// answer with no view is the error. `session migrate-s9`'s live-VM path has the reply in hand (and its render
+    /// checked) before it deletes the mirror (§T3 S4 as amended in phase 4).
+    pub async fn view_reply(&self, sid: &str, rel: &str) -> Result<Result<crate::wire::view::TranscriptViewReply, String>, BridgeError> {
         let q = ViewQuery { rel: rel.to_string(), n: self.sync.view_messages, parent: false };
-        let refuse = |why: String| {
-            let outcome = ViewOutcome::Refused(why);
-            audit_view(self.paths, sid, &self.target.vm_id, &outcome);
-            if let ViewOutcome::Refused(why) = &outcome {
-                tracing::warn!(session = sid, "transcript view refused: {why}");
-            }
-            outcome
-        };
         let sent = exchange(&self.x("GET /transcript/view", true), |t| {
             let q = &q;
             async move { self.dp.transcript_view(self.target, &t, q).await }
         })
         .await;
-        let reply = match sent {
-            Ok((reply, Verdict::Done)) => reply.body.ok_or_else(|| BridgeError::Protocol("GET /transcript/view answered without a view".into()))?,
-            Ok((reply, _)) => return Err(BridgeError::Protocol(format!("GET /transcript/view answered HTTP {} where a view was due", reply.status))),
+        match sent {
+            Ok((reply, Verdict::Done)) => reply.body.map(Ok).ok_or_else(|| BridgeError::Protocol("GET /transcript/view answered without a view".into())),
+            Ok((reply, _)) => Err(BridgeError::Protocol(format!("GET /transcript/view answered HTTP {} where a view was due", reply.status))),
             Err(BridgeError::Http { status: 200, body }) => {
                 let first = crate::wire::redact::scrub(body.lines().next().unwrap_or_default()).into_owned();
-                return Ok(refuse(format!("the view's answer is not one the Mac takes: {first}")));
+                let why = format!("the view's answer is not one the Mac takes: {first}");
+                audit_view(self.paths, sid, &self.target.vm_id, &ViewOutcome::Refused(why.clone()));
+                tracing::warn!(session = sid, "transcript view refused: {why}");
+                Ok(Err(why))
             }
-            Err(e) => return Err(e),
-        };
-        let target = ViewTarget { mac_projects: &self.sync.mac_projects, slug: &self.sync.slug, session_id: sid, mac_cwd: &self.sync.mac_cwd };
-        match crate::bridge::view::write_view(&target, &reply, self.sync.view_messages, self.rules)? {
-            ViewOutcome::Refused(why) => Ok(refuse(why)),
-            outcome => {
-                audit_view(self.paths, sid, &self.target.vm_id, &outcome);
-                Ok(outcome)
-            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// S12 (T, phase 4): `reply`'s view of `sid` written carrying `renames` (`view::write_view_carrying`), audited
+    /// `transcript_view` (`written`, `unchanged` or `refused`, a refusal warned) as [`SyncCtx::write_view`] audits
+    /// it: the write that follows [`SyncCtx::view_reply`].
+    pub(crate) fn write_view_reply(&self, sid: &str, reply: &crate::wire::view::TranscriptViewReply, renames: &[Vec<u8>]) -> Result<ViewOutcome, BridgeError> {
+        let target = ViewTarget { mac_projects: &self.sync.mac_projects, slug: &self.sync.slug, session_id: sid, mac_cwd: &self.sync.mac_cwd };
+        let outcome = crate::bridge::view::write_view_carrying(&target, reply, self.sync.view_messages, self.rules, renames)?;
+        audit_view(self.paths, sid, &self.target.vm_id, &outcome);
+        if let ViewOutcome::Refused(why) = &outcome {
+            tracing::warn!(session = sid, "transcript view refused: {why}");
+        }
+        Ok(outcome)
     }
 }
 

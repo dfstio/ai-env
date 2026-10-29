@@ -158,13 +158,27 @@ pub trait LinkFactory {
         let _ = session_id;
     }
 
+    /// S12 (T): the pump applied a custom title of `session_id` (a rename: the CLI's `session_title_changed`;
+    /// `startup` when it came before its generation's first init). A remote factory has the session's view end
+    /// with it (the live code-out trigger's title step; a startup one only into a view that holds no rename)
+    /// and, at a startup, answers this process's rename of the session still due, else the view's newest rename
+    /// (`view::view_rename`), which the pump keeps over
+    /// the frame's: a rename made in Cursor while the chat was closed. A local one does nothing and answers `None`.
+    fn title_changed(&mut self, session_id: &str, title: &str, startup: bool) -> Option<String> {
+        let _ = (session_id, title, startup);
+        None
+    }
+
     /// The wrapper is about to exit (S8 W1, added to C3): the supervisor
     /// finished and the census end row is written. A remote factory waits,
     /// at most `budget` (what is left of the hard stop), for its live
     /// session to end (its `detach{final}` sent, the best-effort suspend the
     /// session task fires after it, L2) and for the code-out trigger's close
     /// (`codeout::CLOSE_WAIT`), which that suspend waits for (plan §11). A
-    /// local one is done at once.
+    /// local one is done at once. S12 (R1-1): a remote factory first tells its
+    /// plan the deadline (`SessionPlan::close_by`, now plus `budget`), before
+    /// anything here waits and before the future it returns is built, so the
+    /// closing suspend writes its `vm_suspend` row before the pump's cut.
     fn close(&mut self, budget: Duration) -> Pin<Box<dyn Future<Output = ()>>> {
         let _ = budget;
         Box::pin(std::future::ready(()))
@@ -268,6 +282,8 @@ pub struct RemoteLinks {
     /// S10 §B: the migrations ([`RemoteLinks::with_moves`]): `[vm]` (its
     /// margin) and phase A; `None`: no migration, a `prepare_move` fails for good.
     moves: Option<(VmCfg, PrepareFn)>,
+    /// S12 (T): where the session's view is (`SessionPlan::view_sync`): what a startup title reads.
+    view: Option<crate::bridge::s3::TranscriptSync>,
 }
 
 impl RemoteLinks {
@@ -285,6 +301,7 @@ impl RemoteLinks {
             .with_moves(plan.cfg.vm.clone(), Box::new(move |trigger| Box::pin(pipeline::prepare_move(Rc::clone(&prepare), trigger))));
         links.shared.borrow_mut().snap.pinned = plan.pinned().map(str::to_string);
         plan.set_quiet(links.quiet.subscribe());
+        links.view = plan.view_sync();
         links.plan = Some(plan);
         links
     }
@@ -296,7 +313,7 @@ impl RemoteLinks {
     #[must_use]
     pub fn with_pipeline(paths: Paths, pipeline: PipelineFn) -> RemoteLinks {
         let (quiet, _) = tokio::sync::watch::channel(QuietState { verdict: crate::bridge::park::Verdict::Idle, since: tokio::time::Instant::now(), last_host: None });
-        RemoteLinks { paths, pipeline, shared: Rc::new(RefCell::new(Shared::default())), tasks: Vec::new(), plan: None, quiet, moves: None }
+        RemoteLinks { paths, pipeline, shared: Rc::new(RefCell::new(Shared::default())), tasks: Vec::new(), plan: None, quiet, moves: None, view: None }
     }
 
     /// S10 §B: the factory migrates its chat: `vm` (`[vm]`) decides when one
@@ -306,6 +323,13 @@ impl RemoteLinks {
     #[must_use]
     pub fn with_moves(mut self, vm: VmCfg, prepare: PrepareFn) -> RemoteLinks {
         self.moves = Some((vm, prepare));
+        self
+    }
+
+    /// S12 (T): the factory with `sync` as its view (the seam a test reads a startup title through).
+    #[must_use]
+    pub fn with_view(mut self, sync: crate::bridge::s3::TranscriptSync) -> RemoteLinks {
+        self.view = Some(sync);
         self
     }
 
@@ -387,6 +411,7 @@ impl LinkFactory for RemoteLinks {
             // S10 §D: parked now: the park so far counts too.
             snap.park.parked_ms = snap.park.parked_ms.saturating_add(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
+        snap.view_title = shared.trigger.as_ref().and_then(CodeoutTrigger::shown_title);
         Some(snap)
     }
 
@@ -407,7 +432,48 @@ impl LinkFactory for RemoteLinks {
         }
     }
 
+    /// S12 (T, §T3 L1): the rename's ensure goes to the live trigger (its title step writes the view; a startup's
+    /// only into a view that holds no rename), or, with none live, waits in `Shared.title_unsent` for the next
+    /// generation's (a startup's never in place of a due live one of the session, L3); a session id that is no
+    /// uuid stores nothing (a title never becomes a path, §T4 item 4). At a startup the answer is this process's
+    /// rename of the session still due (the live trigger's, else `title_unsent`'s: L3 keeps it over the startup's,
+    /// so the view will end with it; §T3 L1 as amended in wave 1's fix round), else the view's newest rename, as
+    /// written (`view::view_rename`), `None` without a view; else `None`.
+    fn title_changed(&mut self, session_id: &str, title: &str, startup: bool) -> Option<String> {
+        if !crate::bridge::registry::is_uuid(session_id) {
+            return None;
+        }
+        let e = crate::bridge::title::Ensure { session: session_id.to_string(), text: title.to_string(), only_if_none: startup };
+        let due_live = {
+            let mut s = self.shared.borrow_mut();
+            match &s.trigger {
+                Some(trigger) => trigger.set_title(e),
+                None => {
+                    let keeps_due = startup && s.title_unsent.as_ref().is_some_and(|due| due.session == session_id && !due.only_if_none);
+                    if !keeps_due {
+                        s.title_unsent = Some(e);
+                    }
+                }
+            }
+            // A move (or a retry) while a rename made here was still due, its trigger stuck: the view's newest is
+            // then an older name, which the rename's ensure is about to follow.
+            s.trigger.as_ref().and_then(CodeoutTrigger::due_title).or_else(|| s.title_unsent.clone()).filter(|d| d.session == session_id && !d.only_if_none).map(|d| d.text)
+        };
+        if !startup {
+            return None;
+        }
+        if let Some(text) = due_live {
+            return Some(text);
+        }
+        let v = self.view.as_ref()?;
+        crate::bridge::view::view_rename(&crate::bridge::view::ViewTarget { mac_projects: &v.mac_projects, slug: &v.slug, session_id, mac_cwd: &v.mac_cwd }.path())
+    }
+
     fn close(&mut self, budget: Duration) -> Pin<Box<dyn Future<Output = ()>>> {
+        // S12 (R1): the closing suspend learns the close's deadline now, before anything here waits.
+        if let Some(plan) = &self.plan {
+            plan.close_by(tokio::time::Instant::now() + budget);
+        }
         // S10 §B: a migration's phase A dies with the session (its Touch ID's dialog with it), its prepared VM let go.
         abandon_migration(&self.shared, self.plan.as_deref(), "the session closes");
         let tasks = std::mem::take(&mut self.tasks);
@@ -649,6 +715,8 @@ struct Shared {
     parked_at: Option<tokio::time::Instant>,
     /// S10 §B: where the chat's migration stands.
     migration: MigrationState,
+    /// S12 (T): an ensure that came while no trigger was live, for the next generation's.
+    title_unsent: Option<crate::bridge::title::Ensure>,
 }
 
 /// S10 §B: a migration as the remote factory runs it.
@@ -828,6 +896,12 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         s.snap.set_seal(seal);
         // S10 §D: why a session never parks is its latest generation's (its own `ParkReport::Off`, if any, follows).
         s.snap.park.off = None;
+        // S12 (T, §T3 L2, D4): a title still due moves to this generation's trigger (a move, a resume miss's retry, a
+        // start-up respawn); one the old trigger already wrote never moves.
+        let carry = s.trigger.as_ref().and_then(CodeoutTrigger::take_title).or_else(|| s.title_unsent.take());
+        if let Some(e) = carry {
+            trigger.set_title(e);
+        }
         if let Some(old) = s.trigger.replace(trigger) {
             // A replaced generation's trigger (the resume miss's first, a moved chat's last VM's): closed in the background.
             tokio::task::spawn_local(async move {
@@ -2191,6 +2265,9 @@ pub struct RemoteSnapshot {
     pub claude_sha256: Option<String>,
     /// S11 (A.5): what the CLI refused on stderr before its first stdout line (A3); reset at each hand-over.
     pub start_refusal: Option<StartRefusal>,
+    /// S12 (T): what the session's view shows (the live trigger's `CodeoutTrigger::shown_title`): its session and
+    /// title. No census part.
+    pub view_title: Option<(String, crate::bridge::title::SessionTitle)>,
 }
 
 impl RemoteSnapshot {
@@ -2352,6 +2429,175 @@ mod tests {
         let image = RemoteSnapshot { claude_src: Some("image".into()), ..full.clone() };
         assert_eq!(image.census_parts()[5], "claude_src:image", "no argv_dropped part while none was dropped");
         assert!(!image.census_parts().iter().any(|p| p.starts_with("argv_dropped:")));
+    }
+
+    // ---- S12 (T): the chat's name through the link (plans/s12-contracts.md §T3 L1, L2, L7; §T8.1) ----
+
+    const TITLED: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+
+    /// A remote session that starts, then waits for its detach (the wrapper's `Sig::Kill` after `Started`).
+    fn until_detached() -> Script {
+        Box::new(|mut io: SpawnIo| {
+            Box::pin(async move {
+                let _ = io.events.send(started_event(Some(AUTH_TIMERS.claude)));
+                let _ = io.control.recv().await;
+                Err(BridgeError::Transport("detached from spawn x".into()))
+            })
+        })
+    }
+
+    /// A view sync whose projects directory is `<dir>/projects`, its slug `-w` (its S3 is nobody's).
+    fn title_sync(dir: &std::path::Path) -> crate::bridge::s3::TranscriptSync {
+        use crate::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab("127.0.0.1:9".parse().unwrap()) };
+        TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: dir.join("projects"), proxy: None, view_messages: 10 }
+    }
+
+    /// A factory whose every start stays pending (no generation runs).
+    fn pending_links(dir: &std::path::Path) -> RemoteLinks {
+        RemoteLinks::with_pipeline(Paths::from_root_and_env(dir.join("bridge"), None), Box::new(|_, _, _| Box::pin(std::future::pending::<Result<PipelineEnd, SpawnFailure>>())))
+    }
+
+    fn rename_of(text: &str, only_if_none: bool) -> crate::bridge::title::Ensure {
+        crate::bridge::title::Ensure { session: TITLED.into(), text: text.into(), only_if_none }
+    }
+
+    /// S12 (T, §T3 L1, L2, D4): a live rename's ensure goes to the live generation's trigger (no answer); a resume
+    /// miss's retry's generation takes it over while it is still due (no trigger here syncs, so none wrote it): a
+    /// title is never lost with a generation. A session id that is no uuid stores nothing; an ensure set before any
+    /// generation started reaches generation 1's trigger.
+    #[test]
+    fn title_changed_hands_its_ensure_to_the_live_trigger_and_a_due_one_to_the_next() {
+        let d = tempfile::tempdir().unwrap();
+        on_local(async {
+            let live_trigger_takes = |links: &RemoteLinks| links.shared.borrow().trigger.as_ref().and_then(CodeoutTrigger::take_title);
+            let mut links = remote_links(d.path(), vec![Gen::Session(Duration::ZERO, until_detached()), Gen::Session(Duration::ZERO, until_detached())]);
+            let mut gen1 = start(&mut links);
+            assert!(matches!(next(&mut gen1).await, Some(ChildEvent::Started(_))));
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 A", false), None, "a live rename: no answer");
+            assert_eq!(links.title_changed("../not-a-uuid", "Harbour-s12 X", false), None);
+            let mut gen2 = links.start(2, StartReq { why: StartWhy::ResumeRetry { session_id: TITLED.into(), init_answered: false }, credential: None }).unwrap();
+            assert!(matches!(next(&mut gen2).await, Some(ChildEvent::Started(_))));
+            assert_eq!(live_trigger_takes(&links), Some(rename_of("Harbour-s12 A", false)), "generation 2's trigger holds the ensure still due, no other");
+            assert_eq!(live_trigger_takes(&links), None);
+            for link in [&gen1, &gen2] {
+                let _ = link.signal.send(Sig::Kill);
+            }
+            links.close(T).await;
+            // Before any generation: kept for generation 1's trigger.
+            let mut links = remote_links(d.path(), vec![Gen::Session(Duration::ZERO, until_detached())]);
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 B", true), None, "a startup with no view: no answer");
+            let mut gen1 = start(&mut links);
+            assert!(matches!(next(&mut gen1).await, Some(ChildEvent::Started(_))));
+            assert_eq!(live_trigger_takes(&links), Some(rename_of("Harbour-s12 B", true)));
+            let _ = gen1.signal.send(Sig::Kill);
+            links.close(T).await;
+        });
+    }
+
+    /// S12 (T, §T3 L1, V6, M-T3's link form): a startup's answer is the view's newest rename, as written (here
+    /// Cursor's `New name` over an older one): a rename made in Cursor while the chat was closed. A live rename
+    /// asks nothing, and without a view (a test's factory) there is no answer.
+    #[test]
+    fn a_startup_title_answers_the_views_newest_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let sync = title_sync(d.path());
+        crate::bridge::s3::sync::write_placeholder_view(&sync, TITLED, &crate::bridge::scan::Rules::defaults()).unwrap().expect("a view");
+        let view = d.path().join("projects").join("-w").join(format!("{TITLED}.jsonl"));
+        let mut bytes = std::fs::read(&view).unwrap();
+        for name in ["Old name", "New name"] {
+            bytes.extend_from_slice(format!("{{\"type\":\"custom-title\",\"sessionId\":\"{TITLED}\",\"customTitle\":\"{name}\"}}\n").as_bytes());
+        }
+        std::fs::write(&view, &bytes).unwrap();
+        let mut links = pending_links(d.path()).with_view(sync);
+        assert_eq!(links.title_changed(TITLED, "Old name", true).as_deref(), Some("New name"));
+        assert_eq!(links.title_changed(TITLED, "Old name", false), None, "a live rename asks nothing");
+        assert_eq!(links.title_changed("not-a-uuid", "Old name", true), None);
+        assert_eq!(pending_links(d.path()).title_changed(TITLED, "Old name", true), None, "without a view");
+        assert_eq!(std::fs::read(&view).unwrap(), bytes, "a startup's answer reads, never writes");
+    }
+
+    /// S12 (T, §T3 L1 as amended in wave 1's fix round, M-T57): at a startup within the same process, this
+    /// process's rename still due (no trigger here syncs, so none wrote it; a resume miss's retry took it over, L2)
+    /// is the answer, before the view's older rename, which the view stops ending with once that ensure is written;
+    /// the same before any generation (`title_unsent`). A due startup ensure is no answer: the view's newest is.
+    #[test]
+    fn a_startup_title_answers_a_due_rename_before_the_views_older_one() {
+        let d = tempfile::tempdir().unwrap();
+        let sync = title_sync(d.path());
+        crate::bridge::s3::sync::write_placeholder_view(&sync, TITLED, &crate::bridge::scan::Rules::defaults()).unwrap().expect("a view");
+        let view = d.path().join("projects").join("-w").join(format!("{TITLED}.jsonl"));
+        let mut bytes = std::fs::read(&view).unwrap();
+        bytes.extend_from_slice(format!("{{\"type\":\"custom-title\",\"sessionId\":\"{TITLED}\",\"customTitle\":\"Harbour-s12 older\"}}\n").as_bytes());
+        std::fs::write(&view, &bytes).unwrap();
+        on_local(async {
+            let live_trigger_takes = |links: &RemoteLinks| links.shared.borrow().trigger.as_ref().and_then(CodeoutTrigger::take_title);
+            let mut links = remote_links(d.path(), vec![Gen::Session(Duration::ZERO, until_detached()), Gen::Session(Duration::ZERO, until_detached())]).with_view(sync.clone());
+            let mut gen1 = start(&mut links);
+            assert!(matches!(next(&mut gen1).await, Some(ChildEvent::Started(_))));
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 renamed", false), None, "a live rename: no answer");
+            let mut gen2 = links.start(2, StartReq { why: StartWhy::ResumeRetry { session_id: TITLED.into(), init_answered: false }, credential: None }).unwrap();
+            assert!(matches!(next(&mut gen2).await, Some(ChildEvent::Started(_))));
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 older", true).as_deref(), Some("Harbour-s12 renamed"), "the rename still due, not the view's older name");
+            assert_eq!(live_trigger_takes(&links), Some(rename_of("Harbour-s12 renamed", false)), "still the one due (L3)");
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 startup", true).as_deref(), Some("Harbour-s12 older"), "a due startup ensure is no answer: the view's newest");
+            for link in [&gen1, &gen2] {
+                let _ = link.signal.send(Sig::Kill);
+            }
+            links.close(T).await;
+        });
+        let mut links = pending_links(d.path()).with_view(sync);
+        assert_eq!(links.title_changed(TITLED, "Harbour-s12 unsent", false), None);
+        assert_eq!(links.title_changed(TITLED, "Harbour-s12 older", true).as_deref(), Some("Harbour-s12 unsent"), "before any generation: the rename waiting in title_unsent");
+        assert_eq!(std::fs::read(&view).unwrap(), bytes, "a startup's answer reads, never writes");
+    }
+
+    /// S12 (T, §T3 L7, M-T36): the live trigger's last title step shows the view's title, which the snapshot
+    /// carries (for the pump's row, P9); no census part names it.
+    #[test]
+    fn the_view_title_is_in_the_snapshot_and_no_census_part() {
+        let d = tempfile::tempdir().unwrap();
+        on_local(async {
+            let sync = title_sync(d.path());
+            crate::bridge::s3::sync::write_placeholder_view(&sync, TITLED, &crate::bridge::scan::Rules::defaults()).unwrap().expect("a view");
+            let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+            let target = AgentTarget { vm_id: "microvm-1".into(), endpoint: "x".into(), session_token: Secret::new("t".into()), vpc: true, shell: false };
+            let ctx = CodeoutCtx { api: Arc::new(FakeMicrovmApi::new()), dp: Arc::new(Unreached), tokens: Arc::new(Unreached), paths, cfg: Arc::new(BridgeConfig::default()), target, ws: SessionPlan::sample(d.path()).ws, capture_settings: false, transcript: Some(sync) };
+            let mut links = pending_links(d.path());
+            links.shared.borrow_mut().trigger = Some(CodeoutTrigger::spawn(ctx));
+            assert_eq!(links.snapshot().unwrap().view_title, None, "no step yet");
+            assert_eq!(links.title_changed(TITLED, "Harbour-s12 shown", false), None);
+            let until = tokio::time::Instant::now() + T;
+            while links.snapshot().unwrap().view_title.is_none() && tokio::time::Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let snap = links.snapshot().unwrap();
+            let shown = crate::bridge::title::SessionTitle { text: "Harbour-s12 shown".into(), source: crate::bridge::title::TitleSource::Custom };
+            assert_eq!(snap.view_title, Some((TITLED.to_string(), shown)));
+            assert_eq!(snap.census_parts(), RemoteSnapshot { view_title: None, ..snap.clone() }.census_parts(), "no census part");
+            assert!(!snap.census_parts().iter().any(|p| p.contains("Harbour")), "{:?}", snap.census_parts());
+            links.close(T).await;
+        });
+    }
+
+    /// S12 (T, a control: phase 0's default): a local factory takes no title and answers none.
+    #[test]
+    fn the_local_factory_takes_no_title() {
+        let mut local = LocalLinks::new(ChildPlan {
+            program: std::path::PathBuf::from("/bin/true"),
+            argv: Vec::new(),
+            env_set: Vec::new(),
+            env_remove: Vec::new(),
+            child_config_dir: std::path::PathBuf::from("/tmp"),
+            scratch: None,
+            resume: None,
+            slug: None,
+            mirror: crate::bridge::mirror::MirrorCfg { child_projects_root: "/tmp".into(), dest_root: "/tmp".into(), enabled: false, project: None, reason: "test".into() },
+        });
+        for startup in [true, false] {
+            assert_eq!(local.title_changed(TITLED, "Harbour-s12 local", startup), None);
+        }
+        assert_eq!(local.snapshot(), None, "no snapshot, so no view title");
     }
 
     /// A1: each generation's seal is the live one; its account joins the
@@ -3205,6 +3451,33 @@ mod tests {
             let at = std::time::Instant::now();
             links.close(Duration::from_millis(200)).await;
             assert!(at.elapsed() < Duration::from_secs(2), "bounded by the budget: {:?}", at.elapsed());
+        });
+    }
+
+    /// S12 (R1-1): the close tells the plan its deadline (now plus the budget) as its first statement, before the
+    /// future it returns is ever polled, so a closing suspend already waiting learns it at once; the future then
+    /// completes as before. A factory with no plan (a test's own pipeline) sets nothing and closes as before.
+    #[test]
+    fn close_tells_the_plan_its_deadline() {
+        let d = tempfile::tempdir().unwrap();
+        on_local(async {
+            let plan = Rc::new(SessionPlan::sample(d.path()));
+            let mut links = remote_links(d.path(), Vec::new());
+            links.plan = Some(Rc::clone(&plan));
+            assert_eq!(plan.close_deadline(), None, "no deadline before the close");
+            let budget = Duration::from_millis(400);
+            let before = tokio::time::Instant::now();
+            let close = links.close(budget);
+            let after = tokio::time::Instant::now();
+            let deadline = plan.close_deadline().expect("the deadline, before the close's future is polled");
+            assert!(deadline >= before + budget && deadline <= after + budget, "{deadline:?} is not now plus the budget ({:?} to {:?})", before + budget, after + budget);
+            let at = std::time::Instant::now();
+            close.await;
+            assert!(at.elapsed() < Duration::from_secs(2), "the close completes: {:?}", at.elapsed());
+            let mut bare = remote_links(d.path(), Vec::new());
+            let at = std::time::Instant::now();
+            bare.close(budget).await;
+            assert!(at.elapsed() < Duration::from_secs(2), "a factory with no plan closes as before: {:?}", at.elapsed());
         });
     }
 

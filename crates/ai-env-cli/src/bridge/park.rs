@@ -206,4 +206,37 @@ mod tests {
         assert_eq!((UNPARK_PROBE, PARK_ANSWER_WAIT, PARK_REFUSED_LOG_EVERY), (Duration::from_secs(3), Duration::from_secs(10), Duration::from_secs(600)));
         assert_eq!((CPU_BUSY_MS, MIN_QUIET_S, HOLD_OUTPUT, DROP_HOST_KEEP_ALIVE), (300, 30, false, true), "§13's values, B0's (20 Oct)");
     }
+
+    /// S12 (R2-8 to R2-10, a control): the CLI's `session_state_changed` frames (the extension sets
+    /// `CLAUDE_CODE_SDK_READS_SESSION_STATE`, the wrapper forwards it) are `system` frames of no subtype the pump
+    /// reads: each classifies as `ChildFrame::Other` (T's `TitleChanged` takes `session_title_changed` alone), is
+    /// forwarded unchanged, and leaves the verdict to the frames around it: `idle` on a fresh state is idle, a
+    /// turn's `running` busy, `requires_action` then its `can_use_tool` a prompt, `running` with that ask still open
+    /// a prompt still, and the answer, the result, then `idle` idle again.
+    #[test]
+    fn session_state_frames_never_change_the_verdict() {
+        use crate::bridge::hoststate::ChildVerdict;
+        use crate::wire::claude::ChildFrame;
+        let state = |s: &str, n: u64| format!(r#"{{"type":"system","subtype":"session_state_changed","state":"{s}","sdk_host_only":true,"uuid":"{n:08x}-0000-4000-3000-000000000001","session_id":"0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}}"#);
+        let (running, requires_action, idle) = (state("running", 1), state("requires_action", 2), state("idle", 4));
+        for line in [&running, &requires_action, &idle] {
+            assert_eq!(classify_child(line.as_bytes()), ChildFrame::Other, "{line}");
+            assert_eq!(HostState::new().on_child_frame(&classify_child(line.as_bytes()), line.as_bytes()), ChildVerdict::Forward, "{line}");
+        }
+        let mut st = HostState::new();
+        child(&mut st, &idle);
+        assert_eq!(verdict(&st), Verdict::Idle, "idle on a fresh session");
+        host(&mut st, USER);
+        child(&mut st, &running);
+        assert_eq!(verdict(&st), Verdict::Busy, "the turn's running: a turn at work");
+        child(&mut st, &requires_action);
+        child(&mut st, ASK);
+        assert_eq!(verdict(&st), Verdict::Prompt, "requires_action, then the can_use_tool: a prompt");
+        child(&mut st, &state("running", 3));
+        assert_eq!(verdict(&st), Verdict::Prompt, "running with the ask still open: still a prompt");
+        host(&mut st, r#"{"type":"control_response","response":{"subtype":"success","request_id":"perm-1","response":{"behavior":"allow"}}}"#);
+        child(&mut st, RESULT);
+        child(&mut st, &idle);
+        assert_eq!(verdict(&st), Verdict::Idle, "answered, its result, then idle: idle");
+    }
 }

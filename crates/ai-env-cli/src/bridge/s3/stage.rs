@@ -896,10 +896,15 @@ pub type ViewBuilder<'a> = &'a dyn Fn(&[u8], u32) -> Result<crate::wire::view::T
 /// masking it, audited `transcript_view`). A view that cannot be built
 /// leaves the originals where they are (a warning; the chat is in S3
 /// already, and a reopen restores it from there). The view's rel and where
-/// the originals went.
+/// the originals went. S12 (T, Bug 2, §T3 S1): the transcript's own
+/// `custom-title` lines (`view::renames_of`, from the tail read for the
+/// view) are read before the originals move and carried into the view
+/// (`view::write_view_carrying`), so a chat keeps its name once staged.
 #[allow(clippy::too_many_arguments)]
 pub fn leave_view(paths: &Paths, sid: &str, chat: &MacChat, projects: &Path, mac_cwd: &str, n: u32, rules: &Rules, build: ViewBuilder<'_>) -> Result<(Option<String>, Option<PathBuf>), BridgeError> {
-    let reply = match tail_of(&chat.main_path(sid)).and_then(|tail| build(&tail, n).map_err(BridgeError::Config)) {
+    let main = chat.main_path(sid);
+    let built = tail_of(&main).and_then(|tail| build(&tail, n).map(|reply| (reply, crate::bridge::view::renames_of(&main, &tail, rules))).map_err(BridgeError::Config));
+    let (reply, renames) = match built {
         Ok(r) => r,
         Err(e) => {
             crate::bridge::voice::warn(&format!("the view of {sid} could not be built ({e}): its transcript stays where it is on this Mac (it is in S3 already)"));
@@ -908,7 +913,7 @@ pub fn leave_view(paths: &Paths, sid: &str, chat: &MacChat, projects: &Path, mac
     };
     let origin = move_to_origin(paths, sid, chat)?;
     let target = ViewTarget { mac_projects: projects, slug: &chat.slug, session_id: sid, mac_cwd };
-    let outcome = crate::bridge::view::write_view(&target, &reply, n, rules)?;
+    let outcome = crate::bridge::view::write_view_carrying(&target, &reply, n, rules, &renames)?;
     super::sync::audit_view(paths, sid, "-", &outcome);
     Ok((matches!(outcome, ViewOutcome::Written { .. } | ViewOutcome::Unchanged { .. }).then(|| target.rel()), Some(origin)))
 }
@@ -922,10 +927,14 @@ pub fn leave_view(paths: &Paths, sid: &str, chat: &MacChat, projects: &Path, mac
 /// chat's original or a mirror skipped for a finding), then the view is
 /// written in their place (audited `transcript_view` for `vm`). A view that
 /// cannot be built leaves the mirror where it is (a warning; the chat is in
-/// S3 already). The view's rel.
+/// S3 already). The view's rel. S12 (T, Bug 2, §T3 S2): the mirror's
+/// `custom-title` lines are read before it is deleted and carried into the
+/// view, as [`leave_view`] carries a staged chat's.
 #[allow(clippy::too_many_arguments)]
 pub fn replace_mirror(paths: &Paths, sid: &str, chat: &MacChat, projects: &Path, mac_cwd: &str, n: u32, rules: &Rules, build: ViewBuilder<'_>, vm: &str) -> Result<Option<String>, BridgeError> {
-    let reply = match tail_of(&chat.main_path(sid)).and_then(|tail| build(&tail, n).map_err(BridgeError::Config)) {
+    let main = chat.main_path(sid);
+    let built = tail_of(&main).and_then(|tail| build(&tail, n).map(|reply| (reply, crate::bridge::view::renames_of(&main, &tail, rules))).map_err(BridgeError::Config));
+    let (reply, renames) = match built {
         Ok(r) => r,
         Err(e) => {
             crate::bridge::voice::warn(&format!("the view of {sid} could not be built ({e}): its S8 mirror stays where it is on this Mac (the chat is in S3 already)"));
@@ -934,7 +943,7 @@ pub fn replace_mirror(paths: &Paths, sid: &str, chat: &MacChat, projects: &Path,
     };
     super::commands::delete_mirror(chat, sid)?;
     let target = ViewTarget { mac_projects: projects, slug: &chat.slug, session_id: sid, mac_cwd };
-    let outcome = crate::bridge::view::write_view(&target, &reply, n, rules)?;
+    let outcome = crate::bridge::view::write_view_carrying(&target, &reply, n, rules, &renames)?;
     super::sync::audit_view(paths, sid, vm, &outcome);
     Ok(matches!(outcome, ViewOutcome::Written { .. } | ViewOutcome::Unchanged { .. }).then(|| target.rel()))
 }

@@ -247,10 +247,16 @@ impl W {
 
     /// A live Cursor window on extension `version`: a census row whose host is this test process.
     fn window(&self, version: &str) {
+        self.window_on(std::process::id(), version);
+    }
+
+    /// S12 (V1): a live Cursor window on extension `version` whose host is `host`: one census row, `start` now (ms).
+    /// `census::running_extensions` counts it while `host` lives and started no later than the row.
+    fn window_on(&self, host: u32, version: &str) {
         let logs = self.root().join("bridge/logs");
         std::fs::create_dir_all(&logs).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-        let row = serde_json::json!({"ppid": std::process::id(), "start": now as u64, "ext": version});
+        let row = serde_json::json!({"ppid": host, "start": now as u64, "ext": version});
         std::fs::OpenOptions::new().create(true).append(true).open(logs.join("census.jsonl")).unwrap().write_all(format!("{row}\n").as_bytes()).unwrap();
     }
 
@@ -273,6 +279,29 @@ impl W {
         let mut c = self.cmd(args);
         c.env("AI_ENV_BRIDGE_LAB_S3_ADDR", st.s3.addr().to_string()).env("AI_ENV_BRIDGE_LAB_AGENT_ADDR", st.endpoint.addr.to_string());
         self.run(c)
+    }
+}
+
+/// S12 (V1, LD-V4): a live process standing in for a second Cursor window's extension host:
+/// `census::running_extensions` counts a row's `ppid` while that process lives and started no later than the row.
+/// `/bin/sleep 300` (no claude, aws or docker), stdio on `/dev/null`, killed and reaped on drop. It starts after this
+/// test process, so a host order differs from a newest-first one.
+struct LiveHost(std::process::Child);
+
+impl LiveHost {
+    fn start() -> LiveHost {
+        LiveHost(Command::new("/bin/sleep").arg("300").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("/bin/sleep"))
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for LiveHost {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -724,6 +753,46 @@ fn admit_auto_retries_a_docker_failure_until_its_tries_are_spent() {
     let rows = w.audit("claude_admit");
     let d = &rows.last().unwrap()["detail"];
     assert_eq!((d["outcome"].as_str(), d.get("attempt"), d.get("test")), (Some("admitted"), None, None));
+}
+
+/// S12 (V2): `claude status` counts a Docker failure's automatic retry from the later of the failure and the last
+/// automatic try's end (`state/claude/<v>.lock`'s `finished_at=`, which D5's trigger waits on too), never 10 minutes
+/// early: a failure by hand moved 10 minutes back, then `--auto` within its cooldown (nothing run) ends later than
+/// it. Once both are past it says the retry is due now, while `--json`'s `retry_from` keeps the time.
+#[test]
+fn status_counts_the_retry_from_the_later_of_the_failure_and_the_last_auto_end() {
+    use ai_env_cli::wire::time::{rfc3339_utc, unix_now};
+    let w = W::new();
+    let bytes = claude_bytes(V);
+    w.serve(V, &bytes, true, None);
+    let toml = w.root().join("bridge/bridge.toml");
+    let mut cfg = std::fs::read_to_string(&toml).unwrap();
+    cfg.push_str("\n[wrapper]\nmode = \"remote\"\n");
+    std::fs::write(&toml, cfg).unwrap();
+    w.make_knobs(&[("FAKE_MAKE_EXIT", "2"), ("FAKE_MAKE_OUT", CARGO_FAILURE)]);
+    let p = w.paths();
+    let out = w.ai(&["claude", "admit", V]);
+    assert_eq!(out.status.code(), Some(1), "{}", all(&out));
+    Record::update(&p, V, |r| r.admission.as_mut().expect("an admission").at = rfc3339_utc(unix_now() - 600)).unwrap();
+    let out = w.ai(&["claude", "admit", V, "--auto"]);
+    assert_eq!(out.status.code(), Some(0), "{}", all(&out));
+    assert_eq!(w.lines("make").len(), 1, "within the cooldown: make not run again");
+    let lock = std::fs::read_to_string(p.claude_lock(V)).unwrap();
+    let finished: u64 = lock.lines().find_map(|l| l.strip_prefix("finished_at=")).and_then(|t| t.parse().ok()).unwrap_or_else(|| panic!("no finished_at: {lock}"));
+    let from = rfc3339_utc(finished + 15 * 60);
+    let line = |w: &W| text(&w.ai(&["claude", "status"]).stdout).lines().find(|l| l.starts_with(&format!("claude {V}: "))).map(str::to_string).unwrap_or_default();
+    let retry_from = |w: &W| {
+        let doc: Value = serde_json::from_slice(&w.ai(&["claude", "status", "--json"]).stdout).unwrap();
+        doc["versions"].as_array().unwrap().iter().find(|r| r["version"] == V).map(|r| r["retry_from"].clone()).unwrap_or_default()
+    };
+    assert_eq!(line(&w), format!("claude {V}: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry from {from} (the next remote wrapper starts it))"));
+    assert_eq!(retry_from(&w), Value::from(from));
+    // Both past: the failure 25 minutes back, the last automatic end 20.
+    let now = unix_now();
+    Record::update(&p, V, |r| r.admission.as_mut().expect("an admission").at = rfc3339_utc(now - 1500)).unwrap();
+    std::fs::write(p.claude_lock(V), format!("finished_at={}\noutcome=failed(docker)\n", now - 1200)).unwrap();
+    assert_eq!(line(&w), format!("claude {V}: failed(docker) (test l2_x failed; attempt 1 of 3; an automatic retry is due now (the next remote wrapper starts it))"));
+    assert_eq!(retry_from(&w), Value::from(rfc3339_utc(now - 300)), "the time, though past");
 }
 
 /// The automatic retry keeps custody (Mike's rule, 24 Oct): a kept binary that is not the signed manifest's is
@@ -1272,6 +1341,35 @@ fn forget_refuses_a_live_windows_version() {
     let out = w.staged(&st, &["claude", "forget", V, "--force"]);
     assert_eq!(out.status.code(), Some(1), "{}", all(&out));
     assert!(text(&out.stderr).contains("nothing to forget"), "{}", all(&out));
+}
+
+/// S12 (V1): gc names a version two live windows run once: this process and a [`LiveHost`] both on 2.1.302 give
+/// `--json`'s `windows` `["2.1.302"]` and the kept line `(2.1.302)`; a newer row for the `LiveHost` (2.1.304, a
+/// window reloaded onto it) is named first, though its host started last. The dry run reads the records and the
+/// census only: no API call.
+#[test]
+fn gc_names_a_version_two_windows_run_once() {
+    let w = W::new();
+    let host = LiveHost::start();
+    w.window("2.1.302");
+    w.window_on(host.pid(), "2.1.302");
+    let kept = |list: &str| format!("claude gc: kept: the 3 newest staged, the bundle's (none) and every live window's ({list}); ai-env claude gc --yes lists S3 too and deletes (one Touch ID)");
+    let gc = |w: &W| -> (Value, String) {
+        let json = w.ai(&["claude", "gc", "--json"]);
+        assert!(json.status.success(), "{}", all(&json));
+        let plain = w.ai(&["claude", "gc"]);
+        assert!(plain.status.success(), "{}", all(&plain));
+        let doc: Value = serde_json::from_slice(&json.stdout).unwrap_or_else(|e| panic!("{e}: {}", all(&json)));
+        (doc["windows"].clone(), text(&plain.stdout).lines().nth(2).unwrap_or_default().to_string())
+    };
+    let (windows, third) = gc(&w);
+    assert_eq!(windows, serde_json::json!(["2.1.302"]));
+    assert_eq!(third, kept("2.1.302"));
+    w.window_on(host.pid(), "2.1.304");
+    let (windows, third) = gc(&w);
+    assert_eq!(windows, serde_json::json!(["2.1.304", "2.1.302"]));
+    assert_eq!(third, kept("2.1.304, 2.1.302"));
+    assert!(w.state().calls.is_empty(), "the dry run makes no API call");
 }
 
 // ---- I1 ----------------------------------------------------------------------------------------------------------

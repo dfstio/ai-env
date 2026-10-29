@@ -232,8 +232,10 @@ pub fn sha256_b64(hex: &str) -> Option<String> {
 
 /// The query parameters a presigned URL must carry.
 const REQUIRED_PARAMS: [&str; 6] = ["X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires", "X-Amz-SignedHeaders", "X-Amz-Signature"];
-/// The other parameters it may carry: S3's own and a temporary credential's token.
-const OPTIONAL_PARAMS: [&str; 9] = ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys", "X-Amz-Security-Token"];
+/// The other parameters it may carry: S3's own (S12, P: `delete`, a
+/// multi-object delete's, with no value and only on the bucket itself) and a
+/// temporary credential's token.
+const OPTIONAL_PARAMS: [&str; 10] = ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys", "delete", "X-Amz-Security-Token"];
 
 /// `value` with each `%XX` decoded (`None` for a malformed escape or a result that is not UTF-8).
 fn percent_decode(value: &str) -> Option<String> {
@@ -300,6 +302,13 @@ fn checked_params(url: &str) -> Result<Vec<(&str, &str)>, String> {
         if params.iter().any(|(n, _)| *n == name) {
             return Err(format!("carries the query parameter {name} twice"));
         }
+        // S12 (P, P-R19): the Mac's DeleteObjects, `POST /?delete`, names the bucket itself and gives `delete` no value.
+        if name == "delete" && !value.is_empty() {
+            return Err("carries delete with a value (a multi-object delete's has none)".into());
+        }
+        if name == "delete" && !key.is_empty() {
+            return Err("carries delete on an object: a multi-object delete names the bucket itself".into());
+        }
         params.push((name, value));
     }
     let get = |name: &str| params.iter().find(|(n, _)| *n == name).map(|(_, v)| *v);
@@ -326,14 +335,16 @@ fn checked_params(url: &str) -> Result<Vec<(&str, &str)>, String> {
 /// printable ASCII without a space, `"` or a backslash (it is written into a
 /// quoted curl config string); `https://` then exactly a transcripts
 /// bucket's host ([`bucket_host`]: no port, no user); a path that is `/`
-/// (the bucket itself: the Mac's ListObjectsV2) or `/` and a key
-/// [`S3Key::parse`] takes (an `OutsideProbe` key included: only the egress
-/// check builds one); a query holding `X-Amz-Algorithm=AWS4-HMAC-SHA256`,
-/// `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires` (1 to 3600),
-/// `X-Amz-SignedHeaders` and `X-Amz-Signature` (64 lowercase hex), besides
-/// them only `versionId`, `uploadId`, `partNumber`, `uploads`, `list-type`,
-/// `prefix`, `continuation-token`, `max-keys` and `X-Amz-Security-Token`,
-/// each once. In debug builds only, a lab URL also passes:
+/// (the bucket itself: the Mac's ListObjectsV2 and, S12, its DeleteObjects)
+/// or `/` and a key [`S3Key::parse`] takes (an `OutsideProbe` key included:
+/// only the egress check builds one); a query holding
+/// `X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-Credential`, `X-Amz-Date`,
+/// `X-Amz-Expires` (1 to 3600), `X-Amz-SignedHeaders` and `X-Amz-Signature`
+/// (64 lowercase hex), besides them only `versionId`, `uploadId`,
+/// `partNumber`, `uploads`, `list-type`, `prefix`, `continuation-token`,
+/// `max-keys`, `delete` (S12: with no value, on the bucket itself only: the
+/// Mac's DeleteObjects) and `X-Amz-Security-Token`, each once. In debug
+/// builds only, a lab URL also passes:
 /// `http://127.0.0.1:<port>/<bucket>[/<key>]?…` (path-style, loopback, the
 /// same query rules). The request types' `check`s narrow it for the VM.
 pub fn check_url(url: &str) -> Result<(), String> {
@@ -653,5 +664,29 @@ mod tests {
             assert_eq!((l.is_lab(), l.host(), l.key()), (true, "127.0.0.1:41234", key.as_str()));
         }
         assert!(check_url(&format!("http://10.0.0.1:41234/ai-env-transcripts-123456789012/{key}?{}", good.split_once('?').unwrap().1)).is_err());
+    }
+
+    /// S12 (P, P-R19): the Mac's DeleteObjects URL (`POST /?delete`) is one
+    /// of the store's: `delete` with no value (empty, or bare: it reads as
+    /// empty) on the bucket itself, signed over the pair a multi-object
+    /// delete signs, and the lab's path-style bucket the same in debug builds
+    /// only; `delete` on an object, with a value, or twice is refused, naming
+    /// why and never the query.
+    #[test]
+    fn check_url_takes_delete_on_the_bucket_alone() {
+        const PAIR: &str = "host;x-amz-checksum-sha256;x-amz-expected-bucket-owner;x-amz-sdk-checksum-algorithm";
+        let good = url("", "delete=&", PAIR, 300, 'd');
+        assert_eq!(check_url(&good), Ok(()));
+        let held = PresignedUrl::new(good.clone()).unwrap();
+        assert_eq!((held.key(), held.param_names()[0], held.signed_headers()), ("", "delete", PAIR));
+        assert_eq!(check_url(&url("", "delete&", PAIR, 300, 'd')), Ok(()), "a bare delete reads as empty");
+        let lab = format!("http://127.0.0.1:41234/{}?{}", bucket_name("123456789012").unwrap(), good.split_once('?').unwrap().1);
+        assert_eq!(check_url(&lab).is_ok(), cfg!(debug_assertions), "the lab's bucket itself, in debug builds only");
+        let on_key = url(&format!("v1/{S}/mac/{SHA}"), "delete=&", PAIR, 300, 'd');
+        assert_eq!(check_url(&on_key), Err("carries delete on an object: a multi-object delete names the bucket itself".to_string()));
+        assert_eq!(check_url(&url("", "delete=1&", PAIR, 300, 'd')), Err("carries delete with a value (a multi-object delete's has none)".to_string()));
+        assert_eq!(check_url(&url("", "delete=&delete=&", PAIR, 300, 'd')), Err("carries the query parameter delete twice".to_string()));
+        let e = PresignedUrl::new(on_key).unwrap_err();
+        assert!(e.starts_with("the presigned URL carries delete on an object") && !e.contains(&"d".repeat(64)) && !e.contains("X-Amz-Credential="), "never the query: {e}");
     }
 }

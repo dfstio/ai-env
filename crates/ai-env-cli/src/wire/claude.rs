@@ -42,6 +42,16 @@
 //! S10 addendum A1 reads one more, forwarded as [`ChildFrame::Other`] was:
 //! child → host `{"type":"rate_limit_event","rate_limit_info":{…},…}`, its
 //! info kept raw for the pump's usage tap (`wire::ratelimit` reads it).
+//!
+//! S12 (T) reads one more child frame, forwarded as `Other` was:
+//! `system`/`session_title_changed`, and the title of an answer the pump knows
+//! to be one ([`title_answer`]; plans/s12-contracts.md §T1.2): child → host
+//! `{"type":"system","subtype":"session_title_changed","title":<t>,"uuid":…,"session_id":<sid>}`
+//! ([`ChildFrame::TitleChanged`]), and `response.response.title` of the success
+//! answer to a host `generate_session_title`. Every other `system` subtype stays
+//! [`ChildFrame::Other`]. Phase 4 (§T3 P2 as amended): the `title` of the host's
+//! own `rename_session` request ([`rename_request_title`]), read only to tell the
+//! CLI's echo of it from its startup frame, never kept as a title itself.
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -72,6 +82,17 @@ pub const STATE_SUBTYPES: [&str; 7] = [
 
 /// The subtype whose every occurrence is replayed (the others keep only their last value).
 pub const CUMULATIVE_SUBTYPE: &str = "apply_flag_settings";
+
+/// S12 (T): the CLI's name for the session, as a `system` frame:
+/// `{"type":"system","subtype":"session_title_changed","title":<t>,"uuid":<u>,"session_id":<sid>}`, at its
+/// start when the session has a name and after each rename (none for a generated title, none for an empty one).
+pub const SESSION_TITLE_CHANGED: &str = "session_title_changed";
+/// S12 (T): the host's request whose success answer carries the chat's title (`response.response.title`).
+pub const GENERATE_TITLE_SUBTYPE: &str = "generate_session_title";
+/// S12 (T, phase 4): the host's rename of the chat (2.1.310's
+/// `{"subtype":"rename_session","title":<t>,"source":"host","session_id":<sid>}`), which the CLI echoes as a
+/// [`SESSION_TITLE_CHANGED`] frame naming `<t>`.
+pub const RENAME_SESSION_SUBTYPE: &str = "rename_session";
 
 /// The CLI's resume-miss text; in stream-json mode it is printed on stderr
 /// AND carried as `errors[0]` of an `error_during_execution` result on stdout.
@@ -168,6 +189,8 @@ pub enum ChildFrame<'a> {
     ControlCancel { request_id: Option<Cow<'a, str>> },
     /// A1: `rate_limit_event`; `info` its `rate_limit_info`, raw.
     RateLimit { info: Option<&'a RawValue> },
+    /// S12 (T): `system`/`session_title_changed`, forwarded untouched (the pump reads it).
+    TitleChanged { session_id: Option<Cow<'a, str>>, title: Option<Cow<'a, str>> },
     /// Everything else (`stream_event`, other `system` subtypes, non-JSON
     /// noise): forwarded untouched.
     Other,
@@ -213,6 +236,7 @@ impl PartialEq for ChildFrame<'_> {
             (F::Assistant { uuid: a, top_level: x }, F::Assistant { uuid: b, top_level: y }) => a == b && x == y,
             (F::ControlCancel { request_id: a }, F::ControlCancel { request_id: b }) => a == b,
             (F::RateLimit { info: a }, F::RateLimit { info: b }) => a.map(RawValue::get) == b.map(RawValue::get),
+            (F::TitleChanged { session_id: a, title: x }, F::TitleChanged { session_id: b, title: y }) => a == b && x == y,
             (F::KeepAlive, F::KeepAlive) | (F::Other, F::Other) => true,
             _ => false,
         }
@@ -272,6 +296,8 @@ struct Peek<'a> {
     parent_tool_use_id: Option<&'a RawValue>,
     #[serde(borrow, default)]
     rate_limit_info: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    title: Option<&'a RawValue>,
 }
 
 /// The two fields of a nested `request` / `response` object.
@@ -326,6 +352,7 @@ pub fn classify_child(line: &[u8]) -> ChildFrame<'_> {
     match ty.as_ref() {
         "transcript_mirror" => ChildFrame::Mirror { file_path: text(p.file_path), entries: raw_items(p.entries) },
         "system" if text(p.subtype).as_deref() == Some("init") => ChildFrame::Init { session_id: text(p.session_id), cwd: text(p.cwd) },
+        "system" if text(p.subtype).as_deref() == Some(SESSION_TITLE_CHANGED) => ChildFrame::TitleChanged { session_id: text(p.session_id), title: text(p.title) },
         "control_response" => {
             let r = inner(p.response);
             ChildFrame::ControlResponse {
@@ -397,6 +424,54 @@ pub fn is_resume_miss(frame: &ChildFrame<'_>) -> bool {
 #[must_use]
 pub fn is_cut_miss(frame: &ChildFrame<'_>) -> bool {
     matches!(frame, ChildFrame::Result { is_error: true, first_error: Some(e), .. } if e.starts_with(CUT_MISS_MARKER))
+}
+
+/// S12 (T): the title of a success `control_response` (`response.response.title`, a string), unescaped;
+/// `None` for an error answer, a `null`, missing or non-string title, a title anywhere else in the line, and
+/// any other line. Read leniently, as [`rewrite_initialize_pid`] reads its pid.
+///
+/// Which answer is one is the pump's to know (the host's request it answers was a
+/// [`GENERATE_TITLE_SUBTYPE`], `HostState::pending_subtype`): this reads the line alone, never a request's body.
+#[must_use]
+pub fn title_answer(line: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Line<'a> {
+        #[serde(borrow, default)]
+        response: Option<&'a RawValue>,
+    }
+    #[derive(Deserialize)]
+    struct Answer<'a> {
+        #[serde(borrow, default)]
+        title: Option<&'a RawValue>,
+    }
+    if !matches!(classify_child(line), ChildFrame::ControlResponse { subtype: Some(s), .. } if s == "success") {
+        return None;
+    }
+    let outer = serde_json::from_slice::<Line<'_>>(line).ok()?.response?;
+    let answer = serde_json::from_str::<Line<'_>>(outer.get()).ok()?.response?;
+    let title = serde_json::from_str::<Answer<'_>>(answer.get()).ok()?.title;
+    text(title).map(Cow::into_owned)
+}
+
+/// S12 (T, phase 4): the `title` of the host's [`RENAME_SESSION_SUBTYPE`] request (`request.title`, a string),
+/// unescaped; `None` for a request of another subtype, a `null`, missing or non-string title, a title anywhere else
+/// in the line, and any other line. Read leniently, as [`title_answer`] reads its answer.
+///
+/// The pump reads it only to tell the CLI's echo of the host's own rename (a `session_title_changed` with that text)
+/// from the CLI's startup frame (§T3 P2 as amended in phase 4); the title it keeps is still the echo's, never this.
+#[must_use]
+pub fn rename_request_title(line: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Request<'a> {
+        #[serde(borrow, default)]
+        title: Option<&'a RawValue>,
+    }
+    let HostFrame::ControlRequest { subtype: Some(subtype), request: Some(request), .. } = classify_host(line) else { return None };
+    if subtype != RENAME_SESSION_SUBTYPE {
+        return None;
+    }
+    let title = serde_json::from_str::<Request<'_>>(request.get()).ok()?.title;
+    text(title).map(Cow::into_owned)
 }
 
 /// A JSON string literal for `s` (quotes and escapes included).
@@ -875,5 +950,83 @@ mod tests {
         // A string ending in the needle is escaped in JSON, so it never matches.
         let quoted = br#"{"type":"control_response","response":{"subtype":"success","request_id":"i1","response":{"note":"\"pid\":4242","pid":4242}}}"#;
         assert!(rewrite_initialize_pid(quoted, 9).is_some_and(|(b, _)| b.ends_with(br#""pid":9}}}"#)));
+    }
+
+    /// S12 (T, §T1.2): 2.1.310's `session_title_changed` classifies with its session and title, borrowed
+    /// unless escaped (an escape is unescaped: a U+202E reaches the pump, which cleans it); a title or a
+    /// session id of the wrong type, `null` or absent reads as absent; two titles fail the peek (`Other`, as
+    /// two of any peeked key do); the frame equals itself and its clone and no other frame; every other
+    /// `system` subtype stays `Other` (R's `session_state_changed` included); the host never sends it.
+    #[test]
+    fn a_title_frame_classifies_and_equals_itself() {
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let line = format!(r#"{{"type":"system","subtype":"session_title_changed","title":"Harbour-s11 word memory","uuid":"00000000-0000-4000-5000-000000000001","session_id":"{sid}"}}"#);
+        let frame = classify_child(line.as_bytes());
+        let ChildFrame::TitleChanged { session_id, title } = &frame else { panic!("not a title frame: {frame:?}") };
+        assert_eq!((session_id.as_deref(), title.as_deref()), (Some(sid), Some("Harbour-s11 word memory")));
+        assert!(matches!(title, Some(Cow::Borrowed(_))) && matches!(session_id, Some(Cow::Borrowed(_))), "unescaped strings are borrowed");
+        assert_eq!(frame, frame.clone());
+        assert_eq!(frame, classify_child(line.as_bytes()));
+        assert_ne!(frame, ChildFrame::Other);
+        assert_ne!(frame, ChildFrame::Init { session_id: Some(sid.into()), cwd: None });
+        assert_ne!(frame, ChildFrame::TitleChanged { session_id: Some(sid.into()), title: Some("another".into()) });
+        let bidi = classify_child(br#"{"type":"system","subtype":"session_title_changed","title":"a\u202eb","session_id":"s"}"#);
+        let ChildFrame::TitleChanged { title: Some(t), .. } = &bidi else { panic!("{bidi:?}") };
+        assert!(matches!(t, Cow::Owned(_)) && t == "a\u{202e}b", "{t:?}");
+        for (odd, want_sid, want_title) in [
+            (r#"{"type":"system","subtype":"session_title_changed","title":7,"session_id":"s"}"#, Some("s"), None),
+            (r#"{"type":"system","subtype":"session_title_changed","title":null,"session_id":"s"}"#, Some("s"), None),
+            (r#"{"type":"system","subtype":"session_title_changed","title":"t"}"#, None, Some("t")),
+            (r#"{"type":"system","subtype":"session_title_changed","title":"t","session_id":5}"#, None, Some("t")),
+        ] {
+            assert_eq!(classify_child(odd.as_bytes()), ChildFrame::TitleChanged { session_id: want_sid.map(Cow::Borrowed), title: want_title.map(Cow::Borrowed) }, "{odd}");
+        }
+        assert_eq!(classify_child(br#"{"type":"system","subtype":"session_title_changed","title":"a","title":"b","session_id":"s"}"#), ChildFrame::Other, "two titles");
+        assert_eq!(classify_child(br#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#), ChildFrame::Other, "R's frame stays Other");
+        assert_eq!(classify_child(br#"{"type":"system","subtype":"status","title":"x"}"#), ChildFrame::Other);
+        assert_eq!(classify_host(line.as_bytes()), HostFrame::Other);
+    }
+
+    /// S12 (T, §T1.2): an answer's title is `response.response.title` of a success `control_response`, a
+    /// string (an escape unescaped); a `null`, missing or non-string title, an error answer holding one, a
+    /// title nested deeper or one level up, another frame's and a line that is no JSON are none.
+    #[test]
+    fn the_title_answer_is_read_from_a_success_response_only() {
+        let answer = |inner: &str| format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"g1","response":{inner}}}}}"#);
+        assert_eq!(title_answer(answer(r#"{"title":"Fix the seed"}"#).as_bytes()).as_deref(), Some("Fix the seed"));
+        assert_eq!(title_answer(answer(r#"{"title":"\u00e9"}"#).as_bytes()).as_deref(), Some("é"), "an escape, unescaped");
+        for none in [
+            answer(r#"{"title":null}"#),
+            answer("{}"),
+            answer(r#"{"title":3}"#),
+            answer(r#"{"x":{"title":"decoy"}}"#),
+            answer(r#""Fix the seed""#),
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"g1","error":"no","response":{"title":"Fix the seed"}}}"#.to_string(),
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"g1","title":"decoy","response":{}}}"#.to_string(),
+            r#"{"type":"system","subtype":"session_title_changed","title":"Fix the seed","session_id":"s"}"#.to_string(),
+            "not json".to_string(),
+        ] {
+            assert_eq!(title_answer(none.as_bytes()), None, "{none}");
+        }
+    }
+
+    /// S12 (T, phase 4): the host's `rename_session` title, as 2.1.310 sends it, unescaped; nothing of another
+    /// request, of a title elsewhere in the line, or of one that is no string.
+    #[test]
+    fn the_rename_requests_title_is_read_from_a_rename_session_only() {
+        let rename = |inner: &str| format!(r#"{{"type":"control_request","request_id":"r1","request":{{"subtype":"rename_session",{inner}"source":"host","session_id":"0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}}}}"#);
+        assert_eq!(rename_request_title(rename(r#""title":"Harbour-s12 renamed","#).as_bytes()).as_deref(), Some("Harbour-s12 renamed"));
+        assert_eq!(rename_request_title(rename(r#""title":"caf\u00e9","#).as_bytes()).as_deref(), Some("café"), "an escape, unescaped");
+        for none in [
+            rename(r#""title":null,"#),
+            rename(""),
+            rename(r#""title":7,"#),
+            r#"{"type":"control_request","request_id":"g1","request":{"subtype":"generate_session_title","title":"decoy","description":"prompt"}}"#.to_string(),
+            r#"{"type":"control_request","request_id":"r1","title":"decoy","request":{"subtype":"rename_session"}}"#.to_string(),
+            r#"{"type":"system","subtype":"session_title_changed","title":"decoy","session_id":"s"}"#.to_string(),
+            "not json".to_string(),
+        ] {
+            assert_eq!(rename_request_title(none.as_bytes()), None, "{none}");
+        }
     }
 }

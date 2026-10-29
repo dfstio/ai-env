@@ -11,7 +11,7 @@ use super::sync::{SyncCtx, SyncReport};
 use super::{S3Sign, S3Target, TranscriptSync};
 use crate::bridge::api::{MicrovmApi, VmState};
 use crate::bridge::config::{BridgeConfig, Paths};
-use crate::bridge::dataplane::{HttpsEndpoint, MintingTokens};
+use crate::bridge::dataplane::{DataPlane, HttpsEndpoint, MintingTokens, TokenSource};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::registry::{self, SessionRow};
 use crate::bridge::remote::audit_event;
@@ -395,14 +395,53 @@ pub fn gc_candidates(paths: &Paths, older_than_days: u32, now: u64) -> std::resu
     Ok(out)
 }
 
+/// S12 (P): the most listings of a session's prefix one purge makes: the
+/// first, one after each delete pass, the last only to verify.
+pub const PURGE_LISTINGS: usize = 3;
+
 /// Delete every current object under `v1/<sid>/` (delete markers; the old
-/// versions expire after 30 days): how many.
+/// versions expire after 30 days): S12 (P) in batches
+/// ([`S3Client::delete_keys`]), the prefix listed again after each pass, at
+/// most [`PURGE_LISTINGS`] listings; how many S3 took. A key S3 did not
+/// delete, or one still listed at the last listing, is the error (exit 7),
+/// before the caller removes anything of the session here.
+///
+/// P-R14: an empty listing ends the purge with the sum of what each pass
+/// deleted (a first listing that is empty sends no DeleteObjects: `Ok(0)`);
+/// a non-empty first or second listing is one pass, and a key of it S3 did
+/// not delete ends the purge at once (error A, no listing after it); a
+/// third listing that still names a key is error B (no third pass). P-R15:
+/// both are `Sdk` (exit 7), naming how many of the distinct keys every
+/// listing so far named were left, the first one left and its code (or
+/// `still listed`), and that the manifest and state are kept, so the
+/// command can run again. A listing's or a pass's own error is returned as
+/// it is. The callers hold the manifest lock across every listing and pass
+/// (P-R16); an object written under the prefix after the first listing (a
+/// `/terminate` tail) is listed and deleted by the second pass (P-R17).
 pub async fn delete_session_objects<S: S3Sign>(client: &S3Client<'_, S>, sid: &str) -> std::result::Result<usize, BridgeError> {
-    let listed = client.list(&format!("{}{sid}/", crate::wire::s3::KEY_PREFIX)).await?;
-    for o in &listed {
-        client.delete(&o.key).await?;
+    let prefix = format!("{}{sid}/", crate::wire::s3::KEY_PREFIX);
+    // What a key left says: `<n> of <m> objects under v1/<sid>/ were not deleted (first: <key>: <why>)`.
+    let left = |n: usize, m: usize, first: &str, why: &str| BridgeError::Sdk {
+        op: "s3 delete objects",
+        message: format!("{n} of {m} objects under {prefix} were not deleted (first: {first}: {why}); its manifest and state are kept: run the command again"),
+    };
+    let mut deleted = 0usize;
+    // The distinct keys every listing so far named.
+    let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for listing in 1..=PURGE_LISTINGS {
+        let keys: Vec<String> = client.list(&prefix).await?.into_iter().map(|o| o.key).collect();
+        let Some(first) = keys.first() else { return Ok(deleted) };
+        named.extend(keys.iter().cloned());
+        if listing == PURGE_LISTINGS {
+            return Err(left(keys.len(), named.len(), first, "still listed"));
+        }
+        let pass = client.delete_keys(&keys).await?;
+        deleted += pass.deleted;
+        if let Some(f) = pass.failed.first() {
+            return Err(left(pass.failed.len(), named.len(), &f.key, &f.code));
+        }
     }
-    Ok(listed.len())
+    Ok(deleted)
 }
 
 /// Remove the view of `rel` (`<slug>/<sid>.jsonl`) under `projects`, only
@@ -672,18 +711,55 @@ pub(crate) fn delete_mirror(chat: &MacChat, sid: &str) -> std::result::Result<()
 /// place once the mirror went (`gone`: deleted, or moved to `origin/`).
 #[allow(clippy::too_many_arguments)]
 fn view_from_mirror(paths: &Paths, m: &Mirror, sid: &str, projects: &Path, n: u32, rules: &Rules, build: stage::ViewBuilder<'_>, gone: impl FnOnce() -> std::result::Result<(), BridgeError>) -> std::result::Result<ViewOutcome, BridgeError> {
-    let tail = stage::tail_of(&m.chat.main_path(sid))?;
+    let main = m.chat.main_path(sid);
+    let tail = stage::tail_of(&main)?;
     let reply = build(&tail, n).map_err(BridgeError::Config)?;
+    // S12 (T, Bug 2, §T3 S3): the mirror's `custom-title` lines, read from the same tail before it goes, carried into the view.
+    let renames = crate::bridge::view::renames_of(&main, &tail, rules);
     gone()?;
     let target = ViewTarget { mac_projects: projects, slug: &m.chat.slug, session_id: sid, mac_cwd: m.row.cwd.as_deref().unwrap_or_default() };
-    let outcome = crate::bridge::view::write_view(&target, &reply, n, rules)?;
+    let outcome = crate::bridge::view::write_view_carrying(&target, &reply, n, rules, &renames)?;
     super::sync::audit_view(paths, sid, m.vm.as_ref().map_or("-", |v| v.id.as_str()), &outcome);
     Ok(outcome)
 }
 
+/// S12 (T, Bug 2, §T3 S4 as amended in phase 4): [`migrate_one`]'s live-VM path on `sctx` (the session's VM at
+/// its live endpoint). Every step that may fail with nothing changed runs first: the mirror's renames, read from
+/// its tail (one that cannot be read fails here, A18); the VM's view (`SyncCtx::view_reply`), and its render
+/// checked (a reply refused, or one that renders no line, fails here, audited `transcript_view` `refused`). Then
+/// the VM's transcript is synced to S3, the mirror deleted, and the view written carrying the renames (a refusal
+/// left at that point, a path's, is the error, never a silent `migrated`). A mirror is never deleted before its
+/// view is in hand: a view that cannot be had keeps the mirror and its renames with nothing else changed (no
+/// manifest written), so the next `migrate-s9` takes it again. The VM's view builder skips `custom-title` lines, so
+/// the renames reach the view only from the mirror.
+pub async fn migrate_live<A: MicrovmApi + S3Sign, D: DataPlane, T: TokenSource>(sctx: &SyncCtx<'_, A, D, T>, chat: &MacChat, sid: &str) -> std::result::Result<ViewOutcome, BridgeError> {
+    let main = chat.main_path(sid);
+    let renames = crate::bridge::view::renames_of(&main, &stage::tail_of(&main)?, sctx.rules);
+    let kept = |why: &str| BridgeError::Protocol(format!("the VM's view of {sid} is not one the Mac takes ({why}): the mirror is kept"));
+    // A 200 that does not parse is audited `refused` by `view_reply` itself.
+    let reply = sctx.view_reply(sid, &super::sync::main_rel(&sctx.sync.slug, sid)).await?.map_err(|why| kept(&why))?;
+    let target = ViewTarget { mac_projects: &sctx.sync.mac_projects, slug: &sctx.sync.slug, session_id: sid, mac_cwd: &sctx.sync.mac_cwd };
+    let now = crate::wire::time::rfc3339_utc_ms(crate::wire::time::unix_now_ms());
+    let unrendered = match crate::bridge::view::render(&reply, sctx.sync.view_messages, sctx.rules, &target, &now, &mut || uuid::Uuid::now_v7().to_string()) {
+        Ok((bytes, _, _)) if !bytes.is_empty() => None,
+        Ok(_) => Some("the view has no message and no title".to_string()),
+        Err(why) => Some(why),
+    };
+    if let Some(why) = unrendered {
+        super::sync::audit_view(sctx.paths, sid, &sctx.target.vm_id, &ViewOutcome::Refused(why.clone()));
+        return Err(kept(&why));
+    }
+    sctx.sync_session(sid).await?;
+    delete_mirror(chat, sid)?;
+    match sctx.write_view_reply(sid, &reply, &renames)? {
+        ViewOutcome::Refused(why) => Err(BridgeError::Config(format!("the view of {sid} was not written ({why}): its mirror was deleted, its transcript is in S3"))),
+        outcome => Ok(outcome),
+    }
+}
+
 /// The migration of one mirror (`session migrate-s9 --yes`): a live VM's
 /// session synced to S3 from the VM, the mirror deleted, the VM's view
-/// written; a gone VM's mirror scanned, then uploaded as
+/// written ([`migrate_live`]); a gone VM's mirror scanned, then uploaded as
 /// `v1/<sid>/mac/<sha256>` (a manifest of a VM-begun chat whose first part is
 /// that object), the view built here, the mirror deleted. A gone VM's mirror
 /// with a finding is not uploaded: its view (built here, masked) takes its
@@ -707,20 +783,25 @@ pub async fn migrate_one<A: MicrovmApi + S3Sign>(ctx: &Ctx, api: &A, target: &S3
         crate::bridge::workspace::audit(&ctx.paths, audit_event::TRANSCRIPT_MIGRATE, &pairs);
         return Migrated { session: sid, vm: m.vm.as_ref().map(|v| v.id.clone()), from: "gone_vm", bytes, outcome: "failed", why: Some(why) };
     }
+    // The row's VM at the endpoint GetMicrovm gives now (as `sync_on_vm` dials it; a row may name none yet).
     let live = match m.live_vm() {
-        Some(vm) => api.get(&vm.id).await.ok().filter(|l| !l.state.is_terminal()).map(|_| vm.clone()),
+        Some(vm) => api.get(&vm.id).await.ok().filter(|l| !l.state.is_terminal()).map(|l| {
+            let mut row = vm.clone();
+            if !l.endpoint.is_empty() {
+                row.endpoint = Some(l.endpoint.clone());
+            }
+            row
+        }),
         None => None,
     };
     let result: std::result::Result<(&'static str, &'static str, Option<String>), BridgeError> = async {
         if let Some(vm) = &live {
+            // S12 (T, Bug 2, §T3 S4 as amended in phase 4): the VM's view in hand before the mirror goes.
             let sync = row_sync(&ctx.paths, &ctx.cfg, &ctx.knobs, &m.row, projects)?;
-            sync_on_vm(ctx, api, vm, &sid, &sync, rules).await?;
-            delete_mirror(&m.chat, &sid)?;
-            // The VM's view, now that the mirror is gone (the sync's own write found the mirror in its place).
             let dp = HttpsEndpoint::new(&ctx.knobs)?;
             let tokens = MintingTokens::new(api, &ctx.paths, &vm.id, false);
             let agent = crate::bridge::agent::AgentTarget::from_row(vm)?;
-            SyncCtx { api, dp: &dp, tokens: &tokens, paths: &ctx.paths, target: &agent, sync: &sync, rules, deadline: None }.write_view(&sid, &super::sync::main_rel(&sync.slug, &sid)).await?;
+            migrate_live(&SyncCtx { api, dp: &dp, tokens: &tokens, paths: &ctx.paths, target: &agent, sync: &sync, rules, deadline: None }, &m.chat, &sid).await?;
             return Ok(("live_vm", "migrated", None));
         }
         let scanned = {

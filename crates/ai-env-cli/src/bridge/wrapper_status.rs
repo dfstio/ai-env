@@ -811,7 +811,11 @@ pub fn rows() -> Vec<DoctorLine> {
                 // T6: automatic admission is promised only when it can happen: `[claude].auto_admit` on (the
                 // default) and the effective mode remote.
                 let auto = wrapper.cfg.as_ref().is_none_or(|c| c.claude.auto_admit) && mode == Mode::Remote;
-                lines.extend(crate::bridge::claude::rows::rows_claude_auto(&crate::bridge::claude::load_all(p), image.as_deref(), installed.as_deref(), &running, auto));
+                // S12 (V2): the records once, then the clock their Docker failures' retry is judged by (now, and
+                // those versions' locks, read only: status writes nothing).
+                let records = crate::bridge::claude::load_all(p);
+                let clock = crate::bridge::claude::RetryClock::read(p, &records);
+                lines.extend(crate::bridge::claude::rows::rows_claude_auto(&records, image.as_deref(), installed.as_deref(), &running, auto, &clock));
                 lines.push(crate::bridge::claude::rows::row_last_claude(&rows));
                 lines.push(row_last_session(&rows, wraps, changed));
             }

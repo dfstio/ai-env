@@ -96,8 +96,9 @@ and finishes.
 AWS asks for one Touch ID):
 
 ```sh doc-test
-ai-env session list                # the chats the wrapper ran, each one's status (parked, migrating, …)
-ai-env session show UUID           # one chat's VM, and in vms every VM it ran on and why it moved
+ai-env session list                # the chats the wrapper ran: each one's status (parked, migrating, …), its name last
+ai-env session list --title seed   # only the chats whose name (as Cursor shows it) holds "seed", in any case
+ai-env session show UUID           # one chat's name and VM, and in vms every VM it ran on and why it moved
 ai-env box fetch WORKSPACE --wip   # the VM's commits and uncommitted files into refs/remotes/box/*
 ai-env box review BRANCH           # what a push of BRANCH would carry (no AWS, no Touch ID; exit 9 on a finding)
 ai-env vm list                     # the VMs that run or are suspended (then the registry reconciled, locally)

@@ -499,6 +499,15 @@ impl World {
         registry::write(&self.paths(), &row).expect("the session row");
     }
 
+    /// S12 (T): session `sid`'s row names its chat `title`, from `source` (`custom` or `ai`), as a pump writes it.
+    pub fn set_title(&self, sid: &str, title: &str, source: &str) {
+        use ai_env_cli::bridge::registry;
+        let mut row = registry::read(&self.paths(), sid).expect("the session row").expect("a session row to title");
+        row.title = Some(title.to_string());
+        row.title_source = Some(source.to_string());
+        registry::write(&self.paths(), &row).expect("the titled row");
+    }
+
     /// Every file under the world, concatenated (lossy).
     pub fn all_files(&self) -> String {
         let mut out = String::new();
@@ -848,12 +857,20 @@ fn bearer_never_in_logs_or_audit() {
 
 /// Every value a page shows is escaped: a session's slug and cwd, a VM's label, an audit row's value, a
 /// settings rule; nothing a row holds becomes markup. (The session and cost pages need B2: green at I1.)
+/// S12 (T, §T3 U8): a chat's name too, in the sessions table and in the session page's `<title>` and heading.
+/// S12 (T, §T3 U6 to U8, M-T26's panel killer and M-T52; wave 1's fix round): a hand-edited name holding a U+202E
+/// (`esc` leaves it as it is) shows its six-character escape in the table cell, the session page's `<title>`, its
+/// heading and its `<dd>`; no page holds the raw character.
 #[test]
 fn pages_render_escaped() {
     let w = World::new();
     let vm = w.vm(&["--label", "<i>vm</i>"]);
     w.session(SID, "remote", Some(&vm), "<script>alert(1)</script>", "/w/\"quoted\" & 'single' <b>");
+    w.set_title(SID, "<script>alert(4)</script>", "custom");
     w.session(SID_LOCAL, "local-child", None, "local", "/w/local");
+    let rlo = char::from_u32(0x202e).expect("U+202E");
+    w.set_title(SID_LOCAL, &format!("Local{rlo}notes"), "ai");
+    let inert = format!("Local{}u202enotes", '\\');
     w.append_audit("vm_suspend", serde_json::json!({"actor": "cli", "id": vm, "purpose": "<script>alert(2)</script>"}));
     plant_captures(&w, SID, "Bash(echo <script>alert(3)</script>)");
     let p = w.serve(&[]);
@@ -865,12 +882,15 @@ fn pages_render_escaped() {
         for n in never {
             assert!(!t.contains(n), "{what}: {n} unescaped:\n{t}");
         }
+        assert!(!t.contains(rlo), "{what}: a raw U+202E:\n{t}");
         for wanted in want {
             assert!(t.contains(wanted), "{what}: no {wanted}:\n{t}");
         }
         assert!(!t.contains(&p.bearer), "{what}: no page holds the bearer");
     };
-    check("sessions", &p.get(""), &["&lt;script&gt;alert(1)&lt;/script&gt;", &format!("href=\"./session/{SID}\""), &format!("href=\"./confirm?action=session-migrate&amp;target={SID}\"")]);
+    check("sessions", &p.get(""), &["&lt;script&gt;alert(1)&lt;/script&gt;", &format!("href=\"./session/{SID}\""), &format!("href=\"./confirm?action=session-migrate&amp;target={SID}\""), "<td>&lt;script&gt;alert(4)&lt;/script&gt;</td>", &format!("<td>{inert}</td>")]);
+    let local = format!("{inert} · 0199a1b2");
+    check("the local session's name", &p.get(&format!("session/{SID_LOCAL}")), &[&format!("<title>{local} · ai-env panel</title>"), &format!("<h1>{local}</h1>"), &format!("<dt>title</dt><dd>{inert} (ai)</dd>")]);
     check("vms", &p.get("vms"), &["&lt;i&gt;vm&lt;/i&gt;", &format!("href=\"./confirm?action=vm-suspend&amp;target={vm}\""), "href=\"./confirm?action=vm-refresh&amp;target=-\""]);
     check("audit", &p.get("audit"), &["purpose=&lt;script&gt;alert(2)&lt;/script&gt;", "<tbody id=\"rows\">"]);
     check("settings", &p.get(&format!("settings/{SID}")), &["Bash(echo &lt;script&gt;alert(3)&lt;/script&gt;)", &format!("ai-env wrapper settings-sync {SID} --all-safe"), "<body data-root=\"../\""]);
@@ -886,6 +906,8 @@ fn pages_render_escaped() {
     assert_eq!(p.get("session/not-a-uuid").status, 400);
     // B2's pages (green at I1).
     check("session", &p.get(&format!("session/{SID}")), &["&lt;b&gt;", "&quot;quoted&quot; &amp; &#39;single&#39;", "<body data-root=\"../\""]);
+    let named = "&lt;script&gt;alert(4)&lt;/script&gt; · 0199a1b2";
+    check("session's name", &p.get(&format!("session/{SID}")), &[&format!("<title>{named} · ai-env panel</title>"), &format!("<h1>{named}</h1>"), "<dt>title</dt><dd>&lt;script&gt;alert(4)&lt;/script&gt; (custom)</dd>"]);
     assert_eq!(p.get("session/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d").status, 404);
     check("cost", &p.get("cost"), &["window "]);
     check("cost since", &p.get("cost?since=2026-10-22"), &["window "]);
@@ -1108,5 +1130,58 @@ fn models_equal_cli_json() {
     assert!(text.contains("csi\\u009b31m del\\u007f end") && !text.contains(['\u{9b}', '\u{7f}']), "{text}");
     assert_eq!(doc("audit?json=1").text(), String::from_utf8_lossy(&cli(&["audit", "tail", "-n", "200", "--json"])));
     assert_eq!(doc("cost?since=24h&json=1").json(), json(&cli(&["cost", "--since", "24h", "--json"])), "cost --json");
+    assert_eq!(p.stop().0, Some(0));
+}
+
+/// S12 (T, §T3 U5 to U8): `/?q=` searches names and ids, case-insensitive: the matching rows, newest first,
+/// with the note `<n> of <m> sessions match` and a link to every session, the name in the Title column; none is
+/// `no session matches`; the form's input shows the search escaped. `?q=…&json=1` is `session list --title …
+/// --json`'s document for a search no id holds. A search over 200 characters is 400 with its line, `q` twice
+/// 400; an empty `q`, or one of spaces alone, is no search.
+#[test]
+fn the_sessions_page_searches_title_and_id() {
+    use ai_env_cli::bridge::panel::model::Q_TOO_LONG;
+    use ai_env_cli::bridge::title::TITLE_MAX;
+    let w = World::new();
+    w.session(SID, "remote", None, "remote", "/w/remote");
+    w.session(SID_LOCAL, "local-child", None, "local", "/w/local");
+    w.set_title(SID, "Harbour-s11 word memory", "custom");
+    w.set_title(SID_LOCAL, "Local notes", "ai");
+    let p = w.serve(&[]);
+    let page = |rel: &str| {
+        let r = p.get(rel);
+        assert_eq!((r.status, r.header("content-type")), (200, Some("text/html; charset=utf-8")), "{rel}: {}", r.text());
+        r.text()
+    };
+    let row_of = |sid: &str| format!("href=\"./session/{sid}\"");
+    let memory = page("?q=MEMORY");
+    assert!(memory.contains(&row_of(SID)) && !memory.contains(&row_of(SID_LOCAL)), "{memory}");
+    assert!(memory.contains("<p class=\"note\">1 of 2 sessions match · <a href=\"./\">all sessions</a></p>"), "{memory}");
+    assert!(memory.contains("<label>search <input name=\"q\" value=\"MEMORY\"></label>") && memory.contains("<form method=\"get\" action=\"./\" class=\"filters\">"), "{memory}");
+    assert!(memory.contains("<th>Session</th><th>Title</th><th>Status</th>") && memory.contains("<td>Harbour-s11 word memory</td>"), "the Title column, second: {memory}");
+    let tail = page("?q=4A5C");
+    assert!(tail.contains(&row_of(SID_LOCAL)) && !tail.contains(&row_of(SID)) && tail.contains("<td>Local notes</td>"), "an id's tail, in capitals: {tail}");
+    let none = page("?q=zzz");
+    assert!(none.contains("0 of 2 sessions match") && none.contains("no session matches") && !none.contains(&row_of(SID)), "{none}");
+    let markup = page("?q=%3Cscript%3E");
+    assert!(markup.contains("value=\"&lt;script&gt;\"") && !markup.contains("<script>"), "{markup}");
+    let cli = w.run(&["session", "list", "--title", "memory", "--json"]);
+    assert_eq!(cli.status.code(), Some(0), "{}", stderr_of(&cli));
+    let doc = p.get("?q=memory&json=1");
+    assert_eq!((doc.status, doc.header("content-type")), (200, Some("application/json")), "{}", doc.text());
+    assert_eq!(doc.json(), serde_json::from_slice::<Value>(&cli.stdout).unwrap(), "session list --title memory --json");
+    assert_eq!(doc.json().as_array().map(|rows| rows.iter().map(|r| r["session_id"].clone()).collect::<Vec<_>>()), Some(vec![Value::String(SID.into())]));
+    assert!(Q_TOO_LONG.contains(&TITLE_MAX.to_string()), "{Q_TOO_LONG}");
+    let long = p.get(&format!("?q={}", "a".repeat(TITLE_MAX + 1)));
+    assert_eq!((long.status, long.text()), (400, format!("{Q_TOO_LONG}\n")));
+    assert_eq!(long.header("content-type"), Some("text/plain; charset=utf-8"));
+    long.assert_hardened("400");
+    assert_eq!(p.get(&format!("?q={}", "a".repeat(TITLE_MAX))).status, 200, "200 characters are a search");
+    assert_eq!(p.get("?q=a&q=b").status, 400, "q twice");
+    assert_eq!(p.get("?q=a&event=x").status, 400, "another key");
+    for empty in ["?q=", "?q=+++"] {
+        let all = page(empty);
+        assert!(all.contains(&row_of(SID)) && all.contains(&row_of(SID_LOCAL)) && !all.contains("sessions match"), "{empty}: no search: {all}");
+    }
     assert_eq!(p.stop().0, Some(0));
 }

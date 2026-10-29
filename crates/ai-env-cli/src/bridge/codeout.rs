@@ -24,6 +24,7 @@ use crate::bridge::dataplane::{exchange, DataPlane, Exchange, TokenSource, Verdi
 use crate::bridge::errors::BridgeError;
 use crate::bridge::remote::audit_event;
 use crate::bridge::scan::Rules;
+use crate::bridge::title::{Ensure, SessionTitle};
 use crate::bridge::voice;
 use crate::bridge::workspace::blobscan::ScanSet;
 use crate::bridge::workspace::snapshot::Scratch;
@@ -1313,7 +1314,10 @@ mod g2_tests {
 /// once, never waited for inside the close budget. [`Self::watch`] hands
 /// out what the session's closing suspend waits on ([`TriggerWatch`]). S10
 /// (R1): [`Self::retail`] hands the VM the chain's next tail, as
-/// non-blocking and coalescing as a fetch's request.
+/// non-blocking and coalescing as a fetch's request. S12 (T):
+/// [`Self::set_title`] has the session's view end with a rename, by the same
+/// task's title step: synchronous, the Mac's view only, never a request to
+/// the VM.
 #[derive(Debug)]
 pub struct CodeoutTrigger {
     shared: Arc<TriggerShared>,
@@ -1330,6 +1334,10 @@ struct TriggerShared {
     /// Every waiter woken when the trigger may be done ([`TriggerWatch`]): it
     /// closed, its task ended a piece of work, or its task went.
     changed: tokio::sync::Notify,
+    /// S12 (T, §T3 L5, R6; wave 1's fix round): the view sync and the tripwires the task read at its start, for the
+    /// close's own title step ([`CodeoutTrigger::close`]: at its start and when its wait for the task runs out) and
+    /// for a due ensure another session's displaces ([`CodeoutTrigger::set_title`], phase 4); `None` without them.
+    title_view: std::sync::Mutex<Option<(crate::bridge::s3::TranscriptSync, Arc<crate::bridge::scan::Rules>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -1359,6 +1367,15 @@ struct TriggerState {
     last: Option<FetchReport>,
     /// When the last failure was said.
     said_at: Option<std::time::Instant>,
+    /// S12 (T): the ensure due ([`CodeoutTrigger::set_title`]), until a title step wrote it or found it there.
+    title: Option<Ensure>,
+    /// S12 (T): a title was set since the task last took `Work::Title`.
+    title_due: bool,
+    /// S12 (T): the last title step's view title, by session ([`CodeoutTrigger::shown_title`]).
+    shown: Option<(String, SessionTitle)>,
+    /// S12 (T, LD-T4 as amended in wave 1's fix round): when a title step last wrote the view (`Appended`):
+    /// `Work::Title` waits out `title::TITLE_WRITE_EVERY` after it.
+    title_written_at: Option<std::time::Instant>,
 }
 
 impl TriggerShared {
@@ -1521,6 +1538,61 @@ impl CodeoutTrigger {
         self.shared.wake.notify_one();
     }
 
+    /// S12 (T): the newest custom title the session's view must end with: returns at once; the task's title
+    /// step writes it (`Work::Title`). A startup ensure (`only_if_none`) never takes the place of a due one of
+    /// the same session that is not; any other replaces what is due. Nothing without a task.
+    ///
+    /// §T3 L3, LD-T4 (as amended in wave 1's fix round): a burst coalesces (the newest due), the task's own title
+    /// step writes the view at most once a `title::TITLE_WRITE_EVERY` (within it the newest stays due, and the task
+    /// wakes at the floor's end), and the step reads the view at write time (R2), so a rename while a sync waits
+    /// on the VM is the one written after that sync. The step after a sync and the close's are not floored.
+    ///
+    /// §T3 L3 as amended in phase 4: the newest wins within one view. An ensure of another session (a `/clear` came
+    /// since: its view is another file) first has the one still due written, at once (the close's own step,
+    /// `title_when_given_up`: one synchronous view write with the view sync the task shared, on the pump's thread,
+    /// R1), so the old chat's rename reaches its view; one that finds no view, or no shared sync yet, is replaced.
+    pub fn set_title(&self, e: Ensure) {
+        if self.task.is_none() {
+            return;
+        }
+        let displaced = self.shared.state().title.as_ref().is_some_and(|due| due.session != e.session);
+        if displaced {
+            title_when_given_up(&self.shared);
+        }
+        let mut st = self.shared.state();
+        let keeps_due = e.only_if_none && st.title.as_ref().is_some_and(|due| due.session == e.session && !due.only_if_none);
+        if !keeps_due {
+            st.title = Some(e);
+        }
+        st.title_due = true;
+        drop(st);
+        self.shared.wake.notify_one();
+    }
+
+    /// S12 (T): the ensure still due, moved out (the next generation's trigger takes it, §T3 L2).
+    ///
+    /// D4: an ensure a step already wrote never moves, so the next trigger never writes it again after a rename
+    /// made in Cursor since.
+    #[must_use]
+    pub fn take_title(&self) -> Option<Ensure> {
+        self.shared.state().title.take()
+    }
+
+    /// S12 (T): the ensure still due, as it is (the link's startup answer, §T3 L1 as amended in wave 1's fix
+    /// round); [`Self::take_title`] moves it.
+    #[must_use]
+    pub fn due_title(&self) -> Option<Ensure> {
+        self.shared.state().title.clone()
+    }
+
+    /// S12 (T): what the session's view showed at the last title step: its session and title.
+    ///
+    /// §T3 L7: the remote link's snapshot (`RemoteSnapshot.view_title`), which the pump's row takes (P9).
+    #[must_use]
+    pub fn shown_title(&self) -> Option<(String, SessionTitle)> {
+        self.shared.state().shown.clone()
+    }
+
     /// At the wrapper's close: no new fetch starts; a running one is waited
     /// for at most `within` ([`CLOSE_WAIT`]), then abandoned (logged): left to
     /// run to its end, which the process's exit may cut (its promotion is one
@@ -1530,15 +1602,24 @@ impl CodeoutTrigger {
     /// aborted, so the trigger is done ([`TriggerWatch`]) only once it ended:
     /// the closing suspend waits for it (within its bound), and no
     /// SuspendMicrovm goes out while its request may still reach the VM. The
-    /// last report.
+    /// last report. S12 (T, §T3 L5, R6; wave 1's fix round): a fetch given up
+    /// so may outlive the process, and the task's own close step with it, so
+    /// a title still due is written here then (one synchronous view write,
+    /// no VM request); a later step of the task finds nothing due. Amended
+    /// in phase 4: the close's own step runs at its start too, before its
+    /// first wait, so it never depends on the close's budget (the caller's
+    /// timeout may cut the wait, or never let it start: the first poll
+    /// always runs this far), and once more when the wait runs out.
     pub async fn close(mut self, within: Duration) -> Option<FetchReport> {
         self.shared.state().closed = true;
         self.shared.wake.notify_one();
         self.shared.closing.notify_waiters();
         self.shared.changed.notify_waiters();
+        title_when_given_up(&self.shared);
         if let Some(mut task) = self.task.take() {
             if tokio::time::timeout(within, &mut task).await.is_err() {
                 tracing::info!(within_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX), "code-out: the fetch still running at the close was given up (left to its end)");
+                title_when_given_up(&self.shared);
             }
         }
         self.last()
@@ -1560,6 +1641,8 @@ enum Work {
     /// The first transcript step of this session (S9 phase 4,
     /// [`transcript_begin`]).
     Begin(String),
+    /// S12 (T): the title step.
+    Title,
     /// S10 (R1): the next tail of this session's chain ([`CodeoutTrigger::retail`]).
     Retail(String),
     /// A fetch, then a turn's capture of each session it was asked for.
@@ -1603,7 +1686,10 @@ async fn capture_session_settings<A, D: DataPlane, T: TokenSource>(ctx: &Codeout
 /// `/suspend` and `/terminate` push its bytes even before a sync). The
 /// subtree goes first: the tail's listing of S3 (S10 R1) may wait up to its
 /// own bound, and a short session would close before the subtree came.
-/// Never fatal (logged), given up at once when the trigger closes.
+/// Never fatal (logged), given up at once when the trigger closes. S12 (T,
+/// §T3 L5): the title step right after the placeholder's, so a title set
+/// before the view existed (a startup frame comes before the init that names
+/// the session) goes into it.
 async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: &str) {
     let sctx = crate::bridge::s3::sync::SyncCtx { api: &*ctx.api, dp: &*ctx.dp, tokens: &*ctx.tokens, paths: &ctx.paths, target: &ctx.target, sync, rules, deadline: None };
     let begin = async {
@@ -1612,6 +1698,7 @@ async fn transcript_begin<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlan
             Ok(None) => {}
             Err(e) => tracing::info!(session, "placeholder view not written: {e}"),
         }
+        title_step(shared, sync, rules, Some(session));
         match crate::bridge::workspace::transcript::restore_subtree(&sctx, session).await {
             Ok(r) => tracing::info!(session, pulled = r.pulled, kept = r.kept, unnamed = r.unnamed, "transcript subtree restored"),
             Err(e) => {
@@ -1662,20 +1749,106 @@ async fn sync_transcript<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane
     }
 }
 
+/// S12 (T): the title step (synchronous; the Mac's view only, never a request to the VM): §T3 L6.
+///
+/// The ensure due, if any, through `view::ensure_custom_title` on its session's view (`sync`'s projects
+/// directory, slug and cwd): `Appended` or `Already` takes it out (unless a newer one replaced it meanwhile);
+/// `NoView` or an error leaves it due, the error logged at debug (it names a path, never the title). Then the
+/// trigger's `shown` is the step's session's (`session`, else the ensure's, else the one named last) title when
+/// its view was read and shows one ([`CodeoutTrigger::shown_title`]). One synchronous call on the pump's thread,
+/// so it never interleaves with another view write (§T3 R1, L8).
+fn title_step(shared: &TriggerShared, sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, session: Option<&str>) {
+    use crate::bridge::view::{ensure_custom_title, Ensured, ViewTarget};
+    let due = shared.state().title.clone();
+    let mut read: Option<(String, Option<SessionTitle>)> = None;
+    if let Some(e) = &due {
+        let target = ViewTarget { mac_projects: &sync.mac_projects, slug: &sync.slug, session_id: &e.session, mac_cwd: &sync.mac_cwd };
+        match ensure_custom_title(&target, e, rules) {
+            Ok((Ensured::NoView, _)) => {}
+            Ok((ensured, shown)) => {
+                {
+                    let mut st = shared.state();
+                    if st.title.as_ref() == Some(e) {
+                        st.title = None;
+                    }
+                    // LD-T4 as amended: the floor of the next `Work::Title` starts at a write.
+                    if ensured == Ensured::Appended {
+                        st.title_written_at = Some(std::time::Instant::now());
+                    }
+                }
+                tracing::debug!(ensured = ?ensured, "title step");
+                read = Some((e.session.clone(), shown));
+            }
+            Err(err) => tracing::debug!("title step: {err}"),
+        }
+    }
+    let Some(sid) = session.map(str::to_string).or_else(|| due.map(|e| e.session)).or_else(|| shared.state().session.clone()) else { return };
+    let shown = match read {
+        Some((read_sid, shown)) if read_sid == sid => shown,
+        _ => view_title_of(sync, rules, &sid),
+    };
+    if let Some(t) = shown {
+        shared.state().shown = Some((sid, t));
+    }
+}
+
+/// S12 (T): what session `sid`'s view shows (`view::shown_title`), when it is a marked view and `sid` a uuid.
+fn view_title_of(sync: &crate::bridge::s3::TranscriptSync, rules: &crate::bridge::scan::Rules, sid: &str) -> Option<SessionTitle> {
+    use crate::wire::view::{is_view_head, VIEW_HEAD_READ};
+    if !crate::bridge::registry::is_uuid(sid) {
+        return None;
+    }
+    let target = crate::bridge::view::ViewTarget { mac_projects: &sync.mac_projects, slug: &sync.slug, session_id: sid, mac_cwd: &sync.mac_cwd };
+    let bytes = crate::bridge::view::existing(&target.path()).ok().flatten()?;
+    if !is_view_head(&bytes[..bytes.len().min(VIEW_HEAD_READ)]) {
+        return None;
+    }
+    crate::bridge::view::shown_title(&bytes, rules)
+}
+
+/// S12 (T, §T3 L5, D5): the task finds the trigger closed: the ensure still due (a `/rename` right before the
+/// close) is written before the task returns, so the next open's view-wins rule (P7) never keeps an older name.
+fn title_at_close<A, D, T>(ctx: &CodeoutCtx<A, D, T>, shared: &TriggerShared, rules: Option<&crate::bridge::scan::Rules>) {
+    let due = shared.state().title.is_some();
+    if let (true, Some(sync), Some(rules)) = (due, &ctx.transcript, rules) {
+        title_step(shared, sync, rules, None);
+    }
+}
+
+/// S12 (T, §T3 L5, R6; wave 1's fix round): the close's own title step, when its wait for the task ran out (a
+/// fetch outlasting it, S10 D5, which the process's exit may cut before the task's close step runs): the ensure
+/// still due, written with the view sync and the tripwires the task shared at its start. Nothing without them (no
+/// sync, or tripwires that did not load: the task never wrote a view either). Amended in phase 4: the close runs
+/// it at its start too, before any wait (§T3 L5), and `set_title` before an ensure of another session takes the
+/// place of the one due (§T3 L3). Each is one synchronous view write on the pump's thread, as the task's (R1).
+fn title_when_given_up(shared: &TriggerShared) {
+    if shared.state().title.is_none() {
+        return;
+    }
+    let view = shared.title_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if let Some((sync, rules)) = view {
+        title_step(shared, &sync, &rules, None);
+    }
+}
+
 /// The trigger's task: a session's start capture once it is named, one
 /// fetch per wake while asked (then a turn's capture, then with
 /// `ctx.transcript` the transcript's sync), until closed; S10 (R1), with
 /// `ctx.transcript`, the chain's next tail when [`CodeoutTrigger::retail`]
 /// asked, before a fetch. Each piece of work
 /// is `busy` from its taking (under the state's lock, so a close sees it or
-/// none starts) to its end.
+/// none starts) to its end. S12 (T), with `ctx.transcript`: the title step
+/// when a title was set (after a session's first transcript step, before an
+/// unpark's tail and a fetch: §T3 L4; at most once a
+/// `title::TITLE_WRITE_EVERY` that wrote the view, LD-T4 as amended in wave
+/// 1's fix round), after each session's sync, and once more at the close.
 async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(ctx: CodeoutCtx<A, D, T>, shared: Arc<TriggerShared>) {
     use crate::bridge::settings_capture::CapturePhase;
     let _gone = TaskGone(Arc::clone(&shared));
     // The view's tripwires, read once: without them no sync runs (a view is never written unmasked).
     let rules = match &ctx.transcript {
         Some(_) => match ScanSet::load(&ctx.paths, &ctx.cfg, &ctx.ws) {
-            Ok(set) => Some(set.rules),
+            Ok(set) => Some(Arc::new(set.rules)),
             Err(e) => {
                 voice::warn(&format!("the session's transcript is not synced to S3: its tripwires do not load ({e})"));
                 None
@@ -1683,11 +1856,17 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
         },
         None => None,
     };
+    // S12 (T, §T3 L5, R6): the same view and tripwires for the close's own title step (`title_when_given_up`).
+    if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+        *shared.title_view.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((sync.clone(), Arc::clone(rules)));
+    }
     loop {
         let work = loop {
-            {
+            let floor = {
                 let mut st = shared.state();
                 if st.closed {
+                    drop(st);
+                    title_at_close(&ctx, &shared, rules.as_deref());
                     return;
                 }
                 if std::mem::take(&mut st.start_due) && ctx.capture_settings {
@@ -1702,6 +1881,22 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
                         // S10 (R1): its tail is the chain's next already.
                         st.retail_due = false;
                         break Work::Begin(id);
+                    }
+                }
+                // S12 (T, §T3 L4): a title set, before an unpark's tail and any fetch still queued. LD-T4 as amended
+                // in wave 1's fix round: at most one view write a `TITLE_WRITE_EVERY`; within it the title stays due
+                // and the task wakes at the floor's end (a stream of names from a VM costs one rewrite a second).
+                let mut floor = None;
+                if std::mem::take(&mut st.title_due) && ctx.transcript.is_some() && rules.is_some() {
+                    match st.title_written_at.map(|at| at + crate::bridge::title::TITLE_WRITE_EVERY).filter(|end| *end > std::time::Instant::now()) {
+                        Some(end) => {
+                            st.title_due = true;
+                            floor = Some(end);
+                        }
+                        None => {
+                            st.busy = true;
+                            break Work::Title;
+                        }
                     }
                 }
                 // S10 (R1): an unpark's tail before any fetch still queued.
@@ -1721,8 +1916,15 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
                     }
                     break Work::Fetch(asked);
                 }
+                floor
+            };
+            match floor {
+                // S12 (T): a title held by the floor: woken at its end, or by anything else first.
+                Some(end) => {
+                    let _ = tokio::time::timeout_at(tokio::time::Instant::from_std(end), shared.wake.notified()).await;
+                }
+                None => shared.wake.notified().await,
             }
-            shared.wake.notified().await;
         };
         let asked = match work {
             Work::Start(id) => {
@@ -1733,6 +1935,13 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
             Work::Begin(id) => {
                 if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
                     transcript_begin(&ctx, &shared, sync, rules, &id).await;
+                }
+                shared.idle(false);
+                continue;
+            }
+            Work::Title => {
+                if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
+                    title_step(&shared, sync, rules, None);
                 }
                 shared.idle(false);
                 continue;
@@ -1755,6 +1964,7 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
         // No fetch starts after the close: a close that came while the tails went (each given up at once) ends the
         // task here. S8's task started its fetch as it took the work, with nothing to wait for between.
         if shared.state().closed {
+            title_at_close(&ctx, &shared, rules.as_deref());
             return;
         }
         let report = match fetch(&ctx, FetchOpts::per_result(&ctx.cfg)).await {
@@ -1783,6 +1993,8 @@ async fn run<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSo
         if let (Some(sync), Some(rules)) = (&ctx.transcript, &rules) {
             for id in asked.iter().filter(|_| !shared.state().closed) {
                 sync_transcript(&ctx, &shared, sync, rules, id).await;
+                // S12 (T, §T3 L5): the sync rewrote the view (carrying its renames): the title step, for that session.
+                title_step(&shared, sync, rules, Some(id));
             }
         }
         shared.idle(false);
@@ -2353,6 +2565,364 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let _ = trigger.close(CLOSE_WAIT).await;
         assert_eq!(std::fs::read(&view).unwrap(), b"{\"type\":\"user\"}\n");
+    }
+
+    // ---- S12 (T): the title step (plans/s12-contracts.md §T3 L3 to L8, §T8.1) ----
+
+    /// S12 (T): [`settings_ctx`] with a transcript sync whose view of SESSION is `<dir>/projects/-w/<SESSION>.jsonl`
+    /// (its S3 is nobody's: a request to it fails, logged), the settings captured or not.
+    fn title_ctx(dir: &Path, vm: Arc<SettingsVm>, capture: bool) -> CodeoutCtx<FakeMicrovmApi, SettingsVm, SettingsVm> {
+        use crate::bridge::s3::{S3Endpoint, S3Target, TranscriptSync, LAB_BUCKET, LAB_OWNER};
+        let mut ctx = settings_ctx(dir, vm);
+        ctx.capture_settings = capture;
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab("127.0.0.1:9".parse().unwrap()) };
+        ctx.transcript = Some(TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: dir.join("projects"), proxy: None, view_messages: 10 });
+        ctx
+    }
+
+    /// SESSION's view under [`title_ctx`]'s sync.
+    fn view_at(dir: &Path) -> std::path::PathBuf {
+        dir.join("projects").join("-w").join(format!("{SESSION}.jsonl"))
+    }
+
+    /// The `custom-title` lines of the file at `path` (none when it is missing).
+    fn titles_in(path: &Path) -> Vec<Vec<u8>> {
+        crate::bridge::view::custom_titles(&std::fs::read(path).unwrap_or_default())
+    }
+
+    /// Until `done`, at most 20 s (the trigger's task runs on this runtime: each poll yields to it).
+    async fn settle(mut done: impl FnMut() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while !done() && std::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn ensure_of(text: &str, only_if_none: bool) -> Ensure {
+        Ensure { session: SESSION.into(), text: text.into(), only_if_none }
+    }
+
+    /// §T3 L5, M-T33: a startup's title set before the session's view exists: the task's step finds no view
+    /// (`NoView`: the ensure stays due, the step's flag taken); the session's first transcript step then writes its
+    /// placeholder and, right after it, the title: the view's last line is ai-env's, and the trigger shows it.
+    #[tokio::test]
+    async fn a_title_set_before_the_placeholder_is_written_into_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = CodeoutTrigger::spawn(title_ctx(dir.path(), Arc::new(settings_vm(false)), false));
+        let e = ensure_of("Harbour-s12 named", true);
+        trigger.set_title(e.clone());
+        settle(|| !trigger.shared.state().title_due).await;
+        assert!(!trigger.shared.state().title_due, "the step ran");
+        assert_eq!(trigger.shared.state().title.as_ref(), Some(&e), "no view yet: the ensure kept due");
+        assert!(!view_at(dir.path()).exists(), "nothing created");
+        assert_eq!(trigger.shown_title(), None);
+        trigger.set_session(SESSION);
+        let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 named");
+        settle(|| titles_in(&view_at(dir.path())) == [line.clone()]).await;
+        let view = std::fs::read(view_at(dir.path())).unwrap();
+        assert!(view.ends_with(&line) && String::from_utf8_lossy(&view).contains(crate::bridge::s3::sync::PLACEHOLDER_TEXT), "the placeholder, ai-env's line last: {}", String::from_utf8_lossy(&view));
+        assert!(crate::bridge::view::is_view_file(&view_at(dir.path())));
+        let shown = SessionTitle { text: "Harbour-s12 named".into(), source: crate::bridge::title::TitleSource::Custom };
+        assert_eq!(trigger.shown_title(), Some((SESSION.to_string(), shown)));
+        assert_eq!(trigger.take_title(), None, "written: nothing due");
+        let _ = trigger.close(CLOSE_WAIT).await;
+    }
+
+    /// §T3 L3, M-T34: the newest ensure of a session wins, but a startup's never takes the place of a live one due
+    /// (a rename made in this process is newer than the name the CLI started with); another session's replaces it,
+    /// once the one due was written (phase 4: here with no sync nothing is written;
+    /// `a_due_title_of_another_session_is_written_before_it_is_replaced` writes it). Nothing without a task.
+    #[tokio::test]
+    async fn the_newest_title_wins_and_a_startup_one_never_replaces_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = CodeoutTrigger::spawn(settings_ctx(dir.path(), Arc::new(settings_vm(false))));
+        let (live_a, startup_b, live_c) = (ensure_of("A", false), ensure_of("B", true), ensure_of("C", false));
+        for (first, then, due) in [(&live_a, &startup_b, &live_a), (&live_a, &live_c, &live_c), (&startup_b, &live_a, &live_a), (&startup_b, &ensure_of("D", true), &ensure_of("D", true))] {
+            trigger.set_title(first.clone());
+            trigger.set_title(then.clone());
+            assert_eq!(trigger.take_title().as_ref(), Some(due), "{first:?} then {then:?}");
+        }
+        let other = Ensure { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c".into(), text: "B".into(), only_if_none: true };
+        trigger.set_title(live_a.clone());
+        trigger.set_title(other.clone());
+        assert_eq!(trigger.take_title(), Some(other), "another session's startup replaces what is due");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!dir.path().join("projects").exists(), "no sync: nothing written");
+        let _ = trigger.close(CLOSE_WAIT).await;
+        // Outside any runtime: no task, nothing kept.
+        let lone = settings_ctx(dir.path(), Arc::new(settings_vm(false)));
+        let kept = std::thread::spawn(move || {
+            let trigger = CodeoutTrigger::spawn(lone);
+            trigger.set_title(ensure_of("A", false));
+            trigger.take_title()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(kept, None);
+    }
+
+    /// §T3 V1, L6, M-T35: a transcript at the view's path is no view: the step leaves it as it was and the ensure
+    /// due (`take_title` then gives it); a marked view in its place and the same ensure set again: written once.
+    #[tokio::test]
+    async fn a_title_with_no_marked_view_stays_due_until_one_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+        let sync = ctx.transcript.clone().unwrap();
+        let view = view_at(dir.path());
+        std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+        let transcript = b"{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n".to_vec();
+        std::fs::write(&view, &transcript).unwrap();
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let e = ensure_of("Harbour-s12 named", false);
+        trigger.set_title(e.clone());
+        settle(|| !trigger.shared.state().title_due).await;
+        assert_eq!(std::fs::read(&view).unwrap(), transcript, "a transcript is left as it was");
+        assert_eq!(trigger.take_title(), Some(e.clone()), "still due");
+        std::fs::remove_file(&view).unwrap();
+        crate::bridge::s3::sync::write_placeholder_view(&sync, SESSION, &Rules::defaults()).unwrap().expect("a marked view");
+        trigger.set_title(e.clone());
+        let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 named");
+        settle(|| !titles_in(&view).is_empty()).await;
+        trigger.set_title(e);
+        settle(|| !trigger.shared.state().title_due).await;
+        assert_eq!(titles_in(&view), [line], "written once");
+        assert_eq!(trigger.take_title(), None);
+        let _ = trigger.close(CLOSE_WAIT).await;
+    }
+
+    /// §T3 L5, D5, M-T15: an ensure set while the task is held (here in a start capture that waits at the VM) is
+    /// written at the close, before the task ends: once `close` returns, the view ends with ai-env's line, and the
+    /// capture was given up at once.
+    #[tokio::test]
+    async fn a_title_due_at_the_close_is_written_before_the_task_ends() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let vm = Arc::new(settings_vm(true));
+        let ctx = title_ctx(dir.path(), vm.clone(), true);
+        crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        trigger.set_session(SESSION);
+        settle(|| vm.gets.load(SeqCst) == 1).await;
+        assert_eq!(vm.gets.load(SeqCst), 1, "the start capture waits at the VM");
+        trigger.set_title(ensure_of("Harbour-s12 renamed", false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(titles_in(&view_at(dir.path())).is_empty(), "the task is held: nothing written yet");
+        let t = std::time::Instant::now();
+        let _ = trigger.close(CLOSE_WAIT).await;
+        assert!(t.elapsed() < CLOSE_WAIT, "the capture given up at once: {:?}", t.elapsed());
+        let view = std::fs::read(view_at(dir.path())).unwrap();
+        assert!(view.ends_with(&crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 renamed")), "{}", String::from_utf8_lossy(&view));
+    }
+
+    /// §T3 L2, D4, M-T14: `take_title` moves the due ensure out once; an ensure a step wrote is no longer due, so a
+    /// next generation's trigger never writes it again.
+    #[tokio::test]
+    async fn take_title_moves_the_due_ensure_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let trigger = CodeoutTrigger::spawn(settings_ctx(dir.path(), Arc::new(settings_vm(false))));
+        let e = ensure_of("Harbour-s12 A", false);
+        trigger.set_title(e.clone());
+        assert_eq!(trigger.take_title(), Some(e.clone()));
+        assert_eq!(trigger.take_title(), None, "moved out, once");
+        let _ = trigger.close(CLOSE_WAIT).await;
+        let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+        crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        trigger.set_title(e);
+        settle(|| !titles_in(&view_at(dir.path())).is_empty()).await;
+        assert_eq!(titles_in(&view_at(dir.path())).len(), 1);
+        assert_eq!(trigger.take_title(), None, "written: nothing to move");
+        let _ = trigger.close(CLOSE_WAIT).await;
+    }
+
+    /// §T3 L5, R6 (wave 1's fix round, as amended in phase 4): an ensure set while a fetch runs that outlasts the
+    /// close's wait (held at the workspace's fetch lock, which the test holds: S10 D5 leaves such a fetch to its end,
+    /// which the process's exit may cut before the task's own close step) is written by the close itself: the view
+    /// ends with ai-env's line when `close` returns, the fetch still held. Once the fetch ended, the task's step finds
+    /// nothing due: the line is there once. Since phase 4 the close's step at its start writes it, so this test fails
+    /// only without both of the close's steps: M-T49's killer is
+    /// `a_title_the_close_could_not_write_at_its_start_is_written_when_its_wait_runs_out`, M-T49b's
+    /// `a_title_due_while_a_fetch_runs_is_written_however_short_the_close_budget`.
+    #[tokio::test]
+    async fn a_title_due_while_a_fetch_outlasts_the_close_is_written_by_the_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+        crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&ctx.paths.workspace_fetch_lock(&ctx.ws.slug)).unwrap().expect("the test holds the fetch lock");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let watch = trigger.watch();
+        trigger.request();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!watch.quiet(), "a fetch running (held at the lock)");
+        trigger.set_title(ensure_of("Harbour-s12 renamed", false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(titles_in(&view_at(dir.path())).is_empty(), "the task is held in the fetch: nothing written yet");
+        let t = std::time::Instant::now();
+        let _ = trigger.close(CLOSE_WAIT).await;
+        assert!(t.elapsed() >= CLOSE_WAIT, "the close gave the fetch up at its bound: {:?}", t.elapsed());
+        let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 renamed");
+        assert_eq!(titles_in(&view_at(dir.path())), std::slice::from_ref(&line), "written by the close, the fetch still held");
+        assert!(!watch.done(), "the abandoned fetch runs on");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), watch.wait_done()).await.expect("the fetch ended: done");
+        assert_eq!(titles_in(&view_at(dir.path())), [line], "the task's own step found nothing due");
+    }
+
+    /// §T3 L5, R6 as amended in phase 4, M-T49b: the close's own title step runs at its start, before its first
+    /// wait, so a title due while a fetch runs (held at the workspace's fetch lock, which the test holds) reaches the
+    /// view however short the caller's budget: `RemoteLinks::close` and the pump bound the close by what is left of
+    /// `close_budget()`, which may be under `CLOSE_WAIT` or nothing, and the process exits right after. With the
+    /// close cut at 50 ms, and with a budget of 0, the view ends with ai-env's line while the fetch is still held;
+    /// once the fetch ended the task's own step finds nothing due: the line is there once.
+    #[tokio::test]
+    async fn a_title_due_while_a_fetch_runs_is_written_however_short_the_close_budget() {
+        for budget in [Duration::from_millis(50), Duration::ZERO] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+            crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+            let held = crate::bridge::vm::lock::try_lock_exclusive(&ctx.paths.workspace_fetch_lock(&ctx.ws.slug)).unwrap().expect("the test holds the fetch lock");
+            let trigger = CodeoutTrigger::spawn(ctx);
+            let watch = trigger.watch();
+            trigger.request();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!watch.quiet(), "a fetch running (held at the lock)");
+            trigger.set_title(ensure_of("Harbour-s12 renamed", false));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(titles_in(&view_at(dir.path())).is_empty(), "the task is held in the fetch: nothing written yet");
+            assert!(tokio::time::timeout(budget, trigger.close(CLOSE_WAIT)).await.is_err(), "{budget:?}: the caller's budget cut the close before its wait ran out");
+            let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 renamed");
+            assert_eq!(titles_in(&view_at(dir.path())), std::slice::from_ref(&line), "{budget:?}: written at the close's start, the fetch still held");
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(10), watch.wait_done()).await.expect("the fetch ended: done");
+            assert_eq!(titles_in(&view_at(dir.path())), [line], "{budget:?}: the task's own step found nothing due");
+        }
+    }
+
+    /// §T3 L5 as amended in phase 4, M-T49: the close's step at its start may fail (here the view's directory is not
+    /// writable for the moment: an error leaves the ensure due, L6); its step when its wait for the task runs out (a
+    /// fetch held at the workspace's fetch lock) writes it then.
+    #[tokio::test]
+    async fn a_title_the_close_could_not_write_at_its_start_is_written_when_its_wait_runs_out() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+        crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+        let held = crate::bridge::vm::lock::try_lock_exclusive(&ctx.paths.workspace_fetch_lock(&ctx.ws.slug)).unwrap().expect("the test holds the fetch lock");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let watch = trigger.watch();
+        trigger.request();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!watch.quiet(), "a fetch running (held at the lock)");
+        trigger.set_title(ensure_of("Harbour-s12 renamed", false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let project = view_at(dir.path()).parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = {
+            let project = project.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+            })
+        };
+        let _ = trigger.close(CLOSE_WAIT).await;
+        writable.await.unwrap();
+        let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 renamed");
+        assert_eq!(titles_in(&view_at(dir.path())), std::slice::from_ref(&line), "written when the close's wait ran out");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), watch.wait_done()).await.expect("the fetch ended: done");
+        assert_eq!(titles_in(&view_at(dir.path())), [line]);
+    }
+
+    /// §T3 L3 as amended in phase 4, M-T34b: the newest ensure wins within one view, not across two. A rename of
+    /// SESSION still due (the task held in its start capture, at the VM) when an ensure of another session comes (a
+    /// `/clear` since, its view another file) is written into SESSION's view at once, with no await, before the
+    /// other takes its place; the other is then the one due, and the close writes it into its own view.
+    #[tokio::test]
+    async fn a_due_title_of_another_session_is_written_before_it_is_replaced() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const OTHER: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+        let dir = tempfile::tempdir().unwrap();
+        let vm = Arc::new(settings_vm(true));
+        let ctx = title_ctx(dir.path(), vm.clone(), true);
+        let sync = ctx.transcript.clone().unwrap();
+        crate::bridge::s3::sync::write_placeholder_view(&sync, SESSION, &Rules::defaults()).unwrap().expect("SESSION's view");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        trigger.set_session(SESSION);
+        settle(|| vm.gets.load(SeqCst) == 1).await;
+        assert_eq!(vm.gets.load(SeqCst), 1, "the start capture waits at the VM: the task is held");
+        trigger.set_title(ensure_of("Harbour-s12 A", false));
+        assert!(titles_in(&view_at(dir.path())).is_empty(), "the task is held: A due");
+        let b = Ensure { session: OTHER.into(), text: "Harbour-s12 B".into(), only_if_none: false };
+        trigger.set_title(b.clone());
+        let line = crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 A");
+        assert_eq!(titles_in(&view_at(dir.path())), std::slice::from_ref(&line), "A written into SESSION's view as B came");
+        assert_eq!(trigger.due_title(), Some(b), "B due");
+        crate::bridge::s3::sync::write_placeholder_view(&sync, OTHER, &Rules::defaults()).unwrap().expect("OTHER's view");
+        let _ = trigger.close(CLOSE_WAIT).await;
+        let other = dir.path().join("projects").join("-w").join(format!("{OTHER}.jsonl"));
+        assert_eq!(titles_in(&other), [crate::bridge::title::custom_title_line(OTHER, "Harbour-s12 B")], "B in its own view");
+        assert_eq!(titles_in(&view_at(dir.path())), [line], "A once, in SESSION's");
+    }
+
+    /// §T3 L5 (A4's second step), M-T50: an ensure set while a turn's tail waits at the VM (the session's first
+    /// tail is refused at once, the turn's held) is written when the close gives that tail up: the task's step after
+    /// the tails, before it returns with no fetch started. Once `close` returns, at once, the view ends with
+    /// ai-env's line.
+    #[tokio::test]
+    async fn a_title_due_while_a_turns_tail_waits_is_written_at_the_close() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let vm = Arc::new(SettingsVm { hold_tail: Some(1), ..settings_vm(false) });
+        let trigger = CodeoutTrigger::spawn(title_ctx(dir.path(), vm.clone(), false));
+        trigger.set_session(SESSION);
+        trigger.request();
+        settle(|| vm.tails.load(SeqCst) == 2).await;
+        assert_eq!(vm.tails.load(SeqCst), 2, "the turn's tail waits at the VM");
+        assert!(crate::bridge::view::is_view_file(&view_at(dir.path())), "the session's placeholder view");
+        trigger.set_title(ensure_of("Harbour-s12 renamed", false));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(titles_in(&view_at(dir.path())).is_empty(), "the task is held in the tail: nothing written yet");
+        let t = std::time::Instant::now();
+        assert_eq!(trigger.close(CLOSE_WAIT).await, None, "no fetch ran");
+        assert!(t.elapsed() < CLOSE_WAIT, "the tail given up at once: {:?}", t.elapsed());
+        let view = std::fs::read(view_at(dir.path())).unwrap();
+        assert!(view.ends_with(&crate::bridge::title::custom_title_line(SESSION, "Harbour-s12 renamed")), "{}", String::from_utf8_lossy(&view));
+    }
+
+    /// LD-T4 as amended in wave 1's fix round, M-T54: the task's title step writes the view at most once a
+    /// `TITLE_WRITE_EVERY`: a second name set right after a write stays due (the view still ends with the first),
+    /// then is written once the floor passed, the task woken for it with no other work; the close's step is not
+    /// floored.
+    #[tokio::test]
+    async fn title_writes_of_the_view_are_at_most_one_a_second() {
+        use crate::bridge::title::TITLE_WRITE_EVERY;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = title_ctx(dir.path(), Arc::new(settings_vm(false)), false);
+        crate::bridge::s3::sync::write_placeholder_view(ctx.transcript.as_ref().unwrap(), SESSION, &Rules::defaults()).unwrap().expect("the session's view");
+        let trigger = CodeoutTrigger::spawn(ctx);
+        let view = view_at(dir.path());
+        let line = |name: &str| crate::bridge::title::custom_title_line(SESSION, name);
+        let t0 = std::time::Instant::now();
+        trigger.set_title(ensure_of("Harbour-s12 A", false));
+        settle(|| titles_in(&view).last() == Some(&line("Harbour-s12 A"))).await;
+        trigger.set_title(ensure_of("Harbour-s12 B", false));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early = titles_in(&view);
+        // Judged only while the first write is surely within its second (it came after `t0`).
+        if t0.elapsed() < TITLE_WRITE_EVERY {
+            assert_eq!(early, [line("Harbour-s12 A")], "B within the floor: not written yet");
+            assert_eq!(trigger.due_title(), Some(ensure_of("Harbour-s12 B", false)), "B still due");
+        }
+        settle(|| titles_in(&view).last() == Some(&line("Harbour-s12 B"))).await;
+        assert!(t0.elapsed() >= TITLE_WRITE_EVERY, "B at the floor's end, never before: {:?}", t0.elapsed());
+        assert_eq!(titles_in(&view), [line("Harbour-s12 A"), line("Harbour-s12 B")], "the task woke for B at the floor's end");
+        assert_eq!(trigger.due_title(), None);
+        // C, set right after B's write: the close's step writes it, unfloored.
+        trigger.set_title(ensure_of("Harbour-s12 C", false));
+        let t = std::time::Instant::now();
+        let _ = trigger.close(CLOSE_WAIT).await;
+        assert!(t.elapsed() < CLOSE_WAIT, "{:?}", t.elapsed());
+        assert_eq!(titles_in(&view).last(), Some(&line("Harbour-s12 C")), "the close's step is not floored");
     }
 
     /// Never inside the close budget: a capture still waiting for the VM as

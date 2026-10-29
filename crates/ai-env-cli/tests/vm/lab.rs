@@ -889,7 +889,8 @@ fn lab_snapshot_log_pass_can_be_re_run_and_probes_are_audited() {
     let mut it = ids.split(',');
     let (a, b) = (it.next().unwrap().to_string(), it.next().unwrap().to_string());
     let log = w.root().join("snap.log");
-    let text = fs::read_to_string(fixture("run-report.log")).unwrap().replace("microvm-00000000-0000-4000-8000-000000000001", &a).replace("microvm-00000000-0000-4000-8000-000000000002", &b);
+    // S12 (R1-15): the probe's two RunMicrovm take the fake's first two ids in either order, so the fixture's go through placeholders.
+    let text = fs::read_to_string(fixture("run-report.log")).unwrap().replace("microvm-00000000-0000-4000-8000-000000000001", "@vm-a@").replace("microvm-00000000-0000-4000-8000-000000000002", "@vm-b@").replace("@vm-a@", &a).replace("@vm-b@", &b);
     fs::write(&log, text).unwrap();
     for _ in 0..2 {
         let o = w.run(&["lab", "run", "snapshot-uniqueness", "--log", &log.display().to_string()]);

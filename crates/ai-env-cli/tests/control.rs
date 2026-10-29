@@ -391,9 +391,9 @@ fn session_list_gains_vm_moves_cost() {
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
         [
-            format!("{S3}  closed  local-child    2026-10-22T15:00:00Z  -tmp-elsewhere  -  0  -"),
-            format!("{S1}  parked  remote         2026-10-22T11:00:00Z  -w-project  {B}  1  $0.254"),
-            format!("{S2}  closed  remote         2026-10-22T08:30:00Z  -w-project  {A}  0  $0.079"),
+            format!("{S3}  closed  local-child    2026-10-22T15:00:00Z  -tmp-elsewhere  -  0  -  -"),
+            format!("{S1}  parked  remote         2026-10-22T11:00:00Z  -w-project  {B}  1  $0.254  Harbour-s11 word memory"),
+            format!("{S2}  closed  remote         2026-10-22T08:30:00Z  -w-project  {A}  0  $0.079  Fix the seed's shallow boundary"),
         ]
     );
     let rows = json(&ok(&w.run(NOW, &["session", "list", "--json"])));
@@ -407,12 +407,41 @@ fn session_list_gains_vm_moves_cost() {
     assert_eq!(
         ok(&o).lines().collect::<Vec<_>>(),
         [
-            format!("{S3}  closed  local-child    2026-10-22T15:00:00Z  -tmp-elsewhere  -  0  -"),
-            format!("{S1}  parked  remote         2026-10-22T11:00:00Z  -w-project  {B}  1  -"),
-            format!("{S2}  closed  remote         2026-10-22T08:30:00Z  -w-project  {A}  0  -"),
+            format!("{S3}  closed  local-child    2026-10-22T15:00:00Z  -tmp-elsewhere  -  0  -  -"),
+            format!("{S1}  parked  remote         2026-10-22T11:00:00Z  -w-project  {B}  1  -  Harbour-s11 word memory"),
+            format!("{S2}  closed  remote         2026-10-22T08:30:00Z  -w-project  {A}  0  -  Fix the seed's shallow boundary"),
         ]
     );
     assert!(stderr(&o).contains("session list: no cost cells: ") && stderr(&o).contains("symlink"), "{}", stderr(&o));
+}
+
+/// S12 (T, §T3 U1): `session list --title TEXT` keeps the chats whose name holds TEXT, whatever its case, names
+/// only (an id's digits find nothing); none is one line naming TEXT (its spaces as one) and exit 0, `[]` with
+/// `--json`; an empty TEXT or one of spaces alone is a usage error naming the flag; nothing is written.
+#[test]
+fn session_list_title_filter() {
+    let w = World::new();
+    assert_eq!(
+        ok(&w.run(NOW, &["session", "list", "--title", "WORD memory"])).lines().collect::<Vec<_>>(),
+        [format!("{S1}  parked  remote         2026-10-22T11:00:00Z  -w-project  {B}  1  $0.254  Harbour-s11 word memory")]
+    );
+    let rows = json(&ok(&w.run(NOW, &["session", "list", "--title", "seed", "--json"])));
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.iter().map(|r| (r["session_id"].as_str(), r["title"].as_str(), r["title_source"].as_str())).collect::<Vec<_>>(), [(Some(S2), Some("Fix the seed's shallow boundary"), Some("ai"))]);
+    let ids = w.run(NOW, &["session", "list", "--title", "1111"]);
+    assert_eq!((code(&ids), stdout(&ids)), (0, "no session's title holds 1111\n".to_string()), "ids are not searched: {}", stderr(&ids));
+    assert_eq!(ok(&w.run(NOW, &["session", "list", "--title", "  nothing   here ", "--json"])).trim_end(), "[]");
+    assert_eq!(ok(&w.run(NOW, &["session", "list", "--title", "  nothing   here "])), "no session's title holds nothing here\n");
+    for blank in ["  ", ""] {
+        let o = w.run(NOW, &["session", "list", "--title", blank]);
+        assert_eq!(code(&o), 2, "{blank:?}: {}", stderr(&o));
+        assert_eq!((stdout(&o), stderr(&o)), (String::new(), "ai-env: --title needs a text\n".to_string()));
+    }
+    // S12 (T, §T1.10, M-T58; wave 1's fix round): the flag's and the value's names are frozen (wave 2's Docs
+    // writes `session list [--json] [--title TEXT]` from them); the help texts may be reworded.
+    let help = ok(&w.run(NOW, &["session", "list", "--help"]));
+    assert!(help.contains("--title <TEXT>") && help.contains("--json"), "the frozen flag and value names (§T1.10): {help}");
+    assert_eq!(w.audit(), std::fs::read_to_string(Path::new(FIXTURE).join("bridge/audit.jsonl")).unwrap(), "reading writes nothing");
 }
 
 /// `vm list` on the fake: RUN and COST after WALL-LEFT (B over its life to 11:30), `--json` items with `cost`.
@@ -467,4 +496,203 @@ fn vm_observed_is_written_once_per_change() {
     ok(&w.run(NOON, &["vm", "list", "--all"]));
     ok(&w.run(NOON, &["vm", "status", B]));
     assert_eq!(observed(&w), [first, second, third], "a terminated row stays as it is");
+}
+
+// ---- S12 (C): the live tests' runs, and B Q4, through the binary (plans/s12-contracts.md §6) ----
+
+/// §C10.1's TV: a live test's VM of the fixture's day.
+const TV: &str = "microvm-0e570000-0000-4000-8000-00000000000e";
+
+/// §C10.1: TV's run, archived into `w`'s root by the real writer (`testruns::archive`, LD-C15) from a test root of
+/// its own: TV's `vm_run` at 12:00 (`max_idle_s` 300, `suspended_s` 3600), a `proxy_stop` at 12:00 (merged, it would
+/// cut the fixture's proxy hours from 12 to 5), its `vm_terminate` by `test` at 12:30, and TV's row with a session
+/// token and a commit made at run time. The run's name and directory.
+fn tv_run(w: &World) -> (String, PathBuf) {
+    use ai_env_cli::bridge::config::Paths;
+    use ai_env_cli::bridge::vm::registry::{write_row, IdleRow, RowStatus, VmRow};
+    let t = tempfile::tempdir().unwrap();
+    let test = Paths::from_root_and_env(t.path().to_path_buf(), None);
+    let line = |ts: &str, event: &str, detail: Value| serde_json::json!({ "v": 2, "ts": ts, "event": event, "session_id": null, "pid": 5150, "detail": detail }).to_string();
+    let vm_run = serde_json::json!({
+        "actor": "cli", "id": TV, "purpose": "test", "image_version": "13.0", "egress": "internet", "shell": "false", "client_token": "0199f0e5-0000-7000-8000-00000000000e",
+        "max_duration_s": "3600", "max_idle_s": "300", "suspended_s": "3600", "memory_mib": "2048"
+    });
+    let lines = [
+        line("2026-10-22T12:00:00Z", "vm_run", vm_run),
+        line("2026-10-22T12:00:00Z", "proxy_stop", serde_json::json!({ "actor": "cli", "instance": "i-0test", "vpc_vms": "0" })),
+        line("2026-10-22T12:30:00Z", "vm_terminate", serde_json::json!({ "actor": "cli", "id": TV, "by": "test" })),
+    ];
+    std::fs::write(test.audit(), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let noon = u64::try_from(DAY).unwrap() + 12 * 3600;
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let row = VmRow {
+        v: 1,
+        status: RowStatus::Terminated,
+        id: TV.into(),
+        session_token: Some(format!("{}{nonce}", "ab".repeat(16))),
+        commit: format!("{}{nonce}", "cd".repeat(16)),
+        started_at: Some(noon),
+        wall_deadline: Some(noon + 3600),
+        max_duration_s: 3600,
+        idle: Some(IdleRow { max_idle_s: 300, suspended_s: 3600, auto_resume: true }),
+        terminated_at: Some(noon + 1800),
+        terminated_by: Some("test".into()),
+        ..VmRow::default()
+    };
+    write_row(&test, &row).unwrap();
+    let dir = ai_env_cli::bridge::testruns::archive(&test, &Paths::from_root_and_env(w.bridge(), None), "live_vm_lifecycle", noon + 3600).unwrap().expect("TV's run");
+    (dir.file_name().unwrap().to_str().unwrap().to_string(), dir)
+}
+
+/// `doc` without its key `key`.
+fn without(mut doc: Value, key: &str) -> Value {
+    doc.as_object_mut().unwrap().remove(key);
+    doc
+}
+
+/// The line right after the `estimate $…` line of `cost`'s text.
+fn after_estimate(text: &str) -> &str {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("estimate $")).unwrap_or_else(|| panic!("no estimate line: {text}"));
+    lines.get(at + 1).copied().unwrap_or_default()
+}
+
+/// The VM table's lines of `cost`'s text (a NOTE says `live test <test>` there; a caveat names live tests too).
+fn vm_lines(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.starts_with("microvm-")).collect()
+}
+
+/// S12 (C1, §C2.3 to §C2.5): TV's run archived into the world's root. `cost --json` of the fixture's day prices A, B
+/// and TV, TV labelled with its test, the run and its dollars named and the proxy the root's (the run kept no
+/// `proxy_stop`); the text names the test in TV's NOTE and its share right after the estimate; `--no-tests` is the
+/// snapshot but for TV counted as left out. The views read the root alone: `session list`, and `vm list` on the
+/// fake with TV as the API still lists it after its test (SOURCE `list`, no cost cell), are what they were before
+/// the run (M-C2, M-C5, M-C6, M-C7, M-C22).
+#[test]
+fn cost_merges_a_live_tests_run_and_no_tests_leaves_it_out() {
+    let w = World::new();
+    let list = ok(&w.run(NOW, &["session", "list"]));
+    let (name, dir) = tv_run(&w);
+    // The run keeps TV's two rows alone (`read_runs` would drop the proxy_stop again, so the merge cannot show it).
+    let kept = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+    assert!(kept.lines().count() == 2 && kept.lines().all(|l| l.contains(TV)), "{kept}");
+    assert_eq!(ok(&w.run(NOW, &["session", "list"])), list, "session list's cost cells read the root alone");
+    let day = ["cost", "--since", "2026-10-22", "--until", "2026-10-23"];
+    let snapshot = json(&expected("cost-2026-10-22.json"));
+    let doc = json(&ok(&w.run(NOW, &[&day[..], &["--json"]].concat())));
+    let vms = doc["vms"].as_array().unwrap();
+    assert_eq!(vms.iter().map(|v| v["id"].as_str().unwrap()).collect::<Vec<_>>(), [A, B, TV]);
+    assert_eq!(vms[..2], snapshot["vms"].as_array().unwrap()[..], "the root's own VMs as they were, unlabelled");
+    let tv = &vms[2];
+    let n = |k: &str| tv[k].as_u64();
+    assert_eq!([n("running_s"), n("suspended_s"), n("starts"), n("resumes"), n("suspends"), n("inferred_suspends")], [Some(300), Some(1500), Some(1), Some(0), Some(1), Some(1)], "{tv}");
+    assert_eq!((tv["usd"].as_f64(), tv["note"].as_str(), tv["test"].as_str()), (Some(0.027_311), Some("live test live_vm_lifecycle; 1 idle suspend inferred; terminated (test)"), Some("live_vm_lifecycle")));
+    assert_eq!((&doc["test_runs"], doc["tests_usd"].as_f64()), (&serde_json::json!([name]), Some(0.027_311)));
+    assert!(doc.get("tests_excluded").is_none() && doc.get("test_runs_unreadable").is_none(), "{doc}");
+    let (usd, base) = (doc["usd"].as_f64().unwrap(), snapshot["usd"].as_f64().unwrap());
+    assert!((usd - (base + 0.027_311)).abs() < 1e-5, "{usd} vs {base} and TV's");
+    assert_eq!((&doc["proxy_usd"], &doc["proxy_assumed"]), (&snapshot["proxy_usd"], &snapshot["proxy_assumed"]), "the test's proxy_stop is never merged");
+    let text = ok(&w.run(NOW, &day));
+    let note = "live test live_vm_lifecycle; 1 idle suspend inferred; terminated (test)";
+    assert!(text.contains(&format!("{TV:<46} {:>7} {:>7} {:>6} {:>7} {:>8} {:>9}  {note}\n", "5m00s", "25m00s", 1, 0, 1, "$0.027")), "{text}");
+    assert_eq!(after_estimate(&text), "live tests: 1 VM(s) of 1 run(s), $0.027 of the estimate (--no-tests leaves them out)", "{text}");
+    // --no-tests: the snapshot, TV counted as left out; no VM labelled.
+    let none = json(&ok(&w.run(NOW, &[&day[..], &["--no-tests", "--json"]].concat())));
+    assert_eq!(none["tests_excluded"].as_u64(), Some(1), "{none}");
+    assert_eq!(without(none, "tests_excluded"), snapshot);
+    let text = ok(&w.run(NOW, &[&day[..], &["--no-tests"]].concat()));
+    assert_eq!(after_estimate(&text), "live tests: 1 VM(s) left out (--no-tests)", "{text}");
+    assert!(!text.contains(TV) && vm_lines(&text).iter().all(|l| !l.contains("live test")), "{text}");
+    // vm list on the fake, TV listed TERMINATED: as before the run, TV's item with no cost cell (rule 7). A first round
+    // settles what the reconcile changes on its own (it removes a row terminated more than 7 days before the real clock).
+    // `--json`'s items are compared by their cells: each listing writes the real clock into a seen row's state_seen_at.
+    let f = World::with_fake();
+    f.fake(|s| {
+        s.vms.insert(TV.into(), vm(TV, VmState::Terminated, DAY + 12 * 3600, Some(DAY + 12 * 3600 + 1800)));
+    });
+    let cells = |f: &World| {
+        let doc = json(&ok(&f.run(NOW, &["vm", "list", "--all", "--json"])));
+        doc["vms"].as_array().unwrap().iter().map(|v| serde_json::json!([v["id"], v["state"], v["source"], v["cost"]])).collect::<Vec<_>>()
+    };
+    let views = |f: &World| (ok(&f.run(NOON, &["vm", "list"])), ok(&f.run(NOW, &["vm", "list", "--all"])), cells(f));
+    views(&f);
+    let before = views(&f);
+    tv_run(&f);
+    assert_eq!(views(&f), before, "vm list reads the root alone");
+    assert!(before.2.contains(&serde_json::json!([TV, "TERMINATED", "list", null])), "{:?}", before.2);
+}
+
+/// S12 (C1, §C2.3 rule 5, LD-C2): a run whose `audit.jsonl` is a symlink cannot be read: `cost` still exits 0 in both
+/// modes, names the run in `test_runs_unreadable` and on its own line, and prices or counts none of it (its VM row
+/// read alone would price TV, M-C4's form for an audit): the document is the snapshot but for that key (M-C8).
+#[test]
+fn cost_names_an_unreadable_test_run_and_still_exits_0() {
+    let w = World::new();
+    let (name, dir) = tv_run(&w);
+    let audit = dir.join("audit.jsonl");
+    std::fs::rename(&audit, w.tmp.path().join("run-audit.jsonl")).unwrap();
+    std::os::unix::fs::symlink(w.tmp.path().join("run-audit.jsonl"), &audit).unwrap();
+    let why = format!("{name}: {} is a symlink; refusing to read it", audit.display());
+    let day = ["cost", "--since", "2026-10-22", "--until", "2026-10-23"];
+    let snapshot = json(&expected("cost-2026-10-22.json"));
+    for mode in [&[][..], &["--no-tests"]] {
+        let doc = json(&ok(&w.run(NOW, &[&day[..], mode, &["--json"]].concat())));
+        assert_eq!(doc["test_runs_unreadable"], serde_json::json!([why]), "{mode:?}: {doc}");
+        assert_eq!(without(doc, "test_runs_unreadable"), snapshot, "{mode:?}: none of the run priced or counted");
+        let text = ok(&w.run(NOW, &[&day[..], mode].concat()));
+        assert_eq!(after_estimate(&text), format!("test runs not read: {why}"), "{mode:?}: {text}");
+        assert!(!text.contains("live tests:") && vm_lines(&text).iter().all(|l| !l.contains("live test")), "{mode:?}: {text}");
+    }
+}
+
+/// S12 (B Q4, §C3.3): `--compare` judges the proxy beside the MicroVM total, as evidence. A file whose t4g.nano line is
+/// far off still exits 0 when the MicroVM total is within: the proxy's line follows the MicroVM verdict, then the
+/// billed rate of each type with a quantity. A file with no EC2 line says what to export, and its JSON has `proxy`
+/// `null` and no rate (M-C20).
+#[test]
+fn cost_compare_prints_the_proxy_verdict_without_making_it_the_exit() {
+    let w = World::new();
+    let ce = |file: &str, groups: &[(&str, &str, Option<&str>)]| {
+        let path = w.tmp.path().join(file);
+        let groups: Vec<Value> = groups
+            .iter()
+            .map(|(k, a, q)| {
+                let mut metrics = serde_json::json!({ "UnblendedCost": { "Amount": a, "Unit": "USD" } });
+                if let Some(q) = q {
+                    metrics["UsageQuantity"] = serde_json::json!({ "Amount": q, "Unit": "N/A" });
+                }
+                serde_json::json!({ "Keys": [k], "Metrics": metrics })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "GroupDefinitions": [{ "Type": "DIMENSION", "Key": "USAGE_TYPE" }],
+            "ResultsByTime": [{ "TimePeriod": { "Start": "2026-10-22", "End": "2026-10-23" }, "Total": {}, "Estimated": false, "Groups": groups }]
+        });
+        std::fs::write(&path, body.to_string()).unwrap();
+        path.display().to_string()
+    };
+    let vcpu = "EUC1-Lambda-MicroVM-vCPU-Second-ARM";
+    let far = ce("far.json", &[(vcpu, "0.36", Some("7240")), ("EUC1-BoxUsage:t4g.nano", "1.00", None)]);
+    let text = ok(&w.run(NOW, &["cost", "--compare", &far]));
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("MicroVM total: ")).unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(
+        lines[at..],
+        [
+            "MicroVM total: estimate $0.388, Cost Explorer $0.360: 7.7 % off: within ±30 %",
+            "proxy total (EUC1-BoxUsage:t4g.nano): estimate $0.058, Cost Explorer $1.000: 94.2 % off: outside ±30 % (evidence, not the exit)",
+            "rate EUC1-Lambda-MicroVM-vCPU-Second-ARM: card $0.0000349960, billed $0.0000497238 (+42.1 %) over 7240.000",
+        ],
+        "{text}"
+    );
+    let doc = json(&ok(&w.run(NOW, &["cost", "--compare", &far, "--json"])));
+    assert_eq!(doc["compare"]["microvm"]["pass"].as_bool(), Some(true), "{doc}");
+    assert_eq!(doc["compare"]["proxy"], serde_json::json!({ "types": ["EUC1-BoxUsage:t4g.nano"], "estimate_usd": 0.0576, "actual_usd": 1.0, "off_pct": -94.2, "pass": false }));
+    assert_eq!((doc["compare"]["rates"][0]["usage_type"].as_str(), doc["compare"]["rates"][0]["quantity"].as_f64(), doc["compare"]["rates"].as_array().map(Vec::len)), (Some(vcpu), Some(7240.0), Some(1)));
+    // vCPU alone, no quantity: the proxy's line names what to export; JSON `null`, no rate.
+    let alone = ce("alone.json", &[(vcpu, "0.36", None)]);
+    let text = ok(&w.run(NOW, &["cost", "--compare", &alone]));
+    assert!(text.ends_with("7.7 % off: within ±30 %\nproxy total: the file holds none of EUC1-BoxUsage:t4g.nano, EUC1-PublicIPv4:InUseAddress, EUC1-EBS:VolumeUsage.gp3 (export EC2-Instances, EC2-Other and VPC too)\n"), "{text}");
+    let doc = json(&ok(&w.run(NOW, &["cost", "--compare", &alone, "--json"])));
+    assert_eq!((&doc["compare"]["proxy"], &doc["compare"]["rates"]), (&Value::Null, &serde_json::json!([])), "{doc}");
 }

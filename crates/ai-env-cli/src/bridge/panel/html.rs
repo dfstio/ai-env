@@ -8,6 +8,7 @@ use super::model::{AuditPage, Confirm, CostPage, Sessions, SettingsPage};
 use super::REFRESH_S;
 use crate::bridge::audit::read::Read;
 use crate::bridge::registry::{SessionView, VmEntry};
+use crate::bridge::title::{self, inert};
 use crate::bridge::vm::cmd::fmt_secs;
 use crate::bridge::vm::ops::Survey;
 use crate::wire::redact::scrub;
@@ -83,7 +84,9 @@ pub fn error(root: &str, status: u16, line: &str) -> String {
     page(root, &format!("Error {status}"), false, &[], &format!("<p class=\"error\">{}</p>\n", esc(line)))
 }
 
-/// `/`: the sessions, newest first.
+/// `/`: the sessions, newest first. S12 (T, §T3 U5, U6): the search form first (the Audit page's), the Title
+/// column second (the name through `title::inert`, `-` without one); with a search, the note `<n> of <m> sessions
+/// match` and a link to every session, and `no session matches` for none. A `q` of spaces alone is no search.
 #[must_use]
 pub fn sessions(m: &Sessions) -> String {
     let rows: Vec<Vec<String>> = m
@@ -102,6 +105,7 @@ pub fn sessions(m: &Sessions) -> String {
             }
             vec![
                 format!("<td>{}</td>", link(&format!("{TOP}session/{sid}"), sid)),
+                td(&r.title.as_deref().filter(|t| !t.is_empty()).map_or(std::borrow::Cow::Borrowed("-"), inert)),
                 td(&r.status),
                 td(&r.mode),
                 td(&r.last_seen),
@@ -113,8 +117,14 @@ pub fn sessions(m: &Sessions) -> String {
             ]
         })
         .collect();
-    let main = table(&["Session", "Status", "Mode", "Last seen", "Slug", "VM", "Moves", "Cost", ""], &rows, "no sessions yet");
-    page(TOP, "Sessions", true, &[("page", "sessions")], &format!("{main}<p class=\"note\">Every action asks for a confirmation first and names its CLI twin.</p>\n"))
+    let searching = m.q.as_deref().and_then(title::needle).is_some();
+    let form = format!(
+        "<form method=\"get\" action=\"{TOP}\" class=\"filters\">\n<label>search <input name=\"q\" value=\"{}\"></label>\n<button type=\"submit\">Search</button>\n</form>\n",
+        esc(m.q.as_deref().unwrap_or_default())
+    );
+    let note = if searching { format!("<p class=\"note\">{} of {} sessions match · {}</p>\n", m.rows.len(), m.total, link(TOP, "all sessions")) } else { String::new() };
+    let main = table(&["Session", "Title", "Status", "Mode", "Last seen", "Slug", "VM", "Moves", "Cost", ""], &rows, if searching { "no session matches" } else { "no sessions yet" });
+    page(TOP, "Sessions", true, &[("page", "sessions")], &format!("{form}{note}{main}<p class=\"note\">Every action asks for a confirmation first and names its CLI twin.</p>\n"))
 }
 
 /// One generation's line.
@@ -122,12 +132,18 @@ fn generation(g: &VmEntry) -> Vec<String> {
     vec![td(&g.gen.to_string()), td(&g.pid.to_string()), td(&g.vm), td(&g.from), td(g.to.as_deref().unwrap_or("-")), td(if g.why.is_empty() { "-" } else { &g.why }), td(g.end.as_deref().unwrap_or("-"))]
 }
 
-/// `/session/<sid>`: `session show`'s view.
+/// `/session/<sid>`: `session show`'s view. S12 (T, §T3 U7): with a name (`title::of_row`), the heading and
+/// `<title>` are `<name> · <sid's first 8>`, else `Session <sid>`; the list gains `session` and `title` (the name
+/// and its source, or `-`) first.
 #[must_use]
 pub fn session(v: &SessionView) -> String {
     let r = &v.row;
     let sid = &r.session_id;
+    let named = title::of_row(r);
+    let heading = named.as_ref().map_or_else(|| format!("Session {sid}"), |t| format!("{} · {}", inert(&t.text), sid.chars().take(8).collect::<String>()));
     let head = [
+        ("session", sid.clone()),
+        ("title", named.as_ref().map_or_else(|| "-".to_string(), |t| format!("{} ({})", inert(&t.text), t.source.word()))),
         ("status", r.status.clone()),
         ("mode", r.mode.clone()),
         ("cwd", r.cwd.clone().unwrap_or_else(|| "-".into())),
@@ -171,7 +187,7 @@ pub fn session(v: &SessionView) -> String {
         None => "<p>none: the chat runs on this Mac</p>\n".to_string(),
     });
     main.push_str(&format!("<p>Settings captures: {}{}</p>\n", v.settings_captures, if v.settings_captures > 0 { format!(" ({})", link(&format!("{BELOW}settings/{sid}"), "the diff")) } else { String::new() }));
-    page(BELOW, &format!("Session {sid}"), false, &[("page", "session")], &main)
+    page(BELOW, &heading, false, &[("page", "session")], &main)
 }
 
 /// The VM row's `vm list` WALL-LEFT cell: `-` for one gone or going.

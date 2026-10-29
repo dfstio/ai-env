@@ -563,6 +563,67 @@ fn t10_3_mid_turn_resends_the_line_once() {
     h.assert_vm_empty();
 }
 
+/// S12 (R2): the state of a CLI's `session_state_changed` frame (`running`,
+/// `requires_action`, `idle`); `None` for any other line.
+fn state_of(v: &Value) -> Option<&str> {
+    if v["type"] == "system" && v["subtype"] == "session_state_changed" {
+        v["state"].as_str()
+    } else {
+        None
+    }
+}
+
+/// S12 (R2-12, LD-R15): T10.3's move mid-turn with the extension's
+/// `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` in Cursor's environment, which the
+/// wrapper forwards to each generation's CLI: the host gets generation 1's
+/// `running` (its uuid's last part 1), the moved CLI's `running` (2) for the
+/// line sent again, then its `idle` after the line's one result; nothing of
+/// the replay swallows a state frame, and the move is T10.3's (one echo, one
+/// result, `inits:1/1`).
+#[test]
+fn t10_3_the_state_frames_cross_a_mid_turn_move() {
+    let p = Harness::prepare();
+    let sid = common::uuid(0x5e55_0123);
+    let (u0, a0) = (common::uuid(0x1201), common::uuid(0x1202));
+    let lines = [
+        format!(r#"{{"type":"user","uuid":"{u0}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#),
+        format!(r#"{{"type":"assistant","uuid":"{a0}","parentUuid":"{u0}","sessionId":"{sid}","message":{{"role":"assistant","content":[{{"type":"text","text":"a reply"}}]}}}}"#),
+    ];
+    p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+    let mark = p.root.join("turn.mark");
+    let mark_s = mark.display().to_string();
+    let resume = format!("--resume={sid}");
+    let mut h = p.spawn_on(Link::Remote, "", &[&resume], &knobs(&[("FAKE_TURN_MS", "60000"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_DEDUP_RESUMED", "1"), ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")]));
+    started(&mut h);
+    let u1 = h.send_user("a line with a long tool");
+    wait_for_mark(&mark, 1, 1);
+    h.expect_out(|v| v["type"] == "assistant" && v["uuid"] == fake_tool_use_uuid(1, 1).as_str(), T);
+    let vm1 = vms_started(&h)[0].clone();
+    h.wait_until("VM 1 holds the tail's key", T, |h| h.rig().endpoint.attempts().iter().any(|a| a.vm.as_deref() == Some(vm1.as_str()) && a.path.starts_with("/transcript/tail") && (200..300).contains(&a.status)));
+    let rig = h.rig();
+    rig.set_vm_knobs(&knobs(&[("FAKE_TURN_MS", "200"), ("FAKE_TURN_MARK", &mark_s)]));
+    platform_ends(rig, &vm1);
+    h.expect_out(|v| is_result_for(v, &u1), T);
+    h.expect_out(|v| state_of(v) == Some("idle"), T);
+    closed(&mut h);
+    let out = h.out_json();
+    let states: Vec<(&str, &str)> = out.iter().filter_map(|v| state_of(v).map(|s| (s, v["uuid"].as_str().unwrap_or_default()))).collect();
+    assert_eq!(
+        states,
+        [("running", "00000001-0000-4000-3000-000000000001"), ("running", "00000001-0000-4000-3000-000000000002"), ("idle", "00000002-0000-4000-3000-000000000002")],
+        "generation 1's running, then the moved CLI's running and idle"
+    );
+    assert!(out.iter().all(|v| state_of(v).is_none() || v["session_id"] == sid.as_str()), "each the chat's session");
+    let result = out.iter().position(|v| is_result_for(v, &u1)).expect("the result");
+    let idle = out.iter().position(|v| state_of(v) == Some("idle")).expect("the idle frame");
+    assert!(idle > result, "idle after the line's one result");
+    assert_eq!(out.iter().filter(|v| is_echo_of(v, &u1)).count(), 1, "one echo");
+    assert_eq!(out.iter().filter(|v| is_result_for(v, &u1)).count(), 1, "one result");
+    let note = h.end_note();
+    assert!(note_has(&note, "inits:1/1") && note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
+    h.assert_vm_empty();
+}
+
 /// T10.5: the session's subagent transcripts (`<sid>/subagents/`, the
 /// manifest's `f/` files once the turn synced) follow the move: on the new
 /// VM they are S3's, byte for byte (restored after the spawn, the code-out
@@ -953,6 +1014,43 @@ fn t10_4_wall_migration_between_turns() {
     h.assert_vm_empty();
 }
 
+/// S12 (R3-3, LD-R12): a migration's phase A fetches the chat's staged V into
+/// the VM it prepares, and that `claude_fetch` row names the chat: a fresh
+/// chat (opened from V's bundle, no `--resume`), whose id only the live
+/// generation's session reader knows (`spawn` keeps it in the plan); S11's
+/// phase A named the plan's `--resume`, none here. The row's VM is the
+/// prepared one, never the chat's; its envelope says the detail's session.
+/// The switch then runs as T10.4's.
+#[test]
+fn a_migrations_phase_a_fetch_names_the_chat() {
+    let mut p = Harness::prepare();
+    let (v, cmd) = {
+        let rig = p.rig();
+        let v = rig.stage_claude("2.1.310", &[]);
+        let cmd = rig.wrapper_for_bundle(&v.version, &[], &knobs(&[]));
+        (v, cmd)
+    };
+    let mut h = p.launch_wrapper(cmd);
+    started(&mut h);
+    turn(&mut h, "one");
+    let sid = session_of(&mut h);
+    synced(&mut h, &sid, 1);
+    let vm1 = vms_started(&h)[0].clone();
+    h.rig().bring_wall_near(&vm1, 600);
+    turn(&mut h, "two");
+    note_with(&mut h, &[&vm1, "its 8-hour wall", "the chat goes on meanwhile"]);
+    wait_for_row(&mut h, "phase A's fetch of V", "claude_fetch", |d| d["why"] == "phase_a");
+    let rows = h.audit_events("claude_fetch");
+    let row = rows.iter().find(|r| r["detail"]["why"] == "phase_a").expect("phase A's row");
+    let d = &row["detail"];
+    assert!(d["vm"].as_str().is_some_and(|vm| vm != vm1), "into the prepared VM, never the chat's: {row}");
+    assert_eq!((d["session"].as_str(), row["session_id"].as_str()), (Some(sid.as_str()), Some(sid.as_str())), "the chat's id: {row}");
+    assert_eq!(d["version"].as_str(), Some(v.version.as_str()), "{row}");
+    wait_for_row(&mut h, "the old VM terminated", "vm_terminate", |d| d["id"] == vm1.as_str() && d["by"] == "migrate");
+    closed(&mut h);
+    h.assert_vm_empty();
+}
+
 /// T10.4 (b), near the wall: a chat closed on its VM is reopened once that
 /// VM nears its wall (`bring_wall_near`: 600 s left). The reopen moves it
 /// before its CLI starts, in generation 1 (one Touch ID, as every start):
@@ -966,6 +1064,8 @@ fn t10_4_wall_migration_between_turns() {
 /// `carried:migrate` and counts the move.
 #[test]
 fn t10_4b_reopen_near_the_wall_migrates_first() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let (mut first, sid, vm1) = closed_chat();
     let rig = first.rig();
     let (runs, decrypts) = (run_tokens(rig).len(), rig.decrypts());
@@ -1023,6 +1123,8 @@ fn t10_4b_reopen_near_the_wall_migrates_first() {
 /// counts it among the re-addresses.
 #[test]
 fn t10_4b_reopen_after_the_wall_readdresses() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let (first, sid, vm1) = closed_chat();
     let rig = first.rig();
     rig.bring_wall_near(&vm1, 1);
@@ -1249,6 +1351,8 @@ fn session_migrate_never_signals_an_s9_wrapper() {
 #[test]
 fn session_migrate_moves_a_closed_chat_offline() {
     use ai_env_cli::bridge::registry;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let (first, sid, vm1) = closed_chat();
     let rig = first.rig();
     let (runs, decrypts) = (run_tokens(rig).len(), rig.decrypts());
@@ -1932,6 +2036,8 @@ mod joint {
     /// answered once. The census counts the re-address alone.
     #[test]
     fn a_migration_refused_at_max_concurrent_stays_until_the_wall() {
+        // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+        let _alone = crate::common::remote::alone();
         let mut p = Harness::prepare();
         p.rig().config(|doc| {
             toml_table(doc, "vm").insert("max_concurrent".into(), toml::Value::Integer(1));
@@ -2460,5 +2566,122 @@ mod joint {
         closed(&mut h);
         closed(&mut other);
         other.assert_vm_empty();
+    }
+
+    /// S12 (R2-10, part B's B3 (c) and (d) offline): the state frames never keep a chat from parking. With the
+    /// extension's `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` forwarded, a turn brings `running`, its result, then
+    /// `idle`, after which the chat parks on its own (`session_park`, `why: idle`); nothing unparks it in the second
+    /// after (no `session_unpark`); the next line unparks it (`by: user`), and its turn brings `running`, its
+    /// result, then `idle` again, from the same CLI (its frames counted on).
+    #[test]
+    fn the_state_frames_never_keep_a_chat_from_parking() {
+        let mut cursor = knobs(&[PARK]);
+        cursor.push(("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"));
+        let mut h = Harness::prepare().spawn_on(Link::Remote, "", &[], &cursor);
+        started(&mut h);
+        let u1 = turn(&mut h, "one");
+        let sid = session_of(&mut h);
+        synced(&mut h, &sid, 1);
+        let vm1 = vms_started(&h)[0].clone();
+        parks_on(&mut h, &vm1);
+        let state_at = |out: &[Value], n: u64| out.iter().position(|v| state_of(v).is_some() && v["uuid"].as_str() == Some(format!("{n:08x}-0000-4000-3000-000000000001").as_str()));
+        let out = h.out_json();
+        let result = out.iter().position(|v| is_result_for(v, &u1)).expect("the first result");
+        let (running, idle) = (state_at(&out, 1).expect("the turn's running"), state_at(&out, 2).expect("the turn's idle"));
+        assert!(running < result && result < idle, "running {running}, the result {result}, then idle {idle}");
+        assert_eq!((state_of(&out[running]), state_of(&out[idle])), (Some("running"), Some("idle")));
+        assert!(h.audit_events("session_park").iter().any(|r| r["detail"]["vm"] == vm1.as_str() && r["detail"]["why"] == "idle"), "{:?}", h.audit_events("session_park"));
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(h.audit_events("session_unpark").is_empty(), "nothing unparked it: {:?}", h.audit_events("session_unpark"));
+        let u2 = turn(&mut h, "two");
+        h.expect_out(|v| state_of(v) == Some("idle") && v["uuid"] == "00000004-0000-4000-3000-000000000001", T);
+        assert!(h.audit_events("session_unpark").iter().any(|r| r["detail"]["vm"] == vm1.as_str() && r["detail"]["by"] == "user"), "{:?}", h.audit_events("session_unpark"));
+        closed(&mut h);
+        let out = h.out_json();
+        let result = out.iter().position(|v| is_result_for(v, &u2)).expect("the second result");
+        let (running, idle) = (state_at(&out, 3).expect("the second turn's running"), state_at(&out, 4).expect("the second turn's idle"));
+        assert!(running < result && result < idle, "running {running}, the result {result}, then idle {idle}");
+        assert_eq!((state_of(&out[running]), state_of(&out[idle])), (Some("running"), Some("idle")));
+        h.assert_vm_empty();
+    }
+
+    // ---- S12 I2 (the lead): the state frames and a title across a move's replay (plans/s12-contracts.md §10.1) ----
+
+    /// S12 I2 (plans/s12-contracts.md §10.1, Q-R5; R §R2.3 R2-12, LD-R15; T §T3 P1 to P3, P7, L1, V2, R7): T10.3's
+    /// move mid-turn (`t10_3_the_state_frames_cross_a_mid_turn_move`'s recipe) with the chat's name said by each
+    /// generation's CLI at its start (`FAKE_TITLE`, as the CLI says a named chat's name), beside the extension's
+    /// `CLAUDE_CODE_SDK_READS_SESSION_STATE=1`. The move's replay swallows neither kind: the host gets generation 1's
+    /// title frame, then its `running`, then the moved CLI's title frame (in the replay, before its line is answered)
+    /// and its `running`, then the last `idle` after the line's one result, each byte for byte the fake's, each title
+    /// frame once. The pump holds each generation's frame until that generation's init: the row takes the name once,
+    /// after generation 1's init named the session (one `chat title` line in the wrapper's log, after `session id
+    /// learned`), and the moved CLI's startup, its init swallowed, changes nothing. The row and the view name the
+    /// title once: the row `custom`, the view's one `custom-title` line ai-env's, written before the move and kept
+    /// (the moved startup's ensure finds it there, V2). The move is T10.3's (one echo, one result, `inits:1/1`).
+    #[test]
+    fn i2_the_state_frames_and_a_title_cross_a_moves_replay() {
+        const NAME: &str = "Harbour-s12 named";
+        let p = Harness::prepare();
+        let sid = crate::common::uuid(0x5e55_0124);
+        let (u0, a0) = (crate::common::uuid(0x1221), crate::common::uuid(0x1222));
+        let lines = [
+            format!(r#"{{"type":"user","uuid":"{u0}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#),
+            format!(r#"{{"type":"assistant","uuid":"{a0}","parentUuid":"{u0}","sessionId":"{sid}","message":{{"role":"assistant","content":[{{"type":"text","text":"a reply"}}]}}}}"#),
+        ];
+        p.plant_transcript(&sid, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let view = p.mac_projects().join(p.slug()).join(format!("{sid}.jsonl"));
+        let mark = p.root.join("turn.mark");
+        let mark_s = mark.display().to_string();
+        let resume = format!("--resume={sid}");
+        let mut h = p.spawn_on(Link::Remote, "", &[&resume], &knobs(&[("FAKE_TURN_MS", "60000"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_DEDUP_RESUMED", "1"), ("FAKE_TITLE", NAME), ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")]));
+        started(&mut h);
+        let u1 = h.send_user("a line with a long tool");
+        wait_for_mark(&mark, 1, 1);
+        h.expect_out(|v| v["type"] == "assistant" && v["uuid"] == fake_tool_use_uuid(1, 1).as_str(), T);
+        let vm1 = vms_started(&h)[0].clone();
+        h.wait_until("VM 1 holds the tail's key", T, |h| h.rig().endpoint.attempts().iter().any(|a| a.vm.as_deref() == Some(vm1.as_str()) && a.path.starts_with("/transcript/tail") && (200..300).contains(&a.status)));
+        // Generation 1's name, applied at its init (which came with the line), is in the view: ai-env's line.
+        let line = ai_env_cli::bridge::title::custom_title_line(&sid, NAME);
+        h.wait_until("generation 1's name in the view", T, |_| std::fs::read(&view).unwrap_or_default().ends_with(&line));
+        let rig = h.rig();
+        rig.set_vm_knobs(&knobs(&[("FAKE_TURN_MS", "200"), ("FAKE_TURN_MARK", &mark_s), ("FAKE_TITLE", NAME)]));
+        platform_ends(rig, &vm1);
+        h.expect_out(|v| is_result_for(v, &u1), T);
+        h.expect_out(|v| state_of(v) == Some("idle"), T);
+        closed(&mut h);
+        let out = h.out_json();
+        let states: Vec<(&str, &str)> = out.iter().filter_map(|v| state_of(v).map(|s| (s, v["uuid"].as_str().unwrap_or_default()))).collect();
+        assert_eq!(
+            states,
+            [("running", "00000001-0000-4000-3000-000000000001"), ("running", "00000001-0000-4000-3000-000000000002"), ("idle", "00000002-0000-4000-3000-000000000002")],
+            "generation 1's running, then the moved CLI's running and idle"
+        );
+        let titles = [crate::common::fake_title_frame(NAME, 0, 1, &sid), crate::common::fake_title_frame(NAME, 0, 2, &sid)];
+        for frame in &titles {
+            assert_eq!(h.seen_out.iter().filter(|l| *l == frame).count(), 1, "{frame}: once, byte for byte\n{}", h.transcript());
+        }
+        let at = |what: &str, uuid: &str| out.iter().position(|v| v["uuid"] == uuid).unwrap_or_else(|| panic!("{what} ({uuid}) reached the host"));
+        let (title1, running1) = (at("generation 1's title frame", &crate::common::fake_title_uuid(0, 1)), at("generation 1's running", "00000001-0000-4000-3000-000000000001"));
+        let (title2, running2) = (at("the moved CLI's title frame", &crate::common::fake_title_uuid(0, 2)), at("the moved CLI's running", "00000001-0000-4000-3000-000000000002"));
+        let result = out.iter().position(|v| is_result_for(v, &u1)).expect("the result");
+        let idle = out.iter().position(|v| state_of(v) == Some("idle")).expect("the idle frame");
+        assert!(title1 < running1 && running1 < title2 && title2 < running2 && running2 < result && result < idle, "title {title1}, running {running1}, the moved title {title2}, running {running2}, the result {result}, idle {idle}");
+        // Held until each generation's init: generation 1's named the row once its init named the session; the moved
+        // CLI's, applied at its swallowed init, changed nothing.
+        let log = h.wrapper_log();
+        let learned = log.find("session id learned").unwrap_or_else(|| panic!("generation 1's init named the session: {log}"));
+        let named: Vec<usize> = log.match_indices("chat title").map(|(i, _)| i).collect();
+        assert!(named.len() == 1 && learned < named[0], "one name taken, after the init: {log}");
+        let row = ai_env_cli::bridge::registry::read(&paths_of(h.rig()), &sid).unwrap().expect("the chat's row");
+        assert_eq!((row.title.as_deref(), row.title_source.as_deref()), (Some(NAME), Some("custom")));
+        let text = std::fs::read(&view).expect("the view");
+        assert!(ai_env_cli::wire::view::is_view_head(&text), "a view");
+        assert_eq!(ai_env_cli::bridge::view::custom_titles(&text), std::slice::from_ref(&line), "ai-env's line alone");
+        assert_eq!(String::from_utf8_lossy(&text).matches(NAME).count(), 1, "the name once");
+        assert_eq!(out.iter().filter(|v| is_echo_of(v, &u1)).count(), 1, "one echo");
+        assert_eq!(out.iter().filter(|v| is_result_for(v, &u1)).count(), 1, "one result");
+        let note = h.end_note();
+        assert!(note_has(&note, "inits:1/1") && note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
+        h.assert_vm_empty();
     }
 }

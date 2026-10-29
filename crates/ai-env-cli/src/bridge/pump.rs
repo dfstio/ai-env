@@ -108,6 +108,8 @@ use crate::bridge::park::QuietState;
 use crate::bridge::remote::link::{request_of, MigrateTrigger};
 use crate::bridge::remote::{note_migrating, note_stayed, StayedThen, MIGRATE_PREP_TRIES};
 use crate::bridge::route::Mode;
+use crate::bridge::scan::Rules;
+use crate::bridge::title::{self, SessionTitle, TitleSource};
 use crate::bridge::voice;
 use crate::bridge::seed;
 use crate::bridge::workspace::TranscriptOutcome;
@@ -1288,6 +1290,40 @@ struct Pump {
     /// `state/accounts.toml` (a remote session's: by the live generation's
     /// seal, `RemoteSnapshot::seal`).
     usage: UsageTap,
+    /// S12 (T): the chat's name as the row holds it (every source `title::merge`d).
+    title: Option<SessionTitle>,
+    /// S12 (T): this process's newest live rename (a frame after its generation's first init), cleaned:
+    /// `fill_remote`'s guard. Phase 4 (§T3 P2 as amended): the CLI's echo of the host's own rename is a live one
+    /// before that init too.
+    live_title: Option<String>,
+    /// S12 (T): a frame not applied yet: before its generation's first init, or naming another session.
+    held_title: Option<HeldTitle>,
+    /// S12 (T): the tripwires titles pass (`title::rules_for`), loaded at the first title; `Some(None)`: they
+    /// did not load, no title in this process.
+    title_rules: Option<Option<Rules>>,
+    /// S12 (T): the last row write a title drove (`title::TITLE_WRITE_EVERY`).
+    title_written_at: Option<Instant>,
+    /// S12 (T, §T3 P5 as amended in phase 4): the `/clear`s this process adopted (an init naming a new session id
+    /// once one was adopted): Cursor's `titleEpoch`. The first adoption is none, so a request the host made before
+    /// the first init belongs to the first session adopted.
+    session_epoch: u32,
+    /// S12 (T, §T3 P5 as amended in phase 4): each pending host `generate_session_title`'s request id and the
+    /// `session_epoch` it was asked in (only the id: never the request's body); a child answer takes its id out.
+    title_asks: BTreeMap<String, u32>,
+    /// S12 (T, §T3 P2 as amended in phase 4): the title of the newest host `rename_session` forwarded to this
+    /// generation's CLI, cleaned: the CLI's echo of it (a frame with that text) is a live rename, before the
+    /// generation's first init too. Only to tell the echo; never a title itself (§T4 item 2 as amended).
+    gen_host_rename: Option<String>,
+}
+
+/// S12 (T, §T3 P2): a `session_title_changed` the pump holds in its one slot: the session it names, its cleaned
+/// title, and whether it came before its generation's first init (a startup, judged once per generation: LD-T1);
+/// phase 4 (§T3 P2 as amended): the CLI's echo of the host's own rename is never a startup.
+#[derive(Debug)]
+struct HeldTitle {
+    session: String,
+    text: String,
+    startup: bool,
 }
 
 /// S10 §B: a migration as the pump runs it: what started it (the wall, or
@@ -1538,6 +1574,14 @@ impl Pump {
             carried: None,
             held_host: VecDeque::new(),
             usage: UsageTap::new(),
+            title: None,
+            live_title: None,
+            held_title: None,
+            title_rules: None,
+            title_written_at: None,
+            session_epoch: 0,
+            title_asks: BTreeMap::new(),
+            gen_host_rename: None,
             sess,
             plan,
         }
@@ -1619,6 +1663,10 @@ impl Pump {
         self.state.begin_gen(self.gen);
         // S10: what the generation is, for its `vms` entry and a moved CLI's miss; a new spawn is parked nowhere.
         self.gen_init = false;
+        // S12 (T, §T3 P3): a frame the last generation's CLI sent and no init applied dies with it; so does the host's
+        // rename that CLI was sent (phase 4: the next CLI echoes only one sent to it).
+        self.held_title = None;
+        self.gen_host_rename = None;
         self.gen_answered = false;
         self.gen_output = false;
         self.move_resumed_by = None;
@@ -1803,6 +1851,9 @@ impl Pump {
                 if matches!(frame, HostFrame::User { .. }) && !self.user_line_seen {
                     self.user_line_seen = true;
                     self.maybe_register();
+                }
+                if let HostFrame::ControlRequest { request_id, subtype: Some(sub), .. } = &frame {
+                    self.on_host_title_request(request_id.as_deref(), sub, &line);
                 }
                 self.in_q.push_back(ChildInput::Line(encode_line(&line)));
                 // S10 §D: the live session's park control reads the chat's quiet after each line.
@@ -2219,6 +2270,23 @@ impl Pump {
                 }
             }
         }
+        // S12 (T, §T3 P5): a success answer to the host's `generate_session_title`, told by the subtype the host's
+        // request was recorded with, before `on_child_frame` takes its id out (never the request's body). Phase 4
+        // (P5 as amended): only for a request asked in this chat, with no `/clear` since (Cursor drops such an
+        // answer too, by its `titleEpoch`); any answer takes its id out of `title_asks`.
+        let asked_in = match &frame {
+            ChildFrame::ControlResponse { request_id: Some(id), .. } => self.title_asks.remove(id.as_ref()),
+            _ => None,
+        };
+        let asked_title = matches!(&frame, ChildFrame::ControlResponse { request_id: Some(id), subtype: Some(s) } if s == "success" && self.state.pending_subtype(id) == Some(claude::GENERATE_TITLE_SUBTYPE));
+        let asked_title = if asked_title && asked_in != Some(self.session_epoch) {
+            if claude::title_answer(&line).is_some() {
+                tracing::info!(why = "stale", "chat title dropped");
+            }
+            false
+        } else {
+            asked_title
+        };
         let init_before = self.state.inits_forwarded();
         let verdict = self.state.on_child_frame(&frame, &line);
         let forwarded = !matches!(verdict, ChildVerdict::Swallow(_));
@@ -2260,6 +2328,11 @@ impl Pump {
                             tracing::info!(session = %id, "new session id in the same process");
                             self.close_row(None);
                             self.row = None;
+                            // S12 (T, §T3 P3): the old row was closed with its name; the new one starts with none. Phase 4
+                            // (§T3 P5 as amended): a title the host asked for before this init is the old chat's.
+                            self.title = None;
+                            self.live_title = None;
+                            self.session_epoch = self.session_epoch.wrapping_add(1);
                             // S10: a move of the new session cuts in its own transcript, fresh until its first result.
                             self.results = 0;
                             self.leaf = None;
@@ -2276,6 +2349,11 @@ impl Pump {
                         self.out.init_id_refused += 1;
                         tracing::warn!(session = ?id, "the remote init named a session whose row is another's: not adopted, this session's row stays");
                     }
+                }
+                // S12 (T, §T3 P3): an init naming the session's own id (adopted now, or the row's already) applies a
+                // held title that names it; one naming another session stays held.
+                if let Some(id) = session_id.as_deref().filter(|id| self.out.session_id.as_deref() == Some(*id)) {
+                    self.apply_held_title(id);
                 }
                 if init_before == 0 && self.state.inits_forwarded() == 1 {
                     self.after_first_init();
@@ -2304,8 +2382,172 @@ impl Pump {
             ChildFrame::Assistant { uuid: Some(uuid), top_level: true } if forwarded => self.last_assistant = Some(uuid.to_string()),
             // A1: forwarded as it came; what it says of the account's usage goes to the tap.
             ChildFrame::RateLimit { info } if forwarded => self.on_rate_limit(info.map(RawValue::get)),
+            // S12 (T, §T3 P1): the CLI's name for the session, forwarded byte for byte above.
+            ChildFrame::TitleChanged { session_id, title: name } if forwarded => self.on_title_frame(session_id.as_deref(), name.as_deref()),
+            // S12 (T, §T3 P5): the generated title, forwarded as it came.
+            ChildFrame::ControlResponse { .. } if forwarded && asked_title => self.on_title_answer(&line),
             _ => {}
         }
+    }
+
+    // -- S12 (T): the chat's name (plans/s12-contracts.md §T3 P1 to P11) ------------------------
+
+    /// S12 (T, §T3 C3, C5): the tripwires every title passes (`title::rules_for` of the session's root and
+    /// config), loaded at the first title. When they do not load no title is taken in this process, said once:
+    /// `chat titles are off for this session: <the load error>` (which names the file and its line, never a pattern).
+    fn title_rules(&mut self) -> Option<&Rules> {
+        if self.title_rules.is_none() {
+            let loaded = match title::rules_for(&self.sess.paths, self.sess.cfg.as_ref()) {
+                Ok(rules) => Some(rules),
+                Err(e) => {
+                    tracing::warn!("chat titles are off for this session: {e}");
+                    None
+                }
+            };
+            self.title_rules = Some(loaded);
+        }
+        self.title_rules.as_ref().and_then(Option::as_ref)
+    }
+
+    /// S12 (T, §T3 C2, C4): `raw` through `title::clean`; `None` when the tripwires did not load, or when it is
+    /// dropped: logged `chat title dropped` with its word and, for a tripwire, the rule's id, never the text.
+    fn cleaned(&mut self, raw: &str) -> Option<String> {
+        let kept = title::clean(raw, self.title_rules()?);
+        match kept {
+            Ok(text) => Some(text),
+            Err(title::Dropped::Tripwire(rule)) => {
+                tracing::info!(why = "tripwire", rule = %rule, "chat title dropped");
+                None
+            }
+            Err(dropped) => {
+                tracing::info!(why = dropped.word(), "chat title dropped");
+                None
+            }
+        }
+    }
+
+    /// S12 (T, §T3 P1, P2): a forwarded `session_title_changed`. Nothing under `--no-session-persistence` (no
+    /// row, no link call), nor for a frame without a session id or a title (a string). A dropped one empties the
+    /// held slot (LD-T2: an older held name is no longer the CLI's newest). A kept one is applied at once when this
+    /// generation's first init came and it names the session; else it is held, a newer frame replacing it, a
+    /// startup when it came before that init (LD-T1). The frame itself went to the host byte for byte.
+    ///
+    /// Phase 4 (§T3 P2 and LD-T1 as amended): the CLI's echo of the host's own rename in this generation (a frame
+    /// whose cleaned text is `gen_host_rename`'s) is a live rename whenever it comes: naming the session, it is
+    /// applied at once, before the generation's first init too, where it empties the held slot (the held name, the
+    /// CLI's startup one, is no longer its newest); naming another, it is held as a live one. A moved generation
+    /// gets no init until the next turn, and its echo held as a startup would lose to a rename carried over the
+    /// move (L2, L3) or die with the generation, though Cursor's line already names it.
+    fn on_title_frame(&mut self, session_id: Option<&str>, raw: Option<&str>) {
+        if self.sess.session.no_session_persistence {
+            return;
+        }
+        let (Some(session), Some(raw)) = (session_id, raw) else { return };
+        let Some(text) = self.cleaned(raw) else {
+            self.held_title = None;
+            return;
+        };
+        let echo = self.gen_host_rename.as_deref() == Some(text.as_str());
+        if (self.gen_init || echo) && self.out.session_id.as_deref() == Some(session) {
+            if !self.gen_init {
+                self.held_title = None;
+            }
+            self.apply_custom_title(session, text, false);
+        } else {
+            self.held_title = Some(HeldTitle { session: session.to_string(), text, startup: !self.gen_init && !echo });
+        }
+    }
+
+    /// S12 (T, phase 4): a host `control_request` forwarded to the CLI, by its subtype: a `generate_session_title`'s
+    /// id is recorded with the `session_epoch` it was asked in (§T3 P5 as amended; `title_asks` keeps only ids still
+    /// pending), a `rename_session`'s title, cleaned, is the generation's `gen_host_rename` (§T3 P2 as amended; one
+    /// dropped by `clean` is none). Nothing else of a request is read, and nothing of it is logged.
+    fn on_host_title_request(&mut self, request_id: Option<&str>, subtype: &str, line: &[u8]) {
+        if subtype == claude::GENERATE_TITLE_SUBTYPE {
+            if let Some(id) = request_id {
+                let state = &self.state;
+                self.title_asks.retain(|asked, _| state.pending_subtype(asked).is_some());
+                self.title_asks.insert(id.to_string(), self.session_epoch);
+            }
+        } else if subtype == claude::RENAME_SESSION_SUBTYPE && !self.sess.session.no_session_persistence {
+            let raw = claude::rename_request_title(line);
+            self.gen_host_rename = raw.and_then(|raw| title::clean(&raw, self.title_rules()?).ok());
+        }
+    }
+
+    /// S12 (T, §T3 P3): an init naming `session` (the session's now): the held title, when it names it, is
+    /// applied with its `startup` and the slot emptied; one naming another session stays held (a hostile VM
+    /// chooses no row, §T4 item 4).
+    fn apply_held_title(&mut self, session: &str) {
+        if self.held_title.as_ref().is_some_and(|h| h.session == session) {
+            if let Some(h) = self.held_title.take() {
+                self.apply_custom_title(&h.session, h.text, h.startup);
+            }
+        }
+    }
+
+    /// S12 (T, §T3 P4, P7): a rename of `session` applied. The link is told first, even when the row will not
+    /// change (its ensure is then `Already`): a remote one has the view end with it, a startup's only into a view
+    /// that holds no rename, and at a startup answers this process's rename still due (L1 as amended in wave 1's
+    /// fix round), else the view's newest rename. The name: at a startup that answer cleaned (a rename made in
+    /// Cursor while the chat was closed wins over the CLI's older name; its line may be a carried S8 mirror's,
+    /// the VM's, so it is cleaned as a frame is), else this process's live one, else the frame's; a live rename's
+    /// is the frame's, which becomes `live_title`.
+    fn apply_custom_title(&mut self, session: &str, text: String, startup: bool) {
+        let shown = self.links.title_changed(session, &text, startup);
+        let name = if startup {
+            match shown.and_then(|s| self.cleaned(&s)) {
+                Some(view) => view,
+                None => self.live_title.clone().unwrap_or(text),
+            }
+        } else {
+            self.live_title = Some(text.clone());
+            text
+        };
+        self.set_title(SessionTitle { text: name, source: TitleSource::Custom });
+    }
+
+    /// S12 (T, §T3 P5): the forwarded success answer to the host's `generate_session_title` (P5's `asked_title`):
+    /// its `response.response.title` (`claude::title_answer`), cleaned, as the `ai` title, which a rename keeps out
+    /// (M2). An error answer, or a `null` or missing title, changes nothing; the request's body (its
+    /// `description`, the user's prompt) is never read. Nothing under `--no-session-persistence` (no row).
+    fn on_title_answer(&mut self, line: &[u8]) {
+        if self.sess.session.no_session_persistence {
+            return;
+        }
+        let Some(raw) = claude::title_answer(line) else { return };
+        if let Some(text) = self.cleaned(&raw) {
+            self.set_title(SessionTitle { text, source: TitleSource::Ai });
+        }
+    }
+
+    /// S12 (T, §T3 P6): `t` over the row's name. No change (`title::merge`): nothing at all. A change: the name,
+    /// the in-memory row's two fields, the log line `chat title` (its source and length); then the row file now
+    /// when no title drove a write within `TITLE_WRITE_EVERY`, else nothing now: the next row write takes it
+    /// (`touch_registry` after each result and at `Started`, `close_row`, `on_link`, `set_status`,
+    /// `maybe_register`), so a burst of titles writes the row at most once a second (§T4 item 4).
+    fn set_title(&mut self, t: SessionTitle) {
+        if !self.merge_title(&t) {
+            return;
+        }
+        let now = Instant::now();
+        if self.row.is_some() && self.title_written_at.is_none_or(|at| now.duration_since(at) >= title::TITLE_WRITE_EVERY) {
+            self.title_written_at = Some(now);
+            self.write_row();
+        }
+    }
+
+    /// S12 (T): [`Pump::set_title`]'s merge and in-memory update, which [`Pump::fill_remote`] makes too (its
+    /// caller writes the row, §T3 P9): whether the name changed. The log line holds the source and the length,
+    /// never the text (§T4 item 3).
+    fn merge_title(&mut self, t: &SessionTitle) -> bool {
+        let Some(new) = title::merge(self.title.as_ref(), t) else { return false };
+        if let Some(row) = self.row.as_mut() {
+            title::set_row(row, Some(&new));
+        }
+        tracing::info!(source = new.source.word(), chars = new.text.chars().count(), "chat title");
+        self.title = Some(new);
+        true
     }
 
     // -- A1: the account's usage, as the chat's turns show it (plan §5) --------------------------
@@ -2472,9 +2714,17 @@ impl Pump {
         let Some(session_id) = self.out.session_id.clone().filter(|s| registry::is_uuid(s)) else { return };
         // S10 (§6.1): an earlier wrapper's history of this session stays, the prefix of this process's entries;
         // `created` stays this wrapper's registration (`confirm_wrapper` judges a wrapper's start against it).
-        self.vms_prefix = registry::read(&self.sess.paths, &session_id).ok().flatten().map(|r| r.vms).unwrap_or_default();
+        let earlier = registry::read(&self.sess.paths, &session_id).ok().flatten();
+        // S12 (T, §T3 P8): so does its name: a rename made here wins over it, an AI title made here only over none or
+        // another AI title.
+        let carried = earlier.as_ref().and_then(title::of_row);
+        self.title = match self.title.take() {
+            None => carried,
+            Some(mine) => title::merge(carried.as_ref(), &mine).or(carried),
+        };
+        self.vms_prefix = earlier.map(|r| r.vms).unwrap_or_default();
         let now = registry::now_rfc3339();
-        let row = SessionRow {
+        let mut row = SessionRow {
             v: registry::REGISTRY_SCHEMA_V,
             session_id: session_id.clone(),
             slug: self.plan.slug.clone(),
@@ -2497,6 +2747,7 @@ impl Pump {
             host_state: self.state.snapshot(),
             ..SessionRow::default()
         };
+        title::set_row(&mut row, self.title.as_ref());
         self.row = Some(row);
         self.registered = true;
         if !self.own_ids.contains(&session_id) {
@@ -2540,7 +2791,12 @@ impl Pump {
     /// pump, the seeded head, the newest WIP ref fetched, one `vms` entry per
     /// generation (S10: after the earlier wrappers' entries, at most
     /// `registry::VMS_KEPT` in all, the oldest dropped); S9's
-    /// ([`Pump::s3_fields`]).
+    /// ([`Pump::s3_fields`]). S12 (T, §T3 P9): what the session's view shows
+    /// (`RemoteSnapshot.view_title`, naming this row's session) merged into
+    /// the name, unless it is a rename other than this process's newest live
+    /// one (that one's view write is still on its way); the caller writes it.
+    /// Never while this process's tripwires do not load (C5: no title here,
+    /// the view's neither; loaded at the first title, this one if it is).
     fn fill_remote(&mut self) {
         let Some(row) = self.row.as_mut() else { return };
         let Some(s) = self.links.snapshot() else { return };
@@ -2556,6 +2812,13 @@ impl Pump {
         }
         row.vms = vms;
         Self::s3_fields(row, &self.sess.paths, self.plan.slug.as_deref());
+        let seen = s.view_title.filter(|(sid, _)| *sid == row.session_id).map(|(_, t)| t);
+        let on_its_way = |t: &SessionTitle| t.source == TitleSource::Custom && self.live_title.as_ref().is_some_and(|live| *live != t.text);
+        let seen = seen.filter(|t| !on_its_way(t));
+        // S12 (T, §T3 C5; wave 1's fix round): the trigger's own tripwires loaded at its start, this process's may not.
+        if let Some(t) = seen.filter(|_| self.title_rules().is_some()) {
+            self.merge_title(&t);
+        }
     }
 
     /// S9's fields of a remote session's row (§5.7): its transcript is kept
@@ -5673,6 +5936,10 @@ mod tests {
             switches: u32,
             /// S10 §D: the quiet the pump told after each line.
             quiet: Vec<QuietState>,
+            /// S12 (T): each `title_changed` call (session, title, startup), and what a startup's answers (the
+            /// view's newest rename).
+            titles: Vec<(String, String, bool)>,
+            view_rename: Option<String>,
         }
 
         struct HandLinks(Rc<RefCell<Hand>>);
@@ -5727,6 +5994,16 @@ mod tests {
                 let mut h = self.0.borrow_mut();
                 h.switches += 1;
                 h.switch
+            }
+
+            fn title_changed(&mut self, session_id: &str, title: &str, startup: bool) -> Option<String> {
+                let mut h = self.0.borrow_mut();
+                h.titles.push((session_id.to_string(), title.to_string(), startup));
+                if startup {
+                    h.view_rename.clone()
+                } else {
+                    None
+                }
             }
         }
 
@@ -9106,6 +9383,640 @@ mod tests {
                 assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("abandoned")], "{ends:?}");
                 assert_eq!(hand.borrow().whys.len(), 1, "no generation after the called-off switch");
             });
+        }
+
+        /// S12 (T): the chat's name in the pump (plans/s12-contracts.md §T3 P1 to P10, §T8.1), over the hand factory:
+        /// the CLI's `session_title_changed` frames and the answer to the host's `generate_session_title`, the row
+        /// they name, and what the link is told.
+        mod t_tests {
+            use super::*;
+
+            /// The CLI's `session_title_changed` for `title`, naming `sid` (2.1.310's shape).
+            fn title_line(title: &str, sid: &str) -> String {
+                format!(r#"{{"type":"system","subtype":"session_title_changed","title":{},"uuid":"00000001-0000-4000-5000-000000000001","session_id":"{sid}"}}"#, serde_json::to_string(title).unwrap())
+            }
+
+            /// The host's `generate_session_title` `id`, its `description` the user's prompt (as 2.1.310 sends it).
+            fn title_request(id: &str, description: &str) -> String {
+                format!(r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"generate_session_title","description":{},"persist":true}}}}"#, serde_json::to_string(description).unwrap())
+            }
+
+            /// The title and source the row file of `sid` holds now (`(None, None)` without a row).
+            fn row_title(paths: &Paths, sid: &str) -> (Option<String>, Option<String>) {
+                registry::read(paths, sid).unwrap().map_or((None, None), |r| (r.title, r.title_source))
+            }
+
+            fn named(text: &str, source: &str) -> (Option<String>, Option<String>) {
+                (Some(text.to_string()), Some(source.to_string()))
+            }
+
+            fn titled(text: &str, source: TitleSource) -> SessionTitle {
+                SessionTitle { text: text.to_string(), source }
+            }
+
+            /// Is `v` the title frame of `title`?
+            fn is_title(v: &Value, title: &str) -> bool {
+                v["subtype"] == "session_title_changed" && v["title"] == title
+            }
+
+            /// The host's EOF, the CLI's exit (its input read to its end), the pump's end: exit 0, the pump concluded.
+            async fn close(host: &Host, far: &mut Far, task: tokio::task::JoinHandle<(i32, Pump)>) -> Pump {
+                host.eof().await;
+                while far.next_input().await.is_some() {}
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0, "the session's end");
+                pump.conclude(code);
+                pump
+            }
+
+            /// The host's request `line` reaches the CLI, which answers `reply`; once the host has the answer.
+            async fn asked(host: &Host, far: &mut Far, line: &str, reply: &str, id: &str) {
+                host.send(line).await;
+                assert_eq!(far.next_input().await.as_deref(), Some(line));
+                far.line(reply).await;
+                host.wait_for("the answer", |v| v["type"] == "control_response" && v["response"]["request_id"] == id).await;
+            }
+
+            /// The files under `dir` (recursively) whose bytes hold `needle`.
+            fn files_holding(dir: &Path, needle: &str) -> Vec<PathBuf> {
+                let (mut out, mut dirs) = (Vec::new(), vec![dir.to_path_buf()]);
+                while let Some(d) = dirs.pop() {
+                    for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                        match e.file_type() {
+                            Ok(t) if t.is_dir() => dirs.push(e.path()),
+                            Ok(t) if t.is_file() && std::fs::read(e.path()).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes())) => out.push(e.path()),
+                            _ => {}
+                        }
+                    }
+                }
+                out
+            }
+
+            /// §T3 P1, P2, P4, P6, M-T37: a rename after the generation's first init, naming the session: the frame
+            /// reaches the host byte for byte, the link hears it as live, and the row says it, `custom`.
+            #[test]
+            fn a_live_title_names_the_row_and_tells_the_link() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some(), "the user line");
+                    let frame = title_line("Harbour-s12 live", SID);
+                    far.line(&frame).await;
+                    host.wait_for("the title frame", |v| is_title(v, "Harbour-s12 live")).await;
+                    assert!(host.raw().contains(&format!("{frame}\n").into_bytes()), "the frame reached the host byte for byte");
+                    assert_eq!(hand.borrow().titles, [(SID.to_string(), "Harbour-s12 live".to_string(), false)]);
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 live", "custom"));
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 live", "custom"), "the closed row keeps it");
+                });
+            }
+
+            /// §T3 P2, P3, P4, P7, C3, LD-T1, M-T3, M-T47: a frame before the generation's first init is held (no link
+            /// call, even for the session's own id) until that init, then applied once as a startup; the view's newest
+            /// rename (the link's answer: one made in Cursor while the chat was closed) is the row's name over the
+            /// frame's, cleaned (a carried S8-mirror line is the VM's, never rewritten: its controls, bidi and separator
+            /// characters spaces; a key shape the scrub masks drops it, and the frame's name stands); with no answer
+            /// the frame's is.
+            #[test]
+            fn a_startup_title_waits_for_its_init_and_the_views_rename_wins() {
+                let ch = |c: u32| char::from_u32(c).expect("a character");
+                let hostile = format!("Harbour-s12{}picked{} in{}Cursor", ch(0x202e), ch(0x7), ch(0x2028));
+                let key = format!("{}{}", "ASIA", "Q".repeat(16));
+                let cases: [(Option<String>, &str); 4] = [
+                    (Some("Harbour-s12 picked in Cursor".to_string()), "Harbour-s12 picked in Cursor"),
+                    (Some(hostile), "Harbour-s12 picked in Cursor"),
+                    (Some(format!("leak {key}")), "Harbour-s12 startup"),
+                    (None, "Harbour-s12 startup"),
+                ];
+                for (view, want) in cases {
+                    let d = tempfile::tempdir().unwrap();
+                    on_local(async {
+                        let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                        hand.borrow_mut().view_rename = view.clone();
+                        let paths = pump.sess.paths.clone();
+                        let task = supervise(pump, io);
+                        let mut far = far(&hand).await;
+                        far.started().await;
+                        host.send(INIT).await;
+                        assert_eq!(far.next_input().await.as_deref(), Some(INIT));
+                        far.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                        far.line(&title_line("Harbour-s12 startup", SID)).await;
+                        host.wait_for("the title frame", |v| is_title(v, "Harbour-s12 startup")).await;
+                        assert!(hand.borrow().titles.is_empty(), "held until the generation's first init");
+                        far.line(&init_frame(SID)).await;
+                        host.wait_for("the init", |v| v["subtype"] == "init").await;
+                        assert_eq!(hand.borrow().titles, [(SID.to_string(), "Harbour-s12 startup".to_string(), true)], "told once, at the init, as a startup");
+                        host.send(&user(1)).await;
+                        assert!(far.next_input().await.is_some());
+                        assert_eq!(row_title(&paths, SID), named(want, "custom"), "{view:?}");
+                        close(&host, &mut far, task).await;
+                        assert_eq!(row_title(&paths, SID), named(want, "custom"), "{view:?}");
+                        assert_eq!(files_holding(d.path(), &key), Vec::<PathBuf>::new(), "{view:?}: no file holds the key shape");
+                    });
+                }
+            }
+
+            /// §T3 P2, P3, §T4 item 4, M-T1, M-T45: a frame naming another session (one whose row is another wrapper's)
+            /// is held and never applied: its init is refused, so no init names it as this session's, and the next
+            /// turn's init, naming this session, applies only a held title that names this session; neither row gets a
+            /// title and the link hears nothing.
+            #[test]
+            fn a_title_of_another_session_is_never_applied() {
+                const OTHER: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let theirs = SessionRow { v: registry::REGISTRY_SCHEMA_V, session_id: OTHER.into(), cwd: Some("/Users/someone/other-workspace".into()), status: "closed".into(), mode: "remote".into(), pid: 1, microvm_id: Some("microvm-other".into()), ..SessionRow::default() };
+                    registry::write(&paths, &theirs).unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&title_line("Harbour-s12 not yours", OTHER)).await;
+                    far.line(&init_frame(OTHER)).await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    // The next turn's init names this session (inits come once a turn): OTHER's frame stays held.
+                    host.send(&user(2)).await;
+                    assert!(far.next_input().await.is_some(), "the second user line");
+                    far.line(&init_frame(SID)).await;
+                    far.line(&result_for(2)).await;
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    let pump = close(&host, &mut far, task).await;
+                    assert_eq!(pump.out.init_id_refused, 1, "the other session's init refused");
+                    assert_eq!(pump.held_title.as_ref().map(|h| h.session.as_str()), Some(OTHER), "held, never applied");
+                    assert!(hand.borrow().titles.is_empty(), "no link call");
+                    assert_eq!(row_title(&paths, SID), (None, None), "this session's row holds no title");
+                    let row = registry::read(&paths, OTHER).unwrap().expect("the other session's row");
+                    assert_eq!((row.pid, row.status.as_str(), row.title, row.title_source), (1, "closed", None, None), "the other session's row as it was");
+                });
+            }
+
+            /// §T3 P5, M2, M-T2, M-T8, M-T24: the success answer to the host's `generate_session_title` is the row's
+            /// `ai` title; an error answer, a `null` title, a titled answer to another request and one to a request
+            /// the host withdrew change nothing; a live rename then wins, and a second answer changes nothing.
+            #[test]
+            fn the_generated_title_is_ai_and_never_replaces_a_rename() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    let words = "Harbour prompt words";
+                    asked(&host, &mut far, &title_request("g0", words), r#"{"type":"control_response","response":{"subtype":"error","request_id":"g0","error":"no title"}}"#, "g0").await;
+                    asked(&host, &mut far, &title_request("g1", words), &answer("g1", r#"{"title":null}"#), "g1").await;
+                    let other = r#"{"type":"control_request","request_id":"o1","request":{"subtype":"get_context_usage"}}"#;
+                    asked(&host, &mut far, other, &answer("o1", r#"{"title":"Harbour-s12 decoy"}"#), "o1").await;
+                    // The host withdraws its request; the CLI's late answer is no longer one.
+                    host.send(&title_request("g2", words)).await;
+                    assert!(far.next_input().await.is_some());
+                    host.send(r#"{"type":"control_cancel_request","request_id":"g2"}"#).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&answer("g2", r#"{"title":"Harbour-s12 withdrawn"}"#)).await;
+                    host.wait_for("the late answer", |v| v["response"]["request_id"] == "g2").await;
+                    assert_eq!(row_title(&paths, SID), (None, None), "none of them is a title");
+                    asked(&host, &mut far, &title_request("g3", words), &answer("g3", r#"{"title":"Harbour-s12 generated"}"#), "g3").await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 generated", "ai"));
+                    // A live rename wins (the row written at the next write: the generated title's was just now).
+                    far.line(&title_line("Harbour-s12 renamed", SID)).await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 renamed", "custom"));
+                    asked(&host, &mut far, &title_request("g4", words), &answer("g4", r#"{"title":"Harbour-s12 generated again"}"#), "g4").await;
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 renamed", "custom"), "an ai title never replaces a rename");
+                    assert_eq!(hand.borrow().titles.len(), 1, "the link hears renames only");
+                });
+            }
+
+            /// §T3 P5, §T4 items 2, 3, M-T38: the host's `generate_session_title` carries the user's prompt in its
+            /// `description`; the row takes the CLI's answer, and no file the session wrote (row, census, audit)
+            /// holds the prompt.
+            #[test]
+            fn the_title_requests_description_never_reaches_the_row() {
+                const WORDS: &str = "Harbour prompt words never kept";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    let request = title_request("g1", WORDS);
+                    host.send(&request).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(request.as_str()), "the request reaches the CLI as it came");
+                    assert_eq!((row_title(&paths, SID), files_holding(d.path(), WORDS)), ((None, None), Vec::new()), "the request names nothing");
+                    far.line(&answer("g1", r#"{"title":"Harbour-s12 generated"}"#)).await;
+                    host.wait_for("the answer", |v| v["response"]["request_id"] == "g1").await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 generated", "ai"));
+                    assert!(paths.census().exists(), "the census end row was written");
+                    assert_eq!(files_holding(d.path(), WORDS), Vec::<PathBuf>::new(), "the prompt in a file");
+                });
+            }
+
+            /// §T3 C2 to C5, P2, LD-T2, M-T39: with `<root>/tripwires.txt` naming `swordfish`, a kept rename is
+            /// applied, then one a tripwire hits and two holding a key shape (one the tripwires and the scrub take,
+            /// one the scrub alone) are dropped: the row keeps the first, the link heard only it. A held name, then a
+            /// dropped one, before the init: the held slot is emptied, nothing applied at the init.
+            #[test]
+            fn a_dropped_title_changes_nothing_and_tells_no_link() {
+                let key = format!("{}{}", "AKIA", "Q".repeat(16));
+                let session_key = format!("{}{}", "ASIA", "Q".repeat(16));
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    std::fs::create_dir_all(d.path().join("bridge")).unwrap();
+                    std::fs::write(d.path().join("bridge").join("tripwires.txt"), "swordfish\n").unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    for name in ["Harbour-s12 kept".to_string(), "the swordfish plan".to_string(), format!("leak {key}"), format!("leak {session_key}")] {
+                        far.line(&title_line(&name, SID)).await;
+                    }
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(host.json().iter().filter(|v| v["subtype"] == "session_title_changed").count(), 4, "every frame reached the host");
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 kept", "custom"));
+                    assert_eq!(hand.borrow().titles, [(SID.to_string(), "Harbour-s12 kept".to_string(), false)]);
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 kept", "custom"));
+                    assert!(files_holding(d.path(), &key).is_empty() && files_holding(d.path(), &session_key).is_empty(), "no key shape in a file");
+                });
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    std::fs::create_dir_all(d.path().join("bridge")).unwrap();
+                    std::fs::write(d.path().join("bridge").join("tripwires.txt"), "swordfish\n").unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    host.send(INIT).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(INIT));
+                    far.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                    far.line(&title_line("Harbour-s12 A", SID)).await;
+                    far.line(&title_line("Harbour-s12 swordfish B", SID)).await;
+                    far.line(&init_frame(SID)).await;
+                    host.wait_for("the init", |v| v["subtype"] == "init").await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    let pump = close(&host, &mut far, task).await;
+                    assert!(pump.held_title.is_none() && pump.title.is_none(), "the dropped frame emptied the held slot");
+                    assert!(hand.borrow().titles.is_empty(), "nothing applied at the init");
+                    assert_eq!(row_title(&paths, SID), (None, None));
+                });
+            }
+
+            /// §T3 P3, M-T21: a `/clear` (an init naming a new id) closes the old row with its name and starts the new
+            /// one with none; a frame naming the next id, held until that id's init, is applied to it.
+            #[test]
+            fn a_clear_starts_the_new_row_without_the_old_title() {
+                const NEW: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e";
+                const NEXT: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5f";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&title_line("Harbour-s12 first", SID)).await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 first", "custom"));
+                    far.line(&init_frame(NEW)).await;
+                    host.wait_for("the new session's init", |v| v["subtype"] == "init" && v["session_id"] == NEW).await;
+                    let old = registry::read(&paths, SID).unwrap().expect("the old row");
+                    assert_eq!((old.status.as_str(), old.title.as_deref(), old.title_source.as_deref()), ("closed", Some("Harbour-s12 first"), Some("custom")), "closed with its name");
+                    assert!(registry::read(&paths, NEW).unwrap().is_some(), "the new session's row");
+                    assert_eq!(row_title(&paths, NEW), (None, None), "the new row starts with none");
+                    far.line(&title_line("Harbour-s12 next", NEXT)).await;
+                    far.line(&init_frame(NEXT)).await;
+                    host.wait_for("the next session's init", |v| v["subtype"] == "init" && v["session_id"] == NEXT).await;
+                    assert_eq!(row_title(&paths, NEXT), named("Harbour-s12 next", "custom"), "the held frame named it");
+                    assert_eq!(row_title(&paths, NEW), (None, None));
+                    close(&host, &mut far, task).await;
+                    let titles = hand.borrow().titles.clone();
+                    assert_eq!(titles, [(SID.to_string(), "Harbour-s12 first".to_string(), false), (NEXT.to_string(), "Harbour-s12 next".to_string(), false)]);
+                });
+            }
+
+            /// §T3 P8, M-T40, M-T48: a reopen's row takes the previous row's name (here `custom`), and an AI title made
+            /// in this process does not replace it: one answered before the first user line (this process then holds
+            /// a name when `maybe_register` merges the earlier row's), and one after it.
+            #[test]
+            fn a_reopen_carries_the_previous_rows_title() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={SID}");
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                    let paths = pump.sess.paths.clone();
+                    let earlier = SessionRow { v: registry::REGISTRY_SCHEMA_V, session_id: SID.into(), status: "closed".into(), mode: "remote".into(), pid: 1, title: Some("Harbour-s12 earlier".into()), title_source: Some("custom".into()), ..SessionRow::default() };
+                    registry::write(&paths, &earlier).unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    // Before any row: the answer is this process's name when the row registers.
+                    asked(&host, &mut far, &title_request("g1", "prompt"), &answer("g1", r#"{"title":"Harbour-s12 generated"}"#), "g1").await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 earlier", "custom"), "the new row keeps it over this process's ai title");
+                    asked(&host, &mut far, &title_request("g2", "prompt"), &answer("g2", r#"{"title":"Harbour-s12 generated again"}"#), "g2").await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    close(&host, &mut far, task).await;
+                    let row = registry_row_at(&paths);
+                    assert_eq!((row.pid, row.title.as_deref(), row.title_source.as_deref()), (std::process::id(), Some("Harbour-s12 earlier"), Some("custom")), "this wrapper's row, the earlier name");
+                });
+            }
+
+            /// SID's row, as `registry_row` reads it from the paths alone.
+            fn registry_row_at(paths: &Paths) -> SessionRow {
+                registry::read(paths, SID).unwrap().expect("the session's row")
+            }
+
+            /// §T3 P9, M-T16, M-T46: what the session's view shows (the snapshot's `view_title`) reaches the row at the
+            /// next row write (here an `ai` one at a result); one naming another session never does, even with no live
+            /// rename to keep it out (after `/clear` the trigger's last step may still name the old session); after a
+            /// live rename a `custom` view title that differs (a view write still on its way) does not either.
+            #[test]
+            fn fill_remote_takes_the_views_title_unless_a_live_one_disagrees() {
+                const OTHER: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    // The view shows `title` of `sid` when turn `n`'s result comes.
+                    let turn = |n: u32, sid: &str, title: SessionTitle| {
+                        hand.borrow_mut().snap.view_title = Some((sid.to_string(), title));
+                        (user(n), result_for(n))
+                    };
+                    let (line, result) = turn(1, SID, titled("Harbour-s12 from the view", TitleSource::Ai));
+                    host.send(&line).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result).await;
+                    host.wait_for("the result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(1).as_str()).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 from the view", "ai"), "the view's title at the next row write");
+                    // Another session's `ai` title while no live rename is set: only the session filter keeps it out.
+                    let (line, result) = turn(2, OTHER, titled("Harbour-s12 other", TitleSource::Ai));
+                    host.send(&line).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result).await;
+                    host.wait_for("the result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 from the view", "ai"), "another session's view title is never this row's");
+                    far.line(&title_line("Harbour-s12 live", SID)).await;
+                    host.wait_for("the rename", |v| is_title(v, "Harbour-s12 live")).await;
+                    for (n, sid, title) in [(3, SID, titled("Harbour-s12 stale", TitleSource::Custom)), (4, OTHER, titled("Harbour-s12 other", TitleSource::Custom)), (5, SID, titled("Harbour-s12 view ai", TitleSource::Ai))] {
+                        let (line, result) = turn(n, sid, title);
+                        host.send(&line).await;
+                        assert!(far.next_input().await.is_some());
+                        far.line(&result).await;
+                        host.wait_for("the result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(n).as_str()).await;
+                        assert_eq!(row_title(&paths, SID), named("Harbour-s12 live", "custom"), "turn {n}");
+                    }
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 live", "custom"));
+                });
+            }
+
+            /// §T3 P6, M-T17: titles A and B 10 ms apart write the row once (A), B riding on the next row write (a
+            /// result); `TITLE_WRITE_EVERY` and 100 ms after that write, C is written at once.
+            #[test]
+            fn title_writes_of_the_row_are_at_most_one_a_second() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&title_line("Harbour-s12 A", SID)).await;
+                    host.wait_for("A", |v| is_title(v, "Harbour-s12 A")).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 A", "custom"), "the first title's write");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    far.line(&title_line("Harbour-s12 B", SID)).await;
+                    host.wait_for("B", |v| is_title(v, "Harbour-s12 B")).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 A", "custom"), "B within the second: not written now");
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 B", "custom"), "B rode on the result's row write");
+                    tokio::time::sleep(title::TITLE_WRITE_EVERY + Duration::from_millis(100)).await;
+                    far.line(&title_line("Harbour-s12 C", SID)).await;
+                    host.wait_for("C", |v| is_title(v, "Harbour-s12 C")).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 C", "custom"), "past the second: written at once");
+                    close(&host, &mut far, task).await;
+                });
+            }
+
+            /// §T3 P3, M-T51 (wave 1's fix round): a frame held by a generation that ends before its first init (here
+            /// a resume miss after its answer, so `spawn_next` starts the retry) dies with it: the retry's CLI sends
+            /// none, and its init applies nothing (no link call, no name in the row).
+            #[test]
+            fn a_held_title_dies_with_its_generation() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={SID}");
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    host.send(INIT).await;
+                    assert_eq!(gen1.next_input().await.as_deref(), Some(INIT));
+                    gen1.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                    gen1.line(&title_line("Harbour-s12 gen 1", SID)).await;
+                    host.wait_for("generation 1's title frame", |v| is_title(v, "Harbour-s12 gen 1")).await;
+                    gen1.line(&format!(r#"{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"x","errors":["No conversation found with session ID: {SID}"]}}"#)).await;
+                    gen1.exit(1).await;
+                    let mut gen2 = far(&hand).await;
+                    assert_eq!(hand.borrow().whys, [StartWhy::First, StartWhy::ResumeRetry { session_id: SID.to_string(), init_answered: true }]);
+                    gen2.started().await;
+                    let replayed: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                    gen2.line(&answer(replayed["request_id"].as_str().unwrap(), r#"{"pid":4242}"#)).await;
+                    gen2.line(&init_frame(SID)).await;
+                    host.wait_for("the retry's init", |v| v["subtype"] == "init").await;
+                    host.send(&user(1)).await;
+                    assert!(gen2.next_input().await.is_some(), "the user line");
+                    assert!(hand.borrow().titles.is_empty(), "the retry's init applied nothing");
+                    assert_eq!(row_title(&paths, SID), (None, None));
+                    let pump = close(&host, &mut gen2, task).await;
+                    assert!(pump.held_title.is_none() && pump.title.is_none(), "the frame died with generation 1");
+                    assert_eq!(row_title(&paths, SID), (None, None));
+                });
+            }
+
+            /// §T3 C5, M-T55 (wave 1's fix round): tripwires that do not load (a bad line in `<root>/tripwires.txt`)
+            /// mean no title in this process, loaded at its first title whatever it is: the view's (the snapshot's,
+            /// shown by a trigger whose own tripwires loaded at its start) never reaches the row, a frame neither; the
+            /// link hears none.
+            #[test]
+            fn a_process_whose_tripwires_did_not_load_takes_no_title() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    std::fs::create_dir_all(d.path().join("bridge")).unwrap();
+                    std::fs::write(d.path().join("bridge").join("tripwires.txt"), "swordfish\n(hunter2\n").unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    hand.borrow_mut().snap.view_title = Some((SID.to_string(), titled("Harbour-s12 from the view", TitleSource::Ai)));
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    assert_eq!(row_title(&paths, SID), (None, None), "the row's first write: the view's title is the first, and no rule loaded");
+                    far.line(&title_line("Harbour-s12 live", SID)).await;
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(row_title(&paths, SID), (None, None), "no title while the tripwires do not load");
+                    let pump = close(&host, &mut far, task).await;
+                    assert!(matches!(pump.title_rules, Some(None)), "loaded once, and off");
+                    assert!(hand.borrow().titles.is_empty(), "the link heard none");
+                    assert_eq!(row_title(&paths, SID), (None, None));
+                });
+            }
+
+            /// §T3 P5 as amended in phase 4, M-T59: an answer to the host's `generate_session_title` names the chat it
+            /// was asked for. Asked under SID and answered after a `/clear` (an init naming NEW): neither row takes it
+            /// (Cursor drops it too, by its `titleEpoch`). A fresh chat's request asked before its first init (Cursor
+            /// asks right after the first prompt; the init comes with the turn) is the first session's: SID takes it.
+            #[test]
+            fn a_generated_title_names_only_the_chat_it_was_asked_for() {
+                const NEW: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    let request = title_request("g1", "prompt");
+                    host.send(&request).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(request.as_str()));
+                    far.line(&init_frame(NEW)).await;
+                    host.wait_for("the new session's init", |v| v["subtype"] == "init" && v["session_id"] == NEW).await;
+                    far.line(&answer("g1", r#"{"title":"Harbour-s12 the old chat's"}"#)).await;
+                    host.wait_for("the late answer", |v| v["response"]["request_id"] == "g1").await;
+                    assert_eq!((row_title(&paths, SID), row_title(&paths, NEW)), ((None, None), (None, None)), "a stale answer names neither chat");
+                    close(&host, &mut far, task).await;
+                    assert_eq!((row_title(&paths, SID), row_title(&paths, NEW)), ((None, None), (None, None)));
+                });
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    host.send(INIT).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(INIT));
+                    far.line(&answer("i1", r#"{"pid":4242}"#)).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some(), "the first prompt");
+                    let request = title_request("g1", "prompt");
+                    host.send(&request).await;
+                    assert_eq!(far.next_input().await.as_deref(), Some(request.as_str()), "asked before any init");
+                    far.line(&init_frame(SID)).await;
+                    far.line(&answer("g1", r#"{"title":"Harbour-s12 generated"}"#)).await;
+                    host.wait_for("the answer", |v| v["response"]["request_id"] == "g1").await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 generated", "ai"), "the first session adopted takes it");
+                    close(&host, &mut far, task).await;
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 generated", "ai"));
+                });
+            }
+
+            /// §T3 P2 and LD-T1 as amended in phase 4, M-T60: a moved generation gets no init until the next turn, so
+            /// its CLI's echo of the host's own rename (here the line that started the move) comes before one. It is a
+            /// live rename, applied at once (the link told `startup` false, so its ensure takes the place of a rename
+            /// carried over the move, L2 and L3, which the link answers a startup with), and it empties the held slot:
+            /// the moved CLI's startup frame, its transcript's older name, is never applied. The row says the host's
+            /// name before any init; nothing more is applied at the next turn's init or at the close.
+            #[test]
+            fn a_moved_generations_echo_of_the_hosts_rename_is_live() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.vm = Some("microvm-1".into());
+                    // What the link answers a startup: a rename carried over the move, still due (L1, L2).
+                    hand.borrow_mut().view_rename = Some("Harbour-s12 carried".into());
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut gen1 = far(&hand).await;
+                    gen1.started().await;
+                    handshake(&host, &mut gen1, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(gen1.next_input().await.is_some());
+                    gen1.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    gen1.send(gone("microvm-1")).await;
+                    host.wait_for("the note", |v| v["subtype"] == "informational").await;
+                    // Cursor's rename (its own line went into the view first): the host's next line starts the move.
+                    let rename = format!(r#"{{"type":"control_request","request_id":"r1","request":{{"subtype":"rename_session","title":"Harbour-s12 picked","source":"host","session_id":"{SID}"}}}}"#);
+                    host.send(&rename).await;
+                    let mut gen2 = far(&hand).await;
+                    moved_to(&hand, "microvm-2", MoveKind::Readdress, "none");
+                    gen2.started().await;
+                    let init2: Value = serde_json::from_str(&gen2.next_input().await.expect("the replayed initialize")).unwrap();
+                    assert_eq!(init2["request"]["subtype"], "initialize");
+                    assert_eq!(gen2.next_input().await.as_deref(), Some(rename.as_str()), "the rename, after the replay");
+                    gen2.line(&answer(init2["request_id"].as_str().unwrap(), r#"{"pid":4343}"#)).await;
+                    gen2.line(&title_line("Harbour-s12 older", SID)).await;
+                    gen2.line(&title_line("Harbour-s12 picked", SID)).await;
+                    gen2.line(&answer("r1", "{}")).await;
+                    host.wait_for("the rename's answer", |v| v["response"]["request_id"] == "r1").await;
+                    assert_eq!(hand.borrow().titles, [(SID.to_string(), "Harbour-s12 picked".to_string(), false)], "the echo, live, before any init; the startup frame held");
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 picked", "custom"));
+                    host.send(&user(2)).await;
+                    assert!(gen2.next_input().await.is_some(), "the next turn's line");
+                    for line in [init_frame(SID), echo(2), result_for(2)] {
+                        gen2.line(&line).await;
+                    }
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    let pump = close(&host, &mut gen2, task).await;
+                    assert!(pump.held_title.is_none(), "the echo emptied the held slot");
+                    assert_eq!(hand.borrow().titles.len(), 1, "nothing applied at the init or at the close");
+                    assert_eq!(row_title(&paths, SID), named("Harbour-s12 picked", "custom"));
+                });
+            }
         }
     }
 }

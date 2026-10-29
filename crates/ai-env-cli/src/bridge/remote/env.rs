@@ -10,6 +10,12 @@
 //! a value), so a credential-shaped name in `env_extra` never travels by
 //! accident. The proxy variables come at P4 (`agent::exec::spawn_env`, from
 //! the VM's row), ahead of these: the rules refuse their names here.
+//!
+//! S12 (R2): the default `[wrapper].env_forward` also carries the extension's
+//! `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` and `CLAUDE_CODE_SDK_READS_SESSION_STATE`
+//! (an explicit list keeps its own); a name of [`HOST_REFRESH_NAMES`] in
+//! either list refuses the session (R2-3: exit 9), since the wrapper answers
+//! a remote CLI's credential refreshes itself, with no token.
 use crate::bridge::agent::exec::{is_env_name, is_proxy_name, refused_name, PROXY_VARS};
 use crate::bridge::config::BridgeConfig;
 use crate::wire::frame::ENV_MAX_ENTRIES;
@@ -34,6 +40,13 @@ const DEBUG_NAME: &str = "DEBUG";
 /// picker reads, so a session never forwards it.
 pub const PROJECT_DIR_NAME: &str = "CLAUDE_CODE_PROJECT_DIR_NAME";
 
+/// S12 (R2): the names that tell the CLI its host refreshes its credentials: `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`
+/// (the extension's SDK sets it only for a host that passes a `getOAuthToken` callback) and
+/// `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH` (`getHostAuthToken`). A remote session never carries either: the wrapper
+/// answers a remote CLI's `oauth_token_refresh` and `host_auth_token_refresh` itself, with no token
+/// (pump.rs:2166-2178), and Tier B, which would answer them, is not built. Refused in `[wrapper]`, any case.
+pub const HOST_REFRESH_NAMES: [&str; 2] = ["CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"];
+
 /// The session's environment before the proxy variables (L4), from
 /// `ext_env` (Cursor's: the wrapper's own environment): each name of
 /// `[wrapper].env_forward`, then `env_extra`, once, when present and valid
@@ -43,8 +56,11 @@ pub const PROJECT_DIR_NAME: &str = "CLAUDE_CODE_PROJECT_DIR_NAME";
 /// not a variable name or that `vm exec --env` refuses (`AWS_*`, a TOKEN,
 /// KEY, SECRET or PASSWORD name, `CLAUDECODE`, `NODE_OPTIONS`, the shim's
 /// `HOME`, `PATH` and `CLAUDE_CONFIG_DIR`, a proxy variable), or
-/// [`PROJECT_DIR_NAME`], or more variables than a spawn takes beside the six
-/// proxy ones; it never holds a value.
+/// [`PROJECT_DIR_NAME`], or (S12, R2-3) a name of [`HOST_REFRESH_NAMES`] in
+/// any case, or more variables than a spawn takes beside the six proxy ones;
+/// it never holds a value. The refresh names' refusal puts its reason in
+/// parentheses right after the name, so the line's scrub (`remote::part`:
+/// a key-shaped name followed by `:` masks the rest) keeps it whole.
 pub fn session_env(cfg: &BridgeConfig, ext_env: &dyn Fn(&str) -> Option<OsString>) -> Result<BTreeMap<String, String>, String> {
     let w = &cfg.wrapper;
     let mut env = BTreeMap::new();
@@ -61,6 +77,9 @@ pub fn session_env(cfg: &BridgeConfig, ext_env: &dyn Fn(&str) -> Option<OsString
         }
         if name == PROJECT_DIR_NAME {
             return Err(format!("[wrapper].{key} names {name}: a remote session keeps its transcript under the workspace's own project, where the mirror and the picker read it; remove it from bridge.toml"));
+        }
+        if HOST_REFRESH_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return Err(format!("[wrapper].{key} names {name} (the wrapper answers a remote CLI's refreshes with no token); remove it from bridge.toml"));
         }
         if w.strip_debug && name.eq_ignore_ascii_case(DEBUG_NAME) {
             tracing::info!("[wrapper].{key} names {name}: kept from the VM (strip_debug)");
@@ -99,7 +118,9 @@ mod tests {
 
     /// L4 with the defaults: the allowlisted names Cursor set, nothing else
     /// of its environment (a token, an AWS key, its own HOME and PATH), and
-    /// the wrapper's six names, which win over a forwarded value.
+    /// the wrapper's six names, which win over a forwarded value. S12 (R2-1):
+    /// the extension's two names cross with Cursor's values; neither refresh
+    /// name does (R2-4: no list configures them).
     #[test]
     fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
         let token = format!("{}-{}-{}", "sk", "ant", "x".repeat(40));
@@ -107,6 +128,10 @@ mod tests {
             ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode"),
             ("LANG", "en_US.UTF-8"),
             ("TERM", "xterm-256color"),
+            ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
+            ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+            ("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1"),
+            ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "1"),
             ("CLAUDE_CODE_OAUTH_TOKEN", &token),
             ("AWS_SECRET_ACCESS_KEY", "s"),
             ("HOME", "/Users/mike"),
@@ -119,6 +144,8 @@ mod tests {
             ("CLAUDE_CODE_ENTRYPOINT", "claude-vscode"),
             ("LANG", "en_US.UTF-8"),
             ("TERM", "xterm-256color"),
+            ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
+            ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
             ("DISABLE_AUTOUPDATER", "1"),
             ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
             ("CLAUDE_CODE_DISABLE_ARTIFACT", "1"),
@@ -172,6 +199,32 @@ mod tests {
         }
         let e = session_env(&cfg("[wrapper]\nenv_extra = [\"BAD-NAME\"]\n"), &|_| None).unwrap_err();
         assert!(e.starts_with("[wrapper].env_extra holds \"BAD-NAME\": not a variable name"), "{e}");
+    }
+
+    /// S12 (R2-3): a refresh name ([`HOST_REFRESH_NAMES`], the two in that
+    /// order) in `env_forward` (beside `LANG`) or in `env_extra`, as given or
+    /// lowercased, is the session's refusal: exactly the frozen text with that
+    /// key and that spelling, no value of Cursor's, within `PART_MAX` (so the
+    /// fix survives the line's cut), and a text the line's scrub leaves as it
+    /// is (its reason in parentheses after the name: a `:` there would mask the
+    /// rest, §R0 item 12). `vm exec --env` does not learn them (R2-5).
+    #[test]
+    fn a_host_refresh_name_is_refused_in_env_forward_and_env_extra() {
+        assert_eq!(HOST_REFRESH_NAMES, ["CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"]);
+        let value = format!("{}-{}", "refresh", "Zq9".repeat(8));
+        let ext = |_: &str| Some(OsString::from(value.clone()));
+        for name in HOST_REFRESH_NAMES {
+            assert_eq!(refused_name(name), None, "{name}: vm exec --env is unchanged");
+            for spelled in [name.to_string(), name.to_ascii_lowercase()] {
+                for (key, toml) in [("env_forward", format!("[wrapper]\nenv_forward = [\"LANG\", \"{spelled}\"]\n")), ("env_extra", format!("[wrapper]\nenv_extra = [\"{spelled}\"]\n"))] {
+                    let e = session_env(&cfg(&toml), &ext).unwrap_err();
+                    assert_eq!(e, format!("[wrapper].{key} names {spelled} (the wrapper answers a remote CLI's refreshes with no token); remove it from bridge.toml"));
+                    assert!(!e.contains(&value), "no value of Cursor's: {e}");
+                    assert!(e.chars().count() <= crate::bridge::remote::PART_MAX, "{} characters: {e}", e.chars().count());
+                    assert_eq!(crate::wire::redact::scrub(&e), e, "the scrub keeps it whole");
+                }
+            }
+        }
     }
 
     /// P4 on a vpc VM (`agent::exec::spawn_env`): the six proxy variables

@@ -481,7 +481,9 @@ async fn readonly_get_unknown_microvm_is_vm_not_found_exit_8() {
 //
 // Each test runs in a temp bridge root holding COPIES of the real bridge.toml,
 // credentials/aws.env (ciphertext) and state/infra.toml, so every row it writes
-// stays there; the keystore is the real one (read-only). The runtime key is
+// stays there, but for the cost rows its `Live` guard keeps under the real
+// root's state/test-runs (S12 C1: the audit rows naming a VM and the stripped
+// VM rows); the keystore is the real one (read-only). The runtime key is
 // unsealed once per test process (one Touch ID). `VmGuard` terminates exactly
 // the VMs a test started (and a pending row's VM it can adopt); any other VM
 // of the image is never touched.
@@ -496,6 +498,9 @@ struct Live {
     paths: Paths,
     cfg: BridgeConfig,
     creds: RuntimeCreds,
+    /// S12 (C1): the real root this test's cost rows are kept in when it drops (`live_world`'s);
+    /// `None` offline.
+    keep: Option<Paths>,
 }
 
 fn live_world() -> Live {
@@ -519,7 +524,222 @@ fn live_world() -> Live {
             ai_env_cli::bridge::vm::client::runtime_credentials(&store, &paths, &cfg).unwrap_or_else(|e| panic!("runtime credentials: {e}"))
         })
         .clone();
-    Live { _dir: dir, paths, cfg, creds }
+    Live { _dir: dir, paths, cfg, creds, keep: Some(real) }
+}
+
+/// S12 (C1): after every guard (each is bound after `live`), keep the test's audit rows naming
+/// a VM and its stripped VM rows under the real root (`testruns::archive`), whatever the test's
+/// outcome; no Touch ID, no AWS call; never panics.
+///
+/// `ai-env cost` reads them back from `state/test-runs`, labelled with the test (plans/s12-contracts.md
+/// §C1.6). Every guard borrows or clones from `live`, so it drops first: the terminate rows and each
+/// row's `terminated_at` are in by now, and `Drop::drop` runs before the fields' drops, so the test's
+/// temporary root still exists. A passed, failed or interrupted (`CRED_SIGNAL`) test keeps its rows
+/// alike (LD-C13); a process killed outright keeps none. The test is the thread's name (libtest's).
+/// A test that ran no VM prints nothing (LD-C11); the lines go through `writeln!`, which a closed
+/// terminal cannot turn into a second panic.
+impl Drop for Live {
+    fn drop(&mut self) {
+        let Some(real) = self.keep.take() else { return };
+        let test = std::thread::current().name().unwrap_or("unnamed").to_string();
+        match ai_env_cli::bridge::testruns::archive(&self.paths, &real, &test, ai_env_cli::wire::time::unix_now()) {
+            Ok(Some(dir)) => {
+                let _ = writeln!(std::io::stderr(), "guard: kept the test's cost rows in {}", dir.display());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "guard: could not keep the test's cost rows: {}; ai-env cost leaves its VMs out", no_account(&e.to_string()));
+            }
+        }
+    }
+}
+
+/// S12 (C1, offline): a `Live` over a temporary test root, `keep` a second temporary root, dropped:
+/// one run named for this test and this process, its audit the three rows naming the VM as stored (no
+/// `proxy_stop`), its files private, its VM row holding none of the values the VM row planted (the
+/// stripped row's allowlist), its audit only the rows' own ids of them (`vm_run`'s client token, which
+/// `vm run` writes, and the delivery's seal tag: ids, under the audit's custody rule), and the test
+/// root gone; a `Live` with `keep: None` keeps nothing (M-C1).
+#[test]
+fn dropping_a_live_keeps_its_stripped_cost_rows_in_its_keep_root() {
+    use ai_env_cli::bridge::testruns::parse_run_name;
+    use ai_env_cli::bridge::vm::registry::{write_row, IdleRow, RowStatus, VmRow};
+    use std::os::unix::fs::PermissionsExt as _;
+    const TEST: &str = "dropping_a_live_keeps_its_stripped_cost_rows_in_its_keep_root";
+    const X: &str = "microvm-0d570000-0000-4000-8000-00000000000d";
+    // What the VM row plants, each made at run time: none may reach the run's VM row.
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let token = format!("{}{nonce}", "9f".repeat(16));
+    let commit = format!("{}{nonce}", "8e".repeat(16));
+    let client_token = uuid::Uuid::now_v7().to_string();
+    let (owner, endpoint, tag) = (format!("owner-{nonce}@host"), format!("{nonce}.lambda-microvm.eu-central-1.on.aws"), format!("tag-{nonce}"));
+    // The test root's audit as a live test writes it: `vm_run` with the row's own client token, the delivery of its seal.
+    let line = |at: &str, event: &str, detail: serde_json::Value| serde_json::json!({ "v": 2, "ts": at, "event": event, "session_id": null, "pid": 4242, "detail": detail }).to_string();
+    let lines = [
+        line("2026-10-25T09:00:00Z", "vm_run", serde_json::json!({ "actor": "cli", "id": X, "purpose": "test", "image_version": "13.0", "egress": "internet", "shell": "false", "client_token": client_token })),
+        line("2026-10-25T09:00:05Z", "proxy_stop", serde_json::json!({ "actor": "cli", "instance": "i-0test", "vpc_vms": "0" })),
+        line("2026-10-25T09:00:30Z", "credential_deliver", serde_json::json!({ "actor": "cli", "id": X, "name": "CLAUDE_CODE_OAUTH_TOKEN", "tag": tag, "source": "combined", "deliver": "fd" })),
+        line("2026-10-25T09:10:00Z", "vm_terminate", serde_json::json!({ "actor": "cli", "id": X, "by": "test" })),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let test_root = dir.path().to_path_buf();
+    let paths = Paths::from_root_and_env(test_root.clone(), None);
+    std::fs::write(paths.audit(), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let row = VmRow {
+        v: 1,
+        status: RowStatus::Terminated,
+        id: X.into(),
+        client_token: client_token.clone(),
+        owner: owner.clone(),
+        endpoint: Some(endpoint.clone()),
+        commit: commit.clone(),
+        session_token: Some(token.clone()),
+        credential_tag: Some(tag.clone()),
+        started_at: Some(1_792_918_800),
+        wall_deadline: Some(1_792_919_700),
+        max_duration_s: 900,
+        idle: Some(IdleRow { max_idle_s: 300, suspended_s: 900, auto_resume: true }),
+        terminated_at: Some(1_792_919_400),
+        terminated_by: Some("test".into()),
+        ..VmRow::default()
+    };
+    write_row(&paths, &row).unwrap();
+    let keep = tempfile::tempdir().unwrap();
+    let real = Paths::from_root_and_env(keep.path().to_path_buf(), None);
+    drop(Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds(), keep: Some(real.clone()) });
+    let runs: Vec<String> = std::fs::read_dir(real.test_runs()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let name = &runs[0];
+    assert_eq!(parse_run_name(name).as_deref(), Some(TEST), "{name}: the thread's name, libtest's");
+    assert!(name.ends_with(&format!("-{}", std::process::id())), "{name}: this process's pid, no .<k>");
+    let run = real.test_runs().join(name);
+    let audit = std::fs::read_to_string(run.join("audit.jsonl")).unwrap();
+    assert_eq!(audit, format!("{}\n{}\n{}\n", lines[0], lines[2], lines[3]), "the three rows naming X, as stored");
+    let vm_row = run.join("state/vms").join(format!("{X}.toml"));
+    for (path, mode) in [(real.test_runs(), 0o700), (run.clone(), 0o700), (run.join("state"), 0o700), (run.join("state/vms"), 0o700), (run.join("audit.jsonl"), 0o600), (vm_row.clone(), 0o600)] {
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777, mode, "{}", path.display());
+    }
+    let mut files = vec![run.join("audit.jsonl")];
+    files.extend(std::fs::read_dir(run.join("state/vms")).unwrap().flatten().map(|e| e.path()));
+    assert_eq!(files.len(), 2, "the audit and X's row alone: {files:?}");
+    let kept = std::fs::read_to_string(&vm_row).unwrap();
+    for planted in [&token, &commit, &client_token, &owner, &endpoint, &tag] {
+        assert!(!kept.contains(planted.as_str()), "{}: a planted value", vm_row.display());
+    }
+    assert!(!kept.contains("session_token"), "{kept}");
+    // The audit's rows as stored: the client token and the seal tag are their ids; nothing else the row planted.
+    for planted in [&token, &commit, &owner, &endpoint] {
+        assert!(!audit.contains(planted.as_str()), "the audit: a planted value");
+    }
+    assert!(audit.contains(&format!("\"client_token\":\"{client_token}\"")) && audit.contains(&format!("\"tag\":\"{tag}\"")), "{audit}");
+    assert!(kept.contains("terminated_by = \"test\"") && kept.contains("terminated_at = 1792919400"), "{kept}");
+    assert!(!test_root.exists(), "the test root went with the Live");
+    // keep: None (every Live but live_world's): nothing kept, anywhere.
+    let other = tempfile::tempdir().unwrap();
+    let other_root = other.path().to_path_buf();
+    let other_paths = Paths::from_root_and_env(other_root.clone(), None);
+    std::fs::write(other_paths.audit(), format!("{}\n", lines[0])).unwrap();
+    write_row(&other_paths, &row).unwrap();
+    drop(Live { _dir: other, paths: other_paths, cfg: BridgeConfig::default(), creds: test_creds(), keep: None });
+    assert!(!other_root.exists());
+    assert_eq!(std::fs::read_dir(real.test_runs()).unwrap().count(), 1, "still the one run");
+}
+
+/// S12 I2 (plans/s12-contracts.md §10.1; C §C8.1 item 4, §C1.4, §C5 item 1; T §T4 items 1 to 3): a live test's
+/// archive holds no title. A `Live` over a temporary test root holding what a live test whose chat was named leaves
+/// there: the chat's closed row with its name (`custom`, as the pump writes it), its view (its marked `ai-title`
+/// line holding the generated name, then Cursor's `custom-title` line and ai-env's), its VM's row, and the audit
+/// rows its wrapper and commands wrote, six naming the VM (`vm_run`, `session_remote_start`, `transcript_view`,
+/// `session_remote_end`, `vm_suspend`, `vm_terminate`) and two naming none (`transcript_stage`, `proxy_stop`); no
+/// audit row holds a name (T: no audit key does). Dropped with a keep root, it keeps one run named for this test:
+/// its audit the six rows naming the VM as stored, its VM row stripped, nothing else, and no file of the run holds
+/// any of the three names.
+#[test]
+fn i2_a_live_tests_archive_holds_no_title() {
+    use ai_env_cli::bridge::registry::{self as sessions, SessionRow};
+    use ai_env_cli::bridge::testruns::parse_run_name;
+    use ai_env_cli::bridge::title::{custom_title_line, set_row, SessionTitle, TitleSource};
+    use ai_env_cli::bridge::vm::registry::{write_row, IdleRow, RowStatus, VmRow};
+    const TEST: &str = "i2_a_live_tests_archive_holds_no_title";
+    const X: &str = "microvm-0d570000-0000-4000-8000-0000000012a2";
+    const SID: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f12a2";
+    const SLUG: &str = "-Users-mike-live-s12-work";
+    // The chat's names: ai-env's (the row's, a rename), Cursor's, and the generated one.
+    const NAMES: [&str; 3] = ["live-s12 named", "live-s12 named in Cursor", "live-s12 generated name"];
+    /// The regular files under `dir`, relative to it, sorted.
+    fn files_of(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => dirs.push(e.path()),
+                    Ok(t) if t.is_file() => out.push(e.path().strip_prefix(dir).unwrap().display().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    let line = |at: &str, event: &str, session: Option<&str>, detail: serde_json::Value| serde_json::json!({ "v": 2, "ts": at, "event": event, "session_id": session, "pid": 4242, "detail": detail }).to_string();
+    let lines = [
+        line("2026-10-25T09:00:00Z", "vm_run", None, serde_json::json!({ "actor": "wrapper", "id": X, "purpose": "session", "image_version": "13.0", "egress": "internet", "shell": "false", "client_token": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f12a3" })),
+        line("2026-10-25T09:00:20Z", "session_remote_start", Some(SID), serde_json::json!({ "actor": "wrapper", "id": X, "spawn": "s-1", "gen": "1", "why": "first" })),
+        line("2026-10-25T09:01:00Z", "transcript_view", Some(SID), serde_json::json!({ "actor": "wrapper", "session": SID, "vm": X, "messages": "2", "masked": "0", "bytes": "640", "outcome": "written" })),
+        line("2026-10-25T09:01:05Z", "transcript_stage", Some(SID), serde_json::json!({ "actor": "cli", "session": SID, "bytes": "640", "parts": "1", "outcome": "staged", "ms": "80" })),
+        line("2026-10-25T09:02:00Z", "proxy_stop", None, serde_json::json!({ "actor": "cli", "instance": "i-0test", "vpc_vms": "0" })),
+        line("2026-10-25T09:03:00Z", "session_remote_end", Some(SID), serde_json::json!({ "actor": "wrapper", "vm": X, "spawn": "s-1", "gen": "1", "exit": "0", "end": "eof", "close_ms": "420", "last_acked_seq": "12" })),
+        line("2026-10-25T09:03:01Z", "vm_suspend", None, serde_json::json!({ "actor": "wrapper", "id": X, "by": "close", "outcome": "fired", "ms": "310" })),
+        line("2026-10-25T09:10:00Z", "vm_terminate", None, serde_json::json!({ "actor": "cli", "id": X, "by": "test" })),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let test_root = dir.path().to_path_buf();
+    let paths = Paths::from_root_and_env(test_root.clone(), None);
+    std::fs::write(paths.audit(), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let row = VmRow {
+        v: 1,
+        status: RowStatus::Terminated,
+        id: X.into(),
+        started_at: Some(1_792_918_800),
+        wall_deadline: Some(1_792_919_700),
+        max_duration_s: 900,
+        idle: Some(IdleRow { max_idle_s: 300, suspended_s: 900, auto_resume: true }),
+        terminated_at: Some(1_792_919_400),
+        terminated_by: Some("test".into()),
+        ..VmRow::default()
+    };
+    write_row(&paths, &row).unwrap();
+    // The chat's closed row, named as the pump names it, and its view, as the live chat left them in the test's root.
+    let mut session = SessionRow { session_id: SID.into(), mode: "remote".into(), status: "closed".into(), microvm_id: Some(X.into()), ..SessionRow::default() };
+    set_row(&mut session, Some(&SessionTitle { text: NAMES[0].into(), source: TitleSource::Custom }));
+    sessions::write(&paths, &session).unwrap();
+    let view = test_root.join("projects").join(SLUG).join(format!("{SID}.jsonl"));
+    std::fs::create_dir_all(view.parent().unwrap()).unwrap();
+    let mut bytes = format!("{{\"aiEnvView\":1,\"type\":\"ai-title\",\"aiTitle\":\"{}\",\"sessionId\":\"{SID}\"}}\n", NAMES[2]).into_bytes();
+    bytes.extend_from_slice(format!("{{\"type\":\"custom-title\",\"sessionId\":\"{SID}\",\"customTitle\":\"{}\"}}\n", NAMES[1]).as_bytes());
+    bytes.extend_from_slice(&custom_title_line(SID, NAMES[0]));
+    std::fs::write(&view, &bytes).unwrap();
+    let held: Vec<String> = files_of(&test_root).into_iter().filter(|f| NAMES.iter().any(|n| std::fs::read_to_string(test_root.join(f)).unwrap_or_default().contains(n))).collect();
+    assert_eq!(held, [format!("projects/{SLUG}/{SID}.jsonl"), format!("state/sessions/{SID}.toml")], "the names in the test root: the view and the row alone");
+    let keep = tempfile::tempdir().unwrap();
+    let real = Paths::from_root_and_env(keep.path().to_path_buf(), None);
+    drop(Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds(), keep: Some(real.clone()) });
+    let runs: Vec<String> = std::fs::read_dir(real.test_runs()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(runs.len(), 1, "one run kept: {runs:?}");
+    assert_eq!(parse_run_name(&runs[0]).as_deref(), Some(TEST), "{}: the thread's name, libtest's", runs[0]);
+    let run = real.test_runs().join(&runs[0]);
+    assert_eq!(files_of(&run), ["audit.jsonl".to_string(), format!("state/vms/{X}.toml")], "the run's audit and the VM's row, nothing else");
+    let audit = std::fs::read_to_string(run.join("audit.jsonl")).unwrap();
+    let naming_x: String = [0, 1, 2, 5, 6, 7].iter().map(|i| format!("{}\n", lines[*i])).collect();
+    assert_eq!(audit, naming_x, "the six rows naming the VM, as stored");
+    for file in files_of(&run) {
+        let text = std::fs::read_to_string(run.join(&file)).unwrap();
+        for name in NAMES {
+            assert!(!text.contains(name), "{file} of the run holds {name:?}");
+        }
+    }
+    assert!(!test_root.exists(), "the test root went with the Live");
 }
 
 /// Terminates, on drop, every VM a test registered (on its own runtime and thread).
@@ -3359,7 +3579,7 @@ fn wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed() {
     const TEST: &str = "wait_for_sync_takes_only_a_part_of_the_vm_past_what_was_committed";
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::from_root_and_env(dir.path().to_path_buf(), None);
-    let live = Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds() };
+    let live = Live { _dir: dir, paths, cfg: BridgeConfig::default(), creds: test_creds(), keep: None };
     let sid = uuid::Uuid::now_v7().to_string();
     let target = ai_env_cli::bridge::s3::S3Target { bucket: "ai-env-transcripts-123456789012".into(), owner: "123456789012".into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Aws };
     let part = |key: S3Key, version: &str, from: u64, len: u64| ManifestPart { key: key.render(), version_id: version.into(), from, len, sha256: "0".repeat(64), encoding: None, stored_len: None, stored_sha256: None };
@@ -3456,7 +3676,9 @@ fn s3_target(live: &Live) -> ai_env_cli::bridge::s3::S3Target {
 /// Made before [`SessionVms`]: it runs once the chats closed and their VMs
 /// ended, so a tail a VM's `/terminate` pushed is purged with the rest.
 /// Interrupted, or when the purge fails, the prefixes to delete by hand are
-/// printed.
+/// printed. S12 (P): the purge is [`PurgeTranscripts::run`], which a test may
+/// call (and time) before the drop; once it purged, the drop finds no session
+/// left (the purge removed `state/transcripts/<sid>/`), so no second Touch ID.
 struct PurgeTranscripts<'a>(&'a Live);
 
 /// The sessions [`PurgeTranscripts`] purges, sorted, each once: those the
@@ -3477,25 +3699,36 @@ fn purge_args(sessions: &[String]) -> Option<Vec<String>> {
     (!sessions.is_empty()).then(|| ["session", "forget"].iter().map(|w| (*w).to_string()).chain(sessions.iter().cloned()).chain(std::iter::once("--purge".to_string())).collect())
 }
 
-impl Drop for PurgeTranscripts<'_> {
-    fn drop(&mut self) {
+impl PurgeTranscripts<'_> {
+    /// The purge the guard's drop runs, callable before it (S12, P: a test may
+    /// time it): `None` when no session needs one (no command, no Touch ID);
+    /// `Some(Ok(<line>))` for `guard: purged the transcripts of <sid>, …`;
+    /// `Some(Err(<line>))` for the guard's three other lines (interrupted,
+    /// exited, did not finish). Never panics.
+    fn run(&self) -> Option<Result<String, String>> {
         let live = self.0;
         let sessions = purged_sessions(&live.paths);
-        let Some(args) = purge_args(&sessions) else { return };
+        let args = purge_args(&sessions)?;
         let by_hand = format!("the objects under v1/<sid>/ in the transcripts bucket are left for each of {}: delete them by hand", sessions.join(", "));
-        let said = if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
-            format!("guard: interrupted, session forget --purge not run: {by_hand}")
-        } else {
-            announce_touch_id("guard", &format!("session forget --purge of {} session(s): their S3 objects", sessions.len()));
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            // A panic of the command's runner (stopped past its limit) is caught: a drop never panics.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(live, &args))) {
-                Ok(out) if out.status.success() => format!("guard: purged the transcripts of {}", sessions.join(", ")),
-                Ok(out) => format!("guard: session forget --purge exited {:?}: {by_hand}", out.status.code()),
-                Err(_) => format!("guard: session forget --purge did not finish: {by_hand}"),
-            }
-        };
-        let _ = writeln!(std::io::stderr(), "{said}");
+        if CRED_SIGNAL.load(Ordering::SeqCst) != 0 {
+            return Some(Err(format!("guard: interrupted, session forget --purge not run: {by_hand}")));
+        }
+        announce_touch_id("guard", &format!("session forget --purge of {} session(s): their S3 objects", sessions.len()));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        // A panic of the command's runner (stopped past its limit) is caught: a drop never panics.
+        Some(match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ai_env_live(live, &args))) {
+            Ok(out) if out.status.success() => Ok(format!("guard: purged the transcripts of {}", sessions.join(", "))),
+            Ok(out) => Err(format!("guard: session forget --purge exited {:?}: {by_hand}", out.status.code())),
+            Err(_) => Err(format!("guard: session forget --purge did not finish: {by_hand}")),
+        })
+    }
+}
+
+impl Drop for PurgeTranscripts<'_> {
+    fn drop(&mut self) {
+        if let Some(said) = self.run() {
+            let _ = writeln!(std::io::stderr(), "{}", said.unwrap_or_else(|e| e));
+        }
     }
 }
 
@@ -5962,4 +6195,360 @@ fn live_s11_fork_first_write() {
     assert!(own_user >= 1 && own_assistant >= 1, "{TEST}: F's file holds F's own turn: {own_user} user and {own_assistant} assistant line(s) none of X's");
     let (a, b) = (x.output(), f.output());
     sweep_live(&live, &[&a, &b, &exec], &[]);
+}
+
+// ---- S12: live (part B's B1; `make test-aws S12=1`: AI_ENV_S12_TESTS=1) ------------------------
+//
+// S12's live tests, each in a temporary root of its own (`live_world` or a
+// world built on it), no wall and no migration inside a test. Part P:
+// DeleteObjects with its body's SHA-256 checksum, and the raw forms S3
+// refuses or takes, recorded (`live_s12_delete_objects_takes_a_sha256_checksum`);
+// a purge of 6000 objects within the command's limit
+// (`live_s12_purge_of_6000_objects_within_the_command_limit`). Part T: a title
+// round trip on a live VM (`live_s12_a_title_round_trips_on_a_live_vm`, wave 2's
+// L). Each Touch ID is announced (`announce_touch_id`); each test's count
+// includes the test process's runtime key, as when it runs alone.
+
+/// Whether S12's live tests run: [`live`], and AI_ENV_S12_TESTS=1 (`make test-aws S12=1`).
+fn s12_live() -> bool {
+    if !live() {
+        return false;
+    }
+    if std::env::var("AI_ENV_S12_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set AI_ENV_S12_TESTS=1 too (make test-aws S12=1) for S12's live tests");
+    false
+}
+
+// ---- S12 P: the batch purge ----------------------------------------------------------------------
+
+/// S12 (P): a DeleteObjects of the Mac to the transcripts bucket with its own
+/// runtime key (`POST /?delete`, the bucket itself), `headers` signed besides
+/// the owner's, `body` as given: S3's status and the first `<Code>` its answer
+/// names (an error document's, or a key's in a DeleteResult). Never the URL,
+/// as [`mac_s3`].
+async fn mac_delete_objects(api: &SdkMicrovmApi, target: &ai_env_cli::bridge::s3::S3Target, headers: Vec<(String, String)>, body: Vec<u8>) -> (u16, Option<String>) {
+    use ai_env_cli::bridge::s3::{presign, S3Method, S3Sign};
+    let req = presign::request(S3Method::Post, target, None, vec![("delete".to_string(), String::new())], headers, ai_env_cli::wire::s3::PRESIGN_EXPIRY);
+    let url = api.presign(&req).await.unwrap_or_else(|e| panic!("presign: {}", no_account(&e.to_string())));
+    let mut rb = tls::reqwest_client().unwrap().request(reqwest::Method::POST, url.expose());
+    for (name, value) in &req.headers {
+        rb = rb.header(name.as_str(), value.as_str());
+    }
+    // As `mac_s3`: never reqwest's Display or Debug of a send failure, which hold the presigned URL.
+    let resp = rb.body(body).send().await.unwrap_or_else(|e| panic!("the request to S3: {}", no_account(&scrub(&e.without_url().to_string()))));
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    (status, ai_env_cli::bridge::s3::client::error_code(&text))
+}
+
+/// What one of S3's answers says in S12 P's lines: `HTTP <status> (<code>)`, the parenthesis only with a code.
+fn s3_said((status, code): &(u16, Option<String>)) -> String {
+    code.as_ref().map_or_else(|| format!("HTTP {status}"), |c| format!("HTTP {status} ({})", no_account(&scrub(c))))
+}
+
+/// S12 (P, §P14.4, part B's B1): DeleteObjects with its body's SHA-256
+/// checksum, against the real bucket with the runtime key (no VM, no chat).
+/// Six objects are put under a fresh `v1/<sid>/mac/` (from outside the
+/// endpoint, which the bucket policy allows the Mac), then three raw
+/// DeleteObjects of the client's own body for the first three: (a) with no
+/// checksum header and (c) with the body's `x-amz-checksum-sha256` alone,
+/// recorded; (b) the SDK header beside the checksum of other bytes, asserted
+/// `HTTP 400 (BadDigest)` (S3 checks the pair). Then the client's own
+/// DeleteObjects names all six with no key refused, and the prefix lists
+/// empty: whatever S3 did with (a) and (c), the client's batch deleted at
+/// least the last three, live objects. The test made
+/// `state/transcripts/<sid>/`, so the guard purges what a failure leaves; it
+/// removes it at its end, so a pass costs one Touch ID (LD-P16): the test
+/// process's runtime key, when no earlier test of the process unsealed it.
+#[test]
+#[ignore = "live, S12 part P, DeleteObjects with its body's SHA-256 checksum, and the raw forms S3 refuses or takes, recorded (about a minute; one Touch ID: the test process's runtime key): AI_ENV_AWS_TESTS=1 AI_ENV_S12_TESTS=1 make test-aws S12=1"]
+fn live_s12_delete_objects_takes_a_sha256_checksum() {
+    const TEST: &str = "live_s12_delete_objects_takes_a_sha256_checksum";
+    use ai_env_cli::bridge::s3::client::{delete_document, Body, S3Client, Written};
+    use ai_env_cli::wire::s3::{sha256_b64, S3Key};
+    use sha2::Digest as _;
+    if !s12_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = live_world();
+    let _purge = PurgeTranscripts(&live);
+    let sid = uuid::Uuid::now_v7().to_string();
+    std::fs::create_dir_all(live.paths.transcript_dir(&sid)).unwrap();
+    let target = s3_target(&live);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = rt.block_on(connect(&live.creds));
+    let client = S3Client::new(&api, &target).unwrap_or_else(|e| panic!("{TEST}: the client: {}", no_account(&e.to_string())));
+    let mut keys = Vec::new();
+    for i in 0..6 {
+        let bytes = format!("{TEST} {sid} {i}\n").into_bytes();
+        let sha = hex::encode(sha2::Sha256::digest(&bytes));
+        let key = S3Key::Mac { session: sid.clone(), sha256: sha.clone() }.render();
+        let len = bytes.len() as u64;
+        let written = rt.block_on(client.put_object(&key, Body::Bytes(bytes), len, &sha, None)).unwrap_or_else(|e| panic!("{TEST}: put {key}: {}", no_account(&e.to_string())));
+        assert!(matches!(written, Written::Stored(_)), "{TEST}: {key}: {written:?}");
+        keys.push(key);
+    }
+    eprintln!("{TEST}: planted 6 objects under v1/{sid}/mac/");
+    // The raw forms name the first three alone, so the client's batch below deletes at least three live objects
+    // whatever S3 does with (a) and (c).
+    let body = delete_document(&keys[..3]).into_bytes();
+    let checksum = |bytes: &[u8]| sha256_b64(&hex::encode(sha2::Sha256::digest(bytes))).expect("a sha256's hex");
+    let (sdk, sum) = ("x-amz-sdk-checksum-algorithm".to_string(), "x-amz-checksum-sha256".to_string());
+    let none = rt.block_on(mac_delete_objects(&api, &target, Vec::new(), body.clone()));
+    eprintln!("{TEST}: no checksum: {}", s3_said(&none));
+    let wrong = rt.block_on(mac_delete_objects(&api, &target, vec![(sdk.clone(), "SHA256".into()), (sum.clone(), checksum(b"other bytes"))], body.clone()));
+    eprintln!("{TEST}: a wrong x-amz-checksum-sha256 beside x-amz-sdk-checksum-algorithm SHA256: {}", s3_said(&wrong));
+    let alone = rt.block_on(mac_delete_objects(&api, &target, vec![(sum, checksum(&body))], body));
+    eprintln!("{TEST}: x-amz-checksum-sha256 alone: {}", s3_said(&alone));
+    // (b) is judged once (c) is said too: when S3 refuses the form, B1 still records (a) and (c) (§11 B1 steps 4, 5).
+    assert_eq!(wrong, (400, Some("BadDigest".to_string())), "{TEST}: S3 checks the body's checksum");
+    let refused = rt.block_on(client.delete_batch(&keys)).unwrap_or_else(|e| panic!("{TEST}: the client's DeleteObjects: {}", no_account(&e.to_string())));
+    assert_eq!(refused, Vec::new(), "{TEST}: no key refused");
+    let listed = rt.block_on(client.list(&format!("v1/{sid}/"))).unwrap_or_else(|e| panic!("{TEST}: list: {}", no_account(&e.to_string())));
+    assert!(listed.is_empty(), "{TEST}: v1/{sid}/ still lists {} object(s)", listed.len());
+    eprintln!("{TEST}: the client's DeleteObjects (x-amz-sdk-checksum-algorithm SHA256, x-amz-checksum-sha256): no key refused; v1/{sid}/ lists empty");
+    // Nothing is left under the prefix: the guard has no session to purge.
+    std::fs::remove_dir_all(live.paths.transcript_dir(&sid)).unwrap();
+}
+
+/// S12 (P, §P14.5, part B's B1): a purge of 6000 objects within the
+/// command's limit (S11's B5 stopped at 300 s, one DeleteObject after
+/// another). 6000 distinct objects are put under a fresh `v1/<sid>/mac/`
+/// with the runtime key, 32 at a time (about $0.03 of PUTs), the time
+/// printed, each `Stored` or, a PUT sent again after its answer was lost,
+/// `Exists` (counted); then the guard's own purge (`session forget <sid>
+/// --purge`, one Touch ID) runs before the guard's drop, timed: it purges,
+/// within `CRED_COMMAND_LIMIT` (past it the runner stops the command and the
+/// purge says it did not finish), and the prefix lists empty. Two Touch IDs:
+/// the test process's runtime key (unless an earlier test of the process
+/// unsealed it), the purge.
+#[test]
+#[ignore = "live, S12 part P, a purge of 6000 objects within the command limit (about two minutes; two Touch IDs: the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S12_TESTS=1 make test-aws S12=1"]
+fn live_s12_purge_of_6000_objects_within_the_command_limit() {
+    const TEST: &str = "live_s12_purge_of_6000_objects_within_the_command_limit";
+    /// The objects planted: about S11's B5 chat (5933 subtree files and its transcript's keys).
+    const OBJECTS: usize = 6000;
+    /// The PUTs in flight at once while planting.
+    const PUTS_AT_ONCE: usize = 32;
+    use ai_env_cli::bridge::s3::client::{Body, S3Client, Written};
+    use ai_env_cli::wire::s3::S3Key;
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+    use sha2::Digest as _;
+    if !s12_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = live_world();
+    let purge = PurgeTranscripts(&live);
+    let sid = uuid::Uuid::now_v7().to_string();
+    std::fs::create_dir_all(live.paths.transcript_dir(&sid)).unwrap();
+    let target = s3_target(&live);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = rt.block_on(connect(&live.creds));
+    let client = S3Client::new(&api, &target).unwrap_or_else(|e| panic!("{TEST}: the client: {}", no_account(&e.to_string())));
+    let t = Instant::now();
+    let puts = (0..OBJECTS).map(|i| {
+        let bytes = format!("{TEST} {sid} {i}\n").into_bytes();
+        let sha = hex::encode(sha2::Sha256::digest(&bytes));
+        let (key, len, client) = (S3Key::Mac { session: sid.clone(), sha256: sha.clone() }.render(), bytes.len() as u64, &client);
+        async move { client.put_object(&key, Body::Bytes(bytes), len, &sha, None).await }
+    });
+    let written: Vec<Written> = rt.block_on(futures_util::stream::iter(puts).buffer_unordered(PUTS_AT_ONCE).try_collect()).unwrap_or_else(|e| panic!("{TEST}: a PUT: {}", no_account(&e.to_string())));
+    // `put_object` sends `If-None-Match: *` and sends a try that got no answer again: a PUT S3 stored whose answer was
+    // lost finds its own object at the retry, `Exists` (the key is its bytes' sha256, the sid fresh: the same object).
+    assert!(written.len() == OBJECTS && written.iter().all(|w| matches!(w, Written::Stored(_) | Written::Exists)), "{TEST}: every object stored");
+    let at_a_retry = written.iter().filter(|w| **w == Written::Exists).count();
+    eprintln!("{TEST}: planted {OBJECTS} objects under v1/{sid}/mac/ in {} ms ({at_a_retry} answered Exists at a retry)", t.elapsed().as_millis());
+    let t = Instant::now();
+    let said = purge.run();
+    let took = t.elapsed();
+    match said {
+        Some(Ok(line)) => eprintln!("{line}"),
+        other => panic!("{TEST}: the purge: {other:?}"),
+    }
+    assert!(took < CRED_COMMAND_LIMIT, "{TEST}: the purge took {} ms", took.as_millis());
+    let listed = rt.block_on(client.list(&format!("v1/{sid}/"))).unwrap_or_else(|e| panic!("{TEST}: list: {}", no_account(&e.to_string())));
+    assert!(listed.is_empty(), "{TEST}: v1/{sid}/ still lists {} object(s)", listed.len());
+    eprintln!("{TEST}: the purge of {OBJECTS} objects took {} ms (the command's limit {} s); v1/{sid}/ lists empty", took.as_millis(), CRED_COMMAND_LIMIT.as_secs());
+}
+
+// ---- S12 T: chat names ---------------------------------------------------------------------------
+
+/// S12 (T, L): the name `session`'s row holds now, and its source word; `(None, None)` without a row.
+fn row_title(live: &Live, session: &str) -> (Option<String>, Option<String>) {
+    ai_env_cli::bridge::registry::read(&live.paths, session).ok().flatten().map_or((None, None), |row| (row.title, row.title_source))
+}
+
+/// S12 (T, L): whether `hay` holds `needle` (an empty needle never).
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// S12 (T, L): the regular files under `root` (no symlink followed) whose bytes hold `needle`, relative to
+/// it, sorted: the places, never their bytes.
+fn files_holding(root: &std::path::Path, needle: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.is_dir() {
+                dirs.push(path);
+            } else if meta.is_file() && std::fs::read(&path).is_ok_and(|bytes| holds(&bytes, needle)) {
+                found.push(path.strip_prefix(root).unwrap_or(path.as_path()).display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// S12 (T, §T8.4, part B's B1 step 2; wave 2's L, X-6): a chat's name round trips on a live VM. A fixture
+/// chat of the real `ai-env-claude` in remote mode (`Chat`, in S11's kind of world: no wall, no migration and
+/// no automatic admission inside the test), the test playing the extension's two title requests in the
+/// shapes the 2.1.310 bundle's `extension.js` sends (read for Q-T6; the image's claude answers both):
+/// `{"subtype":"generate_session_title","description":<the user's prompt>,"persist":true}` and
+/// `{"subtype":"rename_session","title":<t>,"source":"host","session_id":<sid>}`. After the first turn and its
+/// sync, `generate_session_title` with a fixed phrase as its description is answered with a string
+/// `response.response.title`, which the row then holds, `ai` (§T3 P5). Then `rename_session` naming
+/// `live-s12 named` is answered `success` and brings the host the CLI's `session_title_changed` naming it, for
+/// the chat's session (§T3 P1, P4); whether the view already ends with ai-env's line before the next sync is
+/// said (§T3 L4), not judged. The extension also writes its own `custom-title` line into the view at a
+/// rename; the test leaves that out, so the view's line can only be ai-env's. After the next turn's sync the
+/// view's last line is `{"type":"custom-title","sessionId":"<sid>","customTitle":"live-s12 named"}`, once
+/// (Bug 1: §T3 V3, V4). After the close (exit 0 within its budget) the view still ends with it, the row says
+/// the name, `custom`, the phrase is in no file under the test's bridge root, and neither its audit, its census
+/// nor its wrapper log holds the name (§T4 items 2 and 3; B2 step 6's check). Three Touch IDs: the chat, the
+/// test process's runtime key, the purge. About four minutes.
+#[test]
+#[ignore = "live, S12 part T, a chat's name round trips on a live MicroVM (it starts one and asks the model): its generated title, then a rename that ends its view (about four minutes; three Touch IDs: the chat, the test process's runtime key, the purge): AI_ENV_AWS_TESTS=1 AI_ENV_S12_TESTS=1 make test-aws S12=1"]
+fn live_s12_a_title_round_trips_on_a_live_vm() {
+    const TEST: &str = "live_s12_a_title_round_trips_on_a_live_vm";
+    // The host's `generate_session_title` description (the extension sends the user's prompt): fixed, and longer
+    // than any title the CLI makes (two to five words), so no title holds it whole.
+    const PHRASE: &str = "live-s12 phrase: the harbour master logs each ship that docks at the north quay before dawn";
+    // The name the host's `rename_session` gives the chat (§T8.4).
+    const NAME: &str = "live-s12 named";
+    // The two requests' ids (the extension's are random; any id the host has not used will do).
+    const TITLE_ID: &str = "live-s12-title";
+    const RENAME_ID: &str = "live-s12-rename";
+    // How long a title request may take: the CLI asks the model for a generated title.
+    const REQUEST_LIMIT: Duration = Duration::from_secs(120);
+    // How long the view is watched for ai-env's line before the next turn (said, not judged).
+    const EARLY_LIMIT: Duration = Duration::from_secs(10);
+    if !s12_live() {
+        return;
+    }
+    let _signals = Interrupts::catch();
+    let live = s11_world(&[]);
+    let _purge = PurgeTranscripts(&live);
+    let _vms = SessionVms::new(&live);
+    let ws = s8_fixture(&live, "live-s12-title");
+    // The tripwires the wrapper's titles pass in this root (`title::rules_for`, as the pump loads them).
+    let rules = ai_env_cli::bridge::title::rules_for(&live.paths, Some(&live.cfg)).unwrap_or_else(|e| panic!("{TEST}: the test root's tripwires: {e}"));
+    let mut chat = Chat::open(TEST, &live, &ws, &[]);
+    chat.initialize();
+    let first = chat.turn("Reply with exactly OK");
+    assert_eq!(first.result["is_error"], false, "{TEST}: turn 1: {}", first.result);
+    let committed = chat.wait_for_sync(&live, 0);
+    let session = chat.session.clone().expect("the chat's session id");
+
+    // The generated title, answered by the VM's CLI; the row then holds it, `ai`.
+    let asked = Instant::now();
+    chat.send(&serde_json::json!({"type": "control_request", "request_id": TITLE_ID, "request": {"subtype": "generate_session_title", "description": PHRASE, "persist": true}}));
+    let Some(answer) = chat.read_until(REQUEST_LIMIT, Asks::AllowAll, |v| v["type"] == "control_response" && v["response"]["request_id"] == TITLE_ID) else {
+        let err = chat.stderr_now();
+        panic!("{TEST}: no answer to generate_session_title within {REQUEST_LIMIT:?}; the wrapper's stderr: {err}");
+    };
+    assert_eq!(answer["response"]["subtype"], "success", "{TEST}: generate_session_title answered {answer}");
+    let raw = answer["response"]["response"]["title"].as_str().unwrap_or_else(|| panic!("{TEST}: no string title in the answer to generate_session_title: {answer}"));
+    let generated = ai_env_cli::bridge::title::clean(raw, &rules).unwrap_or_else(|why| panic!("{TEST}: the answer's title is no name a row takes ({})", why.word()));
+    eprintln!("{TEST}: generate_session_title answered {generated:?} after {} ms", asked.elapsed().as_millis());
+    let t = Instant::now();
+    loop {
+        let (title, source) = row_title(&live, &session);
+        if title.as_deref() == Some(generated.as_str()) && source.as_deref() == Some("ai") {
+            break;
+        }
+        assert!(t.elapsed() < LIVE_SYNC_LIMIT, "{TEST}: {LIVE_SYNC_LIMIT:?} after the answer the row names the chat {:?} ({}), not {generated:?} (ai)", title.as_deref().unwrap_or("-"), source.as_deref().unwrap_or("-"));
+        chat.idle(LIVE_SYNC_POLL);
+    }
+    eprintln!("{TEST}: the row names the chat {generated:?} (ai) {} ms after the answer", t.elapsed().as_millis());
+
+    // The rename, answered by the VM's CLI, which says the name it took (in either order).
+    let renamed = Instant::now();
+    chat.send(&serde_json::json!({"type": "control_request", "request_id": RENAME_ID, "request": {"subtype": "rename_session", "title": NAME, "source": "host", "session_id": session}}));
+    let (mut answered, mut frames) = (None::<serde_json::Value>, Vec::<serde_json::Value>::new());
+    let ended = chat.read_until(REQUEST_LIMIT, Asks::AllowAll, |v| {
+        if v["type"] == "control_response" && v["response"]["request_id"] == RENAME_ID {
+            answered = Some(v.clone());
+        } else if v["type"] == "system" && v["subtype"] == "session_title_changed" {
+            frames.push(v.clone());
+        }
+        answered.as_ref().is_some_and(|a| a["response"]["subtype"] != "success" || !frames.is_empty())
+    });
+    if ended.is_none() {
+        let err = chat.stderr_now();
+        panic!("{TEST}: rename_session: no answer and title frame within {REQUEST_LIMIT:?} (the answer {answered:?}, the frames {frames:?}); the wrapper's stderr: {err}");
+    }
+    let answered = answered.expect("the rename's answer");
+    assert_eq!(answered["response"]["subtype"], "success", "{TEST}: rename_session answered {answered}");
+    let frame = frames.last().expect("the CLI's title frame");
+    eprintln!("{TEST}: rename_session answered success, and the CLI's session_title_changed said {} {} ms after the request", frame["title"], renamed.elapsed().as_millis());
+    assert_eq!((frame["title"].as_str(), frame["session_id"].as_str()), (Some(NAME), Some(session.as_str())), "{TEST}: the CLI's name for the chat: {frame}");
+
+    // ai-env's line in the extension's shape (§T2), written out here rather than taken from `title::custom_title_line`.
+    let line = format!(r#"{{"type":"custom-title","sessionId":"{session}","customTitle":"{NAME}"}}"#);
+    let custom_lines = |lines: &[String]| lines.iter().filter(|l| l.contains(r#""type":"custom-title""#)).cloned().collect::<Vec<String>>();
+    let t = Instant::now();
+    let early = loop {
+        if view_lines_now(&live, &session).last() == Some(&line) {
+            break Some(t.elapsed());
+        }
+        if t.elapsed() >= EARLY_LIMIT {
+            break None;
+        }
+        chat.idle(Duration::from_millis(250));
+    };
+    match early {
+        Some(after) => eprintln!("{TEST}: the view ends with ai-env's custom-title line {} ms after the rename's answer and frame came, before the next turn", after.as_millis()),
+        None => eprintln!("{TEST}: the view does not end with ai-env's custom-title line {} s after the rename's answer and frame came: the next turn's sync is to bring it", EARLY_LIMIT.as_secs()),
+    }
+
+    // The next turn and its sync (the view then lists the turn's prompt): the view's last line is ai-env's, once.
+    let marker = live_word("quay");
+    let second = chat.turn(&format!("Reply with exactly OK {marker}"));
+    assert_eq!(second.result["is_error"], false, "{TEST}: turn 2: {}", second.result);
+    chat.wait_for_sync(&live, committed);
+    chat.wait_for("the view lists turn 2's prompt (its sync's view write)", LIVE_SYNC_LIMIT, Asks::AllowAll, || (prompt_lines(&view_lines_now(&live, &session), &marker) > 0).then_some(()));
+    let t = Instant::now();
+    let lines = loop {
+        let lines = view_lines_now(&live, &session);
+        if lines.last() == Some(&line) {
+            break lines;
+        }
+        assert!(t.elapsed() < LIVE_SYNC_LIMIT, "{TEST}: after turn 2's sync the view's last line is not ai-env's {line}: its custom-title lines {:?}", custom_lines(&lines));
+        chat.idle(LIVE_SYNC_POLL);
+    };
+    assert_eq!(lines.iter().filter(|l| **l == line).count(), 1, "{TEST}: ai-env's line once after turn 2's sync: the view's custom-title lines {:?}", custom_lines(&lines));
+    eprintln!("{TEST}: after turn 2's sync the view's last line is ai-env's custom-title line, once ({} custom-title line(s) in the view)", custom_lines(&lines).len());
+
+    let (code, close) = chat.close();
+    assert_closed_well(TEST, &live, &chat, code, close);
+    let lines = assert_a_view(TEST, &live, &session);
+    assert!(lines.last() == Some(&line) && lines.iter().filter(|l| **l == line).count() == 1, "{TEST}: after the close the view's last line is ai-env's, once: its custom-title lines {:?}", custom_lines(&lines));
+    let (title, source) = row_title(&live, &session);
+    eprintln!("{TEST}: the closed row names the chat {:?} ({})", title.as_deref().unwrap_or("-"), source.as_deref().unwrap_or("-"));
+    assert_eq!((title.as_deref(), source.as_deref()), (Some(NAME), Some("custom")), "{TEST}: the closed row's name");
+    assert_eq!(files_holding(&live.paths.root, PHRASE.as_bytes()), Vec::<String>::new(), "{TEST}: the host's description (the user's prompt) in these files under the test's root");
+    for file in [live.paths.audit(), live.paths.census(), live.paths.wrapper_log()] {
+        assert!(!std::fs::read(&file).is_ok_and(|bytes| holds(&bytes, NAME.as_bytes())), "{TEST}: the chat's name in {}", file.display());
+    }
+    eprintln!("{TEST}: the phrase is in no file under the test's root, and the name in neither its audit, its census nor its wrapper log");
+    let out = chat.output();
+    sweep_live(&live, &[&out], &[]);
 }

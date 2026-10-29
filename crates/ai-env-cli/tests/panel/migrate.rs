@@ -90,6 +90,8 @@ fn panel_of(rig: &RemoteRig) -> Panel {
 /// The live path, then the offline one: each the CLI's move, by the panel, the panel's nonce the request's.
 #[test]
 fn panel_migrate_is_session_migrate() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = crate::common::remote::alone();
     // Live: a wrapper serves the chat, idle between turns.
     let mut h = Harness::prepare().spawn_on(Link::Remote, "", &[], &CLI);
     started(&mut h);

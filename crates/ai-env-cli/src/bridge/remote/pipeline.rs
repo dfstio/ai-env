@@ -83,7 +83,12 @@
 //!   `codeout::CLOSE_WAIT`; plan §11's order): no fetch of the session
 //!   starts after it, and the last one ended or was given up before it (one
 //!   given up with its request already on its way may still reach the VM
-//!   after it, and wake it).
+//!   after it, and wake it). S12 (R1): it stops short of the close's
+//!   deadline (`SessionPlan::close_by`, set by `RemoteLinks::close` to the
+//!   end of its budget) by `CLOSE_ROW_MARGIN`, so its row is written before
+//!   the pump's own cut: a wait that deadline ends, or a suspend that would
+//!   start past it, is audited `skipped`/`budget` (a SuspendMicrovm already
+//!   sent stays `no_answer`), and the idle policy suspends the VM.
 //!
 //! A resume miss's retry ([`StartWhy::ResumeRetry`]) takes no Touch ID: it
 //! respawns on generation 1's VM with generation 1's backend, after the
@@ -163,8 +168,17 @@ use tokio::time::Instant;
 /// code-out trigger, its read of the VM's spawns and its SuspendMicrovm, so
 /// its exclusive hold of the workspace's `.active` (the verdict and that
 /// request alone) never outlasts it. The pump's wait for it cuts it sooner
-/// (what is left of the close budget, [`SessionPlan::take_closing`]).
+/// (what is left of the close budget, [`SessionPlan::take_closing`]). S12
+/// (R1): so the suspend stops at the earlier of this bound and the close's
+/// deadline less [`CLOSE_ROW_MARGIN`] (`SessionPlan::close_by`), and a wait
+/// the deadline cuts before SuspendMicrovm is audited `skipped`/`budget` (a
+/// SuspendMicrovm it cuts stays `no_answer`) before the pump's cut.
 const CLOSING_BOUND: Duration = Duration::from_millis(crate::bridge::remote::CLOSE_BUDGET_MS);
+
+/// S12 (R1): how long before the close's deadline (`SessionPlan::close_by`) the closing suspend stops waiting, so
+/// its `vm_suspend` row is written before the pump's own cut (`timeout(budget, links.close(budget))`,
+/// pump.rs:4791-4796). Best effort: a runtime starved for longer than this still loses the row.
+const CLOSE_ROW_MARGIN: Duration = Duration::from_millis(50);
 
 /// How long generation 1's start (P0 tries once: [`hold_active_at_start`])
 /// and `vm warm` wait for the workspace's `.active` lock while a closing
@@ -178,6 +192,9 @@ pub(crate) const ACTIVE_WAIT: Duration = Duration::from_secs(2);
 /// over; s8-design-session §3.7). One the host still waits on keeps T0 +
 /// 50 s ([`deadline_of`]).
 const RETRY_WINDOW: Duration = Duration::from_secs(60);
+
+/// S12 (R3): a generation's reader of the session its `claude_fetch` rows name (`fetch_session`'s closure).
+pub(crate) type LiveSession = Rc<dyn Fn() -> Option<String>>;
 
 /// What P0 decided for the whole session, shared (`Rc`, on the pump's
 /// `LocalSet`) by every generation's [`run`]: built by [`precheck`] only;
@@ -287,6 +304,15 @@ pub struct SessionPlan {
     pub dropped: RefCell<Vec<String>>,
     /// S11 (A.5): a `ClaudeRetry` ran: every later generation's `claude_src` says `start_failed` when V did not run.
     claude_retried: Cell<bool>,
+    /// S12 (R1): the close's deadline: `RemoteLinks::close`'s now plus its budget (what is left of the pump's hard
+    /// stop); `None` until the close. A closing suspend stops short of it by `CLOSE_ROW_MARGIN` and audits
+    /// `skipped`/`budget` (a SuspendMicrovm already sent stays `no_answer`).
+    close_by: Cell<Option<Instant>>,
+    /// S12 (R1): woken (`notify_waiters`) each time `close_by` is set, so a closing suspend's wait re-arms.
+    close_by_changed: tokio::sync::Notify,
+    /// S12 (R3): the latest spawned generation's `LiveSession` (set by `spawn`), which a migration's phase A reads
+    /// once its fetch ended (`claude::fetch::prefetch_phase_a`); `None` before the first spawn.
+    live_session: RefCell<Option<LiveSession>>,
 }
 
 /// S10 §B: a migration's prepared VM ([`prepare_move`]): its row (its caps
@@ -372,6 +398,10 @@ impl SessionPlan {
     /// start cannot stop). The pump awaits them after the census end row,
     /// within what is left of its close budget, then exits: what the budget
     /// cuts ends with the process (the idle policy suspends the VM anyway).
+    /// S12 (R1): the closing suspend now writes its `vm_suspend` row before
+    /// that cut: it stops `CLOSE_ROW_MARGIN` short of the close's deadline
+    /// ([`SessionPlan::close_by`], the budget's end), audited
+    /// `skipped`/`budget` (`no_answer` for a SuspendMicrovm already sent).
     #[must_use]
     pub fn take_closing(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(&mut *self.closing.borrow_mut())
@@ -397,6 +427,13 @@ impl SessionPlan {
             Choice::Pin(id) => Some(id),
             _ => None,
         }
+    }
+
+    /// S12 (T): what the session's view is written with ([`session_sync`]'s: none for
+    /// `--no-session-persistence`), for `RemoteLinks`' startup title read.
+    #[must_use]
+    pub fn view_sync(&self) -> Option<crate::bridge::s3::TranscriptSync> {
+        session_sync(self)
     }
 
     /// S10 §D: the pump's quiet as `RemoteLinks::quiet` sends it, which each
@@ -461,6 +498,67 @@ impl SessionPlan {
             task.abort();
         }
         self.release_prepared();
+    }
+
+    /// S12 (R1): the close's deadline becomes `deadline`, unless an earlier one is set; then every waiter of
+    /// `close_by_changed` is woken. `RemoteLinks::close` sets it as its first statement (R1-1, R1-2: the earliest
+    /// wins, so one set by an earlier close is never pushed back).
+    pub(crate) fn close_by(&self, deadline: Instant) {
+        let keep = self.close_by.get().filter(|d| *d <= deadline).unwrap_or(deadline);
+        self.close_by.set(Some(keep));
+        self.close_by_changed.notify_waiters();
+    }
+
+    /// S12 (R1): the close's deadline; `None` before the close. `closing_until` and `past_budget` read it
+    /// through this (so it is used outside tests).
+    #[must_use]
+    pub(crate) fn close_deadline(&self) -> Option<Instant> {
+        self.close_by.get()
+    }
+
+    /// S12 (R1): when a closing suspend begun at `begun` stops waiting: the earlier of `begun + CLOSING_BOUND` and
+    /// the deadline less `CLOSE_ROW_MARGIN`; `true` when that is the deadline's, a tie included. The margin's
+    /// subtraction never goes below what an `Instant` holds: past that, the deadline itself (R1-3, LD-R2).
+    fn closing_until(&self, begun: Instant) -> (Instant, bool) {
+        let bound = begun + CLOSING_BOUND;
+        match self.close_deadline().map(|d| d.checked_sub(CLOSE_ROW_MARGIN).unwrap_or(d)) {
+            Some(cut) if cut <= bound => (cut, true),
+            _ => (bound, false),
+        }
+    }
+
+    /// S12 (R1): the deadline less `CLOSE_ROW_MARGIN` has passed (`false` with no deadline). Its instant itself
+    /// counts as passed (R1-4).
+    fn past_budget(&self) -> bool {
+        self.close_deadline().is_some_and(|d| Instant::now() >= d.checked_sub(CLOSE_ROW_MARGIN).unwrap_or(d))
+    }
+
+    /// S12 (R1): until `closing_until(begun)`'s instant, read again each time the deadline changes; `true` when
+    /// the deadline's instant ended it. Cancel-safe. Each pass enables its `notified()` before it reads the
+    /// deadline, so a `close_by` landing between the read and the sleep is never missed (R1-5).
+    async fn closing_cut(&self, begun: Instant) -> bool {
+        loop {
+            let changed = self.close_by_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (until, budget) = self.closing_until(begun);
+            tokio::select! {
+                () = tokio::time::sleep_until(until) => return budget,
+                () = &mut changed => {}
+            }
+        }
+    }
+
+    /// S12 (R3): the latest spawned generation's session reader, cloned.
+    #[must_use]
+    pub(crate) fn live_session(&self) -> Option<LiveSession> {
+        self.live_session.borrow().clone()
+    }
+
+    /// S12 (R3): `spawn`'s: this generation's reader replaces the last one. So the plan keeps the latest
+    /// generation's whose P4 ran, even one whose start then failed (R3-2).
+    fn set_live_session(&self, live: LiveSession) {
+        *self.live_session.borrow_mut() = Some(live);
     }
 
     /// A1: `session_account` when a generation (`gen`, of `kind`: `first`,
@@ -554,6 +652,9 @@ impl SessionPlan {
             claude: ClaudePlan::default(),
             dropped: RefCell::new(Vec::new()),
             claude_retried: Cell::new(false),
+            close_by: Cell::new(None),
+            close_by_changed: tokio::sync::Notify::new(),
+            live_session: RefCell::new(None),
             cfg,
         }
     }
@@ -953,6 +1054,9 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
         claude,
         dropped: RefCell::new(Vec::new()),
         claude_retried: Cell::new(false),
+        close_by: Cell::new(None),
+        close_by_changed: tokio::sync::Notify::new(),
+        live_session: RefCell::new(None),
     })
 }
 
@@ -1485,7 +1589,8 @@ fn same_vm_restore<'a>(plan: &'a SessionPlan, why: &'a StartWhy) -> Option<&'a s
 /// S11 (A.5): a `ClaudeRetry` names no more the cached claude `bad` that died before its init on the current VM:
 /// its sha256 joins the VM row's `claude_bad` (the row goes with the VM), every later generation's `claude_src`
 /// says `start_failed` when V does not run, and `claude_start_failed` is audited with what the respawn names first
-/// (`next`: a version, or `image`).
+/// (`next`: a version, or `image`). S12 (R3-4): the row names `plan.resume` unless P0's argv, up to a bare `--`,
+/// forks it ([`forks_session`]): then `-`, since the generation died before its init named the fork's own id.
 fn mark_claude_bad(plan: &SessionPlan, gen: u32, mut current: Current, bad: &str) -> Current {
     let id = current.vm.id.clone();
     let marked = vm_registry::update_row(&plan.paths, &id, |r| {
@@ -1506,7 +1611,9 @@ fn mark_claude_bad(plan: &SessionPlan, gen: u32, mut current: Current, bad: &str
     let next = ask.sent.first().map_or_else(|| "image".to_string(), |r| r.version.clone());
     let version = crate::bridge::claude::load_all(&plan.paths).into_iter().find(|r| r.claude_ref().is_some_and(|c| c.sha256 == bad)).map_or_else(|| "unknown".to_string(), |r| r.version);
     tracing::warn!(gen, vm = %id, version = %version, next = %next, "a cached claude died before its init: the respawn names it no more");
-    let pairs = [("session", plan.resume.clone().unwrap_or_else(|| "-".to_string())), ("vm", id), ("version", version), ("sha256", bad.to_string()), ("gen", gen.to_string()), ("next", next)];
+    let end = plan.argv.iter().position(|a| a == "--").unwrap_or(plan.argv.len());
+    let session = plan.resume.clone().filter(|sid| !forks_session(&plan.argv[..end], sid)).unwrap_or_else(|| "-".to_string());
+    let pairs = [("session", session), ("vm", id), ("version", version), ("sha256", bad.to_string()), ("gen", gen.to_string()), ("next", next)];
     audit_event(&plan.paths, event::CLAUDE_START_FAILED, &pairs);
     current
 }
@@ -1984,8 +2091,10 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
         // A resumed or moved session's id is known before its init: the settings' start capture runs beside the spawn (T8.7).
         trigger.set_session(id);
     }
-    // The fetch's row names this generation and the chat's session as the trigger knows it once the fetch ended.
-    let after_output = crate::bridge::claude::fetch::after_output(plan, ctx, Arc::clone(&api), &row, &vm, gen, fetch_session(&trigger, session_id.as_deref(), &spec.argv));
+    // S12 (R3): the generation's session reader, kept for a migration's phase A, and V's fetch after the first output.
+    let live: LiveSession = Rc::new(fetch_session(&trigger, session_id.as_deref(), &spec.argv));
+    plan.set_live_session(Rc::clone(&live));
+    let after_output = crate::bridge::claude::fetch::after_output(plan, ctx, Arc::clone(&api), &row, &vm, gen, move || live());
     let id = vm.id.clone();
     let report = delivery.report();
     let session = tokio::task::spawn_local(session(Rc::clone(plan), gen, plan.ctx(), api, ep, row, vm, spec, io, delivery, trigger.watch()));
@@ -3543,6 +3652,8 @@ enum Skip {
     Parked,
     /// A migration's switch takes the VM's work next.
     Moving,
+    /// S12 (R1): the close's deadline came first (`SessionPlan::close_by`).
+    Budget,
 }
 
 impl Skip {
@@ -3557,6 +3668,7 @@ impl Skip {
             Skip::NotAlone => "not_alone",
             Skip::Parked => "parked",
             Skip::Moving => "moving",
+            Skip::Budget => "budget",
         }
     }
 
@@ -3571,6 +3683,7 @@ impl Skip {
             Skip::NotAlone => "another session or vm warm of the workspace runs",
             Skip::Parked => "its claude stays parked",
             Skip::Moving => "a migration takes the VM's work next",
+            Skip::Budget => "the close's budget ran out; the idle policy suspends it",
         }
     }
 }
@@ -3633,7 +3746,17 @@ fn audit_suspend(paths: &Paths, vm: &str, outcome: &str, why: Option<&str>, from
 /// for to its end (`TriggerWatch::wait_done`: the close no longer aborts it,
 /// so no SuspendMicrovm goes out while its request may reach the VM); a
 /// parked spawn of another chat keeps no VM from it ([`Count::Suspend`]); a
-/// migration's switch skips it (`SessionPlan::begin_switch`).
+/// migration's switch skips it (`SessionPlan::begin_switch`). S12 (R1-6):
+/// each wait (the trigger's, the spawns' read, the SuspendMicrovm) is cut at
+/// the earlier of `CLOSING_BOUND` and the close's deadline less
+/// [`CLOSE_ROW_MARGIN`] ([`SessionPlan::closing_cut`], the step polled
+/// first), so the row is written before the pump's own cut: the deadline's
+/// cut of the trigger wait or of the read is `skipped`/`budget`, and so is
+/// the deadline found passed before the trigger wait, before the read and
+/// before SuspendMicrovm (no token minted, no request sent, LD-R3); a
+/// SuspendMicrovm cut by either instant stays `no_answer` (no `why`). With
+/// no deadline (R1-7: before the close, an older generation's, a factory
+/// with no plan) every step runs as S10's, with its bound and its words.
 #[allow(clippy::too_many_arguments)]
 async fn suspend_on_close<A: MicrovmApi, E: EndpointClient>(plan: &SessionPlan, gen: u32, ctx: &Ctx, api: &A, ep: &E, row: &VmRow, vm: &VmInfo, trigger: &TriggerWatch) {
     if !plan.cfg.vm.suspend_on_close {
@@ -3641,7 +3764,6 @@ async fn suspend_on_close<A: MicrovmApi, E: EndpointClient>(plan: &SessionPlan, 
         return;
     }
     let begun = Instant::now();
-    let until = begun + CLOSING_BOUND;
     let skip = |why: Skip| {
         tracing::info!("closing: no suspend of {} ({})", vm.id, why.text());
         audit_suspend(&plan.paths, &vm.id, "skipped", Some(why.word()), begun);
@@ -3649,11 +3771,34 @@ async fn suspend_on_close<A: MicrovmApi, E: EndpointClient>(plan: &SessionPlan, 
     if plan.moving.get() {
         return skip(Skip::Moving);
     }
-    if tokio::time::timeout_at(until, trigger.wait_done()).await.is_err() {
-        return skip(Skip::TriggerBusy);
+    // S12 (R1-8): a suspend begun past the close's deadline (its exit came after the pump's close began) mints and sends nothing.
+    if plan.past_budget() {
+        return skip(Skip::Budget);
     }
-    tracing::info!("closing: the code-out trigger is done");
-    let live = tokio::time::timeout_at(until, live_spawns(ctx, api, ep, row, vm, Count::Suspend)).await.unwrap_or(None);
+    let cut = tokio::select! {
+        biased;
+        () = trigger.wait_done() => None,
+        budget = plan.closing_cut(begun) => Some(budget),
+    };
+    match cut {
+        Some(true) => return skip(Skip::Budget),
+        Some(false) => return skip(Skip::TriggerBusy),
+        None => tracing::info!("closing: the code-out trigger is done"),
+    }
+    // S12 (R1-6 step 6): the deadline may have passed as the trigger ended: no token is minted for the spawns' read.
+    if plan.past_budget() {
+        return skip(Skip::Budget);
+    }
+    let live = tokio::select! {
+        biased;
+        live = live_spawns(ctx, api, ep, row, vm, Count::Suspend) => live,
+        budget = plan.closing_cut(begun) => {
+            if budget {
+                return skip(Skip::Budget);
+            }
+            None
+        }
+    };
     if let Err(why) = suspend_verdict(true, true, live, plan.started.get() > gen) {
         return skip(why);
     }
@@ -3667,29 +3812,39 @@ async fn suspend_on_close<A: MicrovmApi, E: EndpointClient>(plan: &SessionPlan, 
     };
     match suspend_verdict(true, alone.is_some(), live, plan.started.get() > gen) {
         Err(why) => skip(why),
-        Ok(()) => match tokio::time::timeout_at(until, api.suspend(&vm.id)).await {
-            Ok(r @ (Ok(()) | Err(BridgeError::Conflict(_)))) => {
-                audit_suspend(&plan.paths, &vm.id, if r.is_ok() { "fired" } else { "conflict" }, None, begun);
-                // Its `/suspend` hook empties the shim's credential cache (S7 D3; a Conflict: it was RUNNING no more):
-                // the row stops saying running, which the prewarm's `token_held` reads. Its `credential_at` stays.
-                if let Err(e) = vm_registry::update_row(&plan.paths, &vm.id, |r| {
-                    if r.status == RowStatus::Running {
-                        r.status = RowStatus::Suspended;
+        // S12 (R1-6 step 10, LD-R3): a request the deadline would cut is not sent.
+        Ok(()) if plan.past_budget() => skip(Skip::Budget),
+        Ok(()) => {
+            let answer = tokio::select! {
+                biased;
+                r = api.suspend(&vm.id) => Some(r),
+                _ = plan.closing_cut(begun) => None,
+            };
+            match answer {
+                Some(r @ (Ok(()) | Err(BridgeError::Conflict(_)))) => {
+                    audit_suspend(&plan.paths, &vm.id, if r.is_ok() { "fired" } else { "conflict" }, None, begun);
+                    // Its `/suspend` hook empties the shim's credential cache (S7 D3; a Conflict: it was RUNNING no more):
+                    // the row stops saying running, which the prewarm's `token_held` reads. Its `credential_at` stays.
+                    if let Err(e) = vm_registry::update_row(&plan.paths, &vm.id, |r| {
+                        if r.status == RowStatus::Running {
+                            r.status = RowStatus::Suspended;
+                        }
+                    }) {
+                        tracing::warn!("closing: the row of {} still says running: {e}", vm.id);
                     }
-                }) {
-                    tracing::warn!("closing: the row of {} still says running: {e}", vm.id);
+                    tracing::info!("closing: suspended {} (not waited for)", vm.id);
                 }
-                tracing::info!("closing: suspended {} (not waited for)", vm.id);
+                Some(Err(e)) => {
+                    tracing::warn!("closing: suspend of {}: {e}", vm.id);
+                    audit_suspend(&plan.paths, &vm.id, "failed", None, begun);
+                }
+                // Cut by the bound or by the deadline: a request already sent has no `why` (S10's rule, R1-6 step 11).
+                None => {
+                    tracing::warn!("closing: the suspend of {} had no answer within {} ms (the idle policy suspends it)", vm.id, ms(begun));
+                    audit_suspend(&plan.paths, &vm.id, "no_answer", None, begun);
+                }
             }
-            Ok(Err(e)) => {
-                tracing::warn!("closing: suspend of {}: {e}", vm.id);
-                audit_suspend(&plan.paths, &vm.id, "failed", None, begun);
-            }
-            Err(_) => {
-                tracing::warn!("closing: the suspend of {} had no answer within {} ms (the idle policy suspends it)", vm.id, CLOSING_BOUND.as_millis());
-                audit_suspend(&plan.paths, &vm.id, "no_answer", None, begun);
-            }
-        },
+        }
     }
     // The exclusive hold made shared on its own descriptor; one that did not take is let go first.
     match alone.filter(|guard| guard.share().unwrap_or(false)) {
@@ -5968,6 +6123,21 @@ mod tests {
         }
     }
 
+    /// S12 (R2-3): a refresh name in `[wrapper]` (`remote::env::HOST_REFRESH_NAMES`), Cursor's environment holding
+    /// it, refuses the session at P0: exit 9, `refused`, the line Cursor shows exactly (the key and the name as
+    /// bridge.toml spells them, the reason and the fix whole: the line's scrub masks nothing), before any Touch ID.
+    #[test]
+    fn p0_refuses_a_host_refresh_name_before_any_touch_id() {
+        let w = World::new("[wrapper]\nenv_extra = [\"CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH\"]\n");
+        let f = precheck_with(&w.session(&ARGS), &w.env(&[("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1")]), &a_git_repo).map(drop).unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{}", f.line());
+        assert_eq!(
+            f.line(),
+            "refused before any Touch ID: [wrapper].env_extra names CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH (the wrapper answers a remote CLI's refreshes with no token); remove it from bridge.toml"
+        );
+        assert!(!w.paths.unseal_lock().exists(), "no Touch ID was asked for");
+    }
+
     /// L2: the closing suspend fires only with `suspend_on_close`, alone on
     /// the workspace, with no live spawn on the VM and no retry under way.
     #[test]
@@ -6286,6 +6456,318 @@ mod tests {
         assert_eq!(suspends(&api), 1, "fired at the fetch's end");
         let after = fired.duration_since(began.get().expect("the close began"));
         assert!(after < CLOSE_WAIT * 5, "at the fetch's end, not the close's bound: {after:?}");
+    }
+
+    // ---- S12 (R1): the close budget (plans/s12-contracts.md §7, R1) -----------------------------------------------
+
+    /// S12 (R1): the closing suspend's `vm_suspend` rows of `vm`, their details.
+    fn close_rows(plan: &SessionPlan, vm: &str) -> Vec<serde_json::Value> {
+        let rows = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap();
+        rows.into_iter().filter(|r| r["event"] == "vm_suspend" && r["detail"]["by"] == "close" && r["detail"]["id"] == vm).map(|r| r["detail"].clone()).collect()
+    }
+
+    /// S12 (R1): the rows' `(outcome, why)`, `why` `-` when the row has none.
+    fn words(rows: &[serde_json::Value]) -> Vec<(String, String)> {
+        rows.iter().map(|d| (d["outcome"].as_str().unwrap_or_default().to_string(), d["why"].as_str().unwrap_or("-").to_string())).collect()
+    }
+
+    /// S12 (R1): the token mints and SuspendMicrovm calls the fake API took from its `from`-th call on.
+    fn sent_since(api: &crate::bridge::api::FakeMicrovmApi, from: usize) -> (usize, usize) {
+        use crate::bridge::api::Call;
+        let calls = api.calls();
+        let tokens = calls[from..].iter().filter(|c| matches!(c, Call::Token { .. })).count();
+        let suspends = calls[from..].iter().filter(|c| matches!(c, Call::Suspend(_))).count();
+        (tokens, suspends)
+    }
+
+    /// S12 (R1): `budget` alone, as each test below expects.
+    fn budget() -> Vec<(String, String)> {
+        vec![("skipped".to_string(), "budget".to_string())]
+    }
+
+    /// S12 (R1-2): no deadline before the close; `close_by` sets one and wakes every waiter enabled before it (a
+    /// closing suspend's wait re-arms on it), and keeps the earliest: a later deadline changes nothing, an earlier
+    /// one replaces it.
+    #[tokio::test]
+    async fn close_by_keeps_the_earliest_deadline_and_wakes_its_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        assert_eq!(plan.close_deadline(), None, "no deadline before the close");
+        let t = Instant::now();
+        let changed = plan.close_by_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        plan.close_by(t + Duration::from_millis(500));
+        assert!(tokio::time::timeout(Duration::from_millis(200), changed).await.is_ok(), "a waiter enabled before close_by is woken");
+        assert_eq!(plan.close_deadline(), Some(t + Duration::from_millis(500)));
+        plan.close_by(t + Duration::from_millis(900));
+        assert_eq!(plan.close_deadline(), Some(t + Duration::from_millis(500)), "a later deadline keeps the earlier one");
+        plan.close_by(t + Duration::from_millis(100));
+        assert_eq!(plan.close_deadline(), Some(t + Duration::from_millis(100)), "an earlier one replaces it");
+    }
+
+    /// S12 (R1-3, R1-4): the instant a closing suspend's wait ends: `begun + CLOSING_BOUND` with no deadline, else
+    /// the earlier of that and the deadline less `CLOSE_ROW_MARGIN` (50 ms), a tie the budget's (LD-R2);
+    /// `past_budget` only once the deadline less its margin has passed.
+    #[test]
+    fn closing_until_is_the_earlier_of_the_bound_and_the_budget_less_its_margin() {
+        assert_eq!(CLOSE_ROW_MARGIN, Duration::from_millis(50));
+        let ms = Duration::from_millis;
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let begun = Instant::now();
+        assert_eq!(plan.closing_until(begun), (begun + ms(1500), false), "no deadline: S10's bound");
+        assert!(!plan.past_budget(), "no deadline, no budget");
+        plan.close_by(begun + Duration::from_secs(5));
+        assert_eq!(plan.closing_until(begun), (begun + ms(1500), false), "a deadline past the bound");
+        plan.close_by(begun + ms(1550));
+        assert_eq!(plan.closing_until(begun), (begun + ms(1500), true), "a tie is the budget's");
+        plan.close_by(begun + ms(300));
+        assert_eq!(plan.closing_until(begun), (begun + ms(250), true), "the deadline less its margin");
+        let later = SessionPlan::sample(dir.path());
+        later.close_by(Instant::now() + Duration::from_secs(1));
+        assert!(!later.past_budget(), "before the deadline less its margin");
+        later.close_by(Instant::now());
+        assert!(later.past_budget(), "at the deadline");
+    }
+
+    /// S12 (R1-8, a control of it): a closing suspend that begins past the close's deadline (its exit came after
+    /// the pump's close began) is `skipped`/`budget` at once: its spawns never read (no token minted), no
+    /// SuspendMicrovm, and the plan still holds the workspace's `.active` shared.
+    #[tokio::test]
+    async fn the_closing_suspend_past_the_close_budget_is_skipped_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let ctx = plan.ctx();
+        let done = done_watch(&plan).await;
+        let active = plan.paths.workspace_active(&plan.ws.slug);
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&active, Duration::from_millis(100)).unwrap());
+        let from = api.calls().len();
+        plan.close_by(Instant::now());
+        let t = std::time::Instant::now();
+        suspend_on_close(&plan, 1, &ctx, &api, &api, &row, &vm, &done).await;
+        // Well under `CLOSING_BOUND`: the row's append alone (`sync_data`, `F_FULLFSYNC` on macOS) takes a while on a busy disk.
+        assert!(t.elapsed() < Duration::from_millis(500), "at once: {:?}", t.elapsed());
+        assert_eq!(words(&close_rows(&plan, &vm.id)), budget());
+        assert_eq!(sent_since(&api, from), (0, 0), "no token minted, no SuspendMicrovm");
+        assert!(plan.active.borrow().is_some() && try_lock_exclusive(&active).unwrap().is_none(), "the plan still holds .active");
+        assert!(lock_shared_blocking(&active, Duration::from_millis(100)).is_ok(), "shared");
+    }
+
+    /// S12 (R1-6 step 6, LD-R12): the deadline passes in the same stretch as the trigger ends (the close's
+    /// `close_by`, then the trigger's close, no await between): at the suspend's next poll both its trigger wait and
+    /// its cut are ready, and the biased select ends on the trigger. The check before the spawns' read then finds the
+    /// deadline passed: `skipped`/`budget`, no token minted for the read, no SuspendMicrovm.
+    #[tokio::test]
+    async fn a_budget_that_passes_as_the_trigger_ends_reads_no_spawns() {
+        use crate::bridge::codeout::CLOSE_WAIT;
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let ctx = plan.ctx();
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&plan.paths.workspace_active(&plan.ws.slug), Duration::from_millis(100)).unwrap());
+        let trigger = trigger_of(&plan);
+        let watch = trigger.watch();
+        let from = api.calls().len();
+        let ends = async {
+            // The suspend is at its trigger wait by now, with no deadline.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(close_rows(&plan, &vm.id).is_empty(), "still waiting on the trigger");
+            plan.close_by(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
+            trigger.close(CLOSE_WAIT).await
+        };
+        let ((), _) = tokio::join!(suspend_on_close(&plan, 1, &ctx, &api, &api, &row, &vm, &watch), ends);
+        assert_eq!(words(&close_rows(&plan, &vm.id)), budget());
+        assert_eq!(sent_since(&api, from), (0, 0), "the spawns never read (no token), no SuspendMicrovm");
+    }
+
+    /// S12 (R1-6 step 5): a trigger that is not done (its fetch held: the test holds the workspace's fetch lock)
+    /// is waited for until the close's deadline less its margin, well short of `CLOSING_BOUND`: `skipped`/`budget`,
+    /// no token minted. S10 waited the whole bound there and wrote `trigger_busy`.
+    #[tokio::test]
+    async fn the_close_budget_cuts_the_trigger_wait_short_of_the_closing_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let ctx = plan.ctx();
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&plan.paths.workspace_active(&plan.ws.slug), Duration::from_millis(100)).unwrap());
+        let held = try_lock_exclusive(&plan.paths.workspace_fetch_lock(&plan.ws.slug)).unwrap().expect("the test holds the fetch lock");
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let open = trigger_of(&plan);
+        open.request();
+        let from = api.calls().len();
+        plan.close_by(Instant::now() + Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        suspend_on_close(&plan, 1, &ctx, &api, &api, &row, &vm, &open.watch()).await;
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_millis(600), "cut at the deadline less its margin: {took:?}");
+        assert_eq!(words(&close_rows(&plan, &vm.id)), budget());
+        assert_eq!(sent_since(&api, from), (0, 0), "no token minted, no SuspendMicrovm");
+        drop(open);
+        drop(held);
+    }
+
+    /// S12 (R1-5): a deadline set while the suspend already waits on its trigger re-arms the wait (the Notify): set
+    /// 100 ms in at 300 ms from then, the wait ends about 350 ms in, `skipped`/`budget`, where without it the wait
+    /// would run to `CLOSING_BOUND` and say `trigger_busy`.
+    #[tokio::test]
+    async fn a_close_budget_set_while_the_suspend_waits_rearms_its_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let ctx = plan.ctx();
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&plan.paths.workspace_active(&plan.ws.slug), Duration::from_millis(100)).unwrap());
+        let held = try_lock_exclusive(&plan.paths.workspace_fetch_lock(&plan.ws.slug)).unwrap().expect("the test holds the fetch lock");
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let open = trigger_of(&plan);
+        open.request();
+        let watch = open.watch();
+        let set = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            plan.close_by(Instant::now() + Duration::from_millis(300));
+        };
+        let t = std::time::Instant::now();
+        tokio::join!(suspend_on_close(&plan, 1, &ctx, &api, &api, &row, &vm, &watch), set);
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(300) && took < Duration::from_millis(800), "re-armed on the deadline: {took:?}");
+        assert_eq!(words(&close_rows(&plan, &vm.id)), budget());
+        drop(open);
+        drop(held);
+    }
+
+    thread_local! {
+        /// S12 (R1): the plan [`BudgetDuringRead`] sets the close's deadline of. An `EndpointClient` is `Sync` and a
+        /// plan is not, so the test hands its plan over on the thread its (current-thread) runtime polls on.
+        static READ_PLAN: RefCell<Option<Rc<SessionPlan>>> = const { RefCell::new(None) };
+    }
+
+    /// S12 (R1): the fake API's endpoint whose `/health/detail` first sets the plan's close deadline to now (the
+    /// budget passes during the closing suspend's read of the VM's spawns), then answers as the fake.
+    struct BudgetDuringRead<'a> {
+        fake: &'a crate::bridge::api::FakeMicrovmApi,
+    }
+
+    impl EndpointClient for BudgetDuringRead<'_> {
+        async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<crate::bridge::api::HealthReply, BridgeError> {
+            self.fake.get_health(endpoint, token, port_header).await
+        }
+
+        async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
+            READ_PLAN.with_borrow(|plan| {
+                if let Some(plan) = plan {
+                    plan.close_by(Instant::now());
+                }
+            });
+            self.fake.get_health_detail(endpoint, token, bearer).await
+        }
+    }
+
+    /// S12 (R1-6 step 10, LD-R3): the deadline passes during the spawns' read, which still wins its select (the
+    /// step is polled first): the verdict is to fire, but the check before SuspendMicrovm finds the deadline passed
+    /// and sends none. One token (the read's), `skipped`/`budget`, and the plan holds `.active` shared again.
+    #[tokio::test]
+    async fn the_budget_passed_during_the_spawns_read_sends_no_suspend() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = Rc::new(SessionPlan::sample(dir.path()));
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let ctx = plan.ctx();
+        let done = done_watch(&plan).await;
+        let active = plan.paths.workspace_active(&plan.ws.slug);
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&active, Duration::from_millis(100)).unwrap());
+        READ_PLAN.set(Some(Rc::clone(&plan)));
+        let from = api.calls().len();
+        suspend_on_close(&plan, 1, &ctx, &api, &BudgetDuringRead { fake: &api }, &row, &vm, &done).await;
+        READ_PLAN.set(None);
+        assert!(plan.close_deadline().is_some(), "the read set the deadline");
+        assert_eq!(sent_since(&api, from), (1, 0), "the read's token, no SuspendMicrovm");
+        assert_eq!(words(&close_rows(&plan, &vm.id)), budget());
+        assert!(plan.active.borrow().is_some() && try_lock_exclusive(&active).unwrap().is_none(), "the plan holds .active again");
+        assert!(lock_shared_blocking(&active, Duration::from_millis(100)).is_ok(), "shared");
+    }
+
+    /// S12 (R1): the fake API but for SuspendMicrovm, which never answers (a request on its way that the close's
+    /// deadline cuts).
+    struct NoAnswer<'a> {
+        fake: &'a crate::bridge::api::FakeMicrovmApi,
+    }
+
+    impl MicrovmApi for NoAnswer<'_> {
+        async fn run(&self, spec: &crate::bridge::api::RunSpec) -> Result<VmInfo, BridgeError> {
+            self.fake.run(spec).await
+        }
+
+        async fn get(&self, id: &str) -> Result<VmInfo, BridgeError> {
+            self.fake.get(id).await
+        }
+
+        async fn suspend(&self, _id: &str) -> Result<(), BridgeError> {
+            std::future::pending().await
+        }
+
+        async fn resume(&self, id: &str) -> Result<(), BridgeError> {
+            self.fake.resume(id).await
+        }
+
+        async fn terminate(&self, id: &str) -> Result<(), BridgeError> {
+            self.fake.terminate(id).await
+        }
+
+        async fn list(&self, image_arn: Option<&str>) -> Result<Vec<crate::bridge::api::VmSummary>, BridgeError> {
+            self.fake.list(image_arn).await
+        }
+
+        async fn create_auth_token(&self, id: &str, minutes: u16, port: u16) -> Result<AuthToken, BridgeError> {
+            self.fake.create_auth_token(id, minutes, port).await
+        }
+
+        async fn create_shell_token(&self, id: &str, minutes: u16) -> Result<AuthToken, BridgeError> {
+            self.fake.create_shell_token(id, minutes).await
+        }
+
+        async fn get_image(&self, arn: &str) -> Result<crate::bridge::api::ImageInfo, BridgeError> {
+            self.fake.get_image(arn).await
+        }
+
+        async fn list_image_versions(&self, arn: &str) -> Result<Vec<crate::bridge::api::ImageVersion>, BridgeError> {
+            self.fake.list_image_versions(arn).await
+        }
+
+        async fn get_network_connector(&self, identifier: &str) -> Result<serde_json::Value, BridgeError> {
+            self.fake.get_network_connector(identifier).await
+        }
+
+        async fn list_managed_images(&self) -> Result<Vec<crate::bridge::api::ManagedImage>, BridgeError> {
+            self.fake.list_managed_images().await
+        }
+    }
+
+    /// S12 (R1-6 step 11): a SuspendMicrovm sent and cut in flight by the close's deadline stays `no_answer` (S10's
+    /// rule: `why` belongs to `skipped` alone), cut at the deadline less its margin; the plan holds `.active` shared
+    /// again.
+    #[tokio::test]
+    async fn a_suspend_cut_in_flight_by_the_budget_stays_no_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = SessionPlan::sample(dir.path());
+        let api = crate::bridge::api::FakeMicrovmApi::new();
+        let (row, vm) = closing_vm(&plan, &api).await;
+        let ctx = plan.ctx();
+        let done = done_watch(&plan).await;
+        let active = plan.paths.workspace_active(&plan.ws.slug);
+        *plan.active.borrow_mut() = Some(lock_shared_blocking(&active, Duration::from_millis(100)).unwrap());
+        plan.close_by(Instant::now() + Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        suspend_on_close(&plan, 1, &ctx, &NoAnswer { fake: &api }, &api, &row, &vm, &done).await;
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_millis(600), "cut at the deadline less its margin: {took:?}");
+        let rows = close_rows(&plan, &vm.id);
+        assert_eq!(words(&rows), [("no_answer".to_string(), "-".to_string())]);
+        assert!(rows[0].get("why").is_none(), "no why beside no_answer: {}", rows[0]);
+        assert!(plan.active.borrow().is_some() && try_lock_exclusive(&active).unwrap().is_none(), "the plan holds .active again");
+        assert!(lock_shared_blocking(&active, Duration::from_millis(100)).is_ok(), "shared");
     }
 
     /// P1 (the plan's mutant "seed and unseal sequential"): the Touch ID and
@@ -6753,6 +7235,84 @@ mod a3_tests {
         assert_eq!(fetch_row(&plan, 1, &forks, Some(sid), None), (None, None, Some("1".into())), "a fork its init has not named: never the session it forked");
         assert_eq!(fetch_row(&plan, 1, &forks, Some(sid), Some(fork)), named(fork, "1"), "a fork its init named");
         assert_eq!(fetch_row(&plan, 3, &move_argv(&forks, Some(fork), &Cut::None), Some(fork), None), named(fork, "3"), "the named fork moved: resumed as any");
+    }
+
+    /// S12 (R3): the `claude_fetch` row of a migration's phase A on a plan whose `--resume` is `resume` and whose
+    /// latest generation was spawned with `argv`, its trigger named `named` (its reader kept by the plan, as
+    /// [`spawn`] keeps it), then `adopted` (the pump's adoption of an init) after the call, before the fetch ended
+    /// (here at once: no S3 target, `failed`): its envelope's session and its detail's.
+    fn phase_a_row(plan: &mut SessionPlan, argv: &[String], resume: Option<&str>, named: Option<&str>, adopted: Option<&str>) -> (Option<String>, Option<String>) {
+        plan.resume = resume.map(str::to_string);
+        let plan: &SessionPlan = plan;
+        let phase_a = || crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event::CLAUDE_FETCH && r["detail"]["why"] == "phase_a").collect::<Vec<_>>();
+        let before = phase_a().len();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, async {
+            let trigger = super::tests::trigger_of(plan);
+            if let Some(id) = named {
+                trigger.set_session(id);
+            }
+            plan.set_live_session(Rc::new(fetch_session(&trigger, named, argv)));
+            let api = Arc::new(crate::bridge::api::FakeMicrovmApi::new());
+            crate::bridge::claude::fetch::prefetch_phase_a(plan, &plan.ctx(), api, &row_with(true, &[]), &vm_info());
+            if let Some(id) = adopted {
+                trigger.set_session(id);
+            }
+            let t = std::time::Instant::now();
+            while phase_a().len() == before {
+                assert!(t.elapsed() < Duration::from_secs(10), "phase A's fetch wrote no claude_fetch row");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let rows = phase_a();
+        let row = rows.last().expect("phase A's row");
+        assert_eq!(row["detail"]["outcome"].as_str(), Some("failed"), "{row}");
+        assert!(row["detail"].get("gen").is_none(), "no generation on a phase-A row: {row}");
+        let text = |v: &serde_json::Value| v.as_str().map(str::to_string);
+        (text(&row["session_id"]), text(&row["detail"]["session"]))
+    }
+
+    /// S12 (R3-3): a migration's phase A names the live chat as its fetch ends, through the latest generation's
+    /// reader: a fresh chat's adopted id (S11 named none), a fork's own id once its init named it and none before
+    /// (S11 named the session it forked), and a plain resume's (a control). The envelope says what the detail says.
+    #[test]
+    fn phase_a_names_the_live_session_never_a_forks_parent() {
+        let d = tempfile::tempdir().unwrap();
+        let mut plan = planned(d.path(), Some("2.1.310"));
+        let (p, f, x, s) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e");
+        let both = |sid: &str| (Some(sid.to_string()), Some(sid.to_string()));
+        let base = plan.argv.clone();
+        let argv = |extra: &[&str]| -> Vec<String> { base.iter().cloned().chain(extra.iter().map(|a| (*a).to_string())).collect() };
+        assert_eq!(phase_a_row(&mut plan, &argv(&[]), None, None, Some(x)), both(x), "a fresh chat: its adopted id");
+        let forks = argv(&["--resume", p, "--fork-session"]);
+        assert_eq!(phase_a_row(&mut plan, &forks, Some(p), Some(p), Some(f)), both(f), "a fork its init named: its own id");
+        assert_eq!(phase_a_row(&mut plan, &forks, Some(p), Some(p), None), (None, None), "a fork not named yet: never its parent");
+        assert_eq!(phase_a_row(&mut plan, &argv(&["--resume", s]), Some(s), Some(s), None), both(s), "a plain resume");
+    }
+
+    /// S12 (R3-4): a `ClaudeRetry` after a fork's generation died before its init (`--resume P --fork-session`)
+    /// names no session in its `claude_start_failed` row (`-`, no envelope session): its own id is unknown there,
+    /// and P is its parent's. A plain `--resume S` keeps S.
+    #[test]
+    fn claude_start_failed_names_no_parent_of_a_fork() {
+        let (p, s) = ("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e");
+        for (extra, resume, want) in [(&["--resume", p, "--fork-session"][..], p, None), (&["--resume", s][..], s, Some(s))] {
+            let d = tempfile::tempdir().unwrap();
+            let mut plan = planned(d.path(), Some("2.1.310"));
+            plan.resume = Some(resume.to_string());
+            plan.argv.extend(extra.iter().map(|a| (*a).to_string()));
+            let v = cref("2.1.310", 'b');
+            let row = row_with(true, &[]);
+            vm_registry::write_row(&plan.paths, &row).unwrap();
+            let path = d.path().join("backend.json");
+            std::fs::write(&path, serde_json::to_string(&crate::bridge::api::FakeState::new()).unwrap()).unwrap();
+            let backend = Backend::Fake(crate::bridge::vm::fake_file::FileFakeMicrovmApi::open(&path).unwrap());
+            let current = Current { backend: Rc::new(backend), row, vm: vm_info(), how: "started", seed: "cloned", seeded_head: None, seal: Seal { tag: "0".repeat(16), account: None } };
+            mark_claude_bad(&plan, 2, current, &v.sha256);
+            let rows: Vec<serde_json::Value> = crate::bridge::audit::read_rows(&plan.paths.audit(), None).unwrap().into_iter().filter(|r| r["event"] == event::CLAUDE_START_FAILED).collect();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!((rows[0]["detail"]["session"].as_str(), rows[0]["session_id"].as_str()), (Some(want.unwrap_or("-")), want), "{extra:?}: {}", rows[0]);
+        }
     }
 
     /// A same-VM respawn restores the transcript only for a resumed chat: a resume miss's session, else the

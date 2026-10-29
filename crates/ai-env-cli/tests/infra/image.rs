@@ -5640,6 +5640,8 @@ fn the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read() {
         want.extend(reads(fake).into_iter().filter(|n| (n.starts_with("FAKE_") || n.starts_with("GIT_") || n == "ARGV_LOG") && !spawn_sets.contains(&n.as_str())));
     }
     assert_eq!(lacks(&removed, &want), Vec::<String>::new(), "REMOVED_ENV (tests/common/mod.rs) lacks these");
+    // S12 (Q-R10): the one real CLI variable the fake claude obeys (R2's state frames); a test run from a Claude Code chat inherits it.
+    assert!(removed.contains("CLAUDE_CODE_SDK_READS_SESSION_STATE"), "REMOVED_ENV (tests/common/mod.rs) lacks CLAUDE_CODE_SDK_READS_SESSION_STATE");
     assert!(spawn_sets.iter().all(|n| !removed.contains(*n)), "Prepared::spawn sets {spawn_sets:?} before it removes REMOVED_ENV");
 
     let wrapper = const_list(&dir.join("tests/wrapper.rs"), "WRAPPER_ENV");
@@ -5929,6 +5931,40 @@ fn make_n_test_aws_s11_1_runs_the_s11_tests_alone() {
     let plain = dry(&[], &[("S11", "1")]);
     assert_eq!(run_line(&plain), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}"), "S11=1 in the environment is ignored");
     assert!(!plain.contains("AI_ENV_S11_TESTS") && !plain.contains("live_s11_"), "{plain}");
+    assert_eq!(read(&log), "", "make -n ran a tool");
+}
+
+/// S12 (P, phase 0): `make test-aws S12=1` runs the live_s12_* tests alone (AI_ENV_S12_TESTS=1, every part's under
+/// one filter) and sets no code token minutes; with SLOW=1 only the slow switch; beside S11=1 both filters. The same
+/// name in the environment adds nothing. Nothing runs.
+#[test]
+fn make_n_test_aws_s12_1_runs_the_s12_tests_alone() {
+    let t = tempfile::tempdir().unwrap();
+    let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
+    let bin = bin_with(t.path(), &fakes);
+    let log = t.path().join("tools.log");
+    let dry = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = make(t.path(), &bin, &["-n", "test-aws"]).args(args).env("FAKE_LOG", &log).envs(envs.iter().copied()).bounded();
+        assert!(out.status.success(), "{args:?}: {}", all(&out));
+        stdout(&out)
+    };
+    let cargo = "cargo +1.98.1 test -p ai-env-cli --features bridge --test aws";
+    let compile = format!("{NO_KEY} {LAB_UNSET} {cargo} --no-run");
+    let tail = format!("{cargo} -- --ignored --test-threads=1 --nocapture");
+    let run_line = |text: &str| text.lines().find(|l| l.starts_with(LAB_UNSET)).unwrap_or_else(|| panic!("no test run in the dry run: {text}")).to_string();
+    let knobs_set = |text: &str| text.split_whitespace().filter(|w| w.starts_with("AI_ENV_BRIDGE_LAB_") && w.contains('=')).map(str::to_string).collect::<Vec<_>>();
+
+    let s12 = dry(&["S12=1"], &[]);
+    assert_eq!(s12.lines().next(), Some(compile.as_str()), "the keyless compile first: {s12}");
+    assert_eq!(run_line(&s12), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S12_TESTS=1  {tail} live_s12_"));
+    assert!(knobs_set(&s12).is_empty() && !s12.contains("AI_ENV_AWS_SLOW") && !s12.contains("AI_ENV_S11_TESTS"), "{s12}");
+    let slow = dry(&["S12=1", "SLOW=1"], &[]);
+    assert_eq!(run_line(&slow), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1 AI_ENV_AWS_SLOW=1 AI_ENV_S12_TESTS=1  {tail} live_s12_"), "the slow switch alone, no code token minutes");
+    assert!(knobs_set(&slow).is_empty(), "a lab knob set for S12's tests: {slow}");
+    assert_eq!(run_line(&dry(&["S11=1", "S12=1"], &[])), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1  AI_ENV_S11_TESTS=1 AI_ENV_S12_TESTS=1  {tail} live_s11_ live_s12_"));
+    let plain = dry(&[], &[("S12", "1")]);
+    assert_eq!(run_line(&plain), format!("{LAB_UNSET} AI_ENV_AWS_TESTS=1   {tail}"), "S12=1 in the environment is ignored");
+    assert!(!plain.contains("AI_ENV_S12_TESTS") && !plain.contains("live_s12_"), "{plain}");
     assert_eq!(read(&log), "", "make -n ran a tool");
 }
 

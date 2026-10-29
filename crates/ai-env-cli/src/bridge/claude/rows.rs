@@ -3,7 +3,7 @@
 //! fallback note, and the newest remote chat's `claude_src`. Never `[NO ]`:
 //! a version VMs cannot run yet leaves chats on what they hold, and no row
 //! offers turning Cursor's auto-update off (VMs follow it with no deploy).
-use super::{failed_why, version_key, Phase, Record, ADMIT_DOCKER_TRIES};
+use super::{failed_why, version_key, Phase, Record, RetryClock, ADMIT_DOCKER_TRIES};
 use crate::bridge::census::RunningExtension;
 use crate::commands::{DoctorLine, Tag};
 
@@ -11,25 +11,30 @@ use crate::commands::{DoctorLine, Tag};
 /// Never `[NO ]`. None when neither a bundle nor a window names a version (LD-36). A version that is the image's
 /// own claude, while no other staged version is named before the image's (P4 names those; a VM that holds one runs
 /// it), runs everywhere already: `[ok ]` unless its admission failed. The seen row promises automatic admission,
-/// and a Docker failure's row its automatic retry ([`rows_claude_auto`] with `auto` false never does).
+/// and a Docker failure's row its automatic retry ([`rows_claude_auto`] with `auto` false never does). S12 (V2,
+/// LD-V7): S11's text, on [`RetryClock::at`] 0: no lock read and never `is due now`, the retry counted from the
+/// failure's own time (its callers are tests and tests/readme.rs).
 #[must_use]
 pub fn rows_claude(records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension]) -> Vec<DoctorLine> {
-    rows_claude_auto(records, image, bundle, running, true)
+    rows_claude_auto(records, image, bundle, running, true, &RetryClock::at(0))
 }
 
 /// [`rows_claude`], the seen row's `(automatic while Docker answers: [claude].auto_admit)` and a Docker failure's
 /// `an automatic retry from <T>` only with `auto`: the caller knows `[claude].auto_admit` is on and the effective
 /// mode is remote (automatic admission starts only at a remote wrapper's `auth status --json` and a remote session's
-/// P0); without it the seen row names `ai-env claude admit <v>` alone, and a Docker failure's its `--redo`.
+/// P0); without it the seen row names `ai-env claude admit <v>` alone, and a Docker failure's its `--redo`. S12
+/// (V2): `<T>` is [`Record::retry_from`] by `clock` (the later of the failure and the version lock's last
+/// automatic end, plus the cooldown), and `an automatic retry is due now` once `clock.now` reached it (§V2.4 rule 6:
+/// that arm alone changes).
 #[must_use]
-pub fn rows_claude_auto(records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension], auto: bool) -> Vec<DoctorLine> {
+pub fn rows_claude_auto(records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension], auto: bool, clock: &RetryClock) -> Vec<DoctorLine> {
     let mut versions: Vec<&str> = bundle.into_iter().chain(running.iter().map(|w| w.ext.as_str())).filter(|v| crate::wire::pin::is_version(v)).collect();
     if versions.is_empty() {
         return Vec::new();
     }
     versions.sort_by_key(|v| std::cmp::Reverse(version_key(v)));
     versions.dedup();
-    let mut lines: Vec<DoctorLine> = versions.iter().map(|v| row_of(v, records, image, bundle, running, auto)).collect();
+    let mut lines: Vec<DoctorLine> = versions.iter().map(|v| row_of(v, records, image, bundle, running, auto, clock)).collect();
     lines.push(DoctorLine::row(Tag::Skip, format!("the image's claude {} runs where no staged version can", image.unwrap_or("unknown"))));
     lines
 }
@@ -45,8 +50,8 @@ pub fn stage_hint(v: &str, bundle: Option<&str>) -> String {
     }
 }
 
-/// The row of version `v` (§8's table).
-fn row_of(v: &str, records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension], auto: bool) -> DoctorLine {
+/// The row of version `v` (§8's table); a Docker failure's retry time judged by `clock` (S12, V2).
+fn row_of(v: &str, records: &[Record], image: Option<&str>, bundle: Option<&str>, running: &[RunningExtension], auto: bool, clock: &RetryClock) -> DoctorLine {
     let mut who: Vec<String> = Vec::new();
     if bundle == Some(v) {
         who.push("the Cursor bundle".into());
@@ -71,7 +76,7 @@ fn row_of(v: &str, records: &[Record], image: Option<&str>, bundle: Option<&str>
                     let n = r.docker_failures();
                     let attempt = super::attempt_words(n);
                     if auto && r.auto_retry() {
-                        let when = super::retry_when(r);
+                        let when = super::retry_when(r, clock);
                         DoctorLine::row(Tag::Warn, format!("{head}: admission failed at docker ({why}; {attempt}); chats run {fallback}  <- an automatic retry{when} (the next remote wrapper starts it), or ai-env claude admit {v} --redo now"))
                     } else if n >= ADMIT_DOCKER_TRIES {
                         DoctorLine::row(Tag::Warn, format!("{head}: admission failed at docker ({why}; {attempt}, no automatic retry left); chats run {fallback}  <- fix it, then ai-env claude admit {v} --redo"))
@@ -187,7 +192,7 @@ mod tests {
         assert_eq!(text(&rows_claude(&records, Some("2.1.309"), Some("2.1.309"), &[])[0]).0, Tag::Warn);
         assert_eq!(text(&rows_claude(&unstaged, Some("2.1.309"), Some("2.1.309"), &[])[0]).0, Tag::Warn, "failed, whatever else is staged");
         // No automatic admission (off, or not remote): the seen row names the command alone (T6).
-        let manual: Vec<(Tag, String)> = rows_claude_auto(&records, Some("2.1.305"), Some("2.1.312"), &running, false).iter().map(text).collect();
+        let manual: Vec<(Tag, String)> = rows_claude_auto(&records, Some("2.1.305"), Some("2.1.312"), &running, false, &RetryClock::at(0)).iter().map(text).collect();
         assert_eq!(manual[0], (Tag::Warn, "claude 2.1.312 (the Cursor bundle): not admitted yet; chats run 2.1.310  <- ai-env claude admit 2.1.312".into()));
         assert_eq!(manual[1..], want[1..], "only the seen row differs");
         // Never `[NO ]`; nothing without a version.
@@ -210,7 +215,7 @@ mod tests {
         put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
         put_docker(&p, "2.1.321", 'b', 3, "2026-10-24T13:50:00Z");
         let records = crate::bridge::claude::load_all(&p);
-        let row = |v: &str, auto: bool| text(&rows_claude_auto(&records, Some("2.1.305"), Some(v), &[], auto)[0]);
+        let row = |v: &str, auto: bool| text(&rows_claude_auto(&records, Some("2.1.305"), Some(v), &[], auto, &RetryClock::at(0))[0]);
         assert_eq!(
             row("2.1.320", true),
             (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run 2.1.310  <- an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now".into())
@@ -218,6 +223,29 @@ mod tests {
         assert_eq!(row("2.1.320", false), (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run 2.1.310  <- fix it, then ai-env claude admit 2.1.320 --redo".into()));
         for auto in [true, false] {
             assert_eq!(row("2.1.321", auto), (Tag::Warn, "claude 2.1.321 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 3 of 3, no automatic retry left); chats run 2.1.310  <- fix it, then ai-env claude admit 2.1.321 --redo".into()));
+        }
+    }
+
+    /// S12 (V2, §V2.4 rule 6): a Docker failure's row counts its automatic retry from the later of the failure and
+    /// the version lock's last automatic end (`clock`), and says it is due now once its clock reached that time;
+    /// without `auto`, the `--redo` alone, whatever the clock. Still `[!! ]`. `rows_claude` keeps S11's text (rule 7,
+    /// LD-V7): the failure's own time, never due now, however long ago that was.
+    #[test]
+    fn a_docker_failures_row_counts_from_the_last_auto_end_or_says_due_now() {
+        use crate::bridge::claude::tests::put_docker;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::from_root_and_env(dir.path().join("bridge"), None);
+        put(&p, "2.1.310", 'e', "staged");
+        put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        let records = crate::bridge::claude::load_all(&p);
+        let a = crate::wire::time::parse_rfc3339_utc("2026-10-24T13:50:00Z").unwrap();
+        let row = |auto: bool, now: u64| text(&rows_claude_auto(&records, Some("2.1.305"), Some("2.1.320"), &[], auto, &RetryClock { now, finished: [("2.1.320".to_string(), a + 600)].into() })[0]);
+        let head = "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run 2.1.310  <- ";
+        assert_eq!(row(true, a + 60), (Tag::Warn, format!("{head}an automatic retry from 2026-10-24T14:15:00Z (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now")));
+        assert_eq!(row(true, a + 3600), (Tag::Warn, format!("{head}an automatic retry is due now (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now")));
+        assert_eq!(text(&rows_claude(&records, Some("2.1.305"), Some("2.1.320"), &[])[0]), (Tag::Warn, format!("{head}an automatic retry from 2026-10-24T14:05:00Z (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now")), "rows_claude: S11's text, no lock, never due now");
+        for now in [a + 60, a + 3600] {
+            assert_eq!(row(false, now), (Tag::Warn, format!("{head}fix it, then ai-env claude admit 2.1.320 --redo")), "{now}");
         }
     }
 

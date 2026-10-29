@@ -107,9 +107,9 @@
     "GB per snapshot operation assumed 2 (a suspend's write, a resume's read; a start's image read unmeasured): T11.1 calibrates them",
     "bursts above the baseline (1 vCPU and the image's memory) are billed while used and invisible here",
     "the images' snapshot storage is taken as a constant ($0.021 a day)",
-    "VMs outside this registry (other owners, a deleted audit) are not counted",
+    "VMs outside this registry (other owners, a deleted audit, a live test before S12 or one killed before its end) are not counted",
     "image builds during make deploy are not counted",
     "Cost Explorer's days are UTC, lag 24 to 48 h and round",
-    "a sleeping Mac writes no rows (the idle rule covers it)"
+    "a sleeping Mac writes no rows: a parked chat's VM is priced by the idle rule, an unparked one's by its wrapper's reconnect, which measures the sleep (suspended max_idle_s after the lid closed); an unparked one that ended asleep left no reconnect and is priced as running to its wall, or to the platform's end once ai-env records it (the chat's next message, a reuse, vm status), and through the sleep until then"
   ]
 }

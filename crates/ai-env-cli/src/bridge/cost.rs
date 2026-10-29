@@ -2,7 +2,9 @@
 //! estimated from the timeline (`timeline`) at one rate card ([`EUC1`]):
 //! `ai-env cost`, `vm list`'s RUN and COST cells, the panel's cost page. No
 //! AWS call. Phase 0 built the rates and declared the rest; S11 wave 1's B2
-//! built it.
+//! built it. S12 (C): the live tests' runs merged, labelled (`estimate_with`,
+//! `bridge::testruns`; `--no-tests` leaves them out), and `--compare`'s
+//! proxy verdict and billed rates (B Q4), evidence beside the exit's verdict.
 use crate::bridge::config::Paths;
 use crate::bridge::errors::BridgeError;
 use crate::bridge::timeline::{Phase, Timeline, VmDefaults, VmTimeline};
@@ -77,6 +79,8 @@ pub const USAGE_GP3: &str = "EUC1-EBS:VolumeUsage.gp3";
 
 /// The five Lambda types: the MicroVM total T11.1 judges.
 pub const MICROVM_USAGE: [&str; 5] = [USAGE_VCPU, USAGE_MEMORY, USAGE_SNAPSHOT_WRITE, USAGE_SNAPSHOT_READ, USAGE_SNAPSHOT_STORAGE];
+/// The proxy's three usage types (B Q4): its instance hours, its public IPv4's and its gp3 volume's.
+pub const PROXY_USAGE: [&str; 3] = [USAGE_T4G_NANO, USAGE_IPV4, USAGE_GP3];
 
 /// One Cost Explorer line.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -104,6 +108,9 @@ pub struct VmCost {
     pub high_usd: f64,
     /// `-`, `<n> idle suspends inferred`, `terminated (<by>)`, … joined by `; `.
     pub note: String,
+    /// S12 (C1): the live test whose run holds this VM (`state/test-runs`); `None` for this root's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
 }
 
 /// One UTC day of a `--by day` estimate.
@@ -137,6 +144,19 @@ pub struct Estimate {
     pub proxy_usd: f64,
     pub proxy_assumed: bool,
     pub not_counted: Vec<String>,
+    /// S12 (C1): the runs (`state/test-runs/<name>`) whose VMs this estimate prices, by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_runs: Vec<String>,
+    /// S12 (C1): what those VMs cost: their `usd` summed; `None` when none is priced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_usd: Option<f64>,
+    /// S12 (C1): `--no-tests` only: the test VMs a merged estimate would have priced in the window and
+    /// this one does not (a VM this root holds too is priced, so it is not left out).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub tests_excluded: u32,
+    /// S12 (C1): each run that could not be read, `<name>: <why>`; none of its VMs is priced or counted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_runs_unreadable: Vec<String>,
     pub anomalies: u32,
     /// `S3`, `CloudWatch`, `data transfer`.
     pub not_estimated: Vec<&'static str>,
@@ -146,10 +166,76 @@ pub struct Estimate {
     pub days: Vec<Day>,
 }
 
-/// The estimate of `[since, until)` from `paths`' audit, VM rows and `[vm]` (defaults when bridge.toml is absent).
+/// `serde`'s skip test for `tests_excluded`.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The estimate of `[since, until)` with the live tests' runs merged: `estimate_with(.., Tests::Merge)`.
+/// `ai-env cost` and the panel's `/cost` (whose `?json=1` is `cost --json`'s document) read it.
 pub fn estimate_for(paths: &Paths, since: u64, until: u64, by_day: bool) -> Result<Estimate, BridgeError> {
-    let t = timeline_for(paths, since, until)?;
-    Ok(estimate(&t, &EUC1, by_day))
+    estimate_with(paths, since, until, by_day, Tests::Merge)
+}
+
+/// The estimate of `[since, until)` from `paths`' audit, VM rows and `[vm]`, the runs under
+/// `paths.test_runs()` merged or left out (§C2.3).
+///
+/// The root is read exactly as [`timeline_for`] reads it (an unreadable audit or `state/vms` is the
+/// `Err`, exit 1), then the runs (`testruns::read_runs`, which never fails: a run it cannot read is
+/// `test_runs_unreadable`, in both modes, and adds to no count). `Merge` (rule 1) builds one timeline
+/// over the root's rows followed by each run's (runs by name), and each run's VM rows followed by the
+/// root's, so `timeline::build`'s id map keeps the root's row of an id both hold (LD-C5); its test VMs
+/// are labelled (rules 2 and 3, [`label_tests`]). `Exclude` (rule 4, `--no-tests`) prices the root
+/// alone and counts in `tests_excluded` the VMs `build` puts in the window over the runs alone (the same
+/// `[vm]`, LD-C6) that the root's own estimate does not price: a VM the root holds too (its `vm gc`
+/// adopted or ended a test's leaked VM) is still priced, so it is not left out. No run holds a row
+/// naming no VM, so the proxy's spans are the root's in both modes (rule 6). Read-only: it creates,
+/// writes, chmods and locks nothing, asks no Touch ID and calls no AWS.
+pub fn estimate_with(paths: &Paths, since: u64, until: u64, by_day: bool, tests: Tests) -> Result<Estimate, BridgeError> {
+    let rows = crate::bridge::audit::read::read_all(&paths.audit())?;
+    let vm_rows = crate::bridge::vm::registry::list_rows(paths)?;
+    let defaults = VmDefaults::from_cfg(&crate::bridge::config::BridgeConfig::load(paths)?.map(|c| c.vm).unwrap_or_default());
+    let (runs, unreadable) = crate::bridge::testruns::read_runs(paths);
+    let run_rows = runs.iter().flat_map(|r| r.rows.iter().cloned());
+    let run_vm_rows = runs.iter().flat_map(|r| r.vm_rows.iter().cloned());
+    let mut est = match tests {
+        Tests::Merge => {
+            let rows: Vec<_> = rows.into_iter().chain(run_rows).collect();
+            let vm_rows: Vec<_> = run_vm_rows.chain(vm_rows).collect();
+            let mut est = estimate(&crate::bridge::timeline::build(&rows, &vm_rows, defaults, since, until), &EUC1, by_day);
+            label_tests(&mut est, &runs);
+            est
+        }
+        Tests::Exclude => {
+            let mut est = estimate(&crate::bridge::timeline::build(&rows, &vm_rows, defaults, since, until), &EUC1, by_day);
+            let alone = crate::bridge::timeline::build(&run_rows.collect::<Vec<_>>(), &run_vm_rows.collect::<Vec<_>>(), defaults, since, until);
+            let left_out = alone.vms.iter().filter(|v| !est.vms.iter().any(|e| e.id == v.vm)).count();
+            est.tests_excluded = u32::try_from(left_out).unwrap_or(u32::MAX);
+            est
+        }
+    };
+    est.test_runs_unreadable = unreadable;
+    Ok(est)
+}
+
+/// §C2.3 rules 2 and 3: a VM is a test VM when a run's VM rows hold its id or a run's row charges it
+/// (`Read.vms.first()`); the first run by name that names it labels it (LD-C5). Its `test` is that
+/// run's test, and its note says so first: `live test <test>`, or `live test <test>; <note>`.
+/// `test_runs` names the runs that label at least one VM, sorted; `tests_usd` is their VMs' `usd`
+/// summed, `None` with none.
+fn label_tests(est: &mut Estimate, runs: &[crate::bridge::testruns::TestRun]) {
+    let mut labelling = std::collections::BTreeSet::new();
+    let mut usd_sum: Option<f64> = None;
+    for v in &mut est.vms {
+        let names = |r: &&crate::bridge::testruns::TestRun| r.vm_rows.iter().any(|row| row.id == v.id) || r.rows.iter().any(|row| row.vms.first() == Some(&v.id));
+        let Some(run) = runs.iter().find(names) else { continue };
+        v.note = if v.note == "-" { format!("live test {}", run.test) } else { format!("live test {}; {}", run.test, v.note) };
+        v.test = Some(run.test.clone());
+        labelling.insert(run.name.clone());
+        *usd_sum.get_or_insert(0.0) += v.usd;
+    }
+    est.test_runs = labelling.into_iter().collect();
+    est.tests_usd = usd_sum.map(usd);
 }
 
 /// The timeline of `[since, until)` from `paths`' audit, its VM rows and `[vm]` (the views' one reading).
@@ -160,16 +246,25 @@ pub fn timeline_for(paths: &Paths, since: u64, until: u64) -> Result<Timeline, B
     Ok(crate::bridge::timeline::build(&rows, &vm_rows, defaults, since, until))
 }
 
+/// Whether an estimate counts the live tests' VMs (S12 C1): each live test's guard keeps its audit rows
+/// naming a VM and its stripped VM rows under the real root's `state/test-runs` (`bridge::testruns`);
+/// `ai-env cost` and the panel merge them (`Merge`), `ai-env cost --no-tests` leaves them out (`Exclude`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tests {
+    Merge,
+    Exclude,
+}
+
 /// The caveats every estimate prints, in order.
 pub const CAVEATS: [&str; 8] = [
     "idle suspends are inferred: a running stretch with no closing row ends max_idle_s after its last activity (the range puts it at that activity and at the next evidence)",
     "GB per snapshot operation assumed 2 (a suspend's write, a resume's read; a start's image read unmeasured): T11.1 calibrates them",
     "bursts above the baseline (1 vCPU and the image's memory) are billed while used and invisible here",
     "the images' snapshot storage is taken as a constant ($0.021 a day)",
-    "VMs outside this registry (other owners, a deleted audit) are not counted",
+    "VMs outside this registry (other owners, a deleted audit, a live test before S12 or one killed before its end) are not counted",
     "image builds during make deploy are not counted",
     "Cost Explorer's days are UTC, lag 24 to 48 h and round",
-    "a sleeping Mac writes no rows (the idle rule covers it)",
+    "a sleeping Mac writes no rows: a parked chat's VM is priced by the idle rule, an unparked one's by its wrapper's reconnect, which measures the sleep (suspended max_idle_s after the lid closed); an unparked one that ended asleep left no reconnect and is priced as running to its wall, or to the platform's end once ai-env records it (the chat's next message, a reuse, vm status), and through the sleep until then",
 ];
 
 /// What the estimate leaves out.
@@ -356,7 +451,7 @@ fn note_of(v: &VmTimeline) -> String {
     }
 }
 
-/// The same, from what is already read.
+/// The same, from what is already read (S12: no run labelled, nothing left out).
 #[must_use]
 pub fn estimate(t: &Timeline, rates: &Rates, by_day: bool) -> Estimate {
     let (since, until) = (t.since, t.until);
@@ -377,6 +472,7 @@ pub fn estimate(t: &Timeline, rates: &Rates, by_day: bool) -> Estimate {
                 low_usd: round(use_of(t, v, Which::Low, since, until).usd(rates)),
                 high_usd: round(use_of(t, v, Which::High, since, until).usd(rates)),
                 note: note_of(v),
+                test: None,
             }
         })
         .collect();
@@ -396,6 +492,11 @@ pub fn estimate(t: &Timeline, rates: &Rates, by_day: bool) -> Estimate {
         proxy_usd: proxy,
         proxy_assumed: t.proxy.assumed,
         not_counted: t.not_counted.clone(),
+        // S12 (C1): `estimate_with` fills them.
+        test_runs: Vec::new(),
+        tests_usd: None,
+        tests_excluded: 0,
+        test_runs_unreadable: Vec::new(),
         anomalies: t.vms.iter().map(|v| v.anomalies).sum(),
         not_estimated: NOT_ESTIMATED.to_vec(),
         caveats: CAVEATS.to_vec(),
@@ -459,12 +560,15 @@ pub fn ce_command(start: &str, end: &str) -> String {
 }
 
 /// A Cost Explorer answer, read leniently: its window (UTC midnights), each usage type's summed
-/// `UnblendedCost`, and the days whose figures are still `Estimated`.
+/// `UnblendedCost` and (S12) `UsageQuantity`, and the days whose figures are still `Estimated`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CeAnswer {
     pub start: u64,
     pub end: u64,
     pub by_type: BTreeMap<String, f64>,
+    /// S12 (B Q4): each usage type's `UsageQuantity` summed over the kept days (the JSON's);
+    /// empty for the console's CSV, which has none.
+    pub quantity: BTreeMap<String, f64>,
     pub estimated: Vec<String>,
 }
 
@@ -494,6 +598,7 @@ pub fn parse_compare_in(text: &str, days: Option<(u64, u64)>) -> Result<CeAnswer
     let periods = v["ResultsByTime"].as_array().filter(|a| !a.is_empty()).ok_or_else(usage)?;
     let (mut start, mut end) = (u64::MAX, 0u64);
     let mut by_type: BTreeMap<String, f64> = BTreeMap::new();
+    let mut quantity: BTreeMap<String, f64> = BTreeMap::new();
     let mut estimated = Vec::new();
     for p in periods {
         let from = p["TimePeriod"]["Start"].as_str().and_then(day_start).ok_or_else(usage)?;
@@ -513,12 +618,17 @@ pub fn parse_compare_in(text: &str, days: Option<(u64, u64)>) -> Result<CeAnswer
             let key = g["Keys"][0].as_str().ok_or_else(usage)?;
             let amount = g["Metrics"]["UnblendedCost"]["Amount"].as_str().and_then(|a| a.parse::<f64>().ok()).filter(|a| a.is_finite()).ok_or_else(usage)?;
             *by_type.entry(key.to_string()).or_default() += amount;
+            // S12 (B Q4, §C3.2 rule 1): the billed quantity, read as leniently: a group without one, or with one
+            // that is no finite number, adds nothing and is no error.
+            if let Some(q) = g["Metrics"]["UsageQuantity"]["Amount"].as_str().and_then(|q| q.parse::<f64>().ok()).filter(|q| q.is_finite()) {
+                *quantity.entry(key.to_string()).or_default() += q;
+            }
         }
     }
     if end == 0 {
         return Err(if days.is_some() { "the file has no day within --since/--until".to_string() } else { usage() });
     }
-    Ok(CeAnswer { start, end, by_type, estimated })
+    Ok(CeAnswer { start, end, by_type, quantity, estimated })
 }
 
 /// One CSV line's fields (RFC 4180: quoted with `""` for a quote, or bare); `None` for a malformed line.
@@ -601,7 +711,29 @@ fn parse_console_csv(text: &str, days: Option<(u64, u64)>) -> Result<CeAnswer, S
     if end == 0 {
         return Err(if days.is_some() { "the CSV has no day within --since/--until".to_string() } else { usage() });
     }
-    Ok(CeAnswer { start, end, by_type, estimated: Vec::new() })
+    // The console's CSV holds costs only: no quantity, so no billed rate (§C3.4).
+    Ok(CeAnswer { start, end, by_type, quantity: BTreeMap::new(), estimated: Vec::new() })
+}
+
+/// A verdict over some usage types at T11.1's band (S12: the proxy's).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Judged {
+    /// The types judged, in `PROXY_USAGE`'s order: those the file holds.
+    pub types: Vec<&'static str>,
+    pub estimate_usd: f64,
+    pub actual_usd: f64,
+    /// `(estimate - actual) / actual` in percent, one decimal; `None` with no actual cost.
+    pub off_pct: Option<f64>,
+    pub pass: bool,
+}
+
+/// One priced type's card rate against the rate Cost Explorer billed (`UnblendedCost / UsageQuantity`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BilledRate {
+    pub usage_type: &'static str,
+    pub card: f64,
+    pub billed: f64,
+    pub quantity: f64,
 }
 
 /// The estimate against Cost Explorer: each usage type's pair, and the MicroVM total's verdict.
@@ -614,9 +746,53 @@ pub struct Compared {
     /// `(estimate - actual) / actual` in percent; `None` with no actual cost.
     pub off_pct: Option<f64>,
     pub pass: bool,
+    /// S12 (B Q4): the proxy's verdict over the proxy types the file holds; `None` when it holds none.
+    /// Evidence: never the exit.
+    pub proxy: Option<Judged>,
+    /// S12 (B Q4): the card rate against the billed one, for each of the estimate's eight types the
+    /// file has a positive quantity of, in the lines' order.
+    pub rates: Vec<BilledRate>,
+}
+
+/// T11.1's rule for a total: `(off_pct, pass)`, the percent off at one decimal (`None` with no actual
+/// cost) and whether the estimate lies within ±`COMPARE_BAND` of the actual (a zero actual passes only a
+/// zero estimate). The MicroVM total and the proxy's (§C3.2 rule 2) are judged alike.
+fn judge(estimate: f64, actual: f64) -> (Option<f64>, bool) {
+    let off_pct = (actual > 0.0).then(|| (estimate - actual) / actual * 100.0);
+    let pass = if actual > 0.0 { (estimate - actual).abs() <= COMPARE_BAND * actual } else { estimate == 0.0 };
+    (off_pct.map(|p| (p * 10.0).round() / 10.0), pass)
+}
+
+/// `<what>: estimate $<e>, Cost Explorer $<a>: <off>: within ±30 %` (or `outside ±30 %`).
+fn verdict_line(what: &str, estimate: f64, actual: f64, off_pct: Option<f64>, pass: bool) -> String {
+    let band = format!("±{:.0} %", COMPARE_BAND * 100.0);
+    let off = off_pct.map_or_else(|| "no Cost Explorer figure to judge by".to_string(), |p| format!("{:.1} % off", p.abs()));
+    format!("{what}: estimate ${estimate:.3}, Cost Explorer ${actual:.3}: {off}: {} {band}", if pass { "within" } else { "outside" })
+}
+
+/// The card's rate of `usage_type`, one of the estimate's eight lines; `None` for any other type.
+fn card_rate(rates: &Rates, usage_type: &str) -> Option<f64> {
+    Some(match usage_type {
+        USAGE_VCPU => rates.vcpu_second,
+        USAGE_MEMORY => rates.gb_second,
+        USAGE_SNAPSHOT_WRITE => rates.snapshot_write_gb,
+        USAGE_SNAPSHOT_READ => rates.snapshot_read_gb,
+        USAGE_SNAPSHOT_STORAGE => rates.snapshot_storage_gb_hour,
+        USAGE_T4G_NANO => rates.t4g_nano_hour,
+        USAGE_IPV4 => rates.public_ipv4_hour,
+        USAGE_GP3 => rates.gp3_gb_month,
+        _ => return None,
+    })
 }
 
 /// Judge `est` against `ce` (T11.1: the MicroVM total within ±`COMPARE_BAND`).
+///
+/// S12 (B Q4, §C3.2): beside it, the proxy's verdict over the `PROXY_USAGE` types the file holds, in
+/// that order (none: `None`), the estimate's lines for them against the file's amounts, judged by the
+/// same rule (LD-C8, §C3.2 rule 2); and, for each of the estimate's eight lines in order whose type the
+/// file has a positive quantity of, the card's rate against the billed one, the file's amount divided by
+/// its quantity (LD-C7, §C3.2 rule 3). Neither changes `pass`, the exit's (rule 4); nothing of it is
+/// stored.
 #[must_use]
 pub fn compare(est: &Estimate, ce: &CeAnswer) -> Compared {
     let mut lines: Vec<(String, f64, f64)> = est.lines.iter().map(|l| (l.usage_type.to_string(), l.usd, round(ce.by_type.get(l.usage_type).copied().unwrap_or(0.0)))).collect();
@@ -627,25 +803,74 @@ pub fn compare(est: &Estimate, ce: &CeAnswer) -> Compared {
     }
     let actual = round(MICROVM_USAGE.iter().map(|t| ce.by_type.get(*t).copied().unwrap_or(0.0)).sum());
     let estimate = est.microvm_usd;
-    let off_pct = (actual > 0.0).then(|| (estimate - actual) / actual * 100.0);
-    let pass = if actual > 0.0 { (estimate - actual).abs() <= COMPARE_BAND * actual } else { estimate == 0.0 };
-    Compared { lines, estimate_usd: estimate, actual_usd: actual, off_pct: off_pct.map(|p| (p * 10.0).round() / 10.0), pass }
+    let (off_pct, pass) = judge(estimate, actual);
+    let types: Vec<&'static str> = PROXY_USAGE.iter().copied().filter(|t| ce.by_type.contains_key(*t)).collect();
+    let proxy = (!types.is_empty()).then(|| {
+        let estimate_usd = round(est.lines.iter().filter(|l| types.contains(&l.usage_type)).map(|l| l.usd).sum());
+        let actual_usd = round(types.iter().map(|t| ce.by_type.get(*t).copied().unwrap_or(0.0)).sum());
+        let (off_pct, pass) = judge(estimate_usd, actual_usd);
+        Judged { types: types.clone(), estimate_usd, actual_usd, off_pct, pass }
+    });
+    let rates = est
+        .lines
+        .iter()
+        .filter_map(|l| {
+            let quantity = ce.quantity.get(l.usage_type).copied().filter(|q| *q > 0.0)?;
+            let card = card_rate(&EUC1, l.usage_type)?;
+            Some(BilledRate { usage_type: l.usage_type, card, billed: ce.by_type.get(l.usage_type).copied().unwrap_or(0.0) / quantity, quantity })
+        })
+        .collect();
+    Compared { lines, estimate_usd: estimate, actual_usd: actual, off_pct, pass, proxy, rates }
+}
+
+impl Judged {
+    /// `<what>: estimate $<e>, Cost Explorer $<a>: <off>: within ±30 %` (or `outside ±30 %`), as
+    /// `Compared::verdict` words the MicroVM total.
+    #[must_use]
+    pub fn verdict(&self, what: &str) -> String {
+        verdict_line(what, self.estimate_usd, self.actual_usd, self.off_pct, self.pass)
+    }
 }
 
 impl Compared {
-    /// `--json`'s `compare`.
+    /// `--json`'s `compare`: S11's `lines` and `microvm`, then (S12, B Q4) `proxy` (`null` when the file
+    /// holds no proxy type) and `rates` (empty for the console's CSV).
     #[must_use]
     pub fn json(&self) -> serde_json::Value {
         let lines: Vec<serde_json::Value> = self.lines.iter().map(|(t, e, a)| serde_json::json!({ "usage_type": t, "estimate_usd": e, "actual_usd": a })).collect();
-        serde_json::json!({ "lines": lines, "microvm": { "estimate_usd": self.estimate_usd, "actual_usd": self.actual_usd, "off_pct": self.off_pct, "pass": self.pass } })
+        serde_json::json!({
+            "lines": lines,
+            "microvm": { "estimate_usd": self.estimate_usd, "actual_usd": self.actual_usd, "off_pct": self.off_pct, "pass": self.pass },
+            "proxy": self.proxy,
+            "rates": self.rates,
+        })
     }
 
     /// The verdict line.
     #[must_use]
     pub fn verdict(&self) -> String {
-        let band = format!("±{:.0} %", COMPARE_BAND * 100.0);
-        let off = self.off_pct.map_or_else(|| "no Cost Explorer figure to judge by".to_string(), |p| format!("{:.1} % off", p.abs()));
-        format!("MicroVM total: estimate ${:.3}, Cost Explorer ${:.3}: {off}: {} {band}", self.estimate_usd, self.actual_usd, if self.pass { "within" } else { "outside" })
+        verdict_line("MicroVM total", self.estimate_usd, self.actual_usd, self.off_pct, self.pass)
+    }
+
+    /// The proxy's line (§C3.3): its verdict, which is evidence and never the exit, or what the file
+    /// lacks (B Q4 needs an export with the EC2 and VPC services).
+    #[must_use]
+    pub fn proxy_verdict(&self) -> String {
+        match &self.proxy {
+            Some(j) => format!("{} (evidence, not the exit)", j.verdict(&format!("proxy total ({})", j.types.join(", ")))),
+            None => format!("proxy total: the file holds none of {} (export EC2-Instances, EC2-Other and VPC too)", PROXY_USAGE.join(", ")),
+        }
+    }
+
+    /// One line per `BilledRate` (§C3.3): `rate <usage type>: card $<card>, billed $<billed> (<pct> %) over
+    /// <quantity>`, the rates at 10 decimals, `<pct>` the billed rate's difference from the card's in
+    /// percent with its sign and one decimal, the quantity at 3 decimals.
+    #[must_use]
+    pub fn rate_lines(&self) -> Vec<String> {
+        self.rates
+            .iter()
+            .map(|r| format!("rate {}: card ${:.10}, billed ${:.10} ({:+.1} %) over {:.3}", r.usage_type, r.card, r.billed, (r.billed - r.card) / r.card * 100.0, r.quantity))
+            .collect()
     }
 }
 
@@ -668,6 +893,17 @@ pub fn render_text(est: &Estimate, t_since: u64, t_until: u64, hint: bool) -> Ve
         out.push(format!("{:<46} {:>22} {:>9}", l.usage_type, format!("{:.3} {}", l.quantity, l.unit), format!("${:.3}", l.usd)));
     }
     out.push(format!("estimate ${:.3} (range ${:.3}–{:.3}); not counted: {}", est.usd, est.low_usd, est.high_usd, est.not_estimated.join(", ")));
+    // S12 (C1, LD-C14): the live tests' share, each line only when it applies, so S11's text stays without runs.
+    if let Some(usd) = est.tests_usd {
+        let k = est.vms.iter().filter(|v| v.test.is_some()).count();
+        out.push(format!("live tests: {k} VM(s) of {} run(s), ${usd:.3} of the estimate (--no-tests leaves them out)", est.test_runs.len()));
+    }
+    if est.tests_excluded > 0 {
+        out.push(format!("live tests: {} VM(s) left out (--no-tests)", est.tests_excluded));
+    }
+    if !est.test_runs_unreadable.is_empty() {
+        out.push(format!("test runs not read: {}", est.test_runs_unreadable.join("; ")));
+    }
     for d in &est.days {
         out.push(format!("day {}  ${:.3} (range ${:.3}–{:.3})  MicroVM ${:.3}  proxy ${:.3}", d.day, d.usd, d.low_usd, d.high_usd, d.microvm_usd, d.proxy_usd));
     }
@@ -714,9 +950,12 @@ fn read_compare(file: &Path) -> Result<String, String> {
 }
 
 /// `ai-env cost` (B §B3.4, §B3.5): no AWS call, no Touch ID. Exit 2 for an unreadable `<when>`, a window that
-/// ends before it starts or an unusable `--compare` file; 1 for an unreadable audit, or a comparison outside the band
-/// (whatever becomes of the output). A window reaching past now ends now: what has not happened is not priced.
-pub fn cmd_cost(since: Option<&str>, until: Option<&str>, by_day: bool, json: bool, compare_file: Option<&Path>) -> crate::errors::Result<()> {
+/// ends before it starts or an unusable `--compare` file; 1 for an unreadable audit or VM directory of the root, or a
+/// comparison whose MicroVM total lies outside the band (whatever becomes of the output). A window reaching past now
+/// ends now: what has not happened is not priced. S12 (C1): the live tests' runs are merged, labelled, unless `tests`
+/// is `Exclude` (`--no-tests`); a run that cannot be read is named and never an exit, and neither is the proxy's
+/// verdict (B Q4).
+pub fn cmd_cost(since: Option<&str>, until: Option<&str>, by_day: bool, json: bool, compare_file: Option<&Path>, tests: Tests) -> crate::errors::Result<()> {
     use crate::errors::CliError;
     let paths = Paths::resolve()?;
     let now = crate::bridge::lab::now();
@@ -759,7 +998,7 @@ pub fn cmd_cost(since: Option<&str>, until: Option<&str>, by_day: bool, json: bo
         let msg = if to < asked { format!("the window's start {from_s} is not before now ({to_s})") } else { format!("the window's end {to_s} is not after its start {from_s}") };
         return Err(CliError::Usage(msg));
     }
-    let est = estimate_for(&paths, from, to, by_day)?;
+    let est = estimate_with(&paths, from, to, by_day, tests)?;
     let judged = ce.as_ref().map(|ce| compare(&est, ce));
     // The verdict is the exit even when the output fails (a reader that closed the pipe early is no pass).
     let printed = print_cost(&est, judged.as_ref(), ce.as_ref(), json, (from, to, to < asked));
@@ -806,6 +1045,11 @@ fn print_cost(est: &Estimate, judged: Option<&Compared>, ce: Option<&CeAnswer>, 
                 outln!("{t:<46} {:>10} {:>10} {:>11}", format!("${e:.3}"), format!("${a:.3}"), format!("{}${:.3}", if e < a { "-" } else { "+" }, (e - a).abs()));
             }
             outln!("{}", j.verdict());
+            // S12 (B Q4): the proxy's verdict and the billed rates, evidence after the exit's verdict.
+            outln!("{}", j.proxy_verdict());
+            for line in j.rate_lines() {
+                outln!("{line}");
+            }
         }
     }
     Ok(())
@@ -951,5 +1195,264 @@ mod tests {
         let first = estimate_for(&fixture(), since, DAY + 86_400, false).unwrap();
         assert!(close(est.days[0].usd, first.usd) && est.days[0].lines == first.lines, "{:?} vs {:?}", est.days[0], first);
         assert!(estimate_for(&fixture(), since, until, false).unwrap().days.is_empty(), "no days without --by day");
+    }
+
+    // ---- S12 (C): the live tests' runs, B Q4 and the measured sleep (plans/s12-contracts.md §6) ----
+
+    /// §C10.1's TV: a live test's VM of the fixture's day.
+    const TV: &str = "microvm-0e570000-0000-4000-8000-00000000000e";
+
+    /// A v2 audit line of `event` at `t`.
+    fn audit_line(t: u64, event: &str, detail: &[(&str, &str)]) -> String {
+        let mut d = serde_json::Map::new();
+        d.insert("actor".into(), "cli".into());
+        for (k, v) in detail {
+            d.insert((*k).into(), (*v).into());
+        }
+        serde_json::json!({ "v": 2, "ts": crate::wire::time::rfc3339_utc(t), "event": event, "session_id": null, "pid": 5150, "detail": d }).to_string()
+    }
+
+    /// `from`'s tree copied to `to`.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+
+    /// §C10.1: TV's run, archived into `world` by the real writer (LD-C15) from a test root of its own: TV's
+    /// `vm_run` at 12:00 (`max_idle_s` 300, `suspended_s` 3600), a `proxy_stop` at 12:00 (merged, it would cut
+    /// the fixture's proxy hours from 12 to 5), its `vm_terminate` by `test` at 12:30, and TV's row with a
+    /// session token and a commit made at run time.
+    fn tv_run(world: &Paths) -> std::path::PathBuf {
+        use crate::bridge::vm::registry::{write_row, IdleRow, RowStatus, VmRow};
+        let t = tempfile::tempdir().unwrap();
+        let test = Paths::from_root_and_env(t.path().to_path_buf(), None);
+        let noon = DAY + 12 * 3600;
+        let lines = [
+            audit_line(noon, "vm_run", &[("id", TV), ("purpose", "test"), ("image_version", "13.0"), ("egress", "internet"), ("shell", "false"), ("client_token", "0199f0e5-0000-7000-8000-00000000000e"), ("max_duration_s", "3600"), ("max_idle_s", "300"), ("suspended_s", "3600"), ("memory_mib", "2048")]),
+            audit_line(noon, "proxy_stop", &[("instance", "i-0test"), ("vpc_vms", "0")]),
+            audit_line(noon + 1800, "vm_terminate", &[("id", TV), ("by", "test")]),
+        ];
+        std::fs::write(test.audit(), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let nonce = uuid::Uuid::now_v7().simple().to_string();
+        let row = VmRow {
+            v: 1,
+            status: RowStatus::Terminated,
+            id: TV.into(),
+            session_token: Some(format!("{}{nonce}", "ab".repeat(16))),
+            commit: format!("{}{nonce}", "cd".repeat(16)),
+            started_at: Some(noon),
+            wall_deadline: Some(noon + 3600),
+            max_duration_s: 3600,
+            idle: Some(IdleRow { max_idle_s: 300, suspended_s: 3600, auto_resume: true }),
+            terminated_at: Some(noon + 1800),
+            terminated_by: Some("test".into()),
+            ..VmRow::default()
+        };
+        write_row(&test, &row).unwrap();
+        crate::bridge::testruns::archive(&test, world, "live_vm_lifecycle", DAY + 13 * 3600).unwrap().expect("TV's run")
+    }
+
+    /// S12 (C1, §C2.3): TV's run, archived into a copy of the fixture's root, merges into its day: A, B and
+    /// TV, TV labelled with its test, the run and its dollars named, the proxy the root's (the run kept no
+    /// `proxy_stop`); `--no-tests` is the root's estimate with TV counted; the views' timeline never sees it
+    /// (M-C5, M-C6, M-C7). LD-C5, with ids in two places: a second run, later by name, holds TV's row again
+    /// and copies of A's and B's rows whose times differ from the root's. The root's row wins (A and B
+    /// priced as before, M-C25), the first run by name labels a VM (TV keeps its test, M-C26), and the
+    /// second labels A and B; `--no-tests` still prices A and B, so only TV is left out (LD-C6 as amended,
+    /// M-C29), and a run holding only a VM the root holds leaves nothing out.
+    #[test]
+    fn the_live_tests_runs_merge_labelled_and_no_tests_counts_them() {
+        use crate::bridge::vm::registry::{list_rows, write_row, VmRow};
+        let dir = tempfile::tempdir().unwrap();
+        copy_tree(&fixture().root, dir.path());
+        let world = Paths::from_root_and_env(dir.path().to_path_buf(), None);
+        let run = tv_run(&world);
+        let name = run.file_name().unwrap().to_string_lossy().into_owned();
+        let base = estimate_for(&fixture(), DAY, DAY + 86_400, false).unwrap();
+        let merged = estimate_with(&world, DAY, DAY + 86_400, false, Tests::Merge).unwrap();
+        assert_eq!(merged, estimate_for(&world, DAY, DAY + 86_400, false).unwrap(), "estimate_for (the panel's) merges");
+        assert_eq!(merged.vms.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), [A, B, TV]);
+        assert_eq!(merged.vms[..2], base.vms[..], "the root's own VMs as they were, unlabelled");
+        let tv = &merged.vms[2];
+        assert_eq!((tv.running_s, tv.suspended_s, tv.starts, tv.resumes, tv.suspends, tv.inferred_suspends), (300, 1500, 1, 0, 1, 1), "{tv:?}");
+        assert_eq!((tv.test.as_deref(), tv.note.as_str(), tv.usd), (Some("live_vm_lifecycle"), "live test live_vm_lifecycle; 1 idle suspend inferred; terminated (test)", 0.027_311));
+        assert_eq!((merged.test_runs.clone(), merged.tests_usd, merged.tests_excluded, merged.test_runs_unreadable.clone()), (vec![name.clone()], Some(0.027_311), 0, Vec::<String>::new()));
+        assert!((merged.usd - (base.usd + tv.usd)).abs() < 1e-5, "{} vs {} + {}", merged.usd, base.usd, tv.usd);
+        assert_eq!((merged.proxy_usd, merged.proxy_assumed), (base.proxy_usd, base.proxy_assumed), "the test's proxy_stop is never merged");
+        // --no-tests: the root's own estimate, TV counted as left out.
+        let mut want = base.clone();
+        want.tests_excluded = 1;
+        assert_eq!(estimate_with(&world, DAY, DAY + 86_400, false, Tests::Exclude).unwrap(), want);
+        // The views read the root alone.
+        let t = timeline_for(&world, DAY, DAY + 86_400).unwrap();
+        assert!(t.vms.iter().all(|v| v.vm != TV) && !t.not_counted.iter().any(|v| v == TV), "{t:#?}");
+        // A window the run's VM is not in: nothing labelled, nothing left out.
+        let next = (DAY + 86_400, DAY + 2 * 86_400);
+        let later = estimate_with(&world, next.0, next.1, false, Tests::Merge).unwrap();
+        assert!(later.vms.iter().all(|v| v.test.is_none()) && later.test_runs.is_empty() && later.tests_usd.is_none(), "{later:?}");
+        assert_eq!(estimate_with(&world, next.0, next.1, false, Tests::Exclude).unwrap().tests_excluded, 0);
+        // LD-C5: a second run, later by name and with no audit row, holding TV's row again and stripped copies of A's row
+        // ending an hour earlier and of B's starting an hour earlier (as a test's row of a VM the root's `vm gc` took).
+        let roots = list_rows(&world).unwrap();
+        let copy = |id: &str| roots.iter().find(|r| r.id == id).map(crate::bridge::testruns::strip).unwrap();
+        let t2 = tempfile::tempdir().unwrap();
+        let second = Paths::from_root_and_env(t2.path().to_path_buf(), None);
+        let tv_row = list_rows(&Paths::from_root_and_env(run.clone(), None)).unwrap().remove(0);
+        let a = VmRow { terminated_at: copy(A).terminated_at.map(|t| t - 3600), ..copy(A) };
+        let b = VmRow { started_at: copy(B).started_at.map(|t| t - 3600), ..copy(B) };
+        for row in [&tv_row, &a, &b] {
+            write_row(&second, row).unwrap();
+        }
+        let run2 = crate::bridge::testruns::archive(&second, &world, "zz_second", DAY + 14 * 3600).unwrap().expect("the second run");
+        let name2 = run2.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name < name2, "{name} sorts first");
+        let both = estimate_with(&world, DAY, DAY + 86_400, false, Tests::Merge).unwrap();
+        assert_eq!(both.vms.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), [A, B, TV]);
+        for (v, was) in both.vms[..2].iter().zip(&base.vms) {
+            assert_eq!((v.running_s, v.suspended_s, v.usd, v.low_usd, v.high_usd), (was.running_s, was.suspended_s, was.usd, was.low_usd, was.high_usd), "{}: the root's row wins", v.id);
+            assert_eq!((v.test.as_deref(), v.note.strip_prefix("live test zz_second; ")), (Some("zz_second"), Some(was.note.as_str())), "{}: labelled by the run holding its row", v.id);
+        }
+        assert_eq!(both.vms[2], merged.vms[2], "TV as before: the first run by name labels it");
+        assert_eq!(both.test_runs, [name.clone(), name2]);
+        assert!(both.tests_usd.is_some_and(|u| close(u, usd(base.vms[0].usd + base.vms[1].usd + tv.usd))), "{:?}", both.tests_usd);
+        assert!(close(both.usd, merged.usd), "{} vs {}", both.usd, merged.usd);
+        assert_eq!(estimate_with(&world, DAY, DAY + 86_400, false, Tests::Exclude).unwrap(), want, "the root prices A and B: TV alone is left out");
+        // A run holding only a VM the root holds: --no-tests leaves nothing out.
+        let d3 = tempfile::tempdir().unwrap();
+        copy_tree(&fixture().root, d3.path());
+        let only = Paths::from_root_and_env(d3.path().to_path_buf(), None);
+        let t3 = tempfile::tempdir().unwrap();
+        let third = Paths::from_root_and_env(t3.path().to_path_buf(), None);
+        write_row(&third, &copy(A)).unwrap();
+        crate::bridge::testruns::archive(&third, &only, "a_copy", DAY + 14 * 3600).unwrap().expect("A's copy's run");
+        assert_eq!(estimate_with(&only, DAY, DAY + 86_400, false, Tests::Exclude).unwrap(), base);
+    }
+
+    /// One Cost Explorer group: `(usage type, UnblendedCost, UsageQuantity)`, the quantity left out when `None`.
+    type Group<'a> = (&'a str, &'a str, Option<&'a str>);
+
+    /// A Cost Explorer JSON of `days`, each `(start, end, groups)`.
+    fn ce_days(days: &[(&str, &str, &[Group<'_>])]) -> String {
+        let periods: Vec<serde_json::Value> = days
+            .iter()
+            .map(|(start, end, groups)| {
+                let groups: Vec<serde_json::Value> = groups
+                    .iter()
+                    .map(|(k, a, q)| {
+                        let mut metrics = serde_json::json!({ "UnblendedCost": { "Amount": a, "Unit": "USD" } });
+                        if let Some(q) = q {
+                            metrics["UsageQuantity"] = serde_json::json!({ "Amount": q, "Unit": "N/A" });
+                        }
+                        serde_json::json!({ "Keys": [k], "Metrics": metrics })
+                    })
+                    .collect();
+                serde_json::json!({ "TimePeriod": { "Start": start, "End": end }, "Total": {}, "Groups": groups, "Estimated": false })
+            })
+            .collect();
+        serde_json::json!({ "GroupDefinitions": [{ "Type": "DIMENSION", "Key": "USAGE_TYPE" }], "ResultsByTime": periods, "DimensionValueAttributes": [] }).to_string()
+    }
+
+    /// S12 (B Q4, §C3.2 rule 2): the proxy is judged over the proxy types the file holds, at the MicroVM
+    /// total's band and rule; with none there is no verdict and the line says what to export; its verdict
+    /// never decides `pass`; the console's CSV is judged too, with no rate (M-C19).
+    #[test]
+    fn compare_judges_the_proxy_over_the_ec2_lines_the_file_holds() {
+        let est = estimate_for(&fixture(), DAY, DAY + 86_400, false).unwrap();
+        let day = |groups: &[Group<'_>]| compare(&est, &parse_compare(&ce_days(&[("2026-10-22", "2026-10-23", groups)])).unwrap());
+        let (vcpu, memory) = ((USAGE_VCPU, "0.30", None), (USAGE_MEMORY, "0.07", None));
+        let all = day(&[vcpu, memory, (USAGE_T4G_NANO, "0.0576", None), (USAGE_IPV4, "0.06", None), (USAGE_GP3, "0.025", None)]);
+        let proxy = all.proxy.clone().expect("judged");
+        assert_eq!((proxy.types.clone(), proxy.estimate_usd, proxy.actual_usd, proxy.off_pct, proxy.pass), (PROXY_USAGE.to_vec(), 0.142_639, 0.1426, Some(0.0), true));
+        assert_eq!(all.proxy_verdict(), "proxy total (EUC1-BoxUsage:t4g.nano, EUC1-PublicIPv4:InUseAddress, EUC1-EBS:VolumeUsage.gp3): estimate $0.143, Cost Explorer $0.143: 0.0 % off: within ±30 % (evidence, not the exit)");
+        assert!(all.pass, "the MicroVM total: {all:?}");
+        assert_eq!(all.json()["proxy"], serde_json::json!({ "types": PROXY_USAGE, "estimate_usd": 0.142_639, "actual_usd": 0.1426, "off_pct": 0.0, "pass": true }));
+        assert_eq!(all.json()["rates"], serde_json::json!([]), "no quantity, no rate");
+        // Two of the three, whatever the file's order: those two in PROXY_USAGE's, their lines' sum.
+        let two = day(&[vcpu, (USAGE_GP3, "0.025", None), (USAGE_T4G_NANO, "0.0576", None)]);
+        let proxy = two.proxy.clone().expect("judged");
+        assert_eq!((proxy.types.clone(), proxy.estimate_usd, proxy.actual_usd), (vec![USAGE_T4G_NANO, USAGE_GP3], usd(0.0576 + 0.025_039), usd(0.0576 + 0.025)));
+        // No EC2 line: no verdict, and the line names the export.
+        let none = day(&[vcpu, memory]);
+        assert_eq!(none.proxy, None);
+        assert_eq!(none.proxy_verdict(), "proxy total: the file holds none of EUC1-BoxUsage:t4g.nano, EUC1-PublicIPv4:InUseAddress, EUC1-EBS:VolumeUsage.gp3 (export EC2-Instances, EC2-Other and VPC too)");
+        assert_eq!(none.json()["proxy"], serde_json::Value::Null);
+        // The proxy outside its band is evidence: `pass` stays the MicroVM total's, its line unchanged.
+        let far = day(&[vcpu, memory, (USAGE_T4G_NANO, "1.00", None)]);
+        assert!(far.pass && far.proxy.as_ref().is_some_and(|p| !p.pass && p.off_pct == Some(-94.2)), "{far:?}");
+        assert_eq!(far.proxy_verdict(), "proxy total (EUC1-BoxUsage:t4g.nano): estimate $0.058, Cost Explorer $1.000: 94.2 % off: outside ±30 % (evidence, not the exit)");
+        assert_eq!(far.verdict(), none.verdict());
+        // The console's CSV: judged; it holds no quantity, so no rate.
+        let csv = "\"Usage type\",\"EUC1-Lambda-MicroVM-vCPU-Second-ARM($)\",\"EUC1-BoxUsage:t4g.nano($)\",\"Total costs($)\"\n\"2026-10-22\",\"0.30\",\"0.0576\",\"0.3576\"\n";
+        let console = compare(&est, &parse_compare(csv).unwrap());
+        assert!(console.proxy.as_ref().is_some_and(|p| p.types == [USAGE_T4G_NANO] && p.pass && p.off_pct == Some(0.0)), "{console:?}");
+        assert!(console.rates.is_empty(), "{console:?}");
+    }
+
+    /// S12 (B Q4, §C3.2 rules 1 and 3): each priced type the file has a positive quantity of gets the card's
+    /// rate against the billed one, its cost over its quantity, both summed over the file's days, in the
+    /// estimate's lines' order; a zero quantity, an unpriced type and an unusable quantity get none (M-C21).
+    #[test]
+    fn billed_rates_divide_the_cost_by_its_quantity() {
+        let est = estimate_for(&fixture(), DAY, DAY + 86_400, false).unwrap();
+        let file = ce_days(&[
+            ("2026-10-22", "2026-10-23", &[(USAGE_T4G_NANO, "0.0576", Some("12")), (USAGE_VCPU, "0.1265", Some("3620")), (USAGE_GP3, "0.0125", Some("0")), ("EUC1-Requests-Tier1", "0.01", Some("1")), (USAGE_MEMORY, "0.03", Some("lots"))]),
+            ("2026-10-23", "2026-10-24", &[(USAGE_VCPU, "0.1265", Some("3620")), (USAGE_T4G_NANO, "0.0576", Some("12")), (USAGE_GP3, "0.0125", None), (USAGE_MEMORY, "0.03", None)]),
+        ]);
+        let answer = parse_compare(&file).unwrap();
+        let q: Vec<(&str, f64)> = answer.quantity.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        assert_eq!(q, [("EUC1-BoxUsage:t4g.nano", 24.0), ("EUC1-EBS:VolumeUsage.gp3", 0.0), ("EUC1-Lambda-MicroVM-vCPU-Second-ARM", 7240.0), ("EUC1-Requests-Tier1", 1.0)], "summed over both days; an unusable or missing quantity adds nothing");
+        let judged = compare(&est, &answer);
+        assert_eq!(judged.rates.iter().map(|r| r.usage_type).collect::<Vec<_>>(), [USAGE_VCPU, USAGE_T4G_NANO], "the lines' order; no rate for gp3's zero or an unpriced type");
+        let (v, t) = (&judged.rates[0], &judged.rates[1]);
+        assert_eq!((v.card, v.quantity, t.card, t.quantity), (EUC1.vcpu_second, 7240.0, EUC1.t4g_nano_hour, 24.0));
+        assert!(close(v.billed, 0.2530 / 7240.0) && close(t.billed, 0.0048), "{judged:?}");
+        assert_eq!(
+            judged.rate_lines(),
+            [
+                "rate EUC1-Lambda-MicroVM-vCPU-Second-ARM: card $0.0000349960, billed $0.0000349448 (-0.1 %) over 7240.000",
+                "rate EUC1-BoxUsage:t4g.nano: card $0.0048000000, billed $0.0048000000 (+0.0 %) over 24.000",
+            ]
+        );
+        assert_eq!(judged.json()["rates"][1], serde_json::json!({ "usage_type": USAGE_T4G_NANO, "card": 0.0048, "billed": t.billed, "quantity": 24.0 }));
+    }
+
+    /// S12 (C3, §C4.3): a sleep measured by the wrapper's reconnect prices X suspended from `max_idle_s` after
+    /// the lid closed (the point) within its range (the close and twice the idle time); S11 priced all
+    /// 2200 s as running (M-C9, M-C16).
+    #[test]
+    fn a_measured_sleep_prices_the_vm_suspended_within_its_range() {
+        const X: &str = "microvm-0c000000-0000-4000-8000-00000000000c";
+        let t0 = DAY + 14 * 3600;
+        let lines = [
+            audit_line(t0, "vm_run", &[("id", X), ("purpose", "session"), ("image_version", "13.0"), ("egress", "internet"), ("shell", "false"), ("client_token", "0199f0e5-0000-7000-8000-0000000000c1"), ("max_idle_s", "300"), ("memory_mib", "2048")]),
+            audit_line(t0 + 10, "session_remote_start", &[("id", X), ("spawn", "s1"), ("gen", "1"), ("why", "first")]),
+            audit_line(t0 + 2003, "agent_reconnect", &[("id", X), ("spawn", "s1"), ("reason", "woke after 1800.0 s asleep"), ("ms", "2500")]),
+            audit_line(t0 + 2100, "session_remote_end", &[("vm", X), ("spawn", "s1"), ("gen", "1"), ("exit", "0"), ("end", "close"), ("close_ms", "20"), ("last_acked_seq", "3")]),
+            audit_line(t0 + 2200, "vm_terminate", &[("id", X), ("by", "operator")]),
+        ];
+        let rows: Vec<crate::bridge::audit::read::Read> = lines.iter().map(|l| crate::bridge::audit::read::parse_line(l).unwrap()).collect();
+        let defaults = VmDefaults { memory_mib: 2048, max_idle_s: 300, suspended_s: None, max_duration_s: 28_800 };
+        let t = crate::bridge::timeline::build(&rows, &[], defaults, t0, t0 + 3000);
+        let est = estimate(&t, &EUC1, false);
+        let v = &est.vms[0];
+        let at = |which: Which| {
+            let u = use_of(&t, &t.vms[0], which, t0, t0 + 3000);
+            (u.running_s, u.suspended_s)
+        };
+        assert_eq!([(v.running_s, v.suspended_s), at(Which::Low), at(Which::High)], [(697, 1503), (397, 1803), (997, 1203)], "{:#?}", t.vms[0]);
+        assert_eq!((v.starts, v.resumes, v.suspends, v.inferred_suspends), (1, 1, 1, 1));
+        assert_eq!(v.note, "1 idle suspend inferred; 1 auto-resume inferred; terminated (operator)");
+        // Use's formula (one start and one resume read, one suspend writes; 2 GB of memory).
+        let priced = |running: f64, suspended: f64| {
+            running * VCPUS * EUC1.vcpu_second + running * 2048.0 / 1024.0 * EUC1.gb_second + SUSPEND_WRITE_GB * EUC1.snapshot_write_gb + (START_READ_GB + RESUME_READ_GB) * EUC1.snapshot_read_gb + suspended / 3600.0 * SUSPENDED_GB * EUC1.snapshot_storage_gb_hour
+        };
+        assert!(close(v.usd, usd(priced(697.0, 1503.0))) && close(v.low_usd, usd(priced(397.0, 1803.0))) && close(v.high_usd, usd(priced(997.0, 1203.0))), "{v:?}");
     }
 }

@@ -205,8 +205,10 @@ impl DryForm {
 /// `audit grep` (exit 1 when nothing matched: a documented pattern must
 /// match in the planted world) and `cost`; `claude admit` (Docker),
 /// `claude stage`, `update` and `forget`, and `panel serve` (a server in
-/// the foreground) have no dry form.
-const DRY_FORMS: [DryForm; 25] = [
+/// the foreground) have no dry form. S12's `session list --title`, its own
+/// row before `session list`'s, reads names only: the planted chat has
+/// none, so a documented search prints its no-match line.
+const DRY_FORMS: [DryForm; 26] = [
     DryForm::new(&["wrapper", "install"], Dry::Drop("--write"), &[0], &["dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "uninstall"], Dry::Drop("--write"), &[0], &["nothing to remove", "dry run"], 0, Api::None, false),
     DryForm::new(&["wrapper", "status"], Dry::AsIs, &[0], &["claudeCode.claudeProcessWrapper"], 0, Api::None, false),
@@ -218,6 +220,7 @@ const DRY_FORMS: [DryForm; 25] = [
     DryForm::new(&["vm", "warm"], Dry::Add("--dry-run"), &[0], &["nothing was started", "\"dry_run\": true"], 0, Api::None, false),
     DryForm::new(&["doctor"], Dry::AsIs, &[0, 1], &[], 0, Api::None, true),
     DryForm::new(&["creds", "status"], Dry::AsIs, &[0], &[], 0, Api::None, false),
+    DryForm::new(&["session", "list", "--title"], Dry::AsIs, &[0], &["no session's title holds "], 0, Api::None, false),
     DryForm::new(&["session", "list"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["session", "show"], Dry::AsIs, &[0], &[], 0, Api::None, false),
     DryForm::new(&["wrapper", "census"], Dry::AsIs, &[0], &[], 0, Api::None, false),
@@ -1331,7 +1334,8 @@ fn the_s10_sections_vm_keys_are_bridge_toml_at_their_defaults() {
 /// automatic admission, the stager, the fetch, the preferences, the respawns
 /// and gc; the panel's default port and URL, its bearer, its streams and its
 /// nonce's life, off by default; the compressed stage's compressor and caps;
-/// the cost's band and what it leaves out; the census's new parts and every
+/// the cost's band and what it leaves out; S12's words for an automatic
+/// retry whose time has come (`is due now`); the census's new parts and every
 /// `claude_src` reason; the registry's count and S11's eight events, each a
 /// backticked word. The Commands block names S11's four commands, and no
 /// line of the README advises turning Cursor's Auto Update off. A value the
@@ -1381,6 +1385,7 @@ fn the_s11_section_states_what_the_code_does() {
         format!("{} in all, decoded", gib(stage::STAGE_MAX)),
         format!("within ±{} %", (cost::COMPARE_BAND * 100.0).round()),
         format!("Not counted: {}", cost::NOT_ESTIMATED.join(", ")),
+        "`is due now`".into(),
         format!("newer than {}", ai_env_cli::wire::view::VIEW_EXT_VERSION),
         format!("`{}:cached`", census_part::CLAUDE_SRC),
         format!("`{}:FLAG`", census_part::ARGV_DROPPED),

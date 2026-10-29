@@ -13,7 +13,9 @@
 //! - **oauth-t1**: the real CLI's OAuth refresh, in stream-json host mode
 //!   with the extension's entrypoint (`CLAUDE_CODE_ENTRYPOINT=claude-vscode`,
 //!   S1's `entrypoint` probe) and `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1`,
-//!   which the stock extension never sets (Tier B adds it), and a token
+//!   which the stock extension's Agent SDK sets only for a host that
+//!   passes a `getOAuthToken` callback (2.1.310's own chats pass none, so
+//!   they never carry it; Tier B would), and a token
 //!   Anthropic refuses — the CLI asks its host for a refresh only with
 //!   both ([`ENTRYPOINT`]): when it asks (`oauth_token_refresh`), what no
 //!   reply, a null reply and (with the sealed token, one Touch ID) a valid
@@ -31,7 +33,8 @@
 //!   sent: no Touch ID for it). It makes real requests to Anthropic; every
 //!   run has an empty config dir and HOME of its own. `authwatch::AUTH_TIMERS`
 //!   holds what its row measured (S7 B11 on claude 2.1.296, S8 part B on
-//!   2.1.302, S10 part B on 2.1.305): a new claude
+//!   2.1.302, S10 part B on 2.1.305; `authwatch::AUTH_TIMERS_REVIEWED`
+//!   adds S11 part B's 2.1.310): a new claude
 //!   version is measured again here before the timers are trusted for it.
 use crate::age_cmd::{effective_path, AgeTool};
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -322,7 +325,8 @@ fn observe(seen: &mut Observed, stdin: &mut Option<std::process::ChildStdin>, li
 
 /// One run of the CLI in stream-json host mode, with the extension's
 /// entrypoint ([`ENTRYPOINT`]) and the host's refresh offered, which the
-/// stock extension never offers: an `initialize`, one user
+/// stock extension's own chats never offer (its Agent SDK offers it only
+/// to a host that passes `getOAuthToken`): an `initialize`, one user
 /// message, the refresh answered per `reply`, until the CLI exits (after its
 /// result stdin closes, unless no reply is given) or `limit`; then what it
 /// wrote before the exit is read to the end ([`DRAIN`]). Each line is timed

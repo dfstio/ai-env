@@ -88,13 +88,14 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// fake S3 address, the code token's minutes, the fake claude's api-request
 /// lines and the fake git's whole environment; S11's release curl, gpgv and
 /// admission make, the views' clock, and the fake claude's start-up and
-/// compaction knobs);
+/// compaction knobs; S12's chat-name knobs of the fake claude, and
+/// `CLAUDE_CODE_SDK_READS_SESSION_STATE`, which it obeys as the real CLI does);
 /// removed from every harness run before the test's own `envs`. Every
 /// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 109] = [
+pub const REMOVED_ENV: [&str; 113] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -203,6 +204,11 @@ pub const REMOVED_ENV: [&str; 109] = [
     "FAKE_KNOBS_FILE",
     "FAKE_VERSION_PINNED",
     "FAKE_COMPACT_BEFORE_TURN",
+    // S12: the fake claude's chat names (T), and the session-state name the extension sets (R).
+    "FAKE_TITLE",
+    "FAKE_RENAME_AT_TURN",
+    "FAKE_AI_TITLE",
+    "CLAUDE_CODE_SDK_READS_SESSION_STATE",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",
@@ -1532,6 +1538,20 @@ pub fn fake_compact_boundary_uuid(turn: u64, gen: u64) -> String {
 #[must_use]
 pub fn fake_compact_summary_uuid(turn: u64, gen: u64) -> String {
     format!("{turn:08x}-0000-4000-6000-{gen:012x}")
+}
+
+/// S12 (T): the uuid of the fake's `session_title_changed` at turn `turn` of its generation `gen` (`FAKE_TITLE`'s
+/// at turn 0, `FAKE_RENAME_AT_TURN`'s at its turn), `…-5000-…`.
+#[must_use]
+pub fn fake_title_uuid(turn: u64, gen: u64) -> String {
+    format!("{turn:08x}-0000-4000-5000-{gen:012x}")
+}
+
+/// S12 (T): the fake's `session_title_changed` line for `title_json` (a JSON string's body, as the knob holds it),
+/// byte for byte, without its newline.
+#[must_use]
+pub fn fake_title_frame(title_json: &str, turn: u64, gen: u64, sid: &str) -> String {
+    format!(r#"{{"type":"system","subtype":"session_title_changed","title":"{title_json}","uuid":"{}","session_id":"{sid}"}}"#, fake_title_uuid(turn, gen))
 }
 
 /// The session id of the fake's generation `gen` when neither

@@ -5,6 +5,24 @@
 //! is load–apply–save under `flock(<file>.lock)`; the file is written
 //! atomically, 0600. Reached only through the debug-build knob
 //! `AI_ENV_BRIDGE_LAB_FAKE_API=<file>` (`bridge::lab::vm_knobs`).
+//!
+//! S12 (R1-15 to R1-18): every trait call runs that load–apply–save on
+//! tokio's blocking pool ([`FileFakeMicrovmApi::call`]), never on the
+//! caller's runtime (the wrapper's is current-thread): its timers, the
+//! pump's cut and the closing suspend's, fire on time while a call waits for
+//! the lock or the save's fsyncs. A call its caller stopped waiting for runs
+//! to its end, recorded and saved, as a request already sent does. One
+//! exception: `GET /health` is answered on the caller, within its first
+//! poll, while no one holds the lock, as S11's synchronous fake always
+//! answered it (the lab-scaled readiness wait cuts it at 1 ms). `with`,
+//! `snapshot` and `settled` stay synchronous: the rig and the tests call
+//! them from threads. `open` stays synchronous too, but its callers outside
+//! the tests run it on their runtime, once per backend built
+//! (`vm::cmd::backend`, `agent::credential::connected`): one lock wait with
+//! no time limit, one load and one save with its two full fsyncs, as at
+//! S11. A wrapper builds its backend once, at the first generation's P1
+//! (`credential::backend_for_session`); later generations and a move's
+//! phase A reuse it, so no close opens the fake.
 use crate::bridge::api::{AuthToken, EndpointClient, FakeState, HealthReply, ImageInfo, ImageVersion, ManagedImage, MicrovmApi, RunSpec, VmInfo, VmSummary};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::infra::write_atomic_mode;
@@ -74,15 +92,32 @@ impl FileFakeMicrovmApi {
             Ok(s.clone())
         })
     }
+
+    /// S12 (R1): `f` under the file lock (`with`) on tokio's blocking pool, so a call never holds the caller's runtime
+    /// (the wrapper's is current-thread) through the lock, the load and the save's two full fsyncs. A caller that stops
+    /// waiting (a timeout) leaves the call to run to its end: it is recorded and saved, as the platform takes a request
+    /// already sent. A panic in `f` resumes on the caller; a call the runtime's shutdown cancelled is
+    /// `BridgeError::Config` naming the state file.
+    async fn call<T: Send + 'static>(&self, f: impl FnOnce(&mut FakeState) -> Result<T, BridgeError> + Send + 'static) -> Result<T, BridgeError> {
+        let api = self.clone();
+        match tokio::task::spawn_blocking(move || api.with(f)).await {
+            Ok(answer) => answer,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(_) => Err(BridgeError::Config(format!("fake API state {}: the call did not run (the runtime is shutting down)", self.path.display()))),
+        }
+    }
 }
 
+/// S12 (R1-15): each method's `with` goes through [`FileFakeMicrovmApi::call`], its arguments cloned in.
 impl MicrovmApi for FileFakeMicrovmApi {
     async fn run(&self, spec: &RunSpec) -> Result<VmInfo, BridgeError> {
-        self.with(|s| s.run(spec))
+        let spec = spec.clone();
+        self.call(move |s| s.run(&spec)).await
     }
 
     async fn get(&self, id: &str) -> Result<VmInfo, BridgeError> {
-        let (park, answer) = self.with(|s| Ok((std::mem::take(&mut s.park_get_ms), s.get(id))))?;
+        let id = id.to_string();
+        let (park, answer) = self.call(move |s| Ok((std::mem::take(&mut s.park_get_ms), s.get(&id)))).await?;
         if park > 0 {
             // A process test's slow GetMicrovm (`FakeState::park_get_ms`): the answer comes late, awaited unlocked.
             tokio::time::sleep(std::time::Duration::from_millis(park)).await;
@@ -91,43 +126,52 @@ impl MicrovmApi for FileFakeMicrovmApi {
     }
 
     async fn suspend(&self, id: &str) -> Result<(), BridgeError> {
-        self.with(|s| s.suspend(id))
+        let id = id.to_string();
+        self.call(move |s| s.suspend(&id)).await
     }
 
     async fn resume(&self, id: &str) -> Result<(), BridgeError> {
-        self.with(|s| s.resume(id))
+        let id = id.to_string();
+        self.call(move |s| s.resume(&id)).await
     }
 
     async fn terminate(&self, id: &str) -> Result<(), BridgeError> {
-        self.with(|s| s.terminate(id))
+        let id = id.to_string();
+        self.call(move |s| s.terminate(&id)).await
     }
 
     async fn list(&self, image_arn: Option<&str>) -> Result<Vec<VmSummary>, BridgeError> {
-        self.with(|s| s.list(image_arn))
+        let image_arn = image_arn.map(str::to_string);
+        self.call(move |s| s.list(image_arn.as_deref())).await
     }
 
     async fn create_auth_token(&self, id: &str, minutes: u16, port: u16) -> Result<AuthToken, BridgeError> {
-        self.with(|s| s.create_auth_token(id, minutes, port))
+        let id = id.to_string();
+        self.call(move |s| s.create_auth_token(&id, minutes, port)).await
     }
 
     async fn create_shell_token(&self, id: &str, minutes: u16) -> Result<AuthToken, BridgeError> {
-        self.with(|s| s.create_shell_token(id, minutes))
+        let id = id.to_string();
+        self.call(move |s| s.create_shell_token(&id, minutes)).await
     }
 
     async fn get_image(&self, arn: &str) -> Result<ImageInfo, BridgeError> {
-        self.with(|s| s.get_image(arn))
+        let arn = arn.to_string();
+        self.call(move |s| s.get_image(&arn)).await
     }
 
     async fn list_image_versions(&self, arn: &str) -> Result<Vec<ImageVersion>, BridgeError> {
-        self.with(|s| s.list_image_versions(arn))
+        let arn = arn.to_string();
+        self.call(move |s| s.list_image_versions(&arn)).await
     }
 
     async fn get_network_connector(&self, identifier: &str) -> Result<serde_json::Value, BridgeError> {
-        self.with(|s| s.get_network_connector(identifier))
+        let identifier = identifier.to_string();
+        self.call(move |s| s.get_network_connector(&identifier)).await
     }
 
     async fn list_managed_images(&self) -> Result<Vec<ManagedImage>, BridgeError> {
-        self.with(|s| s.list_managed_images())
+        self.call(|s| s.list_managed_images()).await
     }
 }
 
@@ -139,20 +183,39 @@ impl crate::bridge::s3::S3Sign for FileFakeMicrovmApi {
     }
 }
 
+/// S12 (R1-15): each method's `with` goes through [`FileFakeMicrovmApi::call`], its arguments cloned in; `get_health`
+/// first tries to answer at once.
 impl EndpointClient for FileFakeMicrovmApi {
+    /// S12 (R1-15's one exception): answered on the caller, within its first poll, while no one holds `<file>.lock`
+    /// (one attempt, `lock::try_lock_exclusive`; then `with`'s load, the state's answer and the save, as at S11): the
+    /// lab-scaled readiness wait cuts each `GET /health` at what is left of its 15 ms budget, at least 1 ms
+    /// (`vm::health::read_health` under `AI_ENV_BRIDGE_LAB_BACKOFF_MS=1`), which an answer from the blocking pool, a
+    /// thread away, never meets. Held: through [`FileFakeMicrovmApi::call`], as every other call.
     async fn get_health(&self, endpoint: &str, token: &AuthToken, port_header: u16) -> Result<HealthReply, BridgeError> {
-        self.with(|s| s.get_health(endpoint, token, port_header))
+        if let Some(_guard) = crate::bridge::vm::lock::try_lock_exclusive(&self.lock_path())? {
+            // `with`'s steps under the lock this attempt took (`with` itself would wait for it on a second descriptor).
+            let mut state = self.load()?;
+            let answer = state.get_health(endpoint, token, port_header);
+            self.save(&state)?;
+            return answer;
+        }
+        let (endpoint, token) = (endpoint.to_string(), token.clone());
+        self.call(move |s| s.get_health(&endpoint, &token, port_header)).await
     }
 
     /// The state's answer, or, when it names the shim
     /// (`FakeState::health_detail_at`), the call recorded under the lock and
     /// the request sent to the shim outside it: the routed endpoint checks
-    /// the token against this same file.
+    /// the token against this same file. S12 (R1): that request stays on the
+    /// caller's runtime, after `call` returned.
     async fn get_health_detail(&self, endpoint: &str, token: &AuthToken, bearer: &crate::wire::redact::Secret<String>) -> Result<crate::bridge::api::HealthDetailReply, BridgeError> {
-        let answered = self.with(|s| match s.health_detail_at {
-            Some(at) => s.health_detail_call(endpoint, token).map(|()| Err(at)),
-            None => s.get_health_detail(endpoint, token, bearer).map(Ok),
-        })?;
+        let (at_endpoint, at_token, at_bearer) = (endpoint.to_string(), token.clone(), bearer.clone());
+        let answered = self
+            .call(move |s| match s.health_detail_at {
+                Some(at) => s.health_detail_call(&at_endpoint, &at_token).map(|()| Err(at)),
+                None => s.get_health_detail(&at_endpoint, &at_token, &at_bearer).map(Ok),
+            })
+            .await?;
         match answered {
             Ok(reply) => Ok(reply),
             Err(at) => detail_from_shim(at, endpoint, token, bearer).await,
@@ -308,5 +371,90 @@ mod tests {
         std::fs::write(&path, old.to_string()).unwrap();
         let read = b.snapshot().unwrap();
         assert!(!read.terminate_after_hook && read.hook_ran.is_empty() && read.terminate_answered.is_empty() && read.terminating_since.is_empty());
+    }
+
+    /// S12 (R1-15, R1-16): no call holds its caller's runtime (current-thread, as the wrapper's) while another
+    /// holds `<file>.lock`: a thread holds it (until the calls below are cut; at most 10 s), and each of the 14
+    /// trait methods in turn, under a 150 ms timeout, gives up within 400 ms. Once the lock is let go the cut
+    /// calls run to their end, recorded and saved: the cut SuspendMicrovm is in the state's calls, as a request
+    /// already sent may still suspend the VM.
+    #[tokio::test]
+    async fn a_call_never_blocks_the_runtime() {
+        use crate::wire::redact::Secret;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.json");
+        let api = FileFakeMicrovmApi::open(&path).unwrap();
+        let vm = api.run(&spec("t1")).await.unwrap();
+        api.with(|s| {
+            s.advance_all();
+            Ok(())
+        })
+        .unwrap();
+        let token = api.create_auth_token(&vm.id, 5, 8080).await.unwrap();
+        let bearer = Secret::new("b".repeat(64));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let lock = api.lock_path();
+        let holder = std::thread::spawn(move || {
+            let guard = lock_blocking(&lock).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        async fn cut<T: std::fmt::Debug>(what: &str, call: impl std::future::Future<Output = Result<T, BridgeError>>) {
+            let t = Instant::now();
+            let got = tokio::time::timeout(Duration::from_millis(150), call).await;
+            let took = t.elapsed();
+            assert!(got.is_err() && took < Duration::from_millis(400), "{what}: the lock held elsewhere, cut at 150 ms: {got:?} after {took:?}");
+        }
+        let id = vm.id.as_str();
+        cut("run", api.run(&spec("t2"))).await;
+        cut("get", api.get(id)).await;
+        cut("suspend", api.suspend(id)).await;
+        cut("resume", api.resume(id)).await;
+        cut("terminate", api.terminate("microvm-other0001")).await;
+        cut("list", api.list(None)).await;
+        cut("create_auth_token", api.create_auth_token(id, 5, 8080)).await;
+        cut("create_shell_token", api.create_shell_token(id, 5)).await;
+        cut("get_image", api.get_image(FAKE_IMAGE_ARN)).await;
+        cut("list_image_versions", api.list_image_versions(FAKE_IMAGE_ARN)).await;
+        cut("get_network_connector", api.get_network_connector("nc-0123456789abcdef")).await;
+        cut("list_managed_images", api.list_managed_images()).await;
+        cut("get_health", api.get_health(&vm.endpoint, &token, 8080)).await;
+        cut("get_health_detail", api.get_health_detail(&vm.endpoint, &token, &bearer)).await;
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let t = Instant::now();
+        while !api.snapshot().unwrap().calls.contains(&Call::Suspend(vm.id.clone())) {
+            assert!(t.elapsed() < Duration::from_secs(10), "the cut suspend ran to its end once the lock was free: {:?}", api.snapshot().unwrap().calls);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// S12 (R1-15's exception): `GET /health` with `<file>.lock` free answers within its first poll, as S11's did:
+    /// under a zero timeout (tokio polls the call before its timer) it still has the state's 200, recorded and saved.
+    /// The lab-scaled readiness wait rests on it: each `GET /health` is cut at what is left of a 15 ms budget, at
+    /// least 1 ms (`vm::health::read_health` under `AI_ENV_BRIDGE_LAB_BACKOFF_MS=1`), which an answer from the blocking
+    /// pool, a thread away, never meets. With the lock held it is cut as every call is (`a_call_never_blocks_the_runtime`).
+    #[tokio::test]
+    async fn get_health_answers_within_its_first_poll_while_the_lock_is_free() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.json");
+        let api = FileFakeMicrovmApi::open(&path).unwrap();
+        let vm = api.run(&spec("t1")).await.unwrap();
+        api.with(|s| {
+            s.advance_all();
+            Ok(())
+        })
+        .unwrap();
+        let token = api.create_auth_token(&vm.id, 5, 8080).await.unwrap();
+        let first = tokio::time::timeout(Duration::ZERO, api.get_health(&vm.endpoint, &token, 8080)).await;
+        let reply = first.expect("the lock free: answered within the call's first poll").unwrap();
+        assert_eq!((reply.status, reply.health.and_then(|h| h.microvm_id)), (200, Some(vm.id.clone())));
+        let health = Call::Health { endpoint: vm.endpoint.clone(), port: 8080 };
+        assert_eq!(api.snapshot().unwrap().calls.last(), Some(&health), "the request is recorded and saved");
     }
 }

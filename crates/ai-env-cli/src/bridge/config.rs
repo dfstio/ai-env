@@ -398,6 +398,14 @@ impl Paths {
     pub fn argv_dropped_marker(&self, claude: &str, flag: &str) -> PathBuf {
         self.root.join("state").join("argv-dropped").join(claude).join(flag)
     }
+
+    /// `state/test-runs` (S12 C1, 0700): the live tests' cost rows, one miniature root
+    /// `<YYYYMMDDTHHMMSSZ>-<test>-<pid>/` each (`bridge::testruns`); written only by a live test's guard
+    /// (tests/aws.rs `Live`), read only by `ai-env cost` and the panel's cost page.
+    #[must_use]
+    pub fn test_runs(&self) -> PathBuf {
+        self.root.join("state").join("test-runs")
+    }
 }
 
 /// `arn:aws:lambda:eu-central-1:<12 digits>:network-connector:<name>[:<N>]`,
@@ -729,6 +737,9 @@ impl Default for WrapperCfg {
                 "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
                 "MCP_CONNECTION_NONBLOCKING",
                 "CLAUDE_CODE_ENABLE_TASKS",
+                // S12 (R2): the question tool's preview format and the SDK's session-state frames, as the extension sets them.
+                "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
+                "CLAUDE_CODE_SDK_READS_SESSION_STATE",
                 "LANG",
                 "TERM",
             ]
@@ -1341,6 +1352,8 @@ mod tests {
         assert_eq!(p.claude_lock("2.1.308"), PathBuf::from("/r/state/claude/2.1.308.lock"));
         assert_eq!(p.claude_records_lock(), PathBuf::from("/r/state/claude/records.lock"));
         assert_eq!(p.argv_dropped_marker("2.1.308", "--x"), PathBuf::from("/r/state/argv-dropped/2.1.308/--x"));
+        // S12 (C1): the live tests' cost rows.
+        assert_eq!(p.test_runs(), PathBuf::from("/r/state/test-runs"));
     }
 
     /// S11 (A §6.1): `[claude]` holds `auto_admit` alone, true by default (no table needed); any other key

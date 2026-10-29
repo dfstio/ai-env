@@ -20,6 +20,7 @@
 //! Claude Code versions VMs follow (`claude`), the cost estimate and its
 //! timeline (`cost`, `timeline`), the loopback control panel (`panel`) and
 //! doctor's drift rows (`drift`).
+//! S12: chat names (`title`) and the live tests' cost rows (`testruns`).
 //! Nothing here is compiled into the VM image.
 pub mod accounts;
 pub mod agent;
@@ -66,7 +67,9 @@ pub mod settings_capture;
 pub mod setup_token;
 pub mod sibling;
 pub mod signals;
+pub mod testruns;
 pub mod timeline;
+pub mod title;
 pub mod tls;
 pub mod transport;
 pub mod unseal;

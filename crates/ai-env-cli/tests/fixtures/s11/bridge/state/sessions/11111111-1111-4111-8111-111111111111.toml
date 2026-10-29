@@ -13,6 +13,8 @@ pid = 1
 argv_hash = "fixture"
 respawns = 0
 microvm_id = "microvm-0be03000-0000-4000-8000-00000000000b"
+title = "Harbour-s11 word memory"
+title_source = "custom"
 
 [[vms]]
 gen = 1

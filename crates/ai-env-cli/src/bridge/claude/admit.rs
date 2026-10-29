@@ -853,8 +853,11 @@ pub fn admit(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, version: &str, 
         let spent = if attempt >= ADMIT_DOCKER_TRIES { ", no automatic retry left" } else { "" };
         // D5's trigger runs it again only with `[claude].auto_admit` on and the wrapper's mode remote (doctor's T6).
         let auto = cfg.claude.auto_admit && matches!(cfg.wrapper.wrapper_mode(), Ok(crate::bridge::config::WrapperMode::Remote));
+        // S12 (V2, §V2.4 rule 11): the views' clock, read after `end()`, so under --auto the lock holds the end just
+        // written; by hand it holds no newer one than this failure.
+        let clock = super::RetryClock::read(paths, std::slice::from_ref(&record));
         let next = if auto && record.auto_retry() {
-            format!("an automatic retry{} (the next remote wrapper starts it), or fix it, then ai-env claude admit {version} --redo", super::retry_when(&record))
+            format!("an automatic retry{} (the next remote wrapper starts it), or fix it, then ai-env claude admit {version} --redo", super::retry_when(&record, &clock))
         } else {
             format!("fix it, then ai-env claude admit {version} --redo")
         };

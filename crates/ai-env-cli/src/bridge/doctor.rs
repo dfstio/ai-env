@@ -525,9 +525,18 @@ pub fn bundle_version(dir_name: &str) -> Option<String> {
 /// mode configured), so the seen row may promise it.
 #[must_use]
 pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, auto: bool) -> (Vec<DoctorLine>, Option<String>) {
-    // S11 (LD-35): this Mac's claude records, read here only (the tests hand `bundle_rows` their own).
-    let claude = Paths::resolve().map(|p| crate::bridge::claude::load_all(&p)).unwrap_or_default();
-    bundle_rows(ext_dir, image_claude, version_of, &running_windows(), &claude, auto)
+    // S11 (LD-35): this Mac's claude records, read here only (the tests hand `bundle_rows` their own). S12 (V2,
+    // LD-V8): the clock their Docker failures' retry is judged by, read where they are (its locks, file reads only);
+    // with no bridge root, no record and the time alone.
+    let (claude, clock) = match Paths::resolve() {
+        Ok(p) => {
+            let records = crate::bridge::claude::load_all(&p);
+            let clock = crate::bridge::claude::RetryClock::read(&p, &records);
+            (records, clock)
+        }
+        Err(_) => (Vec::new(), crate::bridge::claude::RetryClock::at(crate::wire::time::unix_now())),
+    };
+    bundle_rows(ext_dir, image_claude, version_of, &running_windows(), &claude, auto, &clock)
 }
 
 /// [`cursor_bundle_rows`] on the live windows `running` and the claude records `claude` (no census or state read:
@@ -535,16 +544,17 @@ pub fn cursor_bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of
 /// `ai-env claude` share), a `[!! ]` per live Cursor window on another extension than that bundle
 /// ([`rows_running_windows`]: a window keeps the extension it loaded until it is reloaded), then (S11) a row per
 /// Claude Code version the bundle or a live window runs and the image's fallback (`claude::rows::rows_claude_auto`,
-/// the seen row's automatic admission named only with `auto`).
+/// the seen row's automatic admission named only with `auto`; S12, V2: a Docker failure's retry judged by `clock`,
+/// handed on as given).
 #[must_use]
-pub fn bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, running: &[crate::bridge::census::RunningExtension], claude: &[crate::bridge::claude::Record], auto: bool) -> (Vec<DoctorLine>, Option<String>) {
+pub fn bundle_rows(ext_dir: &Path, image_claude: Option<&str>, version_of: &dyn Fn(&Path) -> Option<String>, running: &[crate::bridge::census::RunningExtension], claude: &[crate::bridge::claude::Record], auto: bool, clock: &crate::bridge::claude::RetryClock) -> (Vec<DoctorLine>, Option<String>) {
     let dirs = installed_extension_names(ext_dir);
     let bundle = pick_bundle(&dirs);
     let bundled_out = bundle.as_ref().and_then(|(_, dir)| version_of(&ext_dir.join(dir).join("resources").join("native-binary").join("claude")));
     let ver = bundle.as_ref().map(|(v, _)| v.as_str());
     let mut lines = vec![row_cursor_bundle(&dirs, bundled_out.as_deref())];
     lines.extend(rows_running_windows(ver, running));
-    lines.extend(crate::bridge::claude::rows::rows_claude_auto(claude, image_claude, ver, running, auto));
+    lines.extend(crate::bridge::claude::rows::rows_claude_auto(claude, image_claude, ver, running, auto, clock));
     (lines, bundled_out)
 }
 
@@ -3305,6 +3315,7 @@ mod tests {
             &[],
             &[],
             true,
+            &crate::bridge::claude::RetryClock::at(0),
         );
         assert_eq!(*asked.borrow(), vec![dir.join(bundle("2.1.287")).join("resources").join("native-binary").join("claude")]);
         assert_eq!(out.as_deref(), Some("2.1.287 (Claude Code)"));
@@ -3313,18 +3324,41 @@ mod tests {
         assert_eq!(lines.last().map(text), Some((Tag::Skip, "the image's claude 2.1.287 runs where no staged version can".to_string())), "{texts:?}");
         // S11 (A3's rows, A §11.2): the selected bundle's version against the image's own claude.
         assert!(lines.iter().map(text).any(|r| r == (Tag::Ok, "claude 2.1.287 (the Cursor bundle): the image's own claude; chats run it with nothing to fetch".to_string())), "{texts:?}");
-        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], true);
+        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], true, &crate::bridge::claude::RetryClock::at(0));
         let texts: Vec<String> = lines.iter().map(|l| text(l).1).collect();
         assert!(texts.iter().any(|t| t == "the image's claude 2.1.286 runs where no staged version can"), "{texts:?}");
         let admit = "claude 2.1.287 (the Cursor bundle): not admitted yet; chats run the image's 2.1.286  <- ai-env claude admit 2.1.287 (automatic while Docker answers: [claude].auto_admit)";
         assert!(lines.iter().map(text).any(|r| r == (Tag::Warn, admit.to_string())), "{texts:?}");
         // T6: no automatic admission to promise (`[claude].auto_admit` off, or not remote): the admit alone.
-        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], false);
+        let (lines, _) = bundle_rows(dir, Some("2.1.286"), &|_: &Path| None, &[], &[], false, &crate::bridge::claude::RetryClock::at(0));
         let manual = "claude 2.1.287 (the Cursor bundle): not admitted yet; chats run the image's 2.1.286  <- ai-env claude admit 2.1.287";
         assert!(lines.iter().map(text).any(|r| r == (Tag::Warn, manual.to_string())), "{:?}", lines.iter().map(text).collect::<Vec<_>>());
         assert!(!texts.iter().any(|t| t.contains("Auto Update") || t.contains("make claude-update")), "{texts:?}");
-        let (lines, out) = bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") }, &[], &[], true);
+        let (lines, out) = bundle_rows(&dir.join("absent"), Some("2.1.287"), &|_: &Path| -> Option<String> { panic!("no bundle: nothing to ask") }, &[], &[], true, &crate::bridge::claude::RetryClock::at(0));
         assert_eq!((lines.len(), text(&lines[0]).0, out), (1, Tag::Skip, None));
+    }
+
+    /// S12 (V2, §V2.3, LD-V8): `bundle_rows` hands its clock to the claude rows as given: the installed bundle's
+    /// Docker failure counts its automatic retry from the version lock's later end (`clock.finished`), as `claude
+    /// status` and `wrapper status` do, not from the failure alone, and is due now once `clock.now` reached it.
+    #[test]
+    fn bundle_rows_hand_their_clock_to_the_claude_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("extensions");
+        std::fs::create_dir_all(dir.join("anthropic.claude-code-2.1.320-darwin-arm64")).unwrap();
+        let p = Paths::from_root_and_env(tmp.path().join("bridge"), None);
+        crate::bridge::claude::tests::put_docker(&p, "2.1.320", 'a', 1, "2026-10-24T13:50:00Z");
+        let records = crate::bridge::claude::load_all(&p);
+        let a = crate::wire::time::parse_rfc3339_utc("2026-10-24T13:50:00Z").unwrap();
+        let clock = crate::bridge::claude::RetryClock { now: a + 60, finished: [("2.1.320".to_string(), a + 600)].into() };
+        let (lines, _) = bundle_rows(&dir, Some("2.1.305"), &|_: &Path| None, &[], &records, true, &clock);
+        let want = (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run the image's 2.1.305  <- an automatic retry from 2026-10-24T14:15:00Z (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now".to_string());
+        assert!(lines.iter().map(text).any(|r| r == want), "{:?}", lines.iter().map(text).collect::<Vec<_>>());
+        // Its `now` too: at that time, the retry is due.
+        let due = crate::bridge::claude::RetryClock { now: a + 1500, finished: [("2.1.320".to_string(), a + 600)].into() };
+        let (lines, _) = bundle_rows(&dir, Some("2.1.305"), &|_: &Path| None, &[], &records, true, &due);
+        let want = (Tag::Warn, "claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run the image's 2.1.305  <- an automatic retry is due now (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now".to_string());
+        assert!(lines.iter().map(text).any(|r| r == want), "{:?}", lines.iter().map(text).collect::<Vec<_>>());
     }
 
     /// S9: a live Cursor window on another extension than the installed one
@@ -3355,7 +3389,7 @@ mod tests {
         };
         let running = running_extensions(&rows, &identity);
         assert_eq!(running.iter().map(|w| (w.host, w.ext.as_str())).collect::<Vec<_>>(), [(5101, "2.1.301"), (5102, "2.1.302")]);
-        let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &running, &[], true);
+        let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &running, &[], true, &crate::bridge::claude::RetryClock::at(0));
         let texts: Vec<(Tag, String)> = lines.iter().map(text).collect();
         let older = (Tag::Warn, "a Cursor window runs extension 2.1.301 (host pid 5101, since 2026-10-17T09:00:00Z); 2.1.302 is installed  <- reload that window".to_string());
         assert_eq!(texts.iter().filter(|(_, t)| t.starts_with("a Cursor window runs extension ")).cloned().collect::<Vec<_>>(), vec![older.clone()], "the window on the installed 2.1.302 adds no row: {texts:?}");
@@ -3363,7 +3397,7 @@ mod tests {
         assert_eq!(texts[1], older, "right after it: {texts:?}");
         // No live window, or every one on the installed extension: no window row.
         for windows in [Vec::new(), vec![RunningExtension { host: 5102, ext: "2.1.302".into(), started: since, seen: (since + 120) * 1000 }]] {
-            let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &windows, &[], true);
+            let (lines, _) = bundle_rows(dir, None, &|_: &Path| None, &windows, &[], true, &crate::bridge::claude::RetryClock::at(0));
             assert!(lines.iter().all(|l| !text(l).1.starts_with("a Cursor window runs")), "{windows:?}");
         }
         // No installed bundle: nothing to reload a window onto (the bundle row says it is missing).

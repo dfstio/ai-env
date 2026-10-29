@@ -115,6 +115,8 @@ fn t8_2_a_fake_extension_session_runs_on_the_vm() {
     use ai_env_cli::bridge::authwatch::AUTH_TIMERS;
     use ai_env_cli::bridge::remote::{CLOSE_BUDGET_MS, LEG_NAMES};
     use ai_env_cli::wire::workspace::CODE_PORT;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let mut p = Harness::prepare();
     let sid = common::uuid(0x8820);
     let earlier = format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8821));
@@ -1247,6 +1249,8 @@ fn an_unanswered_touch_id_fails_fast_with_the_countdown_and_one_line() {
 /// (another wrapper, a `vm warm`), the VM keeps running.
 #[test]
 fn close_suspends_the_vm_only_when_no_other_session_holds_the_workspace() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let suspends = |calls: &[ai_env_cli::bridge::api::Call]| calls.iter().filter(|c| matches!(c, ai_env_cli::bridge::api::Call::Suspend { .. })).count();
     let session = |p: common::Prepared| {
         let mut h = p.spawn_on(common::Link::Remote, "", &[], &[]);
@@ -1277,6 +1281,39 @@ fn close_suspends_the_vm_only_when_no_other_session_holds_the_workspace() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(suspends(&h.rig().fake_calls()), 1, "the closing session suspended its VM");
+}
+
+/// S12 (R1, M-R7 end to end): the closing suspend's read of the VM's spawns
+/// held at the endpoint (`GET /health/detail`, the close's only new request
+/// on 8080 once the turn synced) is cut at the close's deadline less its
+/// margin, which `RemoteLinks::close` set: its `vm_suspend` row says
+/// `skipped`/`budget` (`ms` under the bound), written before the pump's own
+/// cut, so the close still ends within `CLOSE_BUDGET_MS`. No SuspendMicrovm.
+/// At S11 the pump's cut ended the waiting suspend with no row at all.
+/// Measured alone in the binary's wall-clock lane.
+#[test]
+fn a_closing_suspend_cut_by_the_budget_is_audited_budget() {
+    use ai_env_cli::bridge::remote::CLOSE_BUDGET_MS;
+    use ai_env_cli::wire::workspace::APP_PORT;
+    use common::fake_endpoint::Action;
+    let _alone = common::remote::alone();
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+    started(&mut h);
+    turn(&mut h, "hello");
+    synced(&mut h, &common::fake_fixed_sid(), 1);
+    let vm = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    h.rig().endpoint.script_port(APP_PORT, [Action::Held]);
+    let took = closed(&mut h);
+    h.rig().endpoint.release();
+    assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "the host's EOF to the exit took {took:?}\n{}", h.transcript());
+    let rows: Vec<Value> = h.audit_events("vm_suspend").into_iter().filter(|r| r["detail"]["id"] == vm.as_str()).collect();
+    assert_eq!(rows.len(), 1, "one closing row of {vm}: {rows:?}");
+    let d = &rows[0]["detail"];
+    assert_eq!((d["by"].as_str(), d["outcome"].as_str(), d["why"].as_str()), (Some("close"), Some("skipped"), Some("budget")), "{d}");
+    let ms: u64 = d["ms"].as_str().and_then(|m| m.parse().ok()).unwrap_or(u64::MAX);
+    assert!(ms < 1500, "within the closing bound: {d}");
+    assert_eq!(h.rig().endpoint.held(), 1, "the suspend's read of the VM's spawns, the one request held");
+    assert_eq!(suspends(h.rig()), 0, "no SuspendMicrovm");
 }
 
 // ---- S8 wave 2 (W10): the remote session's offline tests ----------------------------------
@@ -1684,7 +1721,13 @@ fn holding(dirs: &[&Path], needles: &[String]) -> Vec<String> {
 /// `[wrapper].env_forward` names Cursor set and an `env_extra` one, and the
 /// descriptor the token rides on (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`):
 /// nothing else. No `AWS_*` name, no other TOKEN, KEY, SECRET or PASSWORD
-/// name and no secret value of Cursor's environment reaches the VM.
+/// name and no secret value of Cursor's environment reaches the VM. S12
+/// (R2-1, R2-4): the default list's two extension names
+/// (`CLAUDE_CODE_QUESTION_PREVIEW_FORMAT`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`,
+/// placed after `TERM` below, so the forwarded slice is `cursor`'s first 10)
+/// arrive with Cursor's values; the host refresh names Cursor sets
+/// (`CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`, `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH`)
+/// never do: no list names them.
 #[test]
 fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
     use ai_env_cli::bridge::egress::{proxy_url, PROXY_IP, PROXY_PORT};
@@ -1703,8 +1746,12 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
         ("CLAUDE_CODE_ENABLE_TASKS", "true"),
         ("LANG", "en_US.UTF-8"),
         ("TERM", "xterm-256color"),
+        ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
+        ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
         ("MY_FLAG", "on"),
         ("DISABLE_TELEMETRY", "0"),
+        ("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1"),
+        ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "1"),
         ("HTTPS_PROXY", "http://proxy.cursor.invalid:8080"),
         ("AWS_SECRET_ACCESS_KEY", secrets[0].as_str()),
         ("CLAUDE_CODE_OAUTH_TOKEN", secrets[1].as_str()),
@@ -1751,14 +1798,146 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
     .collect();
     // The env_forward names Cursor set, and env_extra's MY_FLAG (its DISABLE_TELEMETRY is the wrapper's, above).
-    want.extend(cursor[..8].iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())));
+    want.extend(cursor[..10].iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())));
     assert_eq!(env, want, "the VM's environment");
+    for refresh in ["CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"] {
+        assert!(!env.contains_key(refresh), "{refresh} reached the VM");
+    }
     for (name, value) in &dumps[0] {
         assert!(!name.starts_with("AWS_"), "{name} reached the VM");
         let credential_named = ["TOKEN", "KEY", "SECRET", "PASSWORD"].iter().any(|w| name.contains(w));
         assert!(!credential_named || (name == "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" && value == "3"), "{name} reached the VM");
         assert!(!secrets.iter().any(|s| value.contains(s.as_str())), "a secret of Cursor's environment reached the VM as {name}");
     }
+}
+
+/// S12 (R2): the state of a CLI's `session_state_changed` frame (`running`,
+/// `requires_action`, `idle`); `None` for any other line.
+fn state_of(v: &Value) -> Option<&str> {
+    if v["type"] == "system" && v["subtype"] == "session_state_changed" {
+        v["state"].as_str()
+    } else {
+        None
+    }
+}
+
+/// S12 (R2.4): what a frame of the fake's stdout is, for its sequence: a state
+/// frame's state, `system/<subtype>` for another system frame, else its type.
+fn frame_kind(v: &Value) -> String {
+    match state_of(v) {
+        Some(state) => state.to_string(),
+        None if v["type"] == "system" => format!("system/{}", v["subtype"].as_str().unwrap_or_default()),
+        None => v["type"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// S12 (R2.4, LD-R9): the fake's state frames, as claude 2.1.310 emits them
+/// with `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` (the real CLI's variable, no
+/// knob): `running` after a turn's echo, `requires_action` before a held
+/// prompt's `can_use_tool` and `running` once it is answered (allowed, denied
+/// or an error; none for an interrupt), `idle` after every result (a
+/// usage-limited one and an interrupted one too); each `{"type":"system","subtype":
+/// "session_state_changed","state":…,"sdk_host_only":true,"uuid":…,"session_id":…}`,
+/// in that key order, its uuid of kind 3000 counting this process's frames.
+/// Without the variable the same run has none, and a `--resume` duplicate
+/// (`FAKE_DEDUP_RESUMED`: a line the resumed transcript holds) gets its echo
+/// and no state frame.
+#[test]
+fn the_fake_emits_its_state_frames_as_claude_2_1_310_does() {
+    let f = Fake::new();
+    let sid = common::fake_fixed_sid();
+    let (u1, u2, u3) = (common::uuid(0x8851), common::uuid(0x8852), common::uuid(0x8853));
+    let stdin = format!("{INIT}\n{}\n{}\n{}\n{}\n", user(&u1), user(&u2), common::permission_answer("perm-1-2", true), user(&u3));
+    let knobs = [("FAKE_ASK", "Bash"), ("FAKE_ASK_TURN", "2"), ("FAKE_USAGE_LIMIT", "turn:3")];
+    let with: Vec<(&str, &str)> = knobs.iter().copied().chain([("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")]).collect();
+    let (code, out, err) = f.run(&[], &with, &stdin);
+    assert_eq!(code, Some(0), "{err}");
+    let frames = json_lines(&out);
+    let kinds: Vec<String> = frames.iter().map(frame_kind).collect();
+    let want = [
+        "control_response", "system/init",
+        // Turn 1.
+        "user", "running", "assistant", "result", "idle",
+        // Turn 2: the held prompt, allowed.
+        "user", "running", "assistant", "requires_action", "control_request", "running", "user", "assistant", "result", "idle",
+        // Turn 3: the usage limit.
+        "user", "running", "result", "idle",
+    ];
+    assert_eq!(kinds, want, "{out:#?}");
+    let states: Vec<&String> = out.iter().filter(|l| l.contains("session_state_changed")).collect();
+    let words = ["running", "idle", "running", "requires_action", "running", "idle", "running", "idle"];
+    assert_eq!(states.len(), words.len());
+    for (n, (line, state)) in states.iter().zip(words).enumerate() {
+        let want = format!(r#"{{"type":"system","subtype":"session_state_changed","state":"{state}","sdk_host_only":true,"uuid":"{:08x}-0000-4000-3000-000000000001","session_id":"{sid}"}}"#, n + 1);
+        assert_eq!(**line, want, "state frame {}", n + 1);
+    }
+    // Without the variable: the same run, no state frame.
+    let g = Fake::new();
+    let (code, out, err) = g.run(&[], &knobs, &stdin);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(!out.iter().any(|l| l.contains("session_state_changed")), "{out:#?}");
+    assert_eq!(json_lines(&out).len(), want.len() - words.len(), "every other frame as before");
+    // A resumed session's duplicate runs no turn: its echo, no state frame.
+    let r = Fake::new();
+    let resumed = common::uuid(0x8854);
+    let dir = r.config().join("projects").join(r.slug());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{resumed}.jsonl")), format!("{{\"type\":\"user\",\"uuid\":\"{u1}\",\"sessionId\":\"{resumed}\"}}\n")).unwrap();
+    let knobs = [("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_DEDUP_RESUMED", "1"), ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")];
+    let (code, out, err) = r.run(&["--resume", &resumed], &knobs, &format!("{INIT}\n{}\n", user(&u1)));
+    assert_eq!(code, Some(0), "{err}");
+    let kinds: Vec<String> = json_lines(&out).iter().map(frame_kind).collect();
+    assert_eq!(kinds, ["control_response", "system/init", "user"], "{out:#?}");
+    // A prompt denied, or answered with an error: `running` once it is answered, then the tool's error, the reply,
+    // the result and `idle`, as for an allowed one.
+    let knobs = [("FAKE_ASK", "Bash"), ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")];
+    let error = r#"{"type":"control_response","response":{"subtype":"error","request_id":"perm-1-1","error":"no answer"}}"#;
+    for (what, answer) in [("denied", common::permission_answer("perm-1-1", false)), ("an error", error.to_string())] {
+        let a = Fake::new();
+        let (code, out, err) = a.run(&[], &knobs, &format!("{INIT}\n{}\n{answer}\n", user(&u1)));
+        assert_eq!(code, Some(0), "{what}: {err}");
+        let kinds: Vec<String> = json_lines(&out).iter().map(frame_kind).collect();
+        let want = ["control_response", "system/init", "user", "running", "assistant", "requires_action", "control_request", "running", "user", "assistant", "result", "idle"];
+        assert_eq!(kinds, want, "{what}: {out:#?}");
+    }
+    // An interrupted prompt: no `running` (the CLI answers the interrupt, withdraws its prompt and ends the turn with
+    // its error result), then `idle`.
+    let i = Fake::new();
+    let interrupt = r#"{"request_id":"x1","type":"control_request","request":{"subtype":"interrupt"}}"#;
+    let (code, out, err) = i.run(&[], &knobs, &format!("{INIT}\n{}\n{interrupt}\n", user(&u1)));
+    assert_eq!(code, Some(0), "{err}");
+    let frames = json_lines(&out);
+    let kinds: Vec<String> = frames.iter().map(frame_kind).collect();
+    let want = ["control_response", "system/init", "user", "running", "assistant", "requires_action", "control_request", "control_response", "control_cancel_request", "result", "idle"];
+    assert_eq!(kinds, want, "{out:#?}");
+    assert_eq!(frames[9]["subtype"].as_str(), Some("error_during_execution"), "the interrupted turn's error result: {}", frames[9]);
+}
+
+/// S12 (R2-1, R2-9): the state frames reach the host only when the wrapper
+/// forwards the variable. Cursor's environment holds
+/// `CLAUDE_CODE_SDK_READS_SESSION_STATE=1`: with the default `[wrapper]` the
+/// host gets one turn's two frames byte for byte as the VM's CLI printed them
+/// (`running`, then `idle` after the result, both of generation 1 and the
+/// chat's session); with an explicit `env_forward` that lacks the name, none.
+#[test]
+fn the_state_frames_reach_the_host_only_when_forwarded() {
+    let sid = common::fake_fixed_sid();
+    let frame = |state: &str, n: u64| format!(r#"{{"type":"system","subtype":"session_state_changed","state":"{state}","sdk_host_only":true,"uuid":"{n:08x}-0000-4000-3000-000000000001","session_id":"{sid}"}}"#);
+    let cursor = [("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")];
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &cursor);
+    started(&mut h);
+    turn(&mut h, "hello");
+    h.expect_out(|v| state_of(v) == Some("idle"), T);
+    closed(&mut h);
+    let states: Vec<String> = h.out_lines().into_iter().filter(|l| l.contains("session_state_changed")).collect();
+    assert_eq!(states, [frame("running", 1), frame("idle", 2)], "{}", h.transcript());
+    let mut p = Harness::prepare();
+    add_config(p.rig(), "[wrapper]\nenv_forward = [\"LANG\"]\n");
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &cursor);
+    started(&mut h);
+    turn(&mut h, "hello");
+    closed(&mut h);
+    assert!(!h.out_lines().iter().any(|l| l.contains("session_state_changed")), "not forwarded, no frame: {}", h.transcript());
 }
 
 /// Invariant 11 on the remote link: the VM's CLI runs with the VM's own
@@ -1825,6 +2004,8 @@ fn eof_closes_within_1500ms_and_leaves_no_child_on_the_vm() {
 /// closes alone, its own closing suspend fires: one SuspendMicrovm.
 #[test]
 fn close_keeps_the_vm_running_while_the_config_probe_lives() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let mut probe = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_INIT_AT_TURN", "1")]);
     let init = probe.send_initialize();
     // Answered by the probe's CLI, which read its knobs at its start: the chat's below are its own.
@@ -2512,6 +2693,8 @@ fn a_reused_vm_with_a_longer_idle_keeps_the_session_through_its_idle() {
 #[test]
 fn resume_on_the_same_vm_keeps_vm_and_session_id() {
     use ai_env_cli::bridge::api::VmState;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
     let init = started(&mut first);
     let sid = init["session_id"].as_str().expect("the session id").to_string();
@@ -3068,6 +3251,8 @@ fn terminate_syncs_the_transcript_first(all: bool) {
 #[test]
 fn vm_terminate_never_wakes_a_suspended_vm_to_sync_it() {
     use ai_env_cli::bridge::api::VmState;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let knobs = [("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_FINAL_MIRROR_MS", "200"), ("FAKE_EXIT_DELAY_MS", "400")];
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &knobs);
     let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
@@ -3529,6 +3714,8 @@ fn a_resume_miss_retry_scans_the_transcript_again_before_it_goes_up() {
 fn a_vm_chat_whose_tools_printed_a_key_shape_resumes_on_its_vm() {
     use ai_env_cli::bridge::api::VmState;
     use std::io::Write as _;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let key = format!("{}{}", "AKIA", "V".repeat(16));
     let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
     let sid = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
@@ -3807,6 +3994,8 @@ fn auth_status(rig: &common::remote::RemoteRig, cwd: &Path) -> std::process::Out
 #[test]
 fn after_the_closing_suspend_the_prewarm_finds_no_token_held() {
     use ai_env_cli::bridge::vm::registry::{read_row, RowStatus};
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[]);
     started(&mut h);
     closed(&mut h);
@@ -4155,11 +4344,17 @@ fn drop_transport_signals_only_the_wrapper_that_wrote_the_row() {
 /// into it, or as soon as a SuspendMicrovm went out: it passes the
 /// endpoint's check and runs in the VM inside the close, and the suspend
 /// fires only once that fetch ended, or was given up at `CLOSE_WAIT` (the
-/// log says so in that order). So the VM ends suspended. With the wait
-/// removed, the suspend goes out as the session task ends, when the close
-/// begins: the code-out let go after it finds the VM suspended, and the
-/// fake's auto-resume leaves it RUNNING. One code-out request, one
-/// SuspendMicrovm, the close within 1.5 s. Measured with the binary's
+/// log says so in that order). So the VM ends suspended, unless the close's
+/// deadline came first (S12, below). With the wait removed, the suspend
+/// goes out as the session task ends, when the close begins: the code-out
+/// let go after it finds the VM suspended, and the fake's auto-resume
+/// leaves it RUNNING. One code-out request, one SuspendMicrovm, the close
+/// within 1.5 s. S12 (R1): the suspend's waits stop at the close's deadline
+/// less its margin, the host's EOF plus 1350 ms. A code-out that ends too
+/// late for that leaves no SuspendMicrovm (`skipped`/`budget`, the VM
+/// RUNNING for the idle policy) or one cut in flight (`no_answer`: at most
+/// one at the fake, the VM's state unchecked). The test takes both, and
+/// still none goes out before the code-out ended. Measured with the binary's
 /// wall-clock lane alone: the hold must go before the trigger gives the
 /// fetch up, while the fetch still waits for its answer (a fetch given up
 /// with its request already on its way may still reach the VM after the
@@ -4168,7 +4363,7 @@ fn drop_transport_signals_only_the_wrapper_that_wrote_the_row() {
 fn the_closing_suspend_waits_for_the_last_code_out() {
     use ai_env_cli::bridge::api::VmState;
     use ai_env_cli::bridge::codeout::CLOSE_WAIT;
-    use ai_env_cli::bridge::remote::CLOSE_BUDGET_MS;
+    use ai_env_cli::bridge::remote::{CLOSE_BUDGET_MS, REMOTE_HARD_STOP_MS};
     use ai_env_cli::wire::workspace::{CODEOUT_ROUTE, CODE_PORT};
     use common::fake_endpoint::Action;
     let _alone = common::remote::alone();
@@ -4195,14 +4390,30 @@ fn the_closing_suspend_waits_for_the_last_code_out() {
     assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "the close took {took:?}\n{}", h.wrapper_log());
     let log = h.wrapper_log();
     let at = |what: &str| log.find(what).unwrap_or_else(|| panic!("{what}: {log}"));
-    let ended = log.find("code-out fetch").or_else(|| log.find("code-out: the fetch still running at the close was given up")).unwrap_or_else(|| panic!("the code-out neither ended nor was given up: {log}"));
-    assert!(at("pump done") < ended && ended < at("closing: suspended"), "the close began, the code-out ended or was given up, then the suspend: {log}");
     let rig = h.rig();
     // Recorded once the VM answered (200, 204), or with 0 when the close gave the fetch up first (its client
     // gone before the answer came; the run goes on in the VM): either way past the check, never refused.
     let codeout = || rig.endpoint.attempts().into_iter().filter(|a| a.port == CODE_PORT && a.path == CODEOUT_ROUTE).map(|a| a.status).collect::<Vec<u16>>();
     wait_for("the code-out's attempt at the endpoint", T, || !codeout().is_empty());
     assert!(matches!(codeout().as_slice(), [0 | 200 | 204]), "the held code-out passed the check: {:?}\n{log}", codeout());
+    // S12 (R1, phase 4): the closing suspend stops at the close's deadline (host EOF plus the hard stop) less its
+    // margin. A code-out the shim takes 800 ms and more for (314-372 ms as a rule; once on a quiet Mac, often under
+    // load) leaves the suspend skipped (`budget`) or its SuspendMicrovm cut in flight (`no_answer`). A SuspendMicrovm
+    // goes out only after the trigger's line, which waits for the fetch's own end (`code-out fetch`).
+    if log.contains("the close's budget ran out") {
+        assert!(took > Duration::from_millis(REMOTE_HARD_STOP_MS) / 2, "a budget skip before the close's deadline: {took:?}\n{log}");
+        assert!(at("pump done") < at("the close's budget ran out"), "the close began, then the skip: {log}");
+        assert_eq!(suspends(rig), 0, "no SuspendMicrovm: the close's deadline came first: {log}");
+        return;
+    }
+    let ended = log.find("code-out fetch").or_else(|| log.find("code-out: the fetch still running at the close was given up")).unwrap_or_else(|| panic!("the code-out neither ended nor was given up: {log}"));
+    let done = at("closing: the code-out trigger is done");
+    if log.contains("had no answer within") {
+        assert!(at("pump done") < at("code-out fetch") && at("code-out fetch") < done && done < at("had no answer within"), "the close began, the code-out ended, the trigger was done, then the suspend was sent and cut: {log}");
+        assert!(suspends(rig) <= 1, "one SuspendMicrovm at most: {log}");
+        return;
+    }
+    assert!(at("pump done") < ended && ended < done && done < at("closing: suspended"), "the close began, the code-out ended or was given up, the trigger was done, then the suspend: {log}");
     assert_eq!(suspends(rig), 1, "the closing suspend went out: {log}");
     let vm = part_of(&h.end_note(), "vm").expect("the session's VM");
     assert!(rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended), "nothing woke the VM after the suspend: {:?}", rig.fake().vms.get(&vm).map(|v| &v.state));
@@ -4322,6 +4533,8 @@ fn a_rule_approved_on_a_vm_the_session_left_survives_a_resume_on_a_new_vm() {
 /// VM: one SuspendMicrovm.
 #[test]
 fn a_closing_suspend_keeps_a_vm_where_a_vm_exec_spawn_lives() {
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
     let mut chat = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[]);
     started(&mut chat);
     let rig = chat.rig();
@@ -4875,6 +5088,43 @@ fn a_staged_claude_runs_on_the_next_chat() {
     assert_eq!((part_of(&note, "claude").as_deref(), part_of(&note, "claude_src").as_deref()), (Some("2.1.310"), Some("cached")), "{note}");
 }
 
+/// S12 (R3-1, a control; M-R19, which S11 left alive): V's fetch after the
+/// first output names the session as it reads once the fetch ended. The
+/// chat's first output is the answer to `initialize`, so the fetch starts
+/// with no session; the VM's curl plays V's GET 3 s late (`S3CURL_SLOW_MS`,
+/// the transcript's PUTs still the tests' S3), and meanwhile the first turn's
+/// init (`FAKE_INIT_AT_TURN`: the CLI's own shape) brings the chat's id, which
+/// the pump adopts. The `claude_fetch` row that says `fetched` names that id,
+/// in its envelope and its detail, generation 1, `after_output`, at least 3 s.
+#[test]
+fn a_fetch_names_the_session_its_init_brought_while_it_ran() {
+    let mut p = Harness::prepare();
+    let cmd = {
+        let rig = p.rig();
+        let v = rig.stage_claude("2.1.310", &[]);
+        let object = rig.root().join("v-object");
+        std::fs::write(&object, rig.s3().get(&v.key().render()).expect("V's object in S3")).expect("V's bytes for the VM's curl");
+        let object = object.display().to_string();
+        rig.set_vm_curl_knobs(&[("S3CURL_REAL", common::remote::REAL_CURL), ("S3CURL_REAL_ONLY", "PUT"), ("S3CURL_BODY", &object), ("S3CURL_SLOW_MS", "3000")]);
+        rig.wrapper_for_bundle(&v.version, &[], &[("FAKE_INIT_AT_TURN", "1")])
+    };
+    let mut h = p.launch_wrapper(cmd);
+    let init = h.send_initialize();
+    h.expect_out(|v| is_response_to(v, &init), T);
+    let u = h.send_user("hello");
+    let sid = h.expect_out(is_init, T)["session_id"].as_str().expect("the init's session id").to_string();
+    h.expect_out(|v| is_result_for(v, &u), T);
+    h.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    let fetched: Vec<Value> = h.audit_events("claude_fetch").into_iter().filter(|r| r["detail"]["outcome"] == "fetched").collect();
+    assert_eq!(fetched.len(), 1, "{fetched:?}");
+    let (row, d) = (&fetched[0], &fetched[0]["detail"]);
+    assert_eq!((row["session_id"].as_str(), d["session"].as_str()), (Some(sid.as_str()), Some(sid.as_str())), "the init's session, read once the fetch ended: {row}");
+    assert_eq!((d["gen"].as_str(), d["why"].as_str()), (Some("1"), Some("after_output")), "{row}");
+    let ms: u64 = d["ms"].as_str().and_then(|m| m.parse().ok()).unwrap_or(0);
+    assert!(ms >= 3000, "the fetch outlasted the init: {row}");
+    closed(&mut h);
+}
+
 /// I1 (A1's cache): a cached claude that dies before its init respawns once on the next best (here the image's),
 /// its sha256 in the VM row's `claude_bad`, `claude_start_failed` audited, the census `image(start_failed)`.
 #[test]
@@ -5171,4 +5421,303 @@ fn i2_a_gzip_chats_reopen_passes_over_a_vm_without_the_cap() {
     assert!(last_line(&err).ends_with(&format!("{old} runs an image older than S11 (no {CAP_TRANSCRIPT_GZIP_V1}): run make deploy, then reopen the chat")), "{err}");
     assert_eq!(h.rig().decrypts(), touch, "no Touch ID for the pinned reopen");
     assert_eq!(audit_rows(h.rig(), "transcript_pull").len(), pulls.len(), "nothing pulled for the pinned reopen");
+}
+
+// ---- S12 (T): chat names (plans/s12-contracts.md §4) ----
+
+/// S12 (T): session `sid`'s view on this Mac (the rig's projects directory).
+fn view_of(h: &Harness, sid: &str) -> PathBuf {
+    h.prepared.mac_projects().join(h.slug()).join(format!("{sid}.jsonl"))
+}
+
+/// S12 (T): ai-env's `custom-title` line of `name` in `sid`'s view, with its newline: the extension's shape
+/// (`sessionId` before `customTitle`, each string as `serde_json` writes it), written out here and not taken from
+/// `title::custom_title_line`, so the view's line is checked byte for byte against §T2's form (M-T25).
+fn ai_env_line(sid: &str, name: &str) -> String {
+    let json = |s: &str| serde_json::to_string(s).expect("a JSON string");
+    format!("{{\"type\":\"custom-title\",\"sessionId\":{},\"customTitle\":{}}}\n", json(sid), json(name))
+}
+
+/// S12 (T): the generation `g` of the fake's env log line `gen <g> <what>` (the rig's log: every wrapper's VM CLI).
+fn fake_gen(h: &Harness, what: &str) -> u64 {
+    let suffix = format!(" {what}");
+    h.env_log().iter().find_map(|l| l.strip_prefix("gen ").and_then(|r| r.strip_suffix(suffix.as_str())).and_then(|g| g.parse().ok())).unwrap_or_else(|| panic!("no `gen <g> {what}` in {:?}", h.env_log()))
+}
+
+/// S12 (T): session `sid`'s registry row (the rig's bridge).
+fn session_row(h: &Harness, sid: &str) -> ai_env_cli::bridge::registry::SessionRow {
+    ai_env_cli::bridge::registry::read(&h.rig().paths(), sid).unwrap().unwrap_or_else(|| panic!("the row of {sid}"))
+}
+
+/// S12 (T): the row's name and its source.
+fn title_of(row: &ai_env_cli::bridge::registry::SessionRow) -> (Option<&str>, Option<&str>) {
+    (row.title.as_deref(), row.title_source.as_deref())
+}
+
+/// S12 (T): the `chat title` lines (a name the row took: its source and length) of `log`.
+fn names_logged(log: &str) -> usize {
+    log.lines().filter(|l| l.contains("chat title") && l.contains("chars=")).count()
+}
+
+/// S12 (T, Bug 1, §T3 P4, L1, V3, V4, M-T9, M-T25, M-T37): a `/rename` in a remote chat (`FAKE_RENAME_AT_TURN`:
+/// the CLI's `custom-title` line in the VM's transcript, which the VM's view builder skips, then its
+/// `session_title_changed`) reaches the chat's view on this Mac as ai-env's own line, in the extension's shape:
+/// after turn 1's sync it is the view's last line, the host having got the CLI's frame byte for byte; after turn
+/// 2's sync the view holds it once, still last (each later view write carries it); the closed row says it, `custom`.
+#[test]
+fn a_rename_in_a_remote_chat_reaches_its_view() {
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RENAME_AT_TURN", "1:Harbour-s12 renamed")]);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    let (view, line) = (view_of(&h, &sid), ai_env_line(&sid, "Harbour-s12 renamed"));
+    turn(&mut h, "rename the chat");
+    synced(&mut h, &sid, 1);
+    h.wait_until("the view's last line is ai-env's", T, |_| std::fs::read_to_string(&view).unwrap_or_default().ends_with(&line));
+    let frame = common::fake_title_frame("Harbour-s12 renamed", 1, fake_gen(&h, "turn 1 renamed"), &sid);
+    assert!(h.seen_out.contains(&frame), "the CLI's frame byte for byte\n{}", h.transcript());
+    turn(&mut h, "after the rename");
+    synced(&mut h, &sid, 2);
+    let text = read(&view);
+    assert!(is_view(&view) && text.ends_with(&line), "still last: {text}");
+    assert_eq!(text.matches(line.trim_end()).count(), 1, "once: {text}");
+    closed(&mut h);
+    assert_eq!(title_of(&session_row(&h, &sid)), (Some("Harbour-s12 renamed"), Some("custom")));
+    assert!(read(&view).ends_with(&line), "after the close too");
+}
+
+/// S12 (T, §T3 P4, P7, P8, L1, V2, R3, M-T3, M-T4, M-T9, M-T31): a chat renamed `Harbour-s12 old` in its first
+/// session, closed, then renamed in Cursor while closed (the extension appends its line to the view); its
+/// reopen's CLI still holds the old name and says so at its start (`FAKE_TITLE`). The view's newest rename wins:
+/// the startup's ensure writes nothing into a view that holds one (the view's last `custom-title` line is still
+/// Cursor's, none naming the old name after it), and the row says `Harbour-s12 new`, `custom`, taken once (the
+/// reopen never names the chat by the frame first). In its first turn the CLI then announces Cursor's name (R3: as
+/// after the extension's `rename_session`): that ensure finds it newest already, so the line stays Cursor's alone.
+#[test]
+fn a_reopen_keeps_a_rename_made_in_cursor_while_closed() {
+    use ai_env_cli::bridge::api::VmState;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
+    let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RENAME_AT_TURN", "1:Harbour-s12 old")]);
+    let sid = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
+    let (view, old) = (view_of(&first, &sid), ai_env_line(&sid, "Harbour-s12 old"));
+    turn(&mut first, "name the chat");
+    synced(&mut first, &sid, 1);
+    first.wait_until("the old name in the view", T, |_| std::fs::read_to_string(&view).unwrap_or_default().ends_with(&old));
+    closed(&mut first);
+    let vm = part_of(&end_note_of(&first, first.pid()), "vm").expect("the first session's VM");
+    let rig = first.rig();
+    wait_for("the closing suspend", T, || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended));
+    // Cursor renames the closed chat: the extension appends its line to the view.
+    let cursor = format!("{{\"type\":\"custom-title\",\"sessionId\":\"{sid}\",\"customTitle\":\"Harbour-s12 new\"}}\n");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&view).expect("the view");
+    std::io::Write::write_all(&mut f, cursor.as_bytes()).expect("Cursor's line");
+    drop(f);
+    let logged = first.wrapper_log().len();
+    let resume = format!("--resume={sid}");
+    let knobs = [("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_TITLE", "Harbour-s12 old"), ("FAKE_RENAME_AT_TURN", "1:Harbour-s12 new")];
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &knobs));
+    let init = started(&mut second);
+    assert_eq!(init["session_id"].as_str(), Some(sid.as_str()), "the same session: {init}");
+    turn(&mut second, "after the reopen");
+    let views = || audit_rows(rig, "transcript_view").iter().filter(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["outcome"] == "written").count();
+    wait_for("the reopen's turn synced and its view written", T, || views() >= 2);
+    closed(&mut second);
+    let env = first.env_log();
+    assert!(env.iter().any(|l| l.ends_with(" title startup")), "the reopen's CLI said its old name: {env:?}");
+    assert_eq!(env.iter().filter(|l| l.ends_with(" turn 1 renamed")).count(), 2, "the first chat's rename and the reopen's echo: {env:?}");
+    let text = read(&view);
+    let at = text.rfind(cursor.trim_end()).unwrap_or_else(|| panic!("Cursor's line in the view: {text}"));
+    assert!(!text[at..].contains("Harbour-s12 old"), "no line naming the old name after Cursor's: {text}");
+    assert_eq!(ai_env_cli::bridge::view::newest_custom_title(text.as_bytes()).as_deref(), Some("Harbour-s12 new"), "the picker's name");
+    assert_eq!(ai_env_cli::bridge::view::custom_titles(text.as_bytes()).last().map(Vec::as_slice), Some(cursor.as_bytes()), "Cursor's line last: {text}");
+    assert_eq!(text.matches(cursor.trim_end()).count(), 1, "the echo's ensure wrote no second line: {text}");
+    assert_eq!(title_of(&session_row(&first, &sid)), (Some("Harbour-s12 new"), Some("custom")));
+    let log = &first.wrapper_log()[logged..];
+    assert_eq!(names_logged(log), 1, "the reopen took one name, the view's: {log}");
+}
+
+/// S12 (T, §T3 P7, L5, V1, V3, M-T41): a chat whose view never got a rename (one lost before S12), reopened while
+/// its CLI says a name at its start (`FAKE_TITLE`): the startup's ensure writes ai-env's line into the view, which
+/// the turn's sync carries, and the row says the name, `custom`.
+#[test]
+fn a_reopen_restores_a_rename_the_view_lost() {
+    use ai_env_cli::bridge::api::VmState;
+    // S12 (R1): needs the closing suspend to fire within the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
+    let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let sid = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
+    let view = view_of(&first, &sid);
+    turn(&mut first, "no name yet");
+    synced(&mut first, &sid, 1);
+    closed(&mut first);
+    let vm = part_of(&end_note_of(&first, first.pid()), "vm").expect("the first session's VM");
+    let rig = first.rig();
+    wait_for("the closing suspend", T, || rig.fake().vms.get(&vm).is_some_and(|v| v.state == VmState::Suspended));
+    assert!(ai_env_cli::bridge::view::custom_titles(read(&view).as_bytes()).is_empty(), "no rename in the view: {}", read(&view));
+    let resume = format!("--resume={sid}");
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_TITLE", "Harbour-s12 kept")]));
+    started(&mut second);
+    turn(&mut second, "after the reopen");
+    let views = || audit_rows(rig, "transcript_view").iter().filter(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["outcome"] == "written").count();
+    wait_for("the reopen's turn synced and its view written", T, || views() >= 2);
+    let line = ai_env_line(&sid, "Harbour-s12 kept");
+    wait_for("the view ends with ai-env's line", T, || std::fs::read_to_string(&view).unwrap_or_default().ends_with(&line));
+    closed(&mut second);
+    let text = read(&view);
+    assert!(is_view(&view) && text.ends_with(&line), "{text}");
+    assert_eq!(text.matches(line.trim_end()).count(), 1, "once: {text}");
+    assert_eq!(title_of(&session_row(&first, &sid)), (Some("Harbour-s12 kept"), Some("custom")));
+}
+
+/// S12 (T, §T3 P5, V5, §T4 items 2, 3, M-T8, M-T38): the host's `generate_session_title` (its `description` the
+/// user's prompt) is answered by the VM's CLI byte for byte; the row takes the answer, `ai`; the VM's view (its
+/// transcript's `ai-title` line, `FAKE_WRITE_TRANSCRIPT`) shows it in its marked first line; the prompt is in no
+/// file under the bridge root or the Mac's projects directory.
+#[test]
+fn the_generated_title_reaches_the_row() {
+    const PROMPT: &str = "Harbour prompt never kept";
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_AI_TITLE", "Fix the shallow seed"), ("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    let id = h.send_control("generate_session_title", &format!(r#"{{"description":"{PROMPT}","persist":true}}"#));
+    h.expect_out(|v| is_response_to(v, &id), T);
+    let answer = format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"title":"Fix the shallow seed"}}}}}}"#);
+    assert!(h.seen_out.contains(&answer), "the answer byte for byte\n{}", h.transcript());
+    turn(&mut h, "a turn");
+    // The row the turn's result wrote, before its sync (the trigger's view shows the placeholder until then, whose
+    // title is no chat's name): the answer's doing alone. After the sync the view's `ai-title` line says it too (P9).
+    assert_eq!(title_of(&session_row(&h, &sid)), (Some("Fix the shallow seed"), Some("ai")), "the answer named the row");
+    synced(&mut h, &sid, 1);
+    closed(&mut h);
+    assert_eq!(title_of(&session_row(&h, &sid)), (Some("Fix the shallow seed"), Some("ai")));
+    let view = read(&view_of(&h, &sid));
+    let first = view.lines().next().unwrap_or_default();
+    assert_eq!(first, format!(r#"{{"aiEnvView":1,"type":"ai-title","aiTitle":"Fix the shallow seed","sessionId":"{sid}"}}"#), "{view}");
+    assert_eq!(holding(&[&h.bridge(), &h.prepared.mac_projects()], &[PROMPT.to_string()]), Vec::<String>::new(), "the prompt in a file");
+}
+
+/// S12 (T, §T3 C1 to C4, §T4 items 3, 4, M-T5): a hostile VM's names. Its CLI's startup name holds a bidi override,
+/// a bell, two spaces and a line separator (JSON escapes, as the CLI prints them): the row says `Harbour-s12 evil
+/// name`. Its turn-1 rename names a key shape the scrub masks: dropped (the row unchanged, no view line holds it).
+/// Both frames reached the host byte for byte; no file under the bridge root or the Mac's projects directory holds
+/// the key; the wrapper's log, the census and the audit hold no name.
+#[test]
+fn a_hostile_title_is_cleaned_or_dropped() {
+    let key = format!("{}{}", "ASIA", "Q".repeat(16));
+    let bs = '\\';
+    let hostile = format!("Harbour-s12{bs}u202eevil{bs}u0007  name{bs}u2028");
+    let rename = format!("leak {key}");
+    let turn_rename = format!("1:{rename}");
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_TITLE", &hostile), ("FAKE_RENAME_AT_TURN", &turn_rename), ("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    turn(&mut h, "a turn");
+    synced(&mut h, &sid, 1);
+    let (view, line) = (view_of(&h, &sid), ai_env_line(&sid, "Harbour-s12 evil name"));
+    h.wait_until("the view ends with ai-env's line", T, |_| std::fs::read_to_string(&view).unwrap_or_default().ends_with(&line));
+    closed(&mut h);
+    assert_eq!(title_of(&session_row(&h, &sid)), (Some("Harbour-s12 evil name"), Some("custom")), "cleaned; the rename dropped");
+    let gen = fake_gen(&h, "title startup");
+    for frame in [common::fake_title_frame(&hostile, 0, gen, &sid), common::fake_title_frame(&rename, 1, gen, &sid)] {
+        assert!(h.seen_out.contains(&frame), "{frame} byte for byte\n{}", h.transcript());
+    }
+    assert!(read(&view).ends_with(&line) && ai_env_cli::bridge::view::custom_titles(read(&view).as_bytes()).len() == 1, "{}", read(&view));
+    assert_eq!(holding(&[&h.bridge(), &h.prepared.mac_projects()], std::slice::from_ref(&key)), Vec::<String>::new(), "the key in a file");
+    let paths = h.rig().paths();
+    for file in [h.bridge().join("logs").join("wrapper.log"), paths.census(), paths.audit()] {
+        assert!(!std::fs::read_to_string(&file).unwrap_or_default().contains("Harbour-s12"), "a name in {}", file.display());
+    }
+    assert!(std::fs::read_to_string(h.bridge().join("logs").join("wrapper.log")).unwrap_or_default().contains("chat title dropped"), "the drop logged (its word, not its text)");
+}
+
+// ---- S12 I2 (the lead): the joint cases (plans/s12-contracts.md §10.1, X-11) ----
+
+/// S12 I2 (plans/s12-contracts.md §10.1; T §T3 P4, P7, P9, L1 to L3, L6, V3, V4, T A19; R §R1.3, R1-6): a remote
+/// chat renamed in a turn, moved, then closed within the budget. Cursor renamed the running chat first (the
+/// extension's `custom-title` line appended to its view), so a rename lost on the way would leave Cursor's older
+/// name in force: a startup never writes over a view that holds a rename (P7). Turn 2's code-out is held at the
+/// endpoint, the VM to be lost with it in flight, so the trigger's task never takes the CLI's `/rename` of turn 3
+/// (`FAKE_RENAME_AT_TURN`): the rename names the row at once, and its ensure is still due when the chat moves.
+/// `vm terminate` ends the VM (its sync first), and the next line re-addresses the chat to a new VM, whose CLI says
+/// the name at its start as the CLI does for a named chat (`FAKE_TITLE`: without it a moved fake sends no startup
+/// frame, and the knob is one constant, T A19). The due ensure moves to the new generation's trigger (L2), which
+/// writes ai-env's line after Cursor's; the moved CLI's startup answers the rename, never Cursor's older name (L1
+/// as amended, P4), so the row never goes back to it; the lost VM's code-out then ends (its connection gone with
+/// the VM; it held the workspace's fetch lock), and the new VM's sync carries the line (V4). The close, its
+/// closing suspend's read of the VM's spawns answered only after 5 s, ends within `CLOSE_BUDGET_MS`, and the last
+/// VM has its `vm_suspend` row by `close` (`skipped`/`budget`, written before the pump's cut). The view's last
+/// `custom-title` line is ai-env's, naming the rename once, after Cursor's; the row says it, `custom`.
+#[test]
+fn i2_a_renamed_remote_chat_moved_and_closed_within_the_budget() {
+    use ai_env_cli::bridge::remote::CLOSE_BUDGET_MS;
+    use ai_env_cli::wire::workspace::{APP_PORT, CODE_PORT};
+    use common::fake_endpoint::Action;
+    const OLDER: &str = "Harbour-s12 older name in Cursor";
+    const NAME: &str = "Harbour-s12 renamed";
+    // S12 (R1): measures the close's budget: alone in the lane.
+    let _alone = common::remote::alone();
+    let rename = format!("3:{NAME}");
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RENAME_AT_TURN", &rename)]);
+    let sid = started(&mut h)["session_id"].as_str().expect("the session id").to_string();
+    let vm1 = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    let view = view_of(&h, &sid);
+    turn(&mut h, "one");
+    synced(&mut h, &sid, 1);
+    // Cursor renames the running chat: the extension appends its line to the view.
+    let cursor = format!("{{\"type\":\"custom-title\",\"sessionId\":\"{sid}\",\"customTitle\":\"{OLDER}\"}}\n");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&view).expect("the view");
+    std::io::Write::write_all(&mut f, cursor.as_bytes()).expect("Cursor's line");
+    drop(f);
+    // Turn 2's code-out waits at the endpoint, and the trigger's task with it (the workspace's fetch lock too).
+    h.rig().endpoint.script_port(CODE_PORT, [Action::Held]);
+    turn(&mut h, "two");
+    h.wait_until("turn 2's code-out held", T, |h| h.rig().endpoint.held() == 1);
+    turn(&mut h, "rename the chat");
+    assert!(h.seen_out.contains(&common::fake_title_frame(NAME, 3, 1, &sid)), "the CLI's frame byte for byte\n{}", h.transcript());
+    h.wait_until("the live rename names the row", T, |h| title_of(&session_row(h, &sid)) == (Some(NAME), Some("custom")));
+    assert!(!read(&view).contains(NAME), "the rename's ensure is due: no title step took it");
+    // The VM goes (its sync first); the next line moves the chat to a new VM, whose CLI says the name at its start.
+    let o = h.rig().run(&["vm", "terminate", &vm1, "--yes"], None);
+    assert!(o.status.success(), "vm terminate: {}", String::from_utf8_lossy(&o.stderr));
+    h.expect_out(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm1) && c.contains("with your next message")), T);
+    let before = read(&view);
+    assert!(before.contains(cursor.trim_end()) && !before.contains(NAME), "still due at the move, Cursor's line carried: {before}");
+    h.rig().set_vm_knobs(&[("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_TITLE", NAME)]);
+    turn(&mut h, "after the move");
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    let vm2 = starts[1]["detail"]["id"].as_str().expect("the new VM").to_string();
+    assert_ne!(vm2, vm1, "a new VM");
+    assert_eq!(starts[1]["detail"]["why"].as_str(), Some("readdress:vm_gone"));
+    // The lost VM's code-out ends (its connection gone with the VM): the fetch lock is the new VM's code-out's.
+    h.rig().endpoint.release();
+    h.wait_until("the new VM's turn synced and its view written", T, |h| {
+        h.audit_events("transcript_view").iter().any(|r| r["detail"]["session"] == sid.as_str() && r["detail"]["vm"] == vm2.as_str() && r["detail"]["outcome"] == "written")
+    });
+    // The close: its closing suspend's read of the new VM's spawns (`GET /health/detail`) is answered after 5 s.
+    h.rig().endpoint.script_port(APP_PORT, [Action::Delay { by: Duration::from_secs(5) }]);
+    let took = closed(&mut h);
+    assert!(took < Duration::from_millis(CLOSE_BUDGET_MS), "the host's EOF to the exit took {took:?}\n{}", h.transcript());
+    let rows: Vec<Value> = h.audit_events("vm_suspend").into_iter().filter(|r| r["detail"]["id"] == vm2.as_str()).collect();
+    assert_eq!(rows.len(), 1, "one closing row of {vm2}: {rows:?}");
+    let d = &rows[0]["detail"];
+    assert_eq!((d["by"].as_str(), d["outcome"].as_str(), d["why"].as_str()), (Some("close"), Some("skipped"), Some("budget")), "{d}");
+    let ms: u64 = d["ms"].as_str().and_then(|m| m.parse().ok()).unwrap_or(u64::MAX);
+    assert!(ms < 1500, "within the closing bound: {d}");
+    assert_eq!(h.rig().endpoint.held(), 1, "turn 2's code-out alone");
+    assert_eq!(suspends(h.rig()), 0, "no SuspendMicrovm");
+    // The moved CLI's startup frame reached the host byte for byte, in the move's replay.
+    let gen = fake_gen(&h, "title startup");
+    assert!(gen >= 2 && h.seen_out.contains(&common::fake_title_frame(NAME, 0, gen, &sid)), "the moved CLI's startup frame\n{}", h.transcript());
+    // The view: Cursor's line, then ai-env's naming the rename, once, last; the row says it.
+    let (text, line) = (read(&view), ai_env_line(&sid, NAME));
+    assert!(is_view(&view) && text.ends_with(&line), "the view's last line is ai-env's: {text}");
+    assert_eq!(ai_env_cli::bridge::view::custom_titles(text.as_bytes()), [cursor.as_bytes().to_vec(), line.as_bytes().to_vec()], "Cursor's, then ai-env's: {text}");
+    assert_eq!(text.matches(NAME).count(), 1, "the rename once: {text}");
+    assert_eq!(title_of(&session_row(&h, &sid)), (Some(NAME), Some("custom")));
+    // The names the row took (`chat title`, by length): Cursor's at most once, through the view before the rename
+    // (P9), then the rename once, and never Cursor's again (the moved startup's answer is the rename, L1).
+    let log = h.wrapper_log();
+    let taken: Vec<usize> = log.lines().filter(|l| l.contains("chat title")).filter_map(|l| l.split_whitespace().find_map(|w| w.strip_prefix("chars="))?.parse().ok()).collect();
+    let (older, renamed) = (OLDER.chars().count(), NAME.chars().count());
+    assert!(taken == [renamed] || taken == [older, renamed], "the names the row took, by length ({older}: Cursor's, {renamed}: the rename): {taken:?}\n{log}");
+    let note = h.end_note();
+    assert!(common::note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
 }

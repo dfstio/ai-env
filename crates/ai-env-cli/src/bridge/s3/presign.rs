@@ -16,11 +16,13 @@ use std::time::{Duration, SystemTime};
 /// our name in another account answers 403, never takes a transcript).
 pub const OWNER_HEADER: &str = "x-amz-expected-bucket-owner";
 /// The headers a request may sign besides `host`, lowercase (plans/s9-contracts.md §2.2); S11 (L5, C.3.4):
-/// `content-encoding`, which an encoded object's PUT or CreateMultipartUpload signs.
-pub const SIGNABLE_HEADERS: [&str; 6] = ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "if-none-match", OWNER_HEADER];
+/// `content-encoding`, which an encoded object's PUT or CreateMultipartUpload signs; S12 (P):
+/// `x-amz-sdk-checksum-algorithm`, which a multi-object delete signs beside its `x-amz-checksum-sha256`.
+pub const SIGNABLE_HEADERS: [&str; 7] = ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "x-amz-sdk-checksum-algorithm", "if-none-match", OWNER_HEADER];
 /// The query parameters a request may sign besides the X-Amz ones, in the
-/// order they must come.
-pub const SIGNABLE_QUERY: [&str; 8] = ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys"];
+/// order they must come; S12 (P): `delete` last (`reorder`'s positions of the
+/// others unchanged).
+pub const SIGNABLE_QUERY: [&str; 9] = ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys", "delete"];
 /// The signing name of S3.
 pub const SIGNING_NAME: &str = "s3";
 
@@ -41,9 +43,13 @@ impl S3Method {
 /// the first broken one): the bucket a transcripts bucket and its owner 12
 /// digits; the key one of the store's ([`S3Key::parse`]); the query names of
 /// [`SIGNABLE_QUERY`], each once, in its order; the headers of
-/// [`SIGNABLE_HEADERS`], lowercase, each once, with [`OWNER_HEADER`] among
-/// them, its value the target's owner; the expiry whole seconds from 1 to
-/// `TAIL_EXPIRY` (3600 s).
+/// [`SIGNABLE_HEADERS`], lowercase, each once; S12 (P, LD-P9): `delete` only
+/// in a POST of the bucket itself (no key), with no value, alone in the query
+/// (a multi-object delete), and `x-amz-sdk-checksum-algorithm` only
+/// `SHA256`, beside `x-amz-checksum-sha256`, in such a delete (which may sign
+/// neither: the live probe presigns the forms S3 should refuse); then
+/// [`OWNER_HEADER`] among the headers, its value the target's owner; the
+/// expiry whole seconds from 1 to `TAIL_EXPIRY` (3600 s).
 pub fn check(req: &PresignReq) -> Result<(), BridgeError> {
     let bad = |why: String| Err(BridgeError::Config(format!("presign: {why}")));
     let t = &req.target;
@@ -78,6 +84,33 @@ pub fn check(req: &PresignReq) -> Result<(), BridgeError> {
             return bad(format!("the header {name} has an empty or unprintable value"));
         }
         seen.push(name);
+    }
+    // S12 (P, P-R18): a multi-object delete (`POST /?delete`) and its SDK checksum header, signed only so.
+    let delete = req.query.iter().find(|(n, _)| n == "delete");
+    if let Some((_, value)) = delete {
+        if req.method != S3Method::Post {
+            return bad("the query parameter delete is a POST's (a multi-object delete)".into());
+        }
+        if req.key.is_some() {
+            return bad("the query parameter delete names the bucket itself, not a key".into());
+        }
+        if !value.is_empty() {
+            return bad("the query parameter delete has no value".into());
+        }
+        if req.query.len() > 1 {
+            return bad("the query parameter delete stands alone".into());
+        }
+    }
+    if let Some((_, algorithm)) = req.headers.iter().find(|(n, _)| n == "x-amz-sdk-checksum-algorithm") {
+        if algorithm != "SHA256" {
+            return bad("x-amz-sdk-checksum-algorithm is SHA256".into());
+        }
+        if !req.headers.iter().any(|(n, _)| n == "x-amz-checksum-sha256") {
+            return bad("x-amz-sdk-checksum-algorithm without x-amz-checksum-sha256".into());
+        }
+        if delete.is_none() {
+            return bad("x-amz-sdk-checksum-algorithm is a multi-object delete's only".into());
+        }
     }
     match req.headers.iter().find(|(n, _)| n == OWNER_HEADER) {
         None => return bad(format!("the request does not sign {OWNER_HEADER}")),
@@ -258,9 +291,10 @@ mod tests {
     }
 
     /// S11 (C.3.4): an encoded object's PUT signs `content-encoding: gzip`; an unsigned extra header is still refused.
+    /// S12 (P): the list holds the SDK checksum header a multi-object delete signs.
     #[test]
     fn content_encoding_is_a_signable_header() {
-        assert_eq!(SIGNABLE_HEADERS, ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "if-none-match", OWNER_HEADER]);
+        assert_eq!(SIGNABLE_HEADERS, ["content-length", "content-encoding", "x-amz-checksum-sha256", "x-amz-checksum-algorithm", "x-amz-sdk-checksum-algorithm", "if-none-match", OWNER_HEADER]);
         let key = Some(format!("v1/{S}/mac/{SHA}"));
         let mut headers = write_headers(3787, SHA, true).unwrap();
         headers.push(("content-encoding".into(), "gzip".into()));
@@ -271,6 +305,56 @@ mod tests {
         let mut other = req.clone();
         other.headers.push(("x-amz-meta-what".into(), "x".into()));
         assert!(matches!(check(&other), Err(BridgeError::Config(m)) if m.contains("x-amz-meta-what")));
+    }
+
+    /// S12 (P, P-R1, P-R18): a multi-object delete, a POST of the bucket
+    /// itself with `delete` (empty, alone: `SIGNABLE_QUERY`'s last, S11's
+    /// eight before it in their order), signs exactly its SDK checksum pair
+    /// beside the owner, `host;x-amz-checksum-sha256;x-amz-expected-bucket-owner;x-amz-sdk-checksum-algorithm`,
+    /// its URL naming no key and `delete` first; with no checksum, or the
+    /// checksum alone, it signs too (the live probe's forms). Refused before
+    /// anything is signed (`Config`, exit 1), each naming its rule: `delete`
+    /// on a GET, a PUT or a DELETE, with a key, with a value, beside another
+    /// parameter; the SDK header other than `SHA256`, without the checksum,
+    /// or in a request without `delete` (a PUT of a key).
+    #[test]
+    fn a_multi_object_delete_signs_its_checksum_pair() {
+        assert_eq!(SIGNABLE_QUERY[..8], ["versionId", "uploadId", "partNumber", "uploads", "list-type", "prefix", "continuation-token", "max-keys"]);
+        assert_eq!(SIGNABLE_QUERY[8], "delete");
+        let checksum = crate::wire::s3::sha256_b64(SHA).unwrap();
+        let sdk = |algorithm: &str| ("x-amz-sdk-checksum-algorithm".to_string(), algorithm.to_string());
+        let sum = || ("x-amz-checksum-sha256".to_string(), checksum.clone());
+        let delete = || vec![("delete".to_string(), String::new())];
+        let req = request(S3Method::Post, &aws(), None, delete(), vec![sdk("SHA256"), sum()], PRESIGN_EXPIRY);
+        let url = sign(lab_credentials(), &req, at()).unwrap();
+        assert_eq!((url.signed_headers(), url.key(), url.param_names()[0]), ("host;x-amz-checksum-sha256;x-amz-expected-bucket-owner;x-amz-sdk-checksum-algorithm", "", "delete"));
+        assert!(url.expose().starts_with("https://ai-env-transcripts-123456789012.s3.eu-central-1.amazonaws.com/?delete=&X-Amz-Algorithm=AWS4-HMAC-SHA256&"), "{url:?}");
+        // The live probe's forms: no checksum header at all, and the checksum alone.
+        for (headers, signed) in [(Vec::new(), "host;x-amz-expected-bucket-owner"), (vec![sum()], "host;x-amz-checksum-sha256;x-amz-expected-bucket-owner")] {
+            let url = sign(lab_credentials(), &request(S3Method::Post, &aws(), None, delete(), headers, PRESIGN_EXPIRY), at()).unwrap();
+            assert_eq!((url.signed_headers(), url.key()), (signed, ""));
+        }
+        let key = Some(format!("v1/{S}/mac/{SHA}"));
+        let mut put = write_headers(3787, SHA, true).unwrap();
+        put.push(sdk("SHA256"));
+        let pair = || vec![sdk("SHA256"), sum()];
+        let refused: Vec<(PresignReq, &str)> = vec![
+            (request(S3Method::Get, &aws(), None, delete(), pair(), PRESIGN_EXPIRY), "the query parameter delete is a POST's (a multi-object delete)"),
+            (request(S3Method::Put, &aws(), None, delete(), pair(), PRESIGN_EXPIRY), "the query parameter delete is a POST's (a multi-object delete)"),
+            (request(S3Method::Delete, &aws(), None, delete(), pair(), PRESIGN_EXPIRY), "the query parameter delete is a POST's (a multi-object delete)"),
+            (request(S3Method::Post, &aws(), key.clone(), delete(), pair(), PRESIGN_EXPIRY), "the query parameter delete names the bucket itself, not a key"),
+            (request(S3Method::Post, &aws(), None, vec![("delete".into(), "x".into())], pair(), PRESIGN_EXPIRY), "the query parameter delete has no value"),
+            (request(S3Method::Post, &aws(), None, vec![("prefix".into(), format!("v1/{S}/")), ("delete".into(), String::new())], pair(), PRESIGN_EXPIRY), "the query parameter delete stands alone"),
+            (request(S3Method::Post, &aws(), None, delete(), vec![sdk("CRC32"), sum()], PRESIGN_EXPIRY), "x-amz-sdk-checksum-algorithm is SHA256"),
+            (request(S3Method::Post, &aws(), None, delete(), vec![sdk("SHA256")], PRESIGN_EXPIRY), "x-amz-sdk-checksum-algorithm without x-amz-checksum-sha256"),
+            (request(S3Method::Put, &aws(), key, Vec::new(), put, PRESIGN_EXPIRY), "x-amz-sdk-checksum-algorithm is a multi-object delete's only"),
+        ];
+        for (req, why) in refused {
+            match sign(lab_credentials(), &req, at()) {
+                Err(BridgeError::Config(m)) => assert_eq!(m, format!("presign: {why}")),
+                other => panic!("{why}: expected Config, got {other:?}"),
+            }
+        }
     }
 
     /// Every method and the bucket itself sign `x-amz-expected-bucket-owner`

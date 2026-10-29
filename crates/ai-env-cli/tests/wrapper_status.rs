@@ -1043,3 +1043,55 @@ fn json_has_doctors_shape() {
         assert_eq!(text(&plain.stdout), format!("{}\n", lines.join("\n")), "the text form prints the same rows");
     }
 }
+
+/// S12 (V2, X-8): in remote mode, the installed bundle's Docker failure
+/// counts its automatic retry from the later of the failure and the version
+/// lock's last automatic end (`state/claude/<v>.lock`'s `finished_at=`),
+/// and says it is due now once both are past; status reads that lock and
+/// never creates or changes it (the harness's no-change check, every run):
+/// without a lock, the failure's own time and no lock made; with an end 1
+/// minute ago, from it.
+#[test]
+fn the_claude_row_counts_a_docker_retry_from_the_last_auto_end_and_writes_nothing() {
+    use ai_env_cli::bridge::claude::{AdmissionRow, Record};
+    use ai_env_cli::wire::time::{rfc3339_utc, unix_now};
+    let home = Home::new();
+    let wrapper = sibling();
+    let w = wrapper.to_str().unwrap();
+    home.write_settings(&format!("{{\n  {}: {},\n  {}: \"default\",\n}}\n", json_str(WRAPPER_SETTING), json_str(w), json_str(PERMISSION_SETTING)));
+    let root = home.path().join("work");
+    std::fs::create_dir_all(&root).unwrap();
+    home.write_bridge_toml(&format!("[wrapper]\nmode = \"remote\"\n\n[workspaces]\nroots = [{}]\n{AWS}", json_str(&root.display().to_string())));
+    home.install_extensions(&["2.1.320"], &[]);
+    let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(home.bridge_dir(), None);
+    let failed_at = |at: u64| {
+        Record::update(&paths, "2.1.320", |r| {
+            r.admission = Some(AdmissionRow {
+                outcome: "failed".into(),
+                step: Some("docker".into()),
+                markers: Some("ok".into()),
+                docker: Some("make: *** [claude-admit-docker] Error 101".into()),
+                docker_test: Some("l2_x".into()),
+                docker_failures: 1,
+                ai_env: "0.1.0".into(),
+                auto: true,
+                at: rfc3339_utc(at),
+                ..AdmissionRow::default()
+            });
+        })
+        .unwrap();
+    };
+    let row = |when: &str| format!("  [!! ] claude 2.1.320 (the Cursor bundle): admission failed at docker (test l2_x failed; attempt 1 of 3); chats run the image's claude  <- an automatic retry{when} (the next remote wrapper starts it), or ai-env claude admit 2.1.320 --redo now");
+    let lock = paths.claude_lock("2.1.320");
+    let now = unix_now();
+    failed_at(now - 600);
+    let out = home.status(&[]);
+    assert_eq!(out.status.code(), Some(0), "{}{}", text(&out.stdout), text(&out.stderr));
+    assert_lines(&text(&out.stdout), &[row(&format!(" from {}", rfc3339_utc(now - 600 + 900)))]);
+    assert!(std::fs::symlink_metadata(&lock).is_err(), "no lock made");
+    std::fs::write(&lock, format!("finished_at={}\noutcome=failed(docker)\n", now - 60)).unwrap();
+    assert_lines(&text(&home.status(&[]).stdout), &[row(&format!(" from {}", rfc3339_utc(now + 840)))]);
+    failed_at(now - 1500);
+    std::fs::write(&lock, format!("finished_at={}\noutcome=failed(docker)\n", now - 1200)).unwrap();
+    assert_lines(&text(&home.status(&[]).stdout), &[row(" is due now")]);
+}

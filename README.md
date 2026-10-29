@@ -147,8 +147,9 @@ ai-env wrapper uninstall [--write]                        # take claudeProcessWr
                                                           #   it warns first while remote chats keep only their view here, S9)
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env wrapper settings-sync UUID [--rule R]… [--all-safe] [--write] [--image-dir DIR]   # a remote chat's approved rules → the image (S8)
-ai-env session list [--json] | show UUID [--json] [--settings-diff] | forget UUID... [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8);
-                                                          #   forget: several ids, every one checked first, one Touch ID for --purge (S10)
+ai-env session list [--json] [--title TEXT] | show UUID [--json] [--settings-diff] | forget UUID... [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8);
+                                                          #   forget: several ids, every one checked first, one Touch ID for --purge (S10);
+                                                          #   list: each chat's name last, --title only the chats whose name holds TEXT (S12)
 ai-env session migrate UUID [--json]                      # a remote chat to a new VM now: its running wrapper moves it between turns,
                                                           #   else this command does (S10; one Touch ID either way)
 ai-env session stage UUID [--warm] [--json] | sync UUID [--json]   # a chat begun on this Mac into S3, its view left / a remote chat's
@@ -167,8 +168,9 @@ ai-env claude forget VERSION [--local] [--force] | gc [--yes] [--json]   # one v
                                                           #   keep the 3 newest staged, the bundle's and the live windows' (--yes: one Touch ID)
 ai-env audit  tail [-n N] [-f] [--session UUID] [--vm ID] [--event E,…] [--actor cli|wrapper|panel] [--since WHEN] [--where K=V]… [--json] | grep PATTERN [-i] [the same filters] [--json]
                                                           #   audit.jsonl's rows, followed with -f / holding a fixed string, exit 1 when none (S11; no AWS, no Touch ID)
-ai-env cost   [--since WHEN] [--until WHEN] [--by day] [--json] [--compare FILE]   # the MicroVMs' and the proxy's cost rebuilt from the audit,
-                                                          #   a range; --compare judges it against Cost Explorer's (S11; no AWS, no Touch ID)
+ai-env cost   [--since WHEN] [--until WHEN] [--by day] [--json] [--compare FILE] [--no-tests]   # the MicroVMs' and the proxy's cost rebuilt from the audit,
+                                                          #   a range; --compare judges it against Cost Explorer's (S11; no AWS, no Touch ID); the live
+                                                          #   tests' VMs counted, labelled, unless --no-tests (S12)
 ai-env panel  serve [--port N] [--bind 127.0.0.1]        # the local control panel on 127.0.0.1, its URL holding this run's bearer; one Touch ID
                                                           #   per action ([panel] enabled = true in bridge.toml; S11)
 ai-env creds  aws-set [--user ai-env-runtime|ai-env-ops] [--check] [--force]   # seal `aws iam create-access-key` JSON from stdin:
@@ -303,7 +305,9 @@ Everything else — every subcommand, `--version`, and every session while neith
   copy was dropped);
 - writes `logs/wrapper.log`, a second census row with `end`/`exit` (`ai-env wrapper census` shows
   `exit=… dur=…`), `audit.jsonl` rows for retries, and one `state/sessions/<uuid>.toml` per chat
-  (`ai-env session list|show|forget`; rows hold digests and a summary, never request bodies);
+  (`ai-env session list|show|forget`; rows hold digests and a summary, never request bodies, and since
+  S12 the chat's name as Cursor shows it, `title` with `title_source` `custom` or `ai`, from the CLI's
+  own frames and the view, never a request: stage S12);
 - exits within 1.5 s of the extension closing stdin (SIGTERM at +0.8 s, SIGKILL at +1.2 s) and
   within 1 s of a SIGTERM.
 
@@ -1102,11 +1106,16 @@ VM's wall moves the chat off it first: stage S10). A chat begun on this Mac goes
 reopens remote, its transcript and its subagents' files through the tripwires first (see Security): a
 finding is exit 9 and none of it is sent. `ai-env session show UUID` shows a chat's VM, spawn, seeded
 head and newest fetched snapshot, since S9 where its transcript is kept (`transcript_home`), where it
-began (`origin`) and its view, and since S10 every VM it ran on (`vms`, with why each started).
+began (`origin`) and its view, since S10 every VM it ran on (`vms`, with why each started), and since
+S12 its name as Cursor shows it, on its second line with where the name came from (`custom` for a
+rename, `ai` for the title claude generated). `ai-env session list` ends each chat's line with that
+name, and `--title TEXT` keeps the chats whose name holds TEXT, whatever its case (names only, never
+ids; stage S12).
 
 ```sh doc-test
-ai-env session list        # the chats the wrapper registered, newest first
-ai-env session show UUID   # one chat's row: its VM, spawn, seeded head, newest fetched snapshot
+ai-env session list                         # the chats the wrapper registered, newest first, each one's name last
+ai-env session list --title "word memory"   # only the chats whose name holds that text, in any case
+ai-env session show UUID                    # one chat's row: its name, VM, spawn, seeded head, newest fetched snapshot
 ```
 
 **Settings that last (T8.7).** A rule approved with "don't ask again" in a remote chat is written into
@@ -1175,7 +1184,12 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
 - of Cursor's environment only the names in `[wrapper] env_forward` and `env_extra` go to the VM; a name
   there that `vm exec --env` refuses (`AWS_*`, a TOKEN, KEY, SECRET or PASSWORD name and the like), a
   proxy variable or `CLAUDE_CODE_PROJECT_DIR_NAME` refuses the session (exit 9, the name named, never a
-  value);
+  value). Since S12 the default `env_forward` also has `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` and
+  `CLAUDE_CODE_SDK_READS_SESSION_STATE`, which the extension sets (with the second, claude reports its
+  session state to Cursor, and the chat still parks), while a bridge.toml that sets `env_forward` keeps
+  its own list; `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH` and `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH` in either
+  list refuse the session too (exit 9), because the wrapper answers a remote claude's refreshes with no
+  token;
 - the scans are tripwires, not proofs: a secret in a shape no rule knows, in a tracked or untracked
   file, goes to AWS; `box seed --dry-run` shows what a first seed would carry. A chat's transcript holds
   what its tools printed: since S9 a remote chat's stays in the VM and in S3 (the Mac never receives it
@@ -1199,7 +1213,10 @@ its last activity at the defaults (stage S10); with `[vm] park = false`, or on a
 the session's keep-alive holds off the idle policy for as long as the chat stays open, up to the VM's
 wall, `[vm] max_duration_s`. When the last chat of a workspace closes, the wrapper suspends its VM
 (`[vm] suspend_on_close`); otherwise the idle policy suspends it after `[vm] max_idle_s`, and a
-suspended VM is terminated once its suspended time or its wall runs out.
+suspended VM is terminated once its suspended time or its wall runs out. The closing suspend fits in
+the close's 1.5 s: since S12 one that the close's budget cuts before it is sent (a slow last fetch, a
+slow read of the VM's spawns) is audited `skipped` with `budget`, its row written before the wrapper
+exits, and the idle policy suspends the VM.
 `ai-env vm terminate --all --yes` ends every VM you started; do it at the end of a day, since a snapshot
 may hold the token until then.
 
@@ -1497,7 +1514,10 @@ chat whose upload or first sync was cut before its manifest counts too, by the a
 `ai-env session forget UUID --purge` also deletes one chat's S3 objects, its manifest, its original
 under `state/transcripts/` and its view, after S8's checks (never while the chat runs); since S10 it
 takes several ids, checks every one before it removes anything, and purges them all with one Touch ID
-(stage S10).
+(stage S10). Since S12 the purge deletes up to 1000 objects a request (DeleteObjects, its body's SHA-256
+signed), sends again only the keys S3 refused for a moment, and lists the chat's prefix again until it
+is empty, three listings at most; an object it could not delete ends the command with exit 7, naming
+the first, and keeps the chat's manifest and state, so the command can run again (stage S12).
 
 ```sh doc-test
 ai-env session gc --remote --yes   # the S3 transcripts of chats closed over 90 days ago (without --yes: the list, no Touch ID)
@@ -1799,9 +1819,10 @@ came from, the transcript, the cut, whether a Touch ID was asked, the ms, and th
 `session_park_refused` (at most one per 10 minutes per chat), `session_reap` and `vm_gc_reconcile`;
 `vm_select` gains the generation and the VM it avoided, `seed` its source (`box`, `mac`, `kept`),
 `session_remote_start` why its VM started, `vm_terminate` the reasons `readdress` and `migrate`, and
-the closing suspend's `vm_suspend` its outcome, why it was skipped and its ms, so a missed suspend
-shows. A session row's status is `active`, `detached` (the link down, or a loss waiting for the next
-message), `parked`, `migrating` (a move under way) or `closed`, and its `vms` list each VM the chat ran
+the closing suspend's `vm_suspend` its outcome, why it was skipped (since S12 also `budget`: the
+close's 1.5 s ran out before the suspend was sent) and its ms, so a missed suspend shows. A session
+row's status is `active`, `detached` (the link down, or a loss waiting for the next message),
+`parked`, `migrating` (a move under way) or `closed`, and its `vms` list each VM the chat ran
 on, across reopens (the newest 64), with why it started (`first`, `retry`, `readdress:vm_gone`,
 `respawn:spawn_gone`, `migrate:wall`, `migrate:command`, `migrate:reopen`, …), how it ended and the
 wrapper's pid. Whether Cursor showed a move's note is recorded by hand after a move:
@@ -1923,11 +1944,14 @@ compressed `session stage`. Its image is 13.0: an older VM keeps running chats o
    manifest, the binary's size and SHA-256, its markers) before the tests. The record counts the
    failures and keeps the failing tests' lines and first panic (`ai-env claude admit V --json` shows
    them; the next run writes `logs/claude-admit-V.log` anew); `ai-env claude status` and doctor name
-   the first failing test, the attempt and when the next one may start, or that the attempts are
-   spent. A refused signature, binary or marker is never tried again by itself, and `--redo` runs
-   whatever the count. A step that may pass again (the network, gpgv missing) records nothing. The
-   tests run on the working tree: no edit in the checkout while an admission runs, or it fails
-   (`failed(docker)`: tried again 15 minutes later, or `--redo`).
+   the first failing test, the attempt and when the next one may start (15 minutes after the later of
+   the failure and the last automatic try's end, `state/claude/V.lock`'s `finished_at`, as the
+   automatic admission counts them; `is due now` once that has passed, and still while that retry
+   runs: no view names a running admission), or that the attempts are spent. A refused signature,
+   binary or marker is never tried again by itself, and `--redo` runs whatever the count. A step that
+   may pass again (the network, gpgv missing) records nothing. The tests run on the working tree: no
+   edit in the checkout while an admission runs, or it fails (`failed(docker)`: tried again 15 minutes
+   later, or `--redo`).
 4. The stage (one Touch ID, the runtime key's): a stager VM (`--egress internet`, no credential, 900 s,
    purpose `claude-stage`) streams V's release from downloads.claude.ai into an S3 PUT the Mac presigned
    with the signed length, the SHA-256 and a new-only condition, so S3 takes no other bytes; the Mac
@@ -1984,9 +2008,9 @@ and a Docker failure's `attempt` and first failing `test`) and `claude_stage`; t
 runs, newest first, never `[NO ]`: `[ok ]` when chats run it (staged, or the image's own claude),
 else `[!! ]` naming the claude chats run meanwhile and the next command (`ai-env claude admit`,
 `stage`, or `admit --redo` after a failure; a Docker failure's row names its first failing test and
-its attempt, then the automatic retry and from when, or that the attempts are spent); then
-`[-  ] the image's claude 2.1.305 runs where no staged version can`. S10's image
-claude row and its Auto Update advice are gone. `ai-env infra pin --check-bundle` says
+its attempt, then the automatic retry and from when (`is due now` once it is due), or that the
+attempts are spent); then `[-  ] the image's claude 2.1.305 runs where no staged version can`. S10's
+image claude row and its Auto Update advice are gone. `ai-env infra pin --check-bundle` says
 `pin: lock 2.1.305 is the image's fallback; Cursor bundle V: VMs follow it (ai-env claude status)`
 with exit 3 (equal: exit 0; no bundle or no readable lock: exit 1), and the deploy's P10 shows that
 note as `[-  ]`. `make claude-pin CLAUDE_VERSION=V` moves the fallback (`ai-env claude manifest`
@@ -2018,14 +2042,15 @@ exactly `127.0.0.1:PORT` (else 403: no DNS rebinding); only GET, HEAD and POST p
 own and its `Sec-Fetch-Site` `same-origin` (else 403), its body a small form (else 413 or 415). Every
 answer carries a strict Content-Security-Policy, `no-referrer`, `X-Frame-Options: DENY`, `nosniff` and
 `no-store`, and never a cookie or a CORS header. The pages, rendered on the Mac with every value
-escaped (each also as JSON with `?json=1`): Sessions (VM, moves, cost), a session (its generations,
-moves, timeline and cost), VMs (with RUN and COST), Audit (live, at most 8 streams), a session's
-settings diff (read-only) and Cost. The actions: suspend, resume and terminate a VM, refresh the list,
-and migrate a chat. Each goes through a confirm page that names its CLI twin (`ai-env vm suspend ID`,
-…) and issues a nonce bound to it, single use for 5 minutes; one action runs at a time (another gets
-409), each asks its own Touch ID from the panel's process, and its rows say `actor=panel`. A live
-chat's migrate is its wrapper's move, with that move's Touch ID. The Run button posts through the
-page's script (a plain form post under `no-referrer` would carry no usable `Origin`, and gets 403).
+escaped (each also as JSON with `?json=1`): Sessions (name, VM, moves, cost; a search over names and
+ids), a session (its name, generations, moves, timeline and cost), VMs (with RUN and COST), Audit
+(live, at most 8 streams), a session's settings diff (read-only) and Cost. The actions: suspend,
+resume and terminate a VM, refresh the list, and migrate a chat. Each goes through a confirm page
+that names its CLI twin (`ai-env vm suspend ID`, …) and issues a nonce bound to it, single use for 5
+minutes; one action runs at a time (another gets 409), each asks its own Touch ID from the panel's
+process, and its rows say `actor=panel`. A live chat's migrate is its wrapper's move, with that move's
+Touch ID. The Run button posts through the page's script (a plain form post under `no-referrer` would
+carry no usable `Origin`, and gets 403).
 The panel's start and stop are audited (`panel_serve`).
 
 **The audit.** `audit.jsonl` is at schema v2: every row's `detail.actor` says who wrote it (`cli`,
@@ -2055,17 +2080,37 @@ ai-env audit grep ID               # every row naming that VM; exit 1 when none 
 `--json`), rebuilt from this Mac's audit alone: no AWS call, no Touch ID. WHEN is `90s`, `30m`, `1h`,
 `2d` before now, an RFC 3339 UTC time or a UTC date. Each VM's running and suspended stretches come
 from its run, resume, suspend and terminate rows and its chats' keep-alive spans; an idle suspend no
-row records is inferred `max_idle_s` after the last activity, which makes the estimate a range. They
-are priced at S10's measured Lambda rates (per vCPU-second of the 1 vCPU baseline, per GB-second of
-the image's memory, per GB of snapshot written, read and stored), plus the proxy's EC2 lines, each
-line under its Cost Explorer usage type. Not counted: S3, CloudWatch, data transfer, image builds,
-and the VMs of another bridge root (the live tests'); the output says so beside its caveats.
+row records is inferred `max_idle_s` after the last activity, which makes the estimate a range. Since
+S12 a sleep the wrapper measured counts too: when a chat's wrapper reconnects after the Mac slept
+longer than `max_idle_s` (`agent_reconnect`, `woke after N s asleep`), the VM its open chat held
+running is priced suspended from `max_idle_s` after the lid closed until that reconnect (inferred,
+with its range), as the platform suspended it. They are priced at S10's measured Lambda rates (per
+vCPU-second of the 1 vCPU baseline, per GB-second of the image's memory, per GB of snapshot written,
+read and stored), plus the proxy's EC2 lines, each line under its Cost Explorer usage type. Not
+counted: S3, CloudWatch, data transfer and image builds; the output says so beside its caveats.
+Since S12 the live tests' VMs are counted too (each test runs them from a bridge root of its own, gone
+with it): every live test's guard keeps the audit rows naming its VMs, and their VM rows cut down to
+ids, times, words and numbers (no token, credential, ARN or path), in a run of its own under this
+root's `state/test-runs/` (0700), which nothing in ai-env deletes. `ai-env cost` and the panel's Cost
+page merge the runs: such a VM's NOTE begins `live test NAME`, and `ai-env cost` prints
+`live tests: K VM(s) of N run(s), $USD of the estimate (--no-tests leaves them out)` after the
+estimate's line. `--no-tests` prices this root's VMs alone and says how many it left out
+(`live tests: K VM(s) left out (--no-tests)`); a run that cannot be read is named
+(`test runs not read: …`) and never fails the command. `vm list`, `session list` and `session show`
+read this root's own rows only.
 `ai-env cost --compare FILE` judges the estimate against a Cost Explorer answer over the file's own
 days (`aws ce get-cost-and-usage … --group-by Type=DIMENSION,Key=USAGE_TYPE`, which an identity
 that reads billing runs: none of ai-env's may; the output prints the exact line): the MicroVM total
-passes within ±30 % (T11.1), and exits 1 outside it. The views carry it too: `vm list` gains RUN and
-COST, `session list` the VM, MOVES and COST, and `session show` the generations, the moves (each
-paired with its end), the timeline and the cost.
+passes within ±30 % (T11.1), and exits 1 outside it. Since S12 it also judges the proxy's lines the
+file holds (the t4g.nano's hours, its public IPv4's and its gp3 volume's) at the same band, as evidence
+that never sets the exit (`proxy total (…): … (evidence, not the exit)`), and prints each priced
+type's card rate beside the rate Cost Explorer billed, from the JSON's `UsageQuantity`
+(`rate TYPE: card $…, billed $… (P %) over QUANTITY`; the console's CSV has no quantities, so no
+rates). The `aws ce` line the output prints asks for every service and the quantities; a console
+export needs EC2-Instances, EC2-Other and VPC too (the public IPv4 bills under VPC), or the output says
+`proxy total: the file holds none of …`.
+The views carry it too: `vm list` gains RUN and COST, `session list` the VM, MOVES and COST, and
+`session show` the generations, the moves (each paired with its end), the timeline and the cost.
 
 ```sh doc-test
 ai-env cost --since 7d   # the last week's estimate and its range: no AWS call, no Touch ID
@@ -2088,9 +2133,13 @@ pinned to another version than the active one. The claude rows (above) replace S
 **The drift rows.** Doctor reads the census's chat rows of each running Cursor window's extension,
 offline, names and flags only, never a value: `[!! ]` for env names it starts chats with that
 `[wrapper] env_forward` and `env_extra` do not forward and no review has classified (`ENV_REVIEWED`,
-`src/bridge/drift.rs`), `[-  ]` for a forwarded name it no longer sets and for a name a remote session
-never carries (one `vm exec` refuses, such as a TOKEN name), `[!! ]` for flags the router
-does not classify (add them to `VALUE_FLAGS` or `BOOL_FLAGS` in `src/wire/argv.rs`, then
+`src/bridge/drift.rs`; since S12 `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` and
+`CLAUDE_CODE_SDK_READS_SESSION_STATE` are forwarded by default instead, so this row names them only
+for a bridge.toml whose own `env_forward` and `env_extra` leave them out), `[-  ]` for a forwarded
+name it no longer sets (a window on an extension that does not set those two lists them there) and
+for a name a remote session never carries (one `vm exec` refuses, such as a TOKEN name; S12's two
+refresh names, which `[wrapper]` refuses, get no row), `[!! ]` for flags the router does not classify
+(add them to `VALUE_FLAGS` or `BOOL_FLAGS` in `src/wire/argv.rs`, then
 `make argv-fixtures EXT=V`), and per extension newer than 2.1.302 whether its reader still names the
 view's fields (`[ok ]`, else `[!! ]`: the view format changed). They replace S10's fixture-drift row.
 
@@ -2125,6 +2174,134 @@ make test-aws S11=1            # S11's live tests (live_s11_*): the stager, clau
                                #   F1 after git checkout -b, C-4 after /compact, a fork's first write
 make test-aws S10=1 WALL=1     # S10's three wall tests alone (about 45 minutes)
 ```
+
+### Chat names (stage S12)
+
+**What changes.** ai-env now knows each chat's name, the one Cursor shows in its tab and in its
+history. The chat's registry row keeps it (`title`, with `title_source`: `custom` for a rename, `ai`
+for the title claude generated); `ai-env session list` ends each chat's line with it, and
+`--title TEXT` searches the names; `ai-env session show` names it on its second line; the panel shows
+and searches it. Two renames that used to get lost are kept: a `/rename` in a remote chat survives a
+window reload (Bug 1), and a rename survives the staging of a chat begun on this Mac (Bug 2). S12
+changes this Mac only: no new image and no deploy (image 13.0 and its shim stay), and the version stays
+0.11.0, so doctor still says `ai-env 0.11.0 = ai-env-claude 0.11.0 = image shim 0.11.0`.
+
+**Where a name comes from.** Only from what claude prints and from the chat's view on this Mac, never
+from a request Cursor sends (the request that asks claude for a title carries the prompt to title,
+which ai-env never reads):
+
+- a rename: claude's `session_title_changed` line, which claude prints at its start when the chat has
+  a name and after every rename, a `/rename` in the chat or a rename in Cursor while the chat runs
+  (Cursor hands that one to claude);
+- the generated title: claude's answer to Cursor's `generate_session_title` request (`ai`);
+- a remote chat's view: its newest `custom-title` line (`custom`), else the title on its first line
+  (`ai`; never the placeholder `Remote chat`).
+
+Every name is cleaned before it is kept: control, bidi, zero-width and other invisible characters
+become spaces, each run of spaces one, and a name keeps at most 200 characters. A name the scrubber
+would change (one that looks like a credential) or a tripwire hits is dropped and changes nothing: the
+wrapper's log says `chat title dropped`, why and the rule's id, never the name.
+
+**Which name wins.** A rename replaces whatever the row held, the newest last; a generated title
+replaces only no name or another generated one, so it never undoes a rename. When a remote chat's
+claude starts (a reopen, a move to a new VM, a restart), the name it prints at its start yields to the
+view's newest rename: a rename made in Cursor while the chat was closed stays the row's and the
+picker's (within one wrapper process, a rename it has not written into the view yet comes first). A
+reopen keeps the name the chat's previous row held until claude or the view names another; after
+`/clear` the new session starts without the old one's name.
+
+**Bug 1: a remote chat's rename, lost at a reload.** A remote chat's file on this Mac is its view
+(stage S9), which the VM's claude never writes: a `/rename` reached the transcript in the VM but not
+the view, and after a window reload the picker named the chat as before. Since S12, once claude
+announces a rename, the wrapper ends the view with ai-env's own `custom-title` line, in the
+extension's shape and key order, unless the view's newest one says it already:
+
+`{"type":"custom-title","sessionId":"UUID","customTitle":"NAME"}`
+
+Cursor's picker takes the newest such line, and every later rewrite of the view keeps it, as it keeps
+Cursor's own. The line goes only into a view ai-env wrote (never into a transcript, a link, a file of
+Cursor's lines alone or a missing file); a view keeps its newest 16 rename lines, and renames in a
+burst rewrite it at most once a second. A rename made just before the chat closes is written before
+the wrapper exits, and one not written yet survives a move to a new VM or a restart. A rename a view
+lost before S12 comes back at the chat's next open, written then only into a view that holds no
+rename.
+
+**Bug 2: a rename, lost at staging.** `ai-env session stage UUID`, the inline stage of a reopen and
+`ai-env session migrate-s9` turn a chat's file (or an S8 mirror) into its view, and the view was
+written once the original had gone: it lost the chat's `custom-title` lines, and the picker no longer
+showed the rename. Since S12 they are read from the transcript first (its tail, else its first
+64 KiB), byte for byte, less any line a tripwire hits or the scrubber would change, and the view ends
+with the newest 16. claude's own record of a rename (`custom-title.json` in the chat's directory, when
+it wrote one) goes up with the chat's other files, as before, so the VM's claude keeps the name too.
+
+**Where it shows.**
+
+- `ai-env session list`: each line's last cell, after the cost (`-` without a name), so the eight cells
+  before it keep their places and the name is the rest of the line. `--title TEXT` keeps the chats
+  whose name holds TEXT, whatever its case and however many spaces separate its words, names only,
+  never ids; with none it prints `no session's title holds TEXT` and exits 0 (`--json`: `[]`), and a
+  TEXT of spaces alone is exit 2.
+- `ai-env session show UUID`: its second line, `title`, then the name and its source in parentheses,
+  `(custom)` or `(ai)`, or `-` without one; `--json` holds `title` and `title_source`, as each row of
+  `session list --json` does.
+- The panel: a Title column on the Sessions page and a search form over names and ids (`?q=TEXT`,
+  case-insensitive, at most 200 characters, else 400; the note `N of M sessions match`), and a
+  session's page headed by its name and the first 8 characters of its id.
+
+The CLI and the panel show a name inert: a character a terminal or a page would act on or hide is
+written as its escape (`\uXXXX`). `--json` prints the row as stored.
+
+**Custody.** A name is the chat's own text, kept where the view keeps it: in the chat's row and in
+ai-env's line in a remote chat's view, nowhere else. No audit row, census part or log line holds one:
+the wrapper's log says `chat title` with the name's source and length only. A VM chooses no row:
+claude's line counts only for the session it runs, and whatever a VM sends is cleaned, capped and
+written at most once a second. `ai-env session forget UUID` removes the row, and the name with it;
+`--purge` removes the view too.
+
+**Limits.**
+
+- A chat with no row has no name here: a passthrough chat, a session outside the roots in remote mode,
+  and one started with `--no-session-persistence`.
+- A rename made in Cursor while a remote chat was closed reaches the row, the view, the picker and the
+  panel, but not the VM's claude, which keeps the older name: at its next start it may name that one,
+  and Cursor may show it in the chat's editor tab until the chat is renamed again (ai-env never hands a
+  rename made on this Mac to claude).
+- `custom-title` lines carry no time: a view holding an older rename of Cursor's wins over a newer
+  `/rename` that the VM's claude holds from before S12 and the view lost.
+- A rename that is dropped (the scrubber or a tripwire) leaves the older name in place.
+- The VM still builds a view without `custom-title` lines (S12 changes no shim): a view keeps them
+  because this Mac carries them across every rewrite.
+- A row from before S12 gets a name only once claude or the view gives one (nothing is backfilled),
+  and there is no `session rename` command.
+
+**The live tests.** `make test-aws S12=1` runs S12's live tests alone (`live_s12_*`): DeleteObjects'
+SHA-256 checksum and a purge of 6000 objects within the command's limit, with the runtime key and no VM
+or chat, then a name's round trip on a live VM (its generated title, then a rename that ends its view);
+about 4 Touch IDs. Each live test that ran a VM ends with `guard: kept the test's cost rows in DIR`
+(stage S11's cost).
+
+```sh
+make test-aws S12=1   # S12's live tests (live_s12_*): DeleteObjects' checksum, a 6000-object purge, a title's round trip on a live VM
+```
+
+**Also in S12.** The rest of S12 is S11's leftovers, on this Mac too:
+
+- the purge of `session gc --remote --yes` and `session forget --purge` deletes up to 1000 objects a
+  request and lists the chat's prefix again; an object left keeps the chat's state for a rerun (stage
+  S9's clean-up);
+- `ai-env cost` counts the live tests' VMs, labelled (`--no-tests` leaves them out), prices a sleep the
+  wrapper measured as suspended, and `--compare` judges the proxy's lines too, as evidence, with the
+  billed rates beside the card's (stage S11's cost);
+- the default `[wrapper] env_forward` gains `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` and
+  `CLAUDE_CODE_SDK_READS_SESSION_STATE`, and the two host refresh names refuse a remote session, exit 9
+  (stage S8's security; stage S11's drift rows);
+- the closing suspend fits in the close's 1.5 s: one the close's budget cuts before it is sent says
+  `skipped` with `budget` in its `vm_suspend` row (stage S8's cost and clean-up);
+- `ai-env claude status`, doctor and `wrapper status` time a Docker failure's automatic retry from the
+  later of the failure and the last automatic try's end, and say `is due now` once it is (stage S11);
+  `ai-env claude gc` names each live window's version once, newest first;
+- a migration's early `claude_fetch` row (`why` `phase_a`) names the chat it fetched for, never the
+  session a fork resumed, and a fork's `claude_start_failed` row names `-`, not the chat it forked.
 
 ### Identities: the deployer, ops and the runtime key
 
@@ -2502,7 +2679,10 @@ the diffs annoy you.
   under it: exit 5). Reopen such a chat.
 - `ai-env cost` is an estimate from this Mac's audit: idle suspends are inferred, the GB a snapshot
   writes or reads and the proxy's rates are calibrated against Cost Explorer (T11.1), and bursts above
-  the baseline go unseen.
+  the baseline go unseen. A VM an open chat held running that ended while the Mac slept (its wall, or
+  its suspended time) left no reconnect to measure the sleep by: it is priced as running to its wall,
+  or to its end once ai-env records that end (the chat's next message does, as it moves the chat to a
+  new VM), and through the sleep until then.
 - The panel's URL holds its bearer: a browser's history or a screen share can show it, and whoever
   has it on this Mac can start the panel's actions (each still asks its Touch ID) until the panel stops.
 

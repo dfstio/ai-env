@@ -352,15 +352,18 @@ pub fn after_output<A: MicrovmApi + S3Sign + 'static>(plan: &SessionPlan, ctx: &
 }
 
 /// A migration's phase A, after its delivery: the same fetch into the prepared VM, as a task of its own, never
-/// awaited by phase A (LD-7); nothing unless V is nameable and the VM names the cap.
+/// awaited by phase A (LD-7); nothing unless V is nameable and the VM names the cap. S12 (R3-3): its row names the
+/// live chat, read when the fetch ends (`fetch_into`, R3-1) through the latest spawned generation's reader taken at
+/// the call (`SessionPlan::live_session`): a fresh chat's adopted id, a fork's own once its init named it, never the
+/// session a fork's argv resumed; no session before any spawn. `gen` stays absent, as before.
 pub fn prefetch_phase_a<A: MicrovmApi + S3Sign + 'static>(plan: &SessionPlan, ctx: &Ctx, api: std::sync::Arc<A>, row: &VmRow, vm: &VmInfo) {
     if !row_has_cap(row) {
         return;
     }
     let Some((want, size)) = nameable_v(&plan.paths, plan) else { return };
-    let (ctx, row, vm, session) = (ctx_of(ctx), row.clone(), vm.clone(), plan.resume.clone());
+    let (ctx, row, vm, live) = (ctx_of(ctx), row.clone(), vm.clone(), plan.live_session());
     tokio::task::spawn_local(async move {
-        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::PhaseA, &|| session.clone(), None).await;
+        fetch_into(&ctx, &api, &row, &vm, &want, size, 0, CLAUDE_POLL_FOR, FetchWhy::PhaseA, &|| live.as_ref().and_then(|f| f()), None).await;
     });
 }
 

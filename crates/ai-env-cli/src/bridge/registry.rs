@@ -125,6 +125,11 @@ pub struct SessionRow {
     /// S10: the pid of the offline `session migrate` moving the chat (the
     /// row `migrating` meanwhile): `forget` and a reopen wait while it lives.
     pub migrating_pid: Option<u32>,
+    /// S12 (T): the chat's name as Cursor shows it, cleaned (`bridge::title::clean`): from the CLI's own frames
+    /// and the session's view, never a request's byte.
+    pub title: Option<String>,
+    /// S12 (T): `custom` (a rename) or `ai` (the generated title): `bridge::title::TitleSource::WORDS`.
+    pub title_source: Option<String>,
 }
 
 /// One child generation's `SessionRow.vms` entry. Lenient: an older wrapper's entry lacks the S10 fields.
@@ -780,12 +785,16 @@ pub fn session_view(paths: &Paths, uuid: &str, now: u64) -> crate::errors::Resul
 
 /// `session show`'s text (frozen by `tests/control.rs`' snapshot): the header, the generations, the moves, the
 /// timeline, the cost and the settings captures' count; every line's control characters escaped
-/// (`audit::read::terminal_safe`), as the TOML dump it replaced escaped them.
+/// (`audit::read::terminal_safe`), as the TOML dump it replaced escaped them. S12 (T, §T3 U4): the header's
+/// second line is the chat's name (`title::of_row`) and its source, `  title      <t>  (custom)` or `(ai)`, the
+/// name through `title::inert`; `  title      -` without one or with a source word this build does not know.
 fn show_lines(v: &SessionView) -> Vec<String> {
     let r = &v.row;
     let dash = |s: Option<&str>| s.filter(|s| !s.is_empty()).unwrap_or("-").to_string();
+    let title = crate::bridge::title::of_row(r).map_or_else(|| "-".to_string(), |t| format!("{}  ({})", crate::bridge::title::inert(&t.text), t.source.word()));
     let mut out = vec![
         format!("session {}", r.session_id),
+        format!("  title      {title}"),
         format!("  status     {}  mode {}  route {}", dash(Some(&r.status)), dash(Some(&r.mode)), dash(Some(&r.route))),
         format!("  cwd        {}", dash(r.cwd.as_deref())),
         format!("  extension  {}", dash(r.ext.as_deref())),
@@ -821,10 +830,13 @@ fn show_lines(v: &SessionView) -> Vec<String> {
 // ---- `ai-env session …` ------------------------------------------------------------------
 
 /// One text line of `session list`: id, status, mode, last_seen, slug (`-` when unset); S11: then the VM, the
-/// moves and the cost (`$<usd>` at 3 decimals, `-` for a chat on this Mac).
+/// moves and the cost (`$<usd>` at 3 decimals, `-` for a chat on this Mac); S12 (T, §T3 U3): then the chat's
+/// name through `title::inert` (`-` without one), the line's last cell: the eight before it keep their places,
+/// and the name is the rest of the line (it may hold spaces). The whole line through `terminal_safe`.
 fn list_line(row: &SessionRow, extra: &ListExtra) -> String {
     let cost = extra.usd.map_or_else(|| "-".to_string(), |u| format!("${u:.3}"));
-    let line = format!("{}  {:<6}  {:<13}  {}  {}  {}  {}  {cost}", row.session_id, row.status, row.mode, row.last_seen, row.slug.as_deref().unwrap_or("-"), extra.vm, extra.moves);
+    let title = row.title.as_deref().filter(|t| !t.is_empty()).map_or_else(|| "-".to_string(), |t| crate::bridge::title::inert(t).into_owned());
+    let line = format!("{}  {:<6}  {:<13}  {}  {}  {}  {}  {cost}  {title}", row.session_id, row.status, row.mode, row.last_seen, row.slug.as_deref().unwrap_or("-"), extra.vm, extra.moves);
     crate::bridge::audit::read::terminal_safe(&line).into_owned()
 }
 
@@ -839,16 +851,34 @@ fn to_json<T: Serialize + ?Sized>(value: &T) -> crate::errors::Result<String> {
     serde_json::to_string_pretty(value).map_err(|e| CliError::Msg(format!("cannot render JSON: {e}")))
 }
 
-/// `ai-env session list [--json]`: every registered session, newest first.
-/// Text: one line per row (`<id>  <status>  <mode>  <last_seen>  <slug>  <vm>  <moves>  <cost>`, S11), or
-/// `no sessions yet`; JSON: a pretty array (`[]` when empty), the rows alone.
-pub fn cmd_list(json: bool) -> crate::errors::Result<()> {
+/// `ai-env session list [--json] [--title TEXT]`: every registered session, newest first.
+/// Text: one line per row (`<id>  <status>  <mode>  <last_seen>  <slug>  <vm>  <moves>  <cost>`, S11; then
+/// `<title>`, S12), or `no sessions yet`; JSON: a pretty array (`[]` when empty), the rows alone (each with
+/// its `title` and `title_source`, a string or `null`).
+/// S12 (T, §T3 U1): `--title TEXT` keeps the rows whose name holds TEXT (`title::needle`, `title::matches`:
+/// case-insensitive, its spaces as one, names only and never ids), filtered before the cost cells are read;
+/// none is `no session's title holds <TEXT>` (exit 0, `[]` with `--json`). A TEXT of spaces alone is a usage
+/// error (exit 2) before anything is read.
+pub fn cmd_list(json: bool, title: Option<&str>) -> crate::errors::Result<()> {
+    let needle = match title {
+        Some(text) => Some(crate::bridge::title::needle(text).ok_or_else(|| CliError::Usage("--title needs a text".into()))?),
+        None => None,
+    };
     let paths = Paths::resolve()?;
-    let rows = list(&paths)?;
+    let mut rows = list(&paths)?;
+    if let Some(needle) = &needle {
+        rows.retain(|r| crate::bridge::title::matches(r, needle, false));
+    }
     if json {
         outln!("{}", to_json(&rows)?);
     } else if rows.is_empty() {
-        outln!("no sessions yet");
+        match title {
+            Some(text) => {
+                let asked = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                outln!("no session's title holds {}", crate::bridge::audit::read::terminal_safe(&crate::bridge::title::inert(&asked)));
+            }
+            None => outln!("no sessions yet"),
+        }
     } else {
         // The rows print whatever the audit, the VM rows or bridge.toml say: without them, no cost cells (`-`),
         // as `vm list` stands without its own.
@@ -1174,6 +1204,8 @@ mod tests {
             origin: Some("vm".into()),
             view: Some(format!("-Users-mike-Documents-DeFi-ai-env/{sid}.jsonl")),
             migrating_pid: Some(4251),
+            title: Some("Harbour-s11 word memory".into()),
+            title_source: Some("custom".into()),
         }
     }
 
@@ -1720,13 +1752,13 @@ mod tests {
     fn list_line_and_forget_suffix() {
         let mut r = row(1, "2026-09-25T10:00:00Z");
         let mac = ListExtra { vm: "-".into(), moves: 0, usd: None };
-        assert_eq!(list_line(&r, &mac), format!("{}  closed  local-child    2026-09-25T10:00:00Z  -  -  0  -", id(1)));
+        assert_eq!(list_line(&r, &mac), format!("{}  closed  local-child    2026-09-25T10:00:00Z  -  -  0  -  -", id(1)));
         r.slug = Some("-tmp-x".into());
         r.status = "active".into();
         r.mode = "local-scratch".into();
-        assert_eq!(list_line(&r, &mac), format!("{}  active  local-scratch  2026-09-25T10:00:00Z  -tmp-x  -  0  -", id(1)));
+        assert_eq!(list_line(&r, &mac), format!("{}  active  local-scratch  2026-09-25T10:00:00Z  -tmp-x  -  0  -  -", id(1)));
         let remote = ListExtra { vm: "microvm-a1".into(), moves: 2, usd: Some(0.1234) };
-        assert!(list_line(&r, &remote).ends_with("-tmp-x  microvm-a1  2  $0.123"), "{}", list_line(&r, &remote));
+        assert!(list_line(&r, &remote).ends_with("-tmp-x  microvm-a1  2  $0.123  -"), "{}", list_line(&r, &remote));
         assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: false, removed_quarantine: false }).as_deref(), Some(" (row)"));
         assert_eq!(forget_suffix(ForgetReport { removed_row: true, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (row, scratch dir)"));
         assert_eq!(forget_suffix(ForgetReport { removed_row: false, removed_scratch: true, removed_quarantine: false }).as_deref(), Some(" (scratch dir)"));
@@ -1740,5 +1772,64 @@ mod tests {
         let j: serde_json::Value = serde_json::from_str(&to_json(&full_row()).unwrap()).unwrap();
         assert_eq!(j["session_id"], id(7));
         assert_eq!(j["host_state"]["max_thinking_tokens"], 8000);
+    }
+
+    /// S12 (T, §T3 U3): the chat's name is the line's last cell, after the cost: the eight cells before it are
+    /// those of the same row without one, and the name is the rest of the line (its spaces kept); what a
+    /// terminal would act on in it (a bidi control `terminal_safe` leaves alone) is written as its escape.
+    #[test]
+    fn list_line_ends_with_the_title() {
+        let mut r = row(1, "2026-10-22T11:00:00Z");
+        r.slug = Some("-w-project".into());
+        let extra = ListExtra { vm: "microvm-b".into(), moves: 1, usd: Some(0.254) };
+        let bare = list_line(&r, &extra);
+        assert!(bare.ends_with("  $0.254  -"), "{bare}");
+        r.title = Some("Harbour-s11 word memory".into());
+        r.title_source = Some("custom".into());
+        let named = list_line(&r, &extra);
+        assert!(named.ends_with("  $0.254  Harbour-s11 word memory"), "{named}");
+        let cells = |l: &str| l.split_whitespace().take(8).map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(cells(&named), cells(&bare), "cells 1 to 8 keep their places");
+        assert_eq!(named.split_whitespace().skip(8).collect::<Vec<_>>(), ["Harbour-s11", "word", "memory"], "the name is the rest");
+        r.title = Some(format!("Harbour{}evil{}x", '\u{202e}', '\u{1b}'));
+        let evil = list_line(&r, &extra);
+        assert!(evil.ends_with("  $0.254  Harbour\\u202eevil\\u001bx"), "{evil}");
+        assert!(!evil.contains(['\u{202e}', '\u{1b}']), "{evil:?}");
+    }
+
+    /// S12 (T, §T3 U4): `session show`'s second line names the chat and its source, or `-` without a name and
+    /// for a source word this build does not know; the header's other lines follow it.
+    #[test]
+    fn show_lines_name_the_title_second() {
+        let lines = |title: Option<&str>, source: Option<&str>| {
+            let mut r = row(1, "2026-10-22T11:00:00Z");
+            r.title = title.map(str::to_string);
+            r.title_source = source.map(str::to_string);
+            show_lines(&SessionView { row: r, generations: Vec::new(), moves: Vec::new(), timeline: Vec::new(), cost: None, wrapper_live: false, settings_captures: 0 })
+        };
+        assert_eq!(lines(Some("Harbour-s11 word memory"), Some("custom"))[1], "  title      Harbour-s11 word memory  (custom)");
+        assert_eq!(lines(Some("Fix it"), Some("ai"))[1], "  title      Fix it  (ai)");
+        assert_eq!(lines(None, None)[1], "  title      -");
+        assert_eq!(lines(Some("Fix it"), Some("generated"))[1], "  title      -", "an unknown source word");
+        assert_eq!(lines(Some("Fix it"), None)[1], "  title      -", "no source word");
+        assert_eq!(lines(Some(&format!("a{}b", '\u{202e}')), Some("custom"))[1], "  title      a\\u202eb  (custom)");
+        let all = lines(Some("Fix it"), Some("ai"));
+        assert_eq!(all[0], format!("session {}", id(1)));
+        assert!(all[2].starts_with("  status     closed  mode local-child"), "{}", all[2]);
+    }
+
+    /// S12 (T), a control: an S11 row (the fixture's chat on this Mac) reads with no title; a row written
+    /// without one has no title key in its TOML (`None` is left out) and reads back as it was.
+    #[test]
+    fn an_s11_row_reads_without_a_title() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s11/bridge/state/sessions/33333333-3333-4333-8333-333333333333.toml");
+        let r = parse_row(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!((r.session_id.as_str(), r.title.as_deref(), r.title_source.as_deref()), ("33333333-3333-4333-8333-333333333333", None, None));
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        write(&p, &r).unwrap();
+        let text = std::fs::read_to_string(path_for(&p, &r.session_id).unwrap()).unwrap();
+        assert!(!text.lines().any(|l| l.starts_with("title")), "{text}");
+        assert_eq!(read(&p, &r.session_id).unwrap(), Some(r));
     }
 }

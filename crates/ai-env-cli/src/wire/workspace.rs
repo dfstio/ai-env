@@ -2975,4 +2975,43 @@ mod tests {
             assert!(e.contains(why), "{why}: {e}");
         }
     }
+
+    /// S12 (P, P-R20): no transfer of the VM takes the Mac's DeleteObjects
+    /// URL (`POST /?delete`, the bucket itself), which `wire::s3::check_url`
+    /// takes since S12: a push, a pull's part, a tail, a claude stage and a
+    /// claude relay, each valid as the tests above build it, with its URL
+    /// replaced by a bucket's `delete` URL signed over its own headers, is
+    /// refused for carrying `delete` (`transfer_url`), never the signature
+    /// named. The shim and the image are unchanged.
+    #[test]
+    fn no_transfer_takes_a_bucket_delete_url() {
+        let rel = format!("{SLUG}/{ID}.jsonl");
+        let seg = format!("v1/{ID}/vm/g1/s/000000000000bc55");
+        let push = TranscriptPush { rel: rel.clone(), from: 48213, len: 3787, sha256: D_SEGMENT.into(), url: presigned(&seg, "", SIGNED_HEADERS_PUT), owner: "123456789012".into(), proxy: Some("http://10.42.0.10:3128".into()) };
+        let part = |key: &str, extra: &str, sha: Option<&str>| PullPart { url: presigned(key, extra, SIGNED_HEADERS_GET), len: 10, sha256: sha.map(str::to_string), encoding: None };
+        let parts = vec![part(&format!("v1/{ID}/mac/{D_BASE}"), "versionId=fv1&", Some(D_BASE)), part(&seg, "versionId=fv2&", Some(D_SEGMENT)), part(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", None)];
+        let pull = TranscriptPull { rel: rel.clone(), parts: parts.clone(), sha256: Some(D_ALL.into()), owner: "123456789012".into(), proxy: None, share: 1 };
+        let tail = TranscriptTail { rel, from: 52000, url: presigned(&format!("v1/{ID}/vm/g1/t/000000000000cb20"), "", SIGNED_HEADERS_TAIL), owner: "123456789012".into(), proxy: None, expires_at: 1_792_235_730 };
+        let (v, sha) = ("2.1.308", sha256_hex(b"claude"));
+        let claude = format!("v1/_claude/mac/{v}/{sha}");
+        let stage = ClaudeStage { version: v.into(), sha256: sha.clone(), size: 290_478_208, url: presigned(&claude, "", SIGNED_HEADERS_GET), owner: "123456789012".into(), proxy: Some("http://10.42.0.10:3128".into()), wait_s: CLAUDE_WAIT_MAX_S };
+        let relay = ClaudeRelay { version: v.into(), sha256: sha, size: 290_478_208, put: presigned(&claude, "", SIGNED_HEADERS_PUT), owner: "123456789012".into() };
+        assert_eq!([push.check(), pull.check(), tail.check(), stage.check(), relay.check()], [Ok(()), Ok(()), Ok(()), Ok(()), Ok(())], "each valid as built");
+        let delete = |signed: &str| presigned("", "delete=&", signed);
+        // The pull's middle part: the parts before it pass, the refusal names the one that carries delete.
+        let mut middle = parts;
+        middle[1].url = delete(SIGNED_HEADERS_GET);
+        let refused = [
+            ("push", TranscriptPush { url: delete(SIGNED_HEADERS_PUT), ..push }.check()),
+            ("pull part", TranscriptPull { parts: middle, ..pull }.check()),
+            ("tail", TranscriptTail { url: delete(SIGNED_HEADERS_TAIL), ..tail }.check()),
+            ("claude stage", ClaudeStage { url: delete(SIGNED_HEADERS_GET), ..stage }.check()),
+            ("claude relay", ClaudeRelay { put: delete(SIGNED_HEADERS_PUT), ..relay }.check()),
+        ];
+        for (what, checked) in refused {
+            let e = checked.unwrap_err();
+            assert_eq!(e, format!("has a {what} URL carrying delete, which a {what} never signs"), "{what}");
+            assert!(!e.contains(&"e".repeat(64)), "never the signature: {e}");
+        }
+    }
 }

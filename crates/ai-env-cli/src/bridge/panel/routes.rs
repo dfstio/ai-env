@@ -245,11 +245,15 @@ async fn get(shared: &Arc<Shared>, rest: &str, q: &Query, head: bool) -> Respons
     let now = crate::bridge::lab::now();
     let below = |prefix: &str| rest.strip_prefix(prefix).filter(|id| !id.is_empty() && !id.contains('/')).map(str::to_string);
     match rest {
-        "/" if q.only(&["json"]) => match blocking(move || model::sessions(&paths, now)).await {
-            Ok(m) if json => json_doc(&m.rows),
-            Ok(m) => html_page(html::sessions(&m)),
-            Err(e) => page_error(TOP, &e, json),
-        },
+        "/" if q.only(&["json", "q"]) => {
+            // S12 (T, §T3 U5): the search over names and ids; an empty `q` reads as none.
+            let search = q.get("q").map(str::to_string);
+            match blocking(move || model::sessions(&paths, now, search.as_deref())).await {
+                Ok(m) if json => json_doc(&m.rows),
+                Ok(m) => html_page(html::sessions(&m)),
+                Err(e) => page_error(TOP, &e, json),
+            }
+        }
         "/vms" if q.only(&["json"]) => match blocking(move || model::vms(&paths, now)).await {
             Ok(s) if json => json_doc(&crate::bridge::vm::ops::survey_json(&s)),
             Ok(s) => html_page(html::vms(&s)),

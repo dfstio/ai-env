@@ -57,6 +57,8 @@
   "origin": null,
   "view": null,
   "migrating_pid": null,
+  "title": "Harbour-s11 word memory",
+  "title_source": "custom",
   "generations": [
     {
       "gen": 1,

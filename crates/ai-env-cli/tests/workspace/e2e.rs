@@ -4,7 +4,8 @@
 //! on the Mac, the routes and the helper's git in the VM's copy. What the
 //! git-backed fake VM stands for in the other areas, here the VM itself
 //! (the lead's integration: T8.1's round trip, D7's boundary, also when the
-//! workspace row missed a seed).
+//! workspace row missed a seed; S12 (D): S11's F1, a branch the agent made
+//! with no new object answered with the manifest alone, then nothing new).
 use super::common::remote::{RemoteRig, FIXTURE_AUTHOR, FIXTURE_DATE};
 use super::common::{git_real, Harness};
 use ai_env_cli::bridge::api::Call;
@@ -499,4 +500,110 @@ fn a_failed_seed_leaves_no_scratch_on_either_side() {
         assert_eq!(entries_under(&rig.vm_home().join(".cache").join("ai-env").join("inbox")), Vec::<String>::new(), "{case}: the VM's inbox is empty");
         assert_eq!(rig.vm_path(&work).exists(), code == Some(0), "{case}: a workspace in the VM only when the seed went in");
     }
+}
+
+// ---- S12 (D): S11's F1 end to end (plans/s11-contracts-C.md §C.1.5, the I2 row) ----
+
+/// The `detail` of each `codeout_fetch` row in the rig's audit, oldest first.
+fn codeout_details(rig: &RemoteRig) -> Vec<Value> {
+    let text = std::fs::read_to_string(rig.bridge().join("audit.jsonl")).unwrap_or_default();
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|r| r["event"] == "codeout_fetch").map(|r| r["detail"].clone()).collect()
+}
+
+/// `vm`'s fetch record (`WsRow.vm[<vm>].fetched`) in the rig's workspace rows.
+fn fetch_record(rig: &RemoteRig, vm: &str) -> Option<ai_env_cli::bridge::workspace::rows::VmFetchRow> {
+    let slug = ai_env_cli::wire::slug::project_dir_name(&rig.work()).expect("the workspace's slug");
+    let rows = ai_env_cli::bridge::workspace::rows::read(&rig.paths(), &slug).expect("the workspace rows");
+    rows.ws.into_values().find_map(|row| row.vm.get(vm).and_then(|v| v.fetched.clone()))
+}
+
+/// The statuses the code port answered `POST /codeout` with, from the endpoint's `from`th attempt on.
+fn codeout_statuses(rig: &RemoteRig, from: usize) -> Vec<u16> {
+    rig.endpoint.attempts().into_iter().skip(from).filter(|a| a.port == CODE_PORT && a.path.starts_with(ai_env_cli::wire::workspace::CODEOUT_ROUTE)).map(|a| a.status).collect()
+}
+
+/// The subcommands the Mac's fake git logged, from its `from`th call on.
+fn mac_subcommands(rig: &RemoteRig, from: usize) -> Vec<String> {
+    rig.mac_git_calls().iter().skip(from).filter_map(|c| c.sub().map(str::to_string)).collect()
+}
+
+/// S11 F1 (plans/s11-contracts-C.md §C.1) end to end, the lead's I2 test that S11 left unbuilt (§C.1.5):
+/// `ai-env box fetch --wip` through the endpoint to the native shim and its real helper, whose VM names
+/// `codeout_manifest_v1` as a 13.0 image's does. After a clean seed, the first fetch gets the manifest alone
+/// (200, no pack): an import without a pack promotes `box/main` and records the VM on `main`. The agent makes a
+/// branch with no new object (`git checkout -b topic`): the next fetch is 200 again, not S10's 204, with 0 bytes
+/// and no `index-pack`, `box/topic` and `box/main` at the seeded HEAD, the record on `topic`. A third fetch takes
+/// the cheap path: nothing new, no `update-ref`, `fetch` or `merge-base`, the record kept. The Mac's branches,
+/// index, worktree and stash never move; one Touch ID per box command (D1).
+#[test]
+fn a_checkout_b_codeout_answers_its_manifest_end_to_end() {
+    let mut p = Harness::prepare();
+    let rig = p.rig();
+    let work = rig.work();
+    let head = rig.head().to_string();
+    let vm = rig.start_vm();
+    let touch = rig.decrypts();
+    let seeded = box_seed(rig);
+    assert_eq!((seeded["outcome"].as_str(), seeded["detail"]["wip"].is_null()), (Some("seeded"), true), "a clean seed, nothing uncommitted: {seeded}");
+    let vm_dir = rig.vm_path(&work);
+    let mac = mac_view(&work);
+    // A fetch's evidence: the marks taken just before it (the endpoint's attempts, the Mac's git calls); what it
+    // left, the VM's record as (HEAD, branch, snapshot) and the newest `codeout_fetch` row.
+    let marks = || (rig.endpoint.attempts().len(), rig.mac_git_calls().len());
+    let record = || fetch_record(rig, &vm).map(|f| (f.head, f.branch, f.wip));
+    let on = |branch: &str| Some((head.clone(), Some(branch.to_string()), None));
+    let newest = || codeout_details(rig).pop().unwrap_or_default();
+    // The first fetch: the manifest alone (200, no pack), imported without one: box/main promoted, the record on main.
+    let (at, _) = marks();
+    let fetched = box_fetch_wip(rig);
+    let report = &fetched["report"];
+    assert_eq!(codeout_statuses(rig, at), [200], "the manifest-only answer: {fetched}");
+    assert_eq!((fetched["vm"].as_str(), fetched["via"].as_str(), report["ok"].as_bool(), report["bytes"].as_u64()), (Some(vm.as_str()), Some("codeout"), Some(true), Some(0)), "{fetched}");
+    assert_eq!(report["promoted"], serde_json::json!({ "refs/remotes/box/main": head }), "box/main alone, at the seeded HEAD: {fetched}");
+    assert!(report.get("wip_ref").is_none() && report.get("note").is_none(), "no snapshot of a clean worktree, nothing noted: {fetched}");
+    assert_eq!(record(), on("main"), "the VM's record stands on main");
+    assert_eq!(git(&work, &["rev-parse", "refs/remotes/box/main"]), head);
+    let row = newest();
+    assert_eq!((row["outcome"].as_str(), row["promoted"].as_str(), row["bytes"].as_str()), (Some("promoted"), Some("1"), Some("0")), "{row}");
+    // The agent's branch, with no new object: the worktree stays clean, so the helper makes no snapshot and no pack.
+    as_agent(&vm_dir, &["checkout", "-q", "-b", "topic"]);
+    assert_eq!(as_agent(&vm_dir, &["symbolic-ref", "--short", "HEAD"]), "topic");
+    // The second fetch: 200 again (S10 answered 204), the import without a pack (update-ref and fetch, never
+    // index-pack), both box tips at the seeded HEAD, the record on topic.
+    let (at, from) = marks();
+    let fetched = box_fetch_wip(rig);
+    let report = &fetched["report"];
+    assert_eq!(codeout_statuses(rig, at), [200], "the manifest-only answer, not S10's 204: {fetched}");
+    assert_eq!(report["bytes"].as_u64(), Some(0), "no pack: {fetched}");
+    assert_eq!(report["promoted"], serde_json::json!({ "refs/remotes/box/main": head, "refs/remotes/box/topic": head }), "the import wants every ref it takes, the unchanged one too: {fetched}");
+    assert!(report.get("wip_ref").is_none(), "no snapshot: {fetched}");
+    assert_eq!(record(), on("topic"), "the VM's record followed its branch");
+    assert_eq!(git(&work, &["rev-parse", "refs/remotes/box/topic"]), head);
+    let row = newest();
+    assert_eq!((row["outcome"].as_str(), row["promoted"].as_str(), row["bytes"].as_str()), (Some("promoted"), Some("2"), Some("0")), "{row}");
+    let subs = mac_subcommands(rig, from);
+    let ran = |sub: &str| subs.iter().any(|s| s == sub);
+    assert!(ran("update-ref") && ran("fetch") && !ran("index-pack"), "an import without a pack: {subs:?}");
+    // The third fetch: the cheap path, nothing new: no import (no update-ref, fetch or merge-base), the record kept.
+    let (at, from) = marks();
+    let fetched = box_fetch_wip(rig);
+    let report = &fetched["report"];
+    assert_eq!(codeout_statuses(rig, at), [200], "{fetched}");
+    assert_eq!((report["ok"].as_bool(), &report["promoted"], report["bytes"].as_u64()), (Some(true), &serde_json::json!({}), Some(0)), "nothing new: {fetched}");
+    let row = newest();
+    assert_eq!(row["outcome"].as_str(), Some("nothing_new"), "{row}");
+    assert!(row.get("bytes").is_none() && row.get("promoted").is_none(), "nothing new names no bytes and no promotion: {row}");
+    let subs = mac_subcommands(rig, from);
+    assert!(!subs.iter().any(|s| ["index-pack", "update-ref", "fetch", "merge-base"].contains(&s.as_str())), "the cheap path runs no import: {subs:?}");
+    assert_eq!(record(), on("topic"), "the record kept");
+    // The end: the Mac's side never moved, three code-outs from the VM, one Touch ID per box command.
+    assert_eq!(mac_view(&work), mac, "the Mac's branches, index, worktree and stash untouched");
+    let rows: Vec<(Option<String>, Option<String>)> = codeout_details(rig).iter().map(|r| (r["vm"].as_str().map(str::to_string), r["via"].as_str().map(str::to_string))).collect();
+    assert_eq!(rows, vec![(Some(vm.clone()), Some("codeout".to_string())); 3], "three codeout_fetch rows, each the VM's through POST /codeout");
+    // DC-4 (as amended): the rig's processes never see AI_ENV_AUDIT_STRICT (`environ` removes every AI_ENV_*), and
+    // there a row the registry refuses is logged and written as v1 (`audit::write_row_with`): the three rows are v2.
+    let text = std::fs::read_to_string(rig.bridge().join("audit.jsonl")).unwrap_or_default();
+    let versions: Vec<Option<u64>> = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|r| r["event"] == "codeout_fetch").map(|r| r["v"].as_u64()).collect();
+    assert_eq!(versions, vec![Some(u64::from(ai_env_cli::bridge::audit::AUDIT_SCHEMA_V)); 3], "registered v2 rows: the rig's processes run without AI_ENV_AUDIT_STRICT, and a refused row is written v1");
+    assert_eq!(rig.decrypts() - touch, 4, "one Touch ID per box command (D1): the seed and three fetches");
 }

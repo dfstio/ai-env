@@ -50,6 +50,26 @@
 //! S11 (C4): every PUT (a PutObject or an UploadPart) is counted in flight
 //! from its head until its answer goes ([`FakeS3::max_in_flight`],
 //! [`FakeS3::flights`]).
+//! S12 (P, plans/s12-contracts.md §P12): DeleteObjects, a POST of the bucket
+//! itself with `delete` (a POST of a key with it stays 405), authenticated as
+//! every request (an unsigned `x-amz-*` header is 403 `AccessDenied`), then
+//! taken as S3 takes it: without `x-amz-checksum-sha256` (a `content-md5` is
+//! never read), or with an `x-amz-sdk-checksum-algorithm` other than
+//! `SHA256`, 400 `InvalidRequest`; a checksum other than its body's 400
+//! `BadDigest`; a body that is no `Delete` of 1 to 1000 `<Object>`s, each
+//! with one non-empty `<Key>` and no `<VersionId>` (a `<Quiet>` of `true` or
+//! `false` when present), 400 `MalformedXML`, nothing deleted. Else each key
+//! in order gets a delete marker (a verbose answer names it `<Deleted>`,
+//! with its marker's version) or, scripted ([`FakeS3::script_key_errors`]),
+//! its own `<Error>` and stays as it is, in a 200 `DeleteResult`. Its own
+//! script ([`FakeS3::script_delete`]) is taken before the queue's, and every
+//! action applies to it (a scripted `Status` of 200 is an error document,
+//! `Drop` deletes and loses the answer); [`FakeS3::plant_after_delete`]
+//! writes an object once the handler answered 200 (one that lands after a
+//! purge's listing). [`S3Request::delete_keys`] records each DeleteObjects'
+//! keys, in its body's order. Every DeleteObject (a DELETE of a key, not an
+//! abort) is counted in flight from its head until its answer goes, apart
+//! from S11's PUTs ([`FakeS3::max_deletes_in_flight`]: the fallback's bound).
 //! Every request is recorded ([`S3Request`]): never a signature's or a
 //! credential's value.
 #![allow(dead_code)]
@@ -107,6 +127,10 @@ pub struct S3Request {
     pub status: u16,
     /// S3's `<Code>` of an error.
     pub code: Option<String>,
+    /// S12 (P): a DeleteObjects' keys (`POST /<bucket>?delete`), in its body's
+    /// order, once its body came whole, whatever the answer (a scripted one
+    /// too); empty for any other request.
+    pub delete_keys: Vec<String>,
 }
 
 /// What the next request does instead of (or before) its own answer.
@@ -176,6 +200,15 @@ struct State {
     in_flight: usize,
     max_in_flight: usize,
     flights: Vec<(bool, String)>,
+    /// S12 (P): what the next DeleteObjects do (taken before `script`).
+    delete_script: VecDeque<S3Action>,
+    /// S12 (P): key → the codes its next DeleteObjects answer for it, one each.
+    key_errors: BTreeMap<String, VecDeque<&'static str>>,
+    /// S12 (P): an object written once the next DeleteObjects answered 200, one each, in order.
+    after_delete: VecDeque<(String, Vec<u8>)>,
+    /// S12 (P): the DeleteObjects of a key in flight now, and the most at once so far (beside S11's PUTs, never with them).
+    deletes_in_flight: usize,
+    max_deletes_in_flight: usize,
 }
 
 impl State {
@@ -219,6 +252,25 @@ impl Drop for InFlight {
         let mut st = self.shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         st.in_flight = st.in_flight.saturating_sub(1);
         st.flights.push((false, std::mem::take(&mut self.key)));
+    }
+}
+
+/// S12 (P): one DeleteObject in flight, from its head until its answer goes (dropped), as [`InFlight`] counts a PUT.
+struct DeleteInFlight(Shared);
+
+impl DeleteInFlight {
+    fn start(shared: &Shared) -> DeleteInFlight {
+        let mut st = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.deletes_in_flight += 1;
+        st.max_deletes_in_flight = st.max_deletes_in_flight.max(st.deletes_in_flight);
+        DeleteInFlight(shared.clone())
+    }
+}
+
+impl Drop for DeleteInFlight {
+    fn drop(&mut self) {
+        let mut st = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.deletes_in_flight = st.deletes_in_flight.saturating_sub(1);
     }
 }
 
@@ -350,6 +402,13 @@ impl FakeS3 {
         self.state().flights.clone()
     }
 
+    /// S12 (P): the most DeleteObjects of a key in flight at once so far, each from its head until its answer goes
+    /// (or its connection ended unanswered): the purge's fallback holds them to `client::DELETE_PARALLEL`.
+    #[must_use]
+    pub fn max_deletes_in_flight(&self) -> usize {
+        self.state().max_deletes_in_flight
+    }
+
     /// Queue `actions` for the next requests, in order.
     pub fn script(&self, actions: Vec<S3Action>) {
         self.state().script.extend(actions);
@@ -373,6 +432,22 @@ impl FakeS3 {
     /// [`FakeS3::script_part`] does for a part.
     pub fn script_complete(&self, actions: Vec<S3Action>) {
         self.state().complete_script.extend(actions);
+    }
+
+    /// S12 (P): queue `actions` for the next DeleteObjects, as [`FakeS3::script_put`] does for a PutObject.
+    pub fn script_delete(&self, actions: Vec<S3Action>) {
+        self.state().delete_script.extend(actions);
+    }
+
+    /// S12 (P): the next DeleteObjects that name `key` answer, one each, an `<Error>` of the next of `codes` for it, and leave it as it is.
+    pub fn script_key_errors(&self, key: &str, codes: &[&'static str]) {
+        self.state().key_errors.entry(key.to_string()).or_default().extend(codes.iter().copied());
+    }
+
+    /// S12 (P): once the handler answered the next DeleteObjects 200 (its markers added; a scripted answer is not the
+    /// handler's), write `key` with `bytes` (a new current version): an object that lands after a purge's listing.
+    pub fn plant_after_delete(&self, key: &str, bytes: &[u8]) {
+        self.state().after_delete.push_back((key.to_string(), bytes.to_vec()));
     }
 
     /// A URL of this fake signed now with `LAB_KEY_ID` and `LAB_SECRET`, for
@@ -591,9 +666,10 @@ async fn read_body_at(stream: &mut TcpStream, req: &mut Req, first: Vec<u8>, len
 async fn serve(mut stream: TcpStream, shared: Shared) {
     let Some((mut req, first)) = read_head(&mut stream).await else { return };
     let part = if req.method == "PUT" { req.param("partNumber").and_then(|n| n.parse::<u32>().ok()) } else { None };
-    let (is_put, is_complete) = {
+    let (is_put, is_complete, is_delete) = {
         let object = req.raw_path.strip_prefix('/').is_some_and(|p| p.contains('/'));
-        (req.method == "PUT" && object && req.param("uploadId").is_none(), req.method == "POST" && req.param("uploadId").is_some())
+        // S12 (P): a DeleteObjects is a POST of the bucket itself with `delete`.
+        (req.method == "PUT" && object && req.param("uploadId").is_none(), req.method == "POST" && req.param("uploadId").is_some(), req.method == "POST" && !object && req.param("delete").is_some())
     };
     let action = {
         let mut st = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -601,6 +677,7 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
             Some(n) => st.part_script.get_mut(&n).and_then(VecDeque::pop_front),
             None if is_put => st.put_script.pop_front(),
             None if is_complete => st.complete_script.pop_front(),
+            None if is_delete => st.delete_script.pop_front(),
             None => None,
         };
         // S11: NoContentEncoding waits in the queue for the next GET.
@@ -612,6 +689,8 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
     // S11 (C4): a PUT is in flight from here (its scripted delay included) until its answer goes (or its
     // connection ends unanswered): ended before the answer is written, so the client never sees one more in flight.
     let flight = (req.method == "PUT" && !key.is_empty()).then(|| InFlight::start(&shared, &key));
+    // S12 (P): a DeleteObject (not an abort, which names its upload) the same way, counted apart.
+    let deleting = (req.method == "DELETE" && !key.is_empty() && req.param("uploadId").is_none()).then(|| DeleteInFlight::start(&shared));
     if let Some(S3Action::Delay(d)) = &action {
         tokio::time::sleep(*d).await;
     }
@@ -627,6 +706,7 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
         chunked,
         status: 0,
         code: None,
+        delete_keys: Vec::new(),
     };
     let writes = matches!(req.method.as_str(), "PUT" | "POST");
     let answer = if writes && chunked {
@@ -660,6 +740,10 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
             shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
             return;
         }
+        // S12 (P): the body came whole: a DeleteObjects' keys, whatever its answer will be.
+        if is_delete {
+            record.delete_keys = named_keys(&req.body);
+        }
         if action == Some(S3Action::Silent) {
             shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
             tokio::time::sleep(CONNECTION_LIMIT).await;
@@ -689,6 +773,7 @@ async fn serve(mut stream: TcpStream, shared: Shared) {
     record.code = answer.code.clone();
     shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).requests.push(record);
     drop(flight);
+    drop(deleting);
     let mut out = head_of(&answer, answer.body.len());
     out.extend_from_slice(&answer.body[..cut.unwrap_or(answer.body.len())]);
     let _ = stream.write_all(&out).await;
@@ -728,6 +813,7 @@ fn respond(req: &Req, bucket: &str, key: &str, params: &[(String, String)], shar
             let id = st.add(key, Vec::new(), true);
             Answer::ok(204, vec![("x-amz-delete-marker".into(), "true".into()), ("x-amz-version-id".into(), id)], Vec::new())
         }
+        ("POST", true) if has("delete") => delete_objects(&mut st, req),
         _ => Answer::error(405, "MethodNotAllowed"),
     }
 }
@@ -895,4 +981,98 @@ fn list_objects(st: &State, req: &Req) -> Answer {
     }
     body.push_str("</ListBucketResult>");
     Answer::ok(200, xml(), body.into_bytes())
+}
+
+/// S12 (P): S3's most keys one DeleteObjects names.
+const DELETE_MAX: usize = 1000;
+/// XML's whitespace.
+const XML_SPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// `text` with XML's five named entities decoded (`&amp;` last).
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+/// The inner texts of `xml`'s `<name>…</name>` elements, in order (no attributes, not nested in themselves), and
+/// whether every `<name>` that opens closes: this fake's own reader, never the client's.
+fn elements<'x>(xml: &'x str, name: &str) -> (Vec<&'x str>, bool) {
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(at) = rest.find(&open) {
+        let inner = &rest[at + open.len()..];
+        let Some(end) = inner.find(&close) else { return (out, false) };
+        out.push(&inner[..end]);
+        rest = &inner[end + close.len()..];
+    }
+    (out, true)
+}
+
+/// S12 (P): the keys a DeleteObjects body names, each `<Object>`'s first `<Key>` unescaped, in order, whatever else
+/// the body holds (what [`S3Request::delete_keys`] records, a malformed body's too).
+fn named_keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    elements(&text, "Object").0.into_iter().filter_map(|o| elements(o, "Key").0.first().map(|k| unescape(k))).collect()
+}
+
+/// S12 (P): a DeleteObjects body's keys (unescaped, in order) and whether it is quiet, `None` where S3 answers
+/// `MalformedXML`: UTF-8 whose root, past whitespace and an optional `<?xml …?>`, is a `Delete` element (its
+/// attributes free) closing at the body's end; 1 to 1000 `<Object>`s, each with exactly one non-empty `<Key>` and no
+/// `<VersionId>`; a `<Quiet>` of `true` or `false` when there is one (none: verbose).
+fn delete_body(body: &[u8]) -> Option<(Vec<String>, bool)> {
+    let text = std::str::from_utf8(body).ok()?.trim_matches(XML_SPACE);
+    let text = match text.strip_prefix("<?xml") {
+        Some(rest) => rest[rest.find("?>")? + 2..].trim_start_matches(XML_SPACE),
+        None => text,
+    };
+    let head = text.strip_prefix("<Delete").filter(|h| h.starts_with('>') || h.starts_with(XML_SPACE))?;
+    let inner = head[head.find('>')? + 1..].strip_suffix("</Delete>")?;
+    let (objects, closed) = elements(inner, "Object");
+    if !closed || objects.is_empty() || objects.len() > DELETE_MAX || inner.matches("<Object>").count() != objects.len() {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(objects.len());
+    for object in objects {
+        let (key, closed) = elements(object, "Key");
+        if !closed || key.len() != 1 || key[0].is_empty() || object.matches("<Key>").count() != 1 || object.contains("<VersionId") {
+            return None;
+        }
+        keys.push(unescape(key[0]));
+    }
+    let quiet = match elements(inner, "Quiet") {
+        (q, true) if q.is_empty() => false,
+        (q, true) if q == ["true"] => true,
+        (q, true) if q == ["false"] => false,
+        _ => return None,
+    };
+    Some((keys, quiet))
+}
+
+/// S12 (P): DeleteObjects of the lab bucket (the module doc), once authenticated: the checksum rules, then the body,
+/// then each key a delete marker or its scripted `<Error>`, in a 200 `DeleteResult`; then the next object planted
+/// after a DeleteObjects is written.
+fn delete_objects(st: &mut State, req: &Req) -> Answer {
+    // S3 asks a DeleteObjects for a checksum of its body: this fake takes the SHA-256 one alone (no content-md5).
+    if req.header("x-amz-checksum-sha256").is_none() || req.header("x-amz-sdk-checksum-algorithm").is_some_and(|a| a != "SHA256") {
+        return Answer::error(400, "InvalidRequest");
+    }
+    if !checked(req).1 {
+        return Answer::error(400, "BadDigest");
+    }
+    let Some((keys, quiet)) = delete_body(&req.body) else { return Answer::error(400, "MalformedXML") };
+    let mut entries = String::new();
+    for key in &keys {
+        if let Some(code) = st.key_errors.get_mut(key).and_then(VecDeque::pop_front) {
+            entries.push_str(&format!("<Error><Key>{}</Key><Code>{code}</Code><Message>{code} (the tests' fake S3)</Message></Error>", escape(key)));
+            continue;
+        }
+        let id = st.add(key, Vec::new(), true);
+        if !quiet {
+            entries.push_str(&format!("<Deleted><Key>{}</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>{id}</DeleteMarkerVersionId></Deleted>", escape(key)));
+        }
+    }
+    if let Some((key, bytes)) = st.after_delete.pop_front() {
+        st.add(&key, bytes, false);
+    }
+    Answer::ok(200, xml(), format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{entries}</DeleteResult>").into_bytes())
 }

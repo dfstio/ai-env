@@ -61,8 +61,15 @@
 //! it, and the image's curl decoding a gzip object (a stand-in for S3 on the
 //! container's loopback serves it). Every L2 container runs the claude under
 //! test when `make claude-admit-docker` names one (`claude_under_test`).
-//! The only claude ever executed is the pinned Linux binary inside L2 (or
-//! the claude under test there).
+//! S12 L2 (D): `POST /claude/stage` on the real image ([`l2_with`]: the
+//! image's ENTRYPOINT with `--curl` at the S9 fake curl, which plays S3 with
+//! a script standing for claude 2.1.399): 201 ready from the cache, the
+//! binary root's 0555 in its root 0755 directory and the index root's 0600,
+//! curl as `ai-env-net` (999) with its configuration on fd 3 alone, the probe
+//! as the agent, `/health/detail` naming the entry; a spawn naming the ref
+//! runs it as the agent (1000:1000), who can neither change nor remove it.
+//! The only real claude ever executed is the pinned Linux binary inside L2
+//! (or the claude under test there); S12's staged one is a shell script.
 #[path = "common/curl.rs"]
 mod curl;
 
@@ -70,6 +77,7 @@ use ai_env_cli::wire::chunk::{decode, Chunker};
 use ai_env_cli::wire::frame::{ClientInfo, CredentialErrCode, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
 use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_CLAUDE_STAGE_V1, CAP_PARK_V1};
 use ai_env_cli::wire::redact::Secret;
+use ai_env_cli::wire::workspace::ClaudeRef;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -832,6 +840,10 @@ struct Spec {
     /// comes from the cache, never from this frame.
     credential: Option<String>,
     grace: Option<u32>,
+    /// S11 (A §2.5): the staged claudes the spawn may run (`spawn.claude`), in
+    /// preference order. Empty in every test before S12's: the field is then
+    /// left out of the frame, which stays S10's.
+    claude: Vec<ClaudeRef>,
 }
 
 impl Spec {
@@ -853,6 +865,15 @@ impl Ran {
         assert_eq!(self.exit, ExitInfo { code: Some(0), signal: None }, "{what}: {}", String::from_utf8_lossy(&self.stderr));
         String::from_utf8(self.stdout).unwrap_or_else(|e| panic!("{what}: {e}"))
     }
+}
+
+/// What `spawned` answered (S11, A §2.5): the spawn's id and pid, and the claude that runs: a cached binary's
+/// version and sha256, the image's version and no sha256, or neither when argv[0] is not `claude`.
+struct Launched {
+    id: SpawnId,
+    pid: u32,
+    claude_version: Option<String>,
+    claude_sha256: Option<String>,
 }
 
 impl Agent {
@@ -902,24 +923,28 @@ impl Agent {
         })
     }
 
-    /// `spawn` (a fresh uuid v7, the secret delivered on fd 3): its id and
-    /// pid, or the shim's refusal. Frames about other spawns, pongs and
-    /// events are skipped.
-    fn spawn(&mut self, spec: &Spec) -> Result<(SpawnId, u32), (SpawnErrCode, String)> {
+    /// `spawn` (a fresh uuid v7, the secret delivered on fd 3, `spec.claude`'s refs): what `spawned` said, or the
+    /// shim's refusal. Frames about other spawns, pongs and events are skipped.
+    fn launch(&mut self, spec: &Spec) -> Result<Launched, (SpawnErrCode, String)> {
         let id = SpawnId::new_v7();
         let secrets = spec.secret.iter().map(|(k, v)| (k.clone(), Secret::new(v.clone()))).collect();
-        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone(), claude: Vec::new() });
+        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone(), claude: spec.claude.clone() });
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             assert!(Instant::now() < deadline, "no answer to spawn {id} within {SPAWN_WAIT:?}");
             match self.next() {
-                Ok(Frame::Spawned { spawn_id, pid, .. }) if spawn_id == id => return Ok((id, pid)),
+                Ok(Frame::Spawned { spawn_id, pid, claude_version, claude_sha256, .. }) if spawn_id == id => return Ok(Launched { id, pid, claude_version, claude_sha256 }),
                 Ok(Frame::SpawnErr { spawn_id, code, message }) if spawn_id == id => return Err((code, message)),
                 Ok(f @ Frame::Error { .. }) => panic!("{f:?} while spawning {id}"),
                 Ok(f) if f.spawn_id() != Some(&id) => {}
                 other => panic!("spawned or spawn_err for {id}, got {other:?}"),
             }
         }
+    }
+
+    /// [`Agent::launch`]'s id and pid (the callers before S12's).
+    fn spawn(&mut self, spec: &Spec) -> Result<(SpawnId, u32), (SpawnErrCode, String)> {
+        self.launch(spec).map(|l| (l.id, l.pid))
     }
 
     /// `bytes` as stdin chunks (seq from 1), then EOF; no `stdin_ack` is
@@ -2584,6 +2609,23 @@ fn l2() -> Container {
     Container::start(&mount.iter().map(String::as_str).collect::<Vec<_>>(), &image, &[])
 }
 
+/// [`l2`] with `docker_args` added to `docker run` and the image's own ENTRYPOINT run with each `(flag, value)`
+/// set ([`with_flags`]), passed as `--entrypoint` and the command as [`l1_with`] passes them: the image's shim
+/// and claude (the claude under test's mount kept), never the cross-built shim.
+fn l2_with(docker_args: &[&str], flags: &[(&str, &str)]) -> Container {
+    require_enabled();
+    let image = local_image();
+    let out = docker(&["image", "inspect", &image]);
+    assert!(out.status.success(), "{image} is missing: run make image-build-local");
+    let argv = with_flags(entrypoint(), flags);
+    let mount = claude_mount();
+    let mut args: Vec<&str> = mount.iter().map(String::as_str).collect();
+    args.extend_from_slice(docker_args);
+    args.extend(["--entrypoint", argv[0].as_str()]);
+    let cmd: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+    Container::start(&args, &image, &cmd)
+}
+
 #[test]
 #[ignore = "Docker: make test-docker"]
 fn l2_claude_version_matches_the_lock() {
@@ -2933,4 +2975,166 @@ fn l2_the_images_curl_decodes_a_gzip_object() {
         }
     }
     eprintln!("L2 gzip: the image's curl decoded {} stored bytes to {} with compressed, wrote them as stored without it, and refused them past max-filesize (exit 63, nothing written, status 200)", stored.len(), decoded.len());
+}
+
+// ---- S12 (D): the claude stage on the image (plans/s11-contracts-A.md §2.2, §2.5) ----
+
+/// S12 (D): the version the staged stand-in reports: never the image's own (the lock names 2.1.305 in S12).
+const STAGED_VERSION: &str = "2.1.399";
+
+/// S12 (D): where the fake curl of [`l2_claude_stage_runs_the_fetched_claude_as_the_agent`] logs, in a directory
+/// only `ai-env-net` (999) enters: the call's configuration holds the presigned URL.
+const STAGE_CURL_DIR: &str = "/tmp/ai-env-s12-curl";
+
+/// S12 (D): the egress proxy a vpc VM's stage names (`bridge::egress::PROXY_IP` and `PROXY_PORT`, which this
+/// shim-only file cannot import); the fake curl never dials it.
+const STAGE_PROXY: &str = "http://10.42.0.10:3128";
+
+/// S12 (D): the staged "binary", a script standing for claude `version`: `--version` prints its line only to the
+/// agent (1000:1000, as the shim's probe runs it) and exits 3 for anyone else; any other call prints who runs it
+/// and the path the shim exec'd.
+fn staged_claude(version: &str) -> String {
+    format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  [ \"$(id -u):$(id -g)\" = 1000:1000 ] || {{ echo \"probed as $(id -u):$(id -g)\" >&2; exit 3; }}\n  echo '{version} (Claude Code)'\n  exit 0\nfi\necho \"uid=$(id -u) gid=$(id -g) exe=$0\"\n"
+    )
+}
+
+/// S11 A1 (plans/s11-contracts-A.md §2.2, §2.5) on the real image, K's test that S11 left unbuilt (§11.4):
+/// `POST /claude/stage`, the S9 fake curl as the shim's `--curl` playing S3 with [`staged_claude`], is 201 ready
+/// from the cache. curl ran as `ai-env-net` (999), `-q -K /dev/fd/3`, fd 3 alone; the binary is root's 0555 at
+/// `/opt/ai-env/claude/<sha256>/claude` in a root 0755 directory, `.partial` root's 0700 and empty, the index
+/// root's 0600 in root's 0700 `/var/lib/ai-env`, which the agent cannot read; the probe ran it as the agent;
+/// `/health/detail` lists the entry. A spawn naming the ref reports its version and sha256 and runs it from the
+/// cache as the agent (1000:1000), who can neither change, move nor remove it. The URL's signature reaches no
+/// log line.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_claude_stage_runs_the_fetched_claude_as_the_agent() {
+    use ai_env_cli::wire::s3::{bucket_host, PresignedUrl, S3Key, SIGNED_HEADERS_GET};
+    use ai_env_cli::wire::workspace::{ClaudeCacheEntry, ClaudeSrc, ClaudeStage, ClaudeStageReply, ClaudeStageState, CLAUDE_STAGE_ROUTE};
+    use sha2::Digest as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    // The fake dir (D-R12), made on the Mac as docker_exec's decoy test makes its own: the S9 fake curl (0755), the
+    // staged claude it serves (0644: ai-env-net reads it) and its two knobs, in a 0755 directory.
+    let staged = staged_claude(STAGED_VERSION);
+    let (sha, len) = (hex::encode(sha2::Sha256::digest(staged.as_bytes())), staged.len() as u64);
+    let fake = tempfile::tempdir().expect("a tempdir for the fake curl");
+    let at = |name: &str| fake.path().join(name);
+    std::fs::copy(curl::FAKE_CURL, at("curl")).expect("copy the fake curl");
+    std::fs::set_permissions(at("curl"), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake curl");
+    std::fs::write(at("staged-claude"), &staged).expect("write the staged claude");
+    std::fs::set_permissions(at("staged-claude"), std::fs::Permissions::from_mode(0o644)).expect("chmod the staged claude");
+    std::fs::write(at("curl.knobs"), format!("export S3CURL_LOG='{STAGE_CURL_DIR}/curl.log'\nexport S3CURL_BODY='/opt/fakecurl/staged-claude'\n")).expect("write the fake curl's knobs");
+    std::fs::set_permissions(fake.path(), std::fs::Permissions::from_mode(0o755)).expect("chmod the fake's directory");
+    // D-R11: the image's ENTRYPOINT with `--curl` at the fake (appended: the ENTRYPOINT passes none); the tempdir
+    // lives in the Vm, past the container.
+    let mount = format!("{}:/opt/fakecurl:ro", fake.path().display());
+    let vm = Vm::started(l2_with(&["-v", &mount], &[("--curl", "/opt/fakecurl/curl")]), Some(fake), 120);
+    let c = &vm.c;
+    // D-R13: the log's directory first, 999's and 0700 (the configuration holds the URL); without it the fake's
+    // lock loop never ends.
+    c.sh(&format!("mkdir -m 0700 {STAGE_CURL_DIR} && chown 999:999 {STAGE_CURL_DIR}"));
+    let mut a = vm.agent();
+    assert!(a.caps.iter().any(|cap| cap == CAP_CLAUDE_STAGE_V1), "the image's shim names {CAP_CLAUDE_STAGE_V1}: {:?}", a.caps);
+    // The stage (D-R14): a presigned GET of exactly the staged claude's key (https: the release shim refuses a lab
+    // URL), its signature the sha256 of a fresh uuid, the documentation owner, the egress proxy, the longest wait.
+    let owner = "123456789012";
+    let signature = hex::encode(sha2::Sha256::digest(SpawnId::new_v7().to_string().as_bytes()));
+    let key = S3Key::Claude { version: STAGED_VERSION.into(), sha256: sha.clone() }.render();
+    let query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ai-env-fake-s3%2F20261025%2Feu-central-1%2Fs3%2Faws4_request&X-Amz-Date=20261025T080000Z&X-Amz-Expires=900&X-Amz-SignedHeaders={}&X-Amz-Signature={signature}",
+        SIGNED_HEADERS_GET.replace(';', "%3B")
+    );
+    let url = PresignedUrl::new(format!("https://{}/{key}?{query}", bucket_host(&format!("ai-env-transcripts-{owner}")))).expect("a presigned GET of the staged claude");
+    let stage = ClaudeStage { version: STAGED_VERSION.into(), sha256: sha.clone(), size: len, url: url.clone(), owner: owner.into(), proxy: Some(STAGE_PROXY.into()), wait_s: 30 };
+    assert_eq!(stage.check(), Ok(()), "the stage passes its own check");
+    let bearer = format!("Authorization: Bearer {}\r\n", vm.token);
+    let (s, body) = http_with(c.port(8080), "POST", CLAUDE_STAGE_ROUTE, &bearer, &serde_json::to_string(&stage).unwrap());
+    // D-R15: only 201 passes (200: no fetch; 202: the fetch outlived wait_s; a refusal: a check, the fetch or the probe).
+    assert_eq!(s, 201, "ready from a fetch within wait_s: {body}\n{}", c.logs());
+    let reply: ClaudeStageReply = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!((reply.state, reply.src, reply.got_len, reply.why.as_deref(), reply.got_sha256.as_deref()), (ClaudeStageState::Ready, Some(ClaudeSrc::Cache), Some(len), None, None), "{body}");
+    let fetch_ms = reply.ms.unwrap_or_else(|| panic!("the fetch's time: {body}"));
+    // DC-2 (as amended), the image's half of claude_stage_never_logs_a_url and its needles: no part of the URL in the
+    // shim's log, neither its signature, whole or cut as `short_sha` cuts a sha (its first 12 digits), nor a presigned
+    // query, the bucket's host or a URL at all. The messages name the part, never the log or the needle.
+    let no_url = |logs: &str| {
+        assert!(!logs.contains(&signature), "the URL's signature reached the shim's log");
+        for (needle, what) in [("X-Amz-", "a presigned query"), (&signature[..12], "a part of the URL's signature"), ("amazonaws.com", "the bucket's host"), ("https://", "a URL")] {
+            assert!(!logs.contains(needle), "{what} reached the shim's log");
+        }
+    };
+    // D-R16 (as amended), D-R19: the fetch's task logged its line and saved the index before the outcome the 201
+    // waited for, and the shim logged the 201's line before it answered. docker logs reads the daemon's copy of the
+    // shim's stderr, written asynchronously, so the log is read with a bounded wait for the 201's line, which follows
+    // the stage's line in that copy; the files and the index need none.
+    let logs = c.wait_log(10, "ai-env: workspace claude-stage status=201 ms=");
+    let fetched = format!("ai-env: claude_stage version={STAGED_VERSION} sha={} outcome=fetched bytes={len} ms=", &sha[..12]);
+    assert!(logs.lines().any(|l| l.starts_with(&fetched)), "{fetched}<ms> in:\n{logs}");
+    assert!(logs.lines().any(|l| l.starts_with("ai-env: workspace claude-stage status=201 ms=")), "the stage's 201 line in:\n{logs}");
+    no_url(&logs);
+    // The files, as root: the cache, its partial directory, the binary's directory and the binary, the index's
+    // directory and the index.
+    let (dir, bin) = (format!("/opt/ai-env/claude/{sha}"), format!("/opt/ai-env/claude/{sha}/claude"));
+    assert_eq!(
+        c.sh(&format!("stat -c '%a %u:%g %F' /opt/ai-env/claude /opt/ai-env/claude/.partial {dir} {bin} /var/lib/ai-env /var/lib/ai-env/claude-index.json")),
+        "755 0:0 directory\n700 0:0 directory\n755 0:0 directory\n555 0:0 regular file\n700 0:0 directory\n600 0:0 regular file",
+        "the cache, .partial, the binary's directory, the binary, /var/lib/ai-env and the index"
+    );
+    let mut names: Vec<String> = c.sh("ls -A /opt/ai-env/claude").lines().map(str::to_string).collect();
+    names.sort();
+    assert_eq!(names, [".partial".to_string(), sha.clone()], "the partial directory and the binary's");
+    assert_eq!(c.sh("ls -A /opt/ai-env/claude/.partial"), "", "no partial file left");
+    assert_eq!(c.sh(&format!("ls -A {dir}")), "claude");
+    assert_eq!(c.sh("ls -A /var/lib/ai-env"), "claude-index.json", "the index alone, no temp file of it left");
+    assert!(c.exec(&["cat", &bin]).stdout == staged.as_bytes(), "the binary is the staged bytes, byte for byte");
+    // The index: one entry, its times the fetch's; the agent cannot read it.
+    let index: serde_json::Value = serde_json::from_str(&c.sh("cat /var/lib/ai-env/claude-index.json")).expect("the index parses");
+    let entries: Vec<ClaudeCacheEntry> = serde_json::from_value(index["entries"].clone()).unwrap_or_else(|e| panic!("{e}: {index}"));
+    let named: Vec<(&str, &str, u64)> = entries.iter().map(|e| (e.version.as_str(), e.sha256.as_str(), e.size)).collect();
+    assert_eq!((index["v"].as_u64(), named), (Some(1), vec![(STAGED_VERSION, sha.as_str(), len)]), "{index}");
+    assert_eq!(entries[0].fetched_at, entries[0].last_used, "both the fetch's time: {index}");
+    let out = c.exec_as("1000", &["cat", "/var/lib/ai-env/claude-index.json"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent read the index: {}", String::from_utf8_lossy(&out.stdout));
+    // `/health/detail`, before the spawn (its pick rewrites `last_used`).
+    let view = vm.detail().claude_cache.expect("/health/detail names the claude cache");
+    assert_eq!(view.entries, entries, "/health/detail's entries are the index's");
+    assert!(view.fetching.is_none() && view.failed.is_empty(), "no fetch under way, no refusal: {view:?}");
+    let lock = ai_env_cli::wire::pin::parse_lock(&std::fs::read_to_string(Path::new(REPO).join("image/claude.lock")).unwrap()).unwrap();
+    assert_eq!(view.image.map(|r| (r.version, r.sha256)), Some((lock.version, lock.sha256)), "the image's own claude, the lock's");
+    // The curl call: the fake's log, copied out by root (999's 0700 directory) into a tempdir of the test's.
+    let copied = tempfile::tempdir().unwrap();
+    std::fs::write(copied.path().join("curl.log"), c.sh(&format!("cat {STAGE_CURL_DIR}/curl.log"))).unwrap();
+    let calls = curl::curl_calls(&copied.path().join("curl.log"));
+    assert_eq!(calls.len(), 1, "one GET");
+    let call = &calls[0];
+    assert_eq!((call.uid, call.fds.as_slice(), call.args.as_slice()), (999, &[3][..], &["-q".to_string(), "-K".to_string(), "/dev/fd/3".to_string()][..]), "curl as ai-env-net, fd 3 alone, its argv");
+    assert_eq!(call.conf("url"), [url.expose()], "the URL as staged");
+    assert_eq!((call.conf("request"), call.conf("proto"), call.conf("proxy")), (vec!["GET".to_string()], vec!["=https".to_string()], vec![STAGE_PROXY.to_string()]), "{}", call.config);
+    assert_eq!(call.conf("header"), [format!("x-amz-expected-bucket-owner: {owner}")], "the owner's header alone: {}", call.config);
+    assert_eq!((call.conf("fail"), call.conf("compressed")), (vec![String::new()], Vec::<String>::new()), "a fail line, no compressed line: {}", call.config);
+    assert_eq!((call.conf("max-filesize"), call.conf("limit-rate")), (vec![len.to_string()], vec!["32M".to_string()]), "{}", call.config);
+    // The spawn (D-R17): one, naming the ref, on the socket whose hello_ok named the cap.
+    let l = a.launch(&Spec { claude: vec![ClaudeRef { version: STAGED_VERSION.into(), sha256: sha.clone() }], ..Spec::argv(&["claude"]) }).unwrap_or_else(|(code, m)| panic!("spawn_err {code:?}: {m}"));
+    assert_eq!((l.claude_version.as_deref(), l.claude_sha256.as_deref()), (Some(STAGED_VERSION), Some(sha.as_str())), "spawned names the cached claude");
+    a.feed(&l.id, b"");
+    let printed = a.collect(&l.id).ok("the staged claude");
+    let ran = format!("uid=1000 gid=1000 exe={bin}");
+    assert_eq!(printed, format!("{ran}\n"), "the cached binary, run as the agent");
+    let spawn_line = format!("ai-env: spawn {} pid={} pgid={} argv0=claude argc=1 cwd=\"/Users/mike\" uid=1000 secret=none claude={STAGED_VERSION} src=cache", l.id, l.pid, l.pid);
+    // D-R19 (D-R16 as amended): the shim logged the spawn line before it answered `spawned`, so Docker's copy is read
+    // with the same bounded wait, and the line is then held whole.
+    let logs = c.wait_log(10, &spawn_line);
+    assert!(logs.lines().any(|line| line == spawn_line), "{spawn_line}\nnot in:\n{logs}");
+    no_url(&logs);
+    // The agent's writes (D-R18): each refused (a chmod's refusal reads otherwise); the bytes and the directory kept.
+    let listing = format!("ls -lan --time-style=full-iso {dir}");
+    let before = c.sh(&listing);
+    for write in [format!("echo x >> {bin}"), format!("rm -f {bin}"), format!("mv {bin} {bin}.x"), format!("touch {dir}/x")] {
+        let out = c.exec_as("1000", &["sh", "-c", &write]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent changed the cached claude ({write}): {}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert!(c.exec(&["cat", &bin]).stdout == staged.as_bytes(), "the binary's bytes as staged");
+    assert_eq!(c.sh(&listing), before, "its directory as it was");
+    eprintln!("L2 claude stage: {STAGED_VERSION} ({len} bytes, sha {}) fetched by curl as {} in {fetch_ms} ms; the spawn as the agent printed {ran}", &sha[..12], call.uid);
 }

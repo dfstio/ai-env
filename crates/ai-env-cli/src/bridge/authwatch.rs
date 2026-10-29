@@ -124,7 +124,7 @@ pub const RETRY_LIMIT: u32 = 3;
 /// claude 2.1.305: `plans/s10-measurements.md`), keyed to the claude version
 /// they name (`claude`, 2.1.305): a new one is measured again with
 /// `ai-env lab run oauth-t1` before they are trusted for it. S8's wrapper
-/// and S12's refresh relay read them: S8 is to compare `claude` with the
+/// and Tier B's refresh relay would read them: S8 is to compare `claude` with the
 /// version of the CLI it runs, a different version being unmeasured until
 /// `oauth-t1` runs again. No test ties `claude` to `image/claude.lock`:
 /// `make claude-pin` moves that pin (S11), and chats may run a newer one.

@@ -40,12 +40,14 @@ pub trait S3Sign: Send + Sync {
 pub struct PresignReq {
     pub method: S3Method,
     pub target: S3Target,
-    /// `None`: the bucket itself (ListObjectsV2).
+    /// `None`: the bucket itself (ListObjectsV2; S12, P: DeleteObjects, `POST /?delete`).
     pub key: Option<String>,
     /// Signed query parameters besides the X-Amz ones, in this order when present: versionId, uploadId,
-    /// partNumber, uploads (empty value), list-type, prefix, continuation-token, max-keys.
+    /// partNumber, uploads (empty value), list-type, prefix, continuation-token, max-keys, delete (empty; a
+    /// multi-object delete's, alone).
     pub query: Vec<(String, String)>,
-    /// Signed headers besides host, lowercase: content-length, x-amz-checksum-sha256, x-amz-checksum-algorithm,
+    /// Signed headers besides host, lowercase: content-length, content-encoding, x-amz-checksum-sha256,
+    /// x-amz-checksum-algorithm, x-amz-sdk-checksum-algorithm (a multi-object delete's only, `SHA256`),
     /// if-none-match, x-amz-expected-bucket-owner. The last is in every request, the Mac's own included, its value
     /// `target.owner`: `presign` refuses (`Config`, exit 1) a request without it or with another value.
     pub headers: Vec<(String, String)>,

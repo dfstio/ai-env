@@ -5,7 +5,7 @@
 use crate::bridge::agent::exec::{is_proxy_name, refused_name};
 use crate::bridge::census::RunningExtension;
 use crate::bridge::config::{Paths, WrapperCfg};
-use crate::bridge::remote::env::{NONESSENTIAL, PROJECT_DIR_NAME, WRAPPER_NAMES};
+use crate::bridge::remote::env::{HOST_REFRESH_NAMES, NONESSENTIAL, PROJECT_DIR_NAME, WRAPPER_NAMES};
 use crate::commands::{DoctorLine, Tag};
 use crate::wire::argv::{flag_class, takes_value, FlagClass};
 use crate::wire::redact::scrub;
@@ -19,11 +19,13 @@ pub const ENV_PREFIXES: [&str; 8] = ["CLAUDE_", "ANTHROPIC_", "MCP_", "DISABLE_"
 /// Env names an extension sets that are reviewed and not forwarded: (name, why).
 /// Part B's P0 doctor run (24 Oct 2026) gave the first list, from the 2.1.301 to
 /// 2.1.303 windows' session rows; remote chats have run without each since S8.
+/// S12 (R2): its two forwarding candidates, `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT`
+/// and `CLAUDE_CODE_SDK_READS_SESSION_STATE`, are forwarded by default now
+/// (`WrapperCfg::default().env_forward`) and left the list: an explicit
+/// `[wrapper] env_forward` that lacks them gets the `[!! ]` row for them.
 pub const ENV_REVIEWED: &[(&str, &str)] = &[
     ("CLAUDE_CODE_CONFIG_PROBE", "marks the extension's config probe; remote probes have run without it since S8"),
     ("CLAUDE_CODE_EMIT_STARTUP_TIMING", "start-up timing for the extension's own log; nothing remote reads it"),
-    ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "the question tool's preview format; remote chats have run without it since S8 (a forwarding candidate)"),
-    ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "the SDK's session-state reading; remote chats have run without it since S8 (a forwarding candidate)"),
 ];
 /// The most names or flags one row lists before ` (+<k> more)`.
 pub const DRIFT_LIST_MAX: usize = 12;
@@ -48,11 +50,16 @@ fn relevant(name: &str) -> bool {
 
 /// Whether a remote session's environment already accounts for `name`: `[wrapper].env_forward` or `env_extra`
 /// forwards it, the wrapper sets it itself (`remote::env`'s `WRAPPER_NAMES` and `NONESSENTIAL`), it is never
-/// forwarded (`PROJECT_DIR_NAME`, a name `vm exec --env` refuses, a proxy variable), or `reviewed` lists it.
+/// forwarded (`PROJECT_DIR_NAME`, a name `vm exec --env` refuses, a proxy variable, S12's refresh names), or
+/// `reviewed` lists it.
 ///
 /// `refused_name` refuses any name holding TOKEN, KEY, SECRET or PASSWORD, so CLI settings that are no credential
 /// (`MAX_THINKING_TOKENS`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, …) count as accounted here although a remote session
 /// never carries them: [`refused_env_names`] names those (C5-R1, its own `[-  ]` row).
+///
+/// S12 (R2-6): a name of `remote::env::HOST_REFRESH_NAMES` is never forwarded either (`session_env` refuses it in
+/// `[wrapper]`, R2-3), as `PROJECT_DIR_NAME` is not: an extension that sets one gets neither the `[!! ]` row nor the
+/// refused row for it (`stock-ext-oauth` stays the detector of `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`).
 fn accounted(name: &str, wrapper: &WrapperCfg, reviewed: &[(&str, &str)]) -> bool {
     wrapper.env_forward.iter().chain(&wrapper.env_extra).any(|n| n.as_str() == name)
         || WRAPPER_NAMES.iter().any(|(n, _)| *n == name)
@@ -61,6 +68,7 @@ fn accounted(name: &str, wrapper: &WrapperCfg, reviewed: &[(&str, &str)]) -> boo
         || refused_name(name).is_some()
         || is_proxy_name(name)
         || reviewed.iter().any(|(n, _)| *n == name)
+        || HOST_REFRESH_NAMES.contains(&name)
 }
 
 /// The env names extension `ext`'s session rows carry, relevant (`ENV_PREFIXES`)
@@ -310,9 +318,18 @@ mod tests {
         v.iter().map(|x| (*x).to_string()).collect()
     }
 
-    /// The default `[wrapper]`'s forwarded names, so a row carrying them has no gone row.
+    /// The default `[wrapper]`'s forwarded names, so a row carrying them has no gone row (S12: the extension's two
+    /// as well, R2-1).
     fn forwarded() -> Vec<&'static str> {
-        vec!["CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "MCP_CONNECTION_NONBLOCKING", "CLAUDE_CODE_ENABLE_TASKS"]
+        vec![
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_AGENT_SDK_VERSION",
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+            "MCP_CONNECTION_NONBLOCKING",
+            "CLAUDE_CODE_ENABLE_TASKS",
+            "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
+            "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+        ]
     }
 
     /// A fake extensions directory: `<dir>/anthropic.claude-code-<V>-darwin-arm64/extension.js` holding `js`.
@@ -583,5 +600,42 @@ mod tests {
         // Any reader's error is the note's why.
         assert_eq!(texts(&view_rows(&s(&["2.1.310"]), &|_| Err("denied".to_string()))), vec!["[-  ] view format: 2.1.310's extension.js cannot be read (denied)".to_string()]);
         assert_eq!(read_extension_js(p, "../2.1.310"), Err("not a version".to_string()));
+    }
+
+    /// S12 (R2-6): a refresh name an extension sets (`remote::env::HOST_REFRESH_NAMES`, which `[wrapper]` refuses) is
+    /// accounted: neither the `[!! ]` row's nor the refused row's (`refused_name` does not refuse it), so a 2.1.310
+    /// window that sets both beside the forwarded names shows no env row at all.
+    #[test]
+    fn a_host_refresh_name_is_accounted_never_unreviewed() {
+        let w = WrapperCfg::default();
+        let env: Vec<&str> = forwarded().into_iter().chain(HOST_REFRESH_NAMES).collect();
+        let rows = vec![session(&["--verbose"], &env)];
+        assert!(unreviewed_env_names(&rows, EXT, &w).is_empty(), "{:?}", unreviewed_env_names(&rows, EXT, &w));
+        assert!(refused_env_names(&rows, EXT).is_empty(), "{:?}", refused_env_names(&rows, EXT));
+        assert_eq!(texts(&env_and_flag_rows(&rows, &[window(EXT)], &w)), Vec::<String>::new());
+    }
+
+    /// S12 (R2): `ENV_REVIEWED` keeps the two names no session forwards, and none of the default `env_forward`'s:
+    /// a reviewed name that is also forwarded by default would hide a list that left it out (R2-2).
+    #[test]
+    fn no_reviewed_name_is_a_default_forwarded_one() {
+        assert_eq!(ENV_REVIEWED.iter().map(|(n, _)| *n).collect::<Vec<_>>(), ["CLAUDE_CODE_CONFIG_PROBE", "CLAUDE_CODE_EMIT_STARTUP_TIMING"]);
+        let forward = WrapperCfg::default().env_forward;
+        for (name, _) in ENV_REVIEWED {
+            assert!(!forward.iter().any(|n| n == name), "{name} is reviewed and forwarded by default");
+        }
+    }
+
+    /// S12 (R2-6): a window on an extension older than the two names (2.1.300: its chats carry the five relevant
+    /// names forwarded before S12) gets the existing gone row for the two, exactly, and nothing else.
+    #[test]
+    fn an_older_window_lacking_the_s12_names_gets_the_gone_note() {
+        let w = WrapperCfg::default();
+        let pre_s12 = ["CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "MCP_CONNECTION_NONBLOCKING", "CLAUDE_CODE_ENABLE_TASKS"];
+        let rows = vec![row("session", "2.1.300", &["--verbose"], &pre_s12)];
+        assert_eq!(
+            texts(&env_and_flag_rows(&rows, &[window("2.1.300")], &w)),
+            vec!["[-  ] extension 2.1.300 starts chats without CLAUDE_CODE_QUESTION_PREVIEW_FORMAT, CLAUDE_CODE_SDK_READS_SESSION_STATE, which [wrapper].env_forward forwards".to_string()]
+        );
     }
 }

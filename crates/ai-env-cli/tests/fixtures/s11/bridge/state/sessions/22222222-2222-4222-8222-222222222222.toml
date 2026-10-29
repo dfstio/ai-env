@@ -13,6 +13,8 @@ pid = 1
 argv_hash = "fixture"
 respawns = 0
 microvm_id = "microvm-0a5fc800-0000-4000-8000-00000000000a"
+title = "Fix the seed's shallow boundary"
+title_source = "ai"
 
 [[vms]]
 gen = 1

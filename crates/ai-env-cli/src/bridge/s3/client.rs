@@ -3,7 +3,14 @@
 //! `MULTIPART_PART` parts with a signed sha256 each: CreateMultipartUpload,
 //! UploadPart, ListParts, CompleteMultipartUpload, AbortMultipartUpload),
 //! ListObjectsV2 of a session's prefix, and DeleteObject (gc, a compaction's
-//! superseded keys, `forget --purge`). Each is presigned like the VM's
+//! superseded keys, `forget --purge`). S12 (P): a purge (`session gc
+//! --remote`, `forget --purge`) sends DeleteObjects in its place, up to 1000
+//! keys a request, quiet, its body's SHA-256 signed
+//! (`x-amz-sdk-checksum-algorithm`, `x-amz-checksum-sha256`); the keys S3
+//! refused for a moment go again, and when S3 refuses the form every key
+//! goes as its own DeleteObject ([`S3Client::delete_keys`]). An answer is an
+//! error document only when its root element is `<Error>`
+//! (`Reply::has_error`). Each is presigned like the VM's
 //! (`S3Sign`, `x-amz-expected-bucket-owner` signed in every one) and sent
 //! with exactly the headers it signed, by `tls::reqwest_client()` (S3 chains
 //! to the Amazon roots: TLS 1.3, no proxy, no redirect), or
@@ -27,8 +34,10 @@
 use super::presign::{request, write_headers};
 use super::{PresignReq, S3Endpoint, S3Method, S3Sign, S3Target};
 use crate::bridge::errors::BridgeError;
-use crate::wire::s3::{PresignedUrl, PRESIGN_EXPIRY};
+use crate::wire::s3::{PresignedUrl, S3Key, PRESIGN_EXPIRY};
 use crate::wire::workspace::PartEncoding;
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,6 +73,18 @@ pub const RETRY_409: [&str; 2] = ["OperationAborted", "ConditionalRequestConflic
 /// body sent nothing for some 20 s (a stall shorter than [`STALL_AFTER`]
 /// that S3's answer reached), which the AWS SDKs retry too.
 pub const RETRY_400: [&str; 1] = ["RequestTimeout"];
+/// S12 (P): the most keys one DeleteObjects names (S3's limit).
+pub const DELETE_BATCH: usize = 1000;
+/// S12 (P): the DeleteObject requests in flight at once when S3 refuses the
+/// batch's form ([`Deleted::one_by_one`]).
+pub const DELETE_PARALLEL: usize = 16;
+/// S12 (P): the per-key codes of a DeleteObjects answer whose keys go again
+/// (only the keys refused so), up to [`PART_TRIES`] rounds.
+pub const KEY_RETRY: [&str; 4] = ["InternalError", "ServiceUnavailable", "SlowDown", "OperationAborted"];
+/// S12 (P, P-R10): the codes of a 400 or 501 that refuse a batch's form (a
+/// 405 refuses it whatever its code): S3 takes no DeleteObjects signed so, and
+/// the fallback deletes every key as its own DeleteObject.
+const BATCH_REFUSED: [&str; 3] = ["InvalidRequest", "MissingContentMD5", "NotImplemented"];
 /// S10 (F5): the bytes of a body's end the connection may still hold once it
 /// took the last chunk: the kernel's send buffer at its largest
 /// (`net.inet.tcp.autosndbufmax`, 4 MiB on macOS) and hyper's own write
@@ -105,6 +126,27 @@ pub struct ListedPart {
     pub size: u64,
     /// `ChecksumSHA256` as S3 stored it (base64), when it did.
     pub checksum: Option<String>,
+}
+
+/// S12 (P): a key a DeleteObjects (or, one by one, a DeleteObject) did not delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyError {
+    pub key: String,
+    /// S3's `<Code>` (`[A-Za-z0-9]`, 1 to 64), or `HTTP <status>` for a DeleteObject refused without one.
+    pub code: String,
+}
+
+/// S12 (P): what [`S3Client::delete_keys`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Deleted {
+    /// The keys S3 took (a delete marker each; a quiet answer names none of them).
+    pub deleted: usize,
+    /// The keys left, in the order `delete_keys` was given them: refused with a
+    /// code outside [`KEY_RETRY`], or still refused at the last round.
+    pub failed: Vec<KeyError>,
+    /// S3 refused the batch's form at the first DeleteObjects, so every key went
+    /// as a DeleteObject of its own, [`DELETE_PARALLEL`] at once.
+    pub one_by_one: bool,
 }
 
 /// A request body.
@@ -572,14 +614,178 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
     }
 
     /// DeleteObject of `key`'s current version (a delete marker: old versions
-    /// expire after 30 days by the bucket's lifecycle).
+    /// expire after 30 days by the bucket's lifecycle). One try (S12, P-R13:
+    /// sync's superseded keys, claude's views and the stager keep S11's
+    /// answers and request order; a purge sends DeleteObjects).
     pub async fn delete(&self, key: &str) -> Result<(), BridgeError> {
+        self.delete_tries(key, 1).await
+    }
+
+    /// S12 (P): DeleteObject of `key`'s current version, up to `tries` tries
+    /// (`send`'s rules: no answer, a 500 or 503, a 409 of [`RETRY_409`], a 400
+    /// of [`RETRY_400`] go again): 200 or 204, else `S3` (`s3 delete: HTTP
+    /// <status> (<code>)`).
+    async fn delete_tries(&self, key: &str, tries: u32) -> Result<(), BridgeError> {
         const OP: &str = "s3 delete";
-        let reply = self.send(OP, S3Method::Delete, Some(key), Vec::new(), Vec::new(), Body::None, 1).await?;
+        let reply = self.send(OP, S3Method::Delete, Some(key), Vec::new(), Vec::new(), Body::None, tries).await?;
         match reply.status {
             200 | 204 => Ok(()),
             s => Err(reply.error("delete", s)),
         }
+    }
+
+    /// S12 (P): DeleteObjects of `keys` (1 to [`DELETE_BATCH`] keys of the
+    /// store, each once) in one request, quiet, its body's SHA-256 signed: the
+    /// keys S3 did not delete, each with its code, in its answer's order.
+    ///
+    /// Refused before any request (`Config`, exit 1, P-R3), in this order: no
+    /// key or more than [`DELETE_BATCH`]; a key [`S3Key::parse`] refuses
+    /// (Debug-quoted, as presign's own text); a key twice. The request is a
+    /// POST of the bucket itself, `delete` its one parameter (P-R1), its body
+    /// [`delete_document`] and [`delete_headers`]' pair signed beside the
+    /// owner. Up to [`PART_TRIES`] tries, presigned anew, as `send` sends
+    /// again (P-R4: no answer, a 500 or 503, a 409 of [`RETRY_409`], a 400 of
+    /// [`RETRY_400`], a 200 whose root is an error document of `InternalError`
+    /// or of [`RETRY_409`]; S3 deletes again, a marker more). Then, on the
+    /// last answer: a 200 `DeleteResult` is read by [`delete_errors`], whose
+    /// refusal is `Sdk` (exit 7); a 200 error document is `S3` with its code;
+    /// a 200 of any other root is `Sdk`; any other status is `S3`, so a
+    /// refused form reads `s3 delete objects: HTTP 400 (InvalidRequest)`.
+    pub async fn delete_batch(&self, keys: &[String]) -> Result<Vec<KeyError>, BridgeError> {
+        const OP: &str = "s3 delete objects";
+        if keys.is_empty() || keys.len() > DELETE_BATCH {
+            return Err(BridgeError::Config(format!("{OP}: a batch of {} keys (1 to {DELETE_BATCH})", keys.len())));
+        }
+        if let Some(foreign) = keys.iter().find(|k| S3Key::parse(k).is_none()) {
+            return Err(BridgeError::Config(format!("{OP}: {foreign:?} is no key of the store")));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(keys.len());
+        if let Some(twice) = keys.iter().find(|k| !seen.insert(k.as_str())) {
+            return Err(BridgeError::Config(format!("{OP}: the batch names {twice} twice")));
+        }
+        let doc = delete_document(keys);
+        let headers = delete_headers(doc.as_bytes());
+        let reply = self.send(OP, S3Method::Post, None, vec![("delete".to_string(), String::new())], headers, Body::Bytes(doc.into_bytes()), PART_TRIES).await?;
+        match (reply.status, root_element(&reply.body)) {
+            (200, Some("DeleteResult")) => delete_errors(&reply.body, keys).map_err(|why| BridgeError::Sdk { op: OP, message: format!("the bucket: {why}") }),
+            (200, Some("Error")) => Err(reply.error("delete objects", 200)),
+            (200, _) => Err(BridgeError::Sdk { op: OP, message: "the bucket: the answer is no DeleteResult".into() }),
+            (status, _) => Err(reply.error("delete objects", status)),
+        }
+    }
+
+    /// S12 (P): every key of `keys` deleted: batches of [`DELETE_BATCH`], the
+    /// keys S3 refused with a code of [`KEY_RETRY`] sent again, one DeleteObject
+    /// each when S3 refuses the batch's form.
+    ///
+    /// Every key is checked before the first request (P-R7, P-R3's text:
+    /// nothing is sent when a later batch would hold a foreign key, LD-P3); a
+    /// key given twice is taken once, at its first place (LD-P2); no key sends
+    /// nothing. Round 1 sends the keys in order, a batch at a time
+    /// ([`Self::delete_batch`]); a key refused with a code of [`KEY_RETRY`]
+    /// goes into the next round, one refused with any other code is `failed`
+    /// with it. Rounds 2 and 3 ([`PART_TRIES`]) send only the keys the round
+    /// before refused so, in order, batched again, after [`RETRY_WAIT`] times
+    /// the rounds so far (logged); one still refused at round 3 is `failed`
+    /// with its last code (P-R8, LD-P4). When S3 refuses round 1's first
+    /// batch for its form (a 405, or a 400 or 501 of [`BATCH_REFUSED`]),
+    /// nothing was deleted by a batch, and every key goes as a DeleteObject
+    /// of its own instead ([`Deleted::one_by_one`], P-R10, LD-P5; no memory
+    /// across calls, LD-P7). Any other error of a batch, a later batch's or
+    /// round's form refusal among them, ends it: what earlier batches deleted
+    /// stays deleted (P-R11, P-R12).
+    pub async fn delete_keys(&self, keys: &[String]) -> Result<Deleted, BridgeError> {
+        const OP: &str = "s3 delete objects";
+        let mut seen = std::collections::HashSet::with_capacity(keys.len());
+        let mut distinct: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if S3Key::parse(key).is_none() {
+                return Err(BridgeError::Config(format!("{OP}: {key:?} is no key of the store")));
+            }
+            if seen.insert(key.as_str()) {
+                distinct.push(key.clone());
+            }
+        }
+        // Each key's place among the distinct ones: `failed` keeps their order, whatever order S3 answers in.
+        let place: std::collections::HashMap<&str, usize> = distinct.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+        // The places a round sends, in order, and the codes the round before refused them with.
+        let (mut pending, mut codes): (Vec<usize>, Vec<String>) = ((0..distinct.len()).collect(), Vec::new());
+        let mut failed: Vec<(usize, KeyError)> = Vec::new();
+        for round in 1..=PART_TRIES {
+            if pending.is_empty() {
+                break;
+            }
+            if round > 1 {
+                tracing::warn!("{OP}: S3 refused {} key(s) for now ({}); sent again (round {round} of {PART_TRIES})", pending.len(), codes.join(", "));
+                tokio::time::sleep(RETRY_WAIT * (round - 1)).await;
+            }
+            let mut again: Vec<(usize, String)> = Vec::new();
+            // The places this round's answers named: a key S3 named twice counts once.
+            let mut named = std::collections::HashSet::new();
+            for (n, batch) in pending.chunks(DELETE_BATCH).enumerate() {
+                let names: Vec<String> = batch.iter().map(|&i| distinct[i].clone()).collect();
+                let refused = match self.delete_batch(&names).await {
+                    Ok(refused) => refused,
+                    Err(e) if round == 1 && n == 0 && form_refused(&e) => return self.delete_one_by_one(&distinct, &e).await,
+                    Err(e) => return Err(e),
+                };
+                for KeyError { key, code } in refused {
+                    // `delete_errors` took only keys the batch named, each one of `place`'s.
+                    let Some(&i) = place.get(key.as_str()) else { continue };
+                    if !named.insert(i) {
+                        continue;
+                    }
+                    if round < PART_TRIES && KEY_RETRY.contains(&code.as_str()) {
+                        again.push((i, code));
+                    } else {
+                        failed.push((i, KeyError { key, code }));
+                    }
+                }
+            }
+            again.sort_by_key(|(i, _)| *i);
+            codes = Vec::new();
+            for (_, code) in &again {
+                if !codes.contains(code) {
+                    codes.push(code.clone());
+                }
+            }
+            pending = again.into_iter().map(|(i, _)| i).collect();
+        }
+        failed.sort_by_key(|(i, _)| *i);
+        Ok(Deleted { deleted: distinct.len() - failed.len(), failed: failed.into_iter().map(|(_, e)| e).collect(), one_by_one: false })
+    }
+
+    /// S12 (P, P-R10, LD-P6): every key of `keys` (distinct, checked) as a
+    /// DeleteObject of its own, once S3 refused the batch's form (`refused`,
+    /// logged once): [`DELETE_PARALLEL`] at once, as a restore pulls its
+    /// subtree, each up to [`PART_TRIES`] tries. A key S3 refuses is `failed`
+    /// with its code, or `HTTP <status>` without one, in the order given; any
+    /// other error (no answer at the last try, a presign refusal) ends it, the
+    /// singles in flight dropped.
+    async fn delete_one_by_one(&self, keys: &[String], refused: &BridgeError) -> Result<Deleted, BridgeError> {
+        tracing::warn!("s3 delete objects: S3 refused the batch's form ({refused}); {} object(s) deleted one by one, {DELETE_PARALLEL} at a time", keys.len());
+        let singles = keys.iter().enumerate().map(|(i, key)| async move {
+            match self.delete_tries(key, PART_TRIES).await {
+                Ok(()) => Ok(None),
+                Err(BridgeError::S3 { status, code, .. }) => Ok(Some((i, KeyError { key: key.clone(), code: code.unwrap_or_else(|| format!("HTTP {status}")) }))),
+                Err(e) => Err(e),
+            }
+        });
+        let done: Vec<Option<(usize, KeyError)>> = futures_util::stream::iter(singles).buffer_unordered(DELETE_PARALLEL).try_collect().await?;
+        let mut failed: Vec<(usize, KeyError)> = done.into_iter().flatten().collect();
+        failed.sort_by_key(|(i, _)| *i);
+        Ok(Deleted { deleted: keys.len() - failed.len(), failed: failed.into_iter().map(|(_, e)| e).collect(), one_by_one: true })
+    }
+}
+
+/// S12 (P, P-R10): whether `e`, a purge's first DeleteObjects' error, refuses
+/// the batch's form: `S3` with status 405 (whatever its code), or 400 or 501
+/// with a code of [`BATCH_REFUSED`].
+fn form_refused(e: &BridgeError) -> bool {
+    match e {
+        BridgeError::S3 { status: 405, .. } => true,
+        BridgeError::S3 { status: 400 | 501, code: Some(code), .. } => BATCH_REFUSED.contains(&code.as_str()),
+        _ => false,
     }
 }
 
@@ -588,6 +794,36 @@ impl<'a, S: S3Sign> S3Client<'a, S> {
 #[must_use]
 pub fn encoding_header(encoding: Option<PartEncoding>) -> Option<(String, String)> {
     encoding.map(|e| ("content-encoding".to_string(), e.word().to_string()))
+}
+
+/// S12 (P): the DeleteObjects body of `keys`: `<Delete xmlns="…">`, one
+/// `<Object><Key>…</Key></Object>` per key in order (escaped), `<Quiet>true</Quiet>`.
+/// P-R2: no XML declaration, no whitespace, no `VersionId` (current versions
+/// only: a delete marker each, as [`S3Client::delete`]); the objects before
+/// `<Quiet>`, the order the AWS CLI writes the `Delete` shape's members in
+/// (LD-P1). `pub`: the live probe sends these bytes (LD-P12).
+#[must_use]
+pub fn delete_document(keys: &[String]) -> String {
+    let mut doc = format!("<Delete xmlns=\"{XMLNS}\">");
+    for key in keys {
+        doc.push_str("<Object><Key>");
+        doc.push_str(&xml_escape(key));
+        doc.push_str("</Key></Object>");
+    }
+    doc.push_str("<Quiet>true</Quiet></Delete>");
+    doc
+}
+
+/// S12 (P, P-R1): the two headers a DeleteObjects of `body` signs besides
+/// the owner's, exactly: `x-amz-sdk-checksum-algorithm: SHA256`, then
+/// `x-amz-checksum-sha256`, the standard padded base64 of the body's 32-byte
+/// SHA-256 (what `wire::s3::sha256_b64` gives for its hex): what AWS's SDKs
+/// send in place of `Content-MD5`. No `content-md5`, and no `content-length`
+/// signed (reqwest sends the length, as for a CompleteMultipartUpload).
+fn delete_headers(body: &[u8]) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+    vec![("x-amz-sdk-checksum-algorithm".to_string(), "SHA256".to_string()), ("x-amz-checksum-sha256".to_string(), checksum)]
 }
 
 /// Query pairs in `presign::SIGNABLE_QUERY`'s order.
@@ -636,9 +872,12 @@ struct Reply {
 }
 
 impl Reply {
-    /// The body is an S3 error document.
+    /// The body is an S3 error document: its root element is `<Error>` (S12,
+    /// P-R6: a 200 DeleteResult naming keys' `<Error>`s is none, so `send`
+    /// never sends a whole batch again for one key's error; a 200 whose root
+    /// is `<Error>`, a CompleteMultipartUpload's late error, still is).
     fn has_error(&self) -> bool {
-        self.body.contains("<Error>")
+        root_element(&self.body) == Some("Error")
     }
 
     /// S3 asks for the request again: a 500 or a 503; a 409 of
@@ -669,6 +908,56 @@ impl Reply {
 pub fn error_code(body: &str) -> Option<String> {
     let at = body.find("<Error>")?;
     xml_values(&body[at..], "Code").into_iter().next().filter(|c| (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// S12 (P, P-R6): the name of `xml`'s root element, `None` when no element
+/// starts there. Skipped first, in any number and order: XML's whitespace
+/// (S3's keep-alive spaces and newlines before a late error), declarations
+/// `<?…?>` and comments `<!--…-->`; then the root is the name after `<` up
+/// to whitespace, `>` or `/` (an XML name: a letter or `_`, then letters,
+/// digits, `_`, `-`, `.`, `:`). Anything else there (a byte order mark,
+/// text, an unclosed declaration or comment, `<!DOCTYPE`) is `None`.
+fn root_element(xml: &str) -> Option<&str> {
+    const SPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+    let mut rest = xml;
+    loop {
+        rest = rest.trim_start_matches(SPACE);
+        if let Some(after) = rest.strip_prefix("<?") {
+            rest = &after[after.find("?>")? + 2..];
+        } else if let Some(after) = rest.strip_prefix("<!--") {
+            rest = &after[after.find("-->")? + 3..];
+        } else {
+            break;
+        }
+    }
+    let after = rest.strip_prefix('<')?;
+    let name = &after[..after.find(|c: char| SPACE.contains(&c) || c == '>' || c == '/')?];
+    let mut chars = name.chars();
+    let first = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (first && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))).then_some(name)
+}
+
+/// S12 (P, P-R5): a 200 DeleteResult's per-key errors, in its order: every
+/// `<Error>` element's first `<Key>` and first `<Code>` (entities decoded; a
+/// code that is not `[A-Za-z0-9]{1,64}` counts as none). `Err` names why the
+/// answer is refused: an error without its key or its code, or one naming a
+/// key `sent` (the request's) does not hold. `<Deleted>` elements (a verbose
+/// answer's) and every `<Message>` are never read (PC-3).
+fn delete_errors(body: &str, sent: &[String]) -> Result<Vec<KeyError>, String> {
+    let sent: std::collections::HashSet<&str> = sent.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for error in xml_elements(body, "Error") {
+        let key = xml_values(error, "Key").into_iter().next();
+        let code = xml_values(error, "Code").into_iter().next().filter(|c| (1..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let (Some(key), Some(code)) = (key, code) else {
+            return Err("the answer names an error without its key or code".into());
+        };
+        if !sent.contains(key.as_str()) {
+            return Err("the answer names an error of a key the request did not name".into());
+        }
+        out.push(KeyError { key, code });
+    }
+    Ok(out)
 }
 
 /// The text of every `<name>…</name>` element of `xml`, in order, its
@@ -1018,5 +1307,183 @@ mod tests {
         let rest = text.strip_prefix("aws s3 list: the bucket: no answer: error sending request: ").unwrap_or_else(|| panic!("{text}"));
         assert!(!rest.is_empty() && !text.contains("http") && !text.contains(&addr.to_string()) && !text.contains("X-Amz") && !text.contains("redacted"), "{text}");
         assert_eq!(crate::errors::CliError::from(e).exit_code(), 7);
+    }
+
+    /// S12 (P, P-R6): an answer is an error document only when its root
+    /// element is `<Error>`, past whitespace (S3's keep-alive spaces and
+    /// newlines), declarations and comments in any order; a byte order mark,
+    /// text, an unclosed declaration or comment, or `<!DOCTYPE` first is no
+    /// root. So a 200 DeleteResult naming one key's `InternalError` is neither
+    /// an error document nor sent again (one key's error never sends its
+    /// batch again), a late `InternalError` after the keep-alive spaces is
+    /// both, and a CompleteMultipartUploadResult whose ETag holds an escaped
+    /// `<Error>` is neither. And the batch's frozen numbers (§3.8).
+    #[test]
+    fn a_key_error_in_a_delete_result_is_no_error_document() {
+        assert_eq!(root_element("  \n\r\n\t<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- a comment -->\n<Error><Code>InternalError</Code></Error>"), Some("Error"));
+        assert_eq!(root_element("<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"), Some("DeleteResult"));
+        assert_eq!(root_element("<!-- one --><?xml version=\"1.0\"?><!-- two --><a/>"), Some("a"), "comments and declarations in any order");
+        for none in ["", "text <Error>", "<?xml version=\"1.0\" encoding=\"UTF-8\"", "<!-- open <Error>", "\u{feff}<Error>", "< Error>", "<!DOCTYPE x><Error>", "<Error"] {
+            assert_eq!(root_element(none), None, "{none:?}");
+        }
+        let reply = |body: &str| Reply { status: 200, version_id: None, etag: None, body: body.to_string() };
+        let result = reply("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Error><Key>k</Key><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error></DeleteResult>");
+        assert!(!result.has_error() && !result.transient(), "one key's error is no error document: the batch is not sent again");
+        let late = reply(&format!("{}\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InternalError</Code><Message>m</Message></Error>", " ".repeat(40)));
+        assert!(late.has_error() && late.transient(), "a late error after the keep-alive spaces goes again");
+        let complete = reply("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult><Bucket>b</Bucket><ETag>&lt;Error&gt;</ETag></CompleteMultipartUploadResult>");
+        assert!(!complete.has_error() && !complete.transient());
+        assert_eq!((KEY_RETRY, DELETE_BATCH, DELETE_PARALLEL), (["InternalError", "ServiceUnavailable", "SlowDown", "OperationAborted"], 1000, 16));
+        assert_eq!(BATCH_REFUSED, ["InvalidRequest", "MissingContentMD5", "NotImplemented"]);
+    }
+
+    /// S12 (P, P-R5): the DeleteResult reader takes S3's answers and nothing
+    /// else: a quiet answer with no error (self-closing, or empty) leaves no
+    /// key; two errors are two keys left, in the answer's order, each with
+    /// its code (entities decoded, `<Message>` never read); a verbose
+    /// answer's `<Deleted>` entries are never read; an error without its
+    /// code, without its key, with a code that is not `[A-Za-z0-9]{1,64}`
+    /// (`Bad Code`, 65 characters), or naming a key the request did not name
+    /// refuses the whole answer.
+    #[test]
+    fn the_delete_result_reader_takes_s3s_answer_and_nothing_else() {
+        let sent = vec!["v1/a".to_string(), "v1/b&c".to_string(), "v1/d".to_string()];
+        let doc = |inner: &str| format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{inner}</DeleteResult>");
+        assert_eq!(delete_errors("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>", &sent), Ok(Vec::new()));
+        assert_eq!(delete_errors(&doc(""), &sent), Ok(Vec::new()));
+        let two = doc("<Error><Key>v1/d</Key><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error><Deleted><Key>v1/a</Key></Deleted><Error><Key>v1/b&amp;c</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>");
+        assert_eq!(delete_errors(&two, &sent), Ok(vec![KeyError { key: "v1/d".into(), code: "SlowDown".into() }, KeyError { key: "v1/b&c".into(), code: "AccessDenied".into() }]), "the answer's order, entities decoded");
+        let verbose = doc("<Deleted><Key>v1/a</Key><DeleteMarker>true</DeleteMarker><DeleteMarkerVersionId>fv9</DeleteMarkerVersionId></Deleted><Deleted><Key>v1/zz</Key></Deleted>");
+        assert_eq!(delete_errors(&verbose, &sent), Ok(Vec::new()), "a verbose answer's Deleted entries are never read");
+        let long = format!("<Error><Key>v1/a</Key><Code>{}</Code></Error>", "A".repeat(65));
+        for (inner, why) in [
+            ("<Error><Key>v1/a</Key><Message>AccessDenied</Message></Error>", "the answer names an error without its key or code"),
+            ("<Error><Code>AccessDenied</Code></Error>", "the answer names an error without its key or code"),
+            ("<Error><Key>v1/a</Key><Code>Bad Code</Code></Error>", "the answer names an error without its key or code"),
+            (long.as_str(), "the answer names an error without its key or code"),
+            ("<Error><Key>v1/d</Key><Code>SlowDown</Code></Error><Error><Key>v1/zz</Key><Code>AccessDenied</Code></Error>", "the answer names an error of a key the request did not name"),
+        ] {
+            assert_eq!(delete_errors(&doc(inner), &sent), Err(why.to_string()), "{inner}");
+        }
+    }
+
+    /// S12 (P, P-R1, P-R2): the DeleteObjects body of two keys is S3's quiet
+    /// form byte for byte (the objects in order, then `<Quiet>`; no
+    /// declaration, no whitespace, no `VersionId`), 298 bytes whose SHA-256
+    /// is a known answer (computed apart with `shasum -a 256`, 25 Oct 2026);
+    /// the pair it signs is the SDK's algorithm and that digest in standard
+    /// base64, what `wire::s3::sha256_b64` gives for its hex. A key is escaped.
+    #[test]
+    fn the_delete_document_and_its_checksum_are_s3s_quiet_form() {
+        let s = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let keys = vec![format!("v1/{s}/mac/b094ab054161cac4f8714d6855dc32bf0488f8eed1c4790aec8f054577f7c5c2"), format!("v1/{s}/vm/g1/base")];
+        let doc = delete_document(&keys);
+        assert_eq!(doc, format!("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Object><Key>{}</Key></Object><Object><Key>{}</Key></Object><Quiet>true</Quiet></Delete>", keys[0], keys[1]));
+        assert_eq!(doc.len(), 298);
+        assert_eq!(hex::encode(Sha256::digest(doc.as_bytes())), "1386c936b42422a089883736d1101195fcc1f7698adc754ddd0efd4162f8ba30");
+        let pair = vec![("x-amz-sdk-checksum-algorithm".to_string(), "SHA256".to_string()), ("x-amz-checksum-sha256".to_string(), "E4bJNrQkIqCJiDc20RARlfzB92mK3HVN3Q79QWL4ujA=".to_string())];
+        assert_eq!(delete_headers(doc.as_bytes()), pair);
+        assert_eq!(crate::wire::s3::sha256_b64("1386c936b42422a089883736d1101195fcc1f7698adc754ddd0efd4162f8ba30").as_deref(), Some(pair[1].1.as_str()), "sha256_b64 of its hex");
+        assert_eq!(delete_document(&["v1/a&b<c>\"d".to_string()]), "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Object><Key>v1/a&amp;b&lt;c&gt;&quot;d</Key></Object><Quiet>true</Quiet></Delete>");
+    }
+
+    /// S12 (P, P-R3, P-R7): `delete_batch` refuses before it sends anything
+    /// (`Config`, exit 1): no key, 1001 keys, a key that is none of the
+    /// store's (Debug-quoted), a key twice; `delete_keys` of no key is
+    /// nothing done, and it checks every key before its first batch, so 1000
+    /// good keys with a foreign one after them send nothing either. S3 is a
+    /// loopback listener that never accepts, the client's waits a test's
+    /// short ones: nothing ever connected to it.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn delete_batch_refuses_an_empty_an_oversized_or_a_foreign_batch_before_sending() {
+        use crate::bridge::s3::{LAB_BUCKET, LAB_OWNER};
+        /// The `Config` text of `r`, its exit 1.
+        fn config<T: std::fmt::Debug>(r: Result<T, BridgeError>) -> String {
+            match r {
+                Err(BridgeError::Config(m)) => {
+                    assert_eq!(crate::errors::CliError::from(BridgeError::Config(m.clone())).exit_code(), 1);
+                    m
+                }
+                other => panic!("expected Config, got {other:?}"),
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab(listener.local_addr().unwrap()) };
+        let signer = crate::bridge::api::FakeMicrovmApi::new();
+        let waits = Waits { stall: Duration::from_millis(300), head: Duration::from_millis(300), chunk: Duration::from_millis(300) };
+        let client = S3Client::new(&signer, &target).unwrap().with_waits(waits);
+        let good = |i: usize| S3Key::Mac { session: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".into(), sha256: format!("{i:064x}") }.render();
+        let thousand: Vec<String> = (0..DELETE_BATCH).map(good).collect();
+        assert_eq!(config(client.delete_batch(&[]).await), "s3 delete objects: a batch of 0 keys (1 to 1000)");
+        let over: Vec<String> = (0..=DELETE_BATCH).map(good).collect();
+        assert_eq!(config(client.delete_batch(&over).await), "s3 delete objects: a batch of 1001 keys (1 to 1000)");
+        assert_eq!(config(client.delete_batch(&[good(0), "v1/not/ours".into()]).await), "s3 delete objects: \"v1/not/ours\" is no key of the store");
+        assert_eq!(config(client.delete_batch(&[good(0), good(1), good(0)]).await), format!("s3 delete objects: the batch names {} twice", good(0)));
+        assert_eq!(client.delete_keys(&[]).await.unwrap(), Deleted::default(), "no key: nothing done");
+        let mut foreign = thousand;
+        foreign.push("x/_egress-check/short".into());
+        assert_eq!(config(client.delete_keys(&foreign).await), "s3 delete objects: \"x/_egress-check/short\" is no key of the store");
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "nothing connected to S3");
+    }
+
+    /// S12 (P, P-R4, P-R5): a 200 is taken only as a DeleteResult that
+    /// `delete_errors` reads. A 200 of another form (an empty body, a
+    /// listing's document) is `aws s3 delete objects: the bucket: the answer
+    /// is no DeleteResult`, and a DeleteResult naming an error of a key the
+    /// request did not name is refused with that reason; each is `Sdk`, exit
+    /// 7, never no key refused (the answer of a misdirected or garbled request
+    /// says nothing of the keys sent). S3 is a loopback listener that takes
+    /// one request whole and answers it once, the client's waits a test's.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_delete_objects_answer_of_another_form_is_refused() {
+        use crate::bridge::s3::{LAB_BUCKET, LAB_OWNER};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        /// A listener that takes one request whole (its head, then its `Content-Length`'s bytes), answers `answer`, and closes.
+        async fn answering(answer: Vec<u8>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut s, _) = l.accept().await.unwrap();
+                let (mut got, mut buf) = (Vec::new(), vec![0u8; 64 * 1024]);
+                loop {
+                    if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                        let len = head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(&answer).await;
+                let _ = s.shutdown().await;
+            });
+            (addr, task)
+        }
+        let ok = |body: &str| format!("HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let session = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let key = S3Key::Mac { session: session.into(), sha256: "a".repeat(64) }.render();
+        let another = S3Key::Mac { session: session.into(), sha256: "b".repeat(64) }.render();
+        let signer = crate::bridge::api::FakeMicrovmApi::new();
+        let waits = Waits { stall: Duration::from_secs(2), head: Duration::from_secs(2), chunk: Duration::from_secs(2) };
+        for (answer, why) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(), "the answer is no DeleteResult"),
+            (ok("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult/>"), "the answer is no DeleteResult"),
+            (ok(&format!("<DeleteResult xmlns=\"{XMLNS}\"><Error><Key>{another}</Key><Code>AccessDenied</Code></Error></DeleteResult>")), "the answer names an error of a key the request did not name"),
+        ] {
+            let (addr, task) = answering(answer).await;
+            let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab(addr) };
+            let e = S3Client::new(&signer, &target).unwrap().with_waits(waits).delete_batch(std::slice::from_ref(&key)).await.unwrap_err();
+            task.abort();
+            assert!(matches!(&e, BridgeError::Sdk { op: "s3 delete objects", message } if *message == format!("the bucket: {why}")), "{why}: {e:?}");
+            assert_eq!(e.to_string(), format!("aws s3 delete objects: the bucket: {why}"));
+            assert_eq!(crate::errors::CliError::from(e).exit_code(), 7, "{why}");
+        }
     }
 }
