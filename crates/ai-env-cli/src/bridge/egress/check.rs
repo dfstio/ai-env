@@ -74,6 +74,13 @@
 //! recorded `no_role` only when that VM runs without an execution role
 //! ([`S3Facts`]).
 //!
+//! **The relay's cases** (S13). The VM security group and NACL open TCP 7443
+//! to the relay's address and nothing else of it. `relay-other-port` asks the
+//! relay's internet face (443) without the proxy and must time out without a
+//! connection; `relay-port` asks its private port and is recorded only. The
+//! network verification's `relay-sg` and `relay-endpoint` rows hold the rest:
+//! the relay's group and who answers on its address.
+//!
 //! The script ([`render_script`]) is rendered on the Mac, the proxy exports
 //! of [`proxy_env`] included (the VM's `ai-env` has no `egress` command),
 //! and sent through the scripted shell ([`run_check_script`]) after the VM's
@@ -116,7 +123,10 @@
 use crate::bridge::api::{EndpointClient, MicrovmApi, VmInfo, VmState};
 use crate::bridge::awscli;
 use crate::bridge::config::{is_rfc1918, BridgeConfig, Paths};
-use crate::bridge::egress::{dns_accepted, is_aws_service_host, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, EGRESS_RULE, LOG_GROUP, PROXY_IP, PROXY_PORT, VM_SUBNET_CIDR, VPC_CIDR};
+use crate::bridge::egress::{
+    dns_accepted, is_aws_service_host, is_valid_host, normalize_connector, parse_squid_line, proxy_env, ConnectorFacts, EgressVerified, SquidLine, VerifiedRecord, DNS_RULE, EGRESS_RULE, LOG_GROUP, PROXY_IP,
+    PROXY_PORT, RELAY_IP, RELAY_PORT, VM_SUBNET_CIDR, VPC_CIDR,
+};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::identity;
 use crate::bridge::infra::read_infra_state;
@@ -176,13 +186,16 @@ enum Kind {
     /// connection (`num_connects` 0), nothing answered (HTTP 000) and it gave
     /// up connecting (rc 6, 7 or 28).
     Direct,
-    /// curl without the proxy to another port of the proxy host: closed only
-    /// on a connect timeout without a connection (rc 28: the security group
-    /// drops it; a refusal would mean the packet reached the host).
+    /// curl without the proxy to another port of the proxy's or the relay's
+    /// host: closed only on a connect timeout without a connection (rc 28: the
+    /// VM security group drops it; a refusal would mean the packet reached the
+    /// host).
     OtherPort,
     /// dig (see [`DnsServer`]).
     Dns(DnsServer),
-    /// Recorded, never judged (IMDS).
+    /// Recorded, never judged: IMDS, and the relay's private port (whether it
+    /// answers is P0-A1's question; judging it would revoke every record
+    /// whenever the relay restarts).
     Recorded,
     /// Through the proxy, an allowlisted host: the tunnel opened (the proxy's
     /// CONNECT answer 200) and the API answered 401 (no API key).
@@ -417,8 +430,9 @@ pub const URL_SLOTS: usize = 3;
 /// The cases, in script order. The proxy exports come right before the
 /// first case (`allowed`); `allowed-last` closes the run. The seven S9 S3
 /// cases (§7.7): `s3-direct` after `direct-ipv6`, `proxy-s3-other-host` after
-/// `proxy-github`, and the five `s3`-group cases before `allowed-last`.
-pub const CASES: [Case; 34] = [
+/// `proxy-github`, and the five `s3`-group cases before `allowed-last`. S13's
+/// two relay cases right after `proxy-other-port`, neither through the proxy.
+pub const CASES: [Case; 36] = [
     Case { name: "allowed", group: "proxy", kind: Kind::Allowed, what: "api.anthropic.com through the proxy (first)", args: "https://api.anthropic.com/v1/models" },
     Case { name: "direct-name", group: "direct", kind: Kind::Direct, what: "api.anthropic.com without the proxy", args: "--noproxy '*' https://api.anthropic.com/v1/models" },
     Case { name: "direct-ipv4", group: "direct", kind: Kind::Direct, what: "1.1.1.1:443 without the proxy", args: "--noproxy '*' https://1.1.1.1/" },
@@ -439,6 +453,8 @@ pub const CASES: [Case; 34] = [
     Case { name: "dns-subnet-udp", group: "dns", kind: Kind::Dns(DnsServer::Platform), what: "dig @<the VM subnet's +2>", args: "@S@" },
     Case { name: "dns-subnet-tcp", group: "dns", kind: Kind::Dns(DnsServer::Platform), what: "dig +tcp @<the VM subnet's +2>", args: "@S@ +tcp" },
     Case { name: "proxy-other-port", group: "other", kind: Kind::OtherPort, what: "the proxy host on port 22, not 3128", args: "--noproxy '*' http://@P@:22/" },
+    Case { name: "relay-other-port", group: "other", kind: Kind::OtherPort, what: "the relay host on port 443 (its internet face), not 7443", args: "--noproxy '*' https://@RL@:443/" },
+    Case { name: "relay-port", group: "other", kind: Kind::Recorded, what: "the relay's private port, without the proxy", args: "--noproxy '*' https://@RL@:@RP@/" },
     Case { name: "imds", group: "other", kind: Kind::Recorded, what: "IMDS (169.254.169.254)", args: "--noproxy '*' http://169.254.169.254/latest/meta-data/" },
     Case { name: "imds-v6", group: "other", kind: Kind::Recorded, what: "IMDS over IPv6 ([fd00:ec2::254])", args: "--noproxy '*' -g http://[fd00:ec2::254]/latest/meta-data/" },
     Case { name: "proxy-ip-literal", group: "proxy", kind: Kind::Connect403, what: "1.1.1.1 through the proxy", args: "https://1.1.1.1/" },
@@ -773,6 +789,8 @@ fn render(nonce: &str, proxy_ip: &str, probe: &S3Probe, cases: &[&Case]) -> Stri
             .replace("@H@", &denied_host(nonce))
             .replace("@B@", &probe.bucket_host)
             .replace("@S3H@", S3_REGIONAL_HOST)
+            .replace("@RL@", RELAY_IP)
+            .replace("@RP@", &RELAY_PORT.to_string())
     };
     let mut lines = vec![
         r"\unalias -a; unset -f command curl dig printf 2>/dev/null; hash -r; unset HISTFILE; set +H".to_string(),
@@ -1265,7 +1283,7 @@ fn judge_case(c: &Case, r: &CaseResult, s3: &S3Facts) -> (Verdict, String) {
         Kind::Direct => (Verdict::Fail, format!("not proven closed: {} (curl did not run, or failed otherwise)", curl_seen(r))),
         Kind::OtherPort if connected || code != 0 => (Verdict::Fail, format!("OPEN: curl reached {}: {}", c.what, curl_seen(r))),
         Kind::OtherPort if r.conn == Some(0) && rc == 28 => (Verdict::Pass, "closed: timed out without a connection (the security group drops it)".into()),
-        Kind::OtherPort if rc == 7 => (Verdict::Fail, "not proven closed: rc 7 (refused or unreachable: a refusal means the packet reached the proxy host on a port other than 3128)".into()),
+        Kind::OtherPort if rc == 7 => (Verdict::Fail, format!("not proven closed: rc 7 (refused or unreachable: a refusal means the packet reached {})", c.what)),
         Kind::OtherPort => (Verdict::Fail, format!("not proven closed: {}", curl_seen(r))),
         Kind::Dns(server) => {
             let ns = r.ns.as_deref().unwrap_or("none");
@@ -1832,7 +1850,9 @@ pub fn decide(ev: &Evidence, connector: &str, at: &str) -> Decision {
         allowlisted: ev.judgement.allowlisted.clone(),
         dns: ev.judgement.dns.clone(),
         dns_rule: DNS_RULE,
-        // S9: the seven §7.7 S3 cases run, so the pass is EGRESS_RULE-verified (passes recorded before S9, rule 0, stop counting: B1 runs the check again).
+        // S13: the relay's cases ran, and the network verification judged the relay's rows (a state without the relay
+        // leaves them unknown and the check fails), so the pass is rule 2; passes recorded before S13 stop counting: B1
+        // runs the check again.
         egress_rule: EGRESS_RULE,
         squid_log: ok_text(&ev.squid),
         network: ok_text(&ev.network),
@@ -2607,7 +2627,10 @@ mod tests {
                     "allowed" | "allowed-last" => curl(c.name, 0, "401", "1", "200", false, false),
                     "direct-name" | "s3-direct" => curl(c.name, 6, "000", "0", "000", false, false),
                     "direct-ipv6" => curl(c.name, 7, "000", "0", "000", false, false),
-                    "direct-ipv4" | "direct-http" | "proxy-other-port" => curl(c.name, 28, "000", "0", "000", false, false),
+                    "direct-ipv4" | "direct-http" | "proxy-other-port" | "relay-other-port" => curl(c.name, 28, "000", "0", "000", false, false),
+                    // S13: the relay's private port answers (its certificate is under the relay's own CA, which curl does
+                    // not trust: rc 60, after a connection).
+                    "relay-port" => curl(c.name, 60, "000", "1", "000", false, false),
                     "imds" | "imds-v6" => curl(c.name, 0, "401", "1", "000", false, false),
                     "proxy-http-8080" => curl(c.name, 0, "403", "1", "000", false, true),
                     "s3-own" => s3line(c.name, "200", "200", "200", "-"),
@@ -2647,8 +2670,9 @@ mod tests {
         judge_with(&parse_markers(&transcript(lines), NONCE).unwrap(), &BTreeSet::new(), s3)
     }
 
-    /// The bounds of the script's two typed parts (bytes; 6182 and 2059 as rendered here): up to and including the URL
-    /// read loop, typed at once, and the rest, typed after the URLs (about 1.5 KB).
+    /// The bounds of the script's two typed parts (bytes; 6118 and 2195 as rendered here, S13's two relay cases and the
+    /// relay's address in no_proxy included): up to and including the URL read loop, typed at once, and the rest, typed
+    /// after the URLs (about 1.5 KB).
     const PRE_MAX: usize = 6400;
     const POST_MAX: usize = 2200;
 
@@ -2724,10 +2748,16 @@ mod tests {
         assert!(s.contains("aienv_d dns-public-port 208.67.222.222 -p 443\n") && s.contains("aienv_c direct-http --noproxy '*' http://1.1.1.1/\n"), "{s}");
         assert!(s.contains(&format!("aienv_c denied https://n{NONCE}.example.com/\n")), "{s}");
         assert!(s.contains("aienv_c proxy-other-port --noproxy '*' http://10.42.0.10:22/\n"));
-        // The proxy exports (both spellings, no_proxy) come right before the first case; allowed runs first and last.
+        // S13: the relay's internet face (judged) and its private port (recorded), right after proxy-other-port.
+        assert!(
+            s.contains("aienv_c proxy-other-port --noproxy '*' http://10.42.0.10:22/\naienv_c relay-other-port --noproxy '*' https://10.42.0.20:443/\naienv_c relay-port --noproxy '*' https://10.42.0.20:7443/\n"),
+            "{s}"
+        );
+        // The proxy exports (both spellings, no_proxy with the relay's address) come right before the first case; allowed
+        // runs first and last.
         let lines: Vec<&str> = s.lines().collect();
         let export = lines.iter().position(|l| l.starts_with("export ")).unwrap();
-        assert_eq!(lines[export], "export https_proxy='http://10.42.0.10:3128' HTTPS_PROXY='http://10.42.0.10:3128' http_proxy='http://10.42.0.10:3128' HTTP_PROXY='http://10.42.0.10:3128' no_proxy='localhost,127.0.0.1,::1' NO_PROXY='localhost,127.0.0.1,::1'");
+        assert_eq!(lines[export], "export https_proxy='http://10.42.0.10:3128' HTTPS_PROXY='http://10.42.0.10:3128' http_proxy='http://10.42.0.10:3128' HTTP_PROXY='http://10.42.0.10:3128' no_proxy='localhost,127.0.0.1,::1,10.42.0.20' NO_PROXY='localhost,127.0.0.1,::1,10.42.0.20'");
         assert!(lines[export + 1] == "aienv_r 10.42.0.10:3128" && lines[export + 2].starts_with("aienv_c allowed "), "{s}");
         assert!(s.contains("aienv_r() {"), "the wait helper is defined");
         assert_eq!(s.matches("aienv_r 10.42.0.10:3128\n").count(), 1, "one wait, right before the first case");
@@ -2742,7 +2772,9 @@ mod tests {
         assert_eq!(names, want);
         assert_eq!((names.first(), names.last()), (Some(&"allowed"), Some(&"allowed-last")));
         assert!(d.len() < 4096 && d.ends_with("\nexit\n") && d.contains("export https_proxy="));
-        assert_eq!(script_budget(CASES.len()), Duration::from_secs(34 * 12 + 60 + 5 + 30), "the cases, the wait for the proxy, slack");
+        assert_eq!(script_budget(CASES.len()), Duration::from_secs(36 * 12 + 95), "the cases, the wait for the proxy, slack");
+        assert!(script_budget(CASES.len()) < Duration::from_secs(900), "inside the check VM's 900 s");
+        assert!(!d.contains("relay-"), "the dns-path script asks no relay case: {d}");
         assert!(d.contains("aienv_r 10.42.0.10:3128\naienv_c allowed "), "the dns-path script waits too: {d}");
         // render_cases (one frame): every case named but those that ask the transcripts bucket — no read loop, no S3
         // helper, no bucket; proxy-s3-other-host asks none and stays.
@@ -2755,6 +2787,7 @@ mod tests {
         assert_eq!(rendered, want);
         assert_eq!(CASES.iter().filter(|c| c.needs_bucket()).map(|c| c.name).collect::<Vec<_>>(), ["s3-direct", "s3-own", "s3-front-bucket", "s3-front-path", "s3-own-outside-prefix", "s3-imds-role"]);
         assert!(rendered.contains(&"proxy-s3-other-host") && r.len() < 4096, "{} bytes", r.len());
+        assert!(rendered.contains(&"relay-other-port") && rendered.contains(&"relay-port"), "both relay cases ask no bucket: {r}");
     }
 
     /// What the Mac types for a check script (`script_frames`): the script up to and including its read loop's line,
@@ -2996,6 +3029,13 @@ mod tests {
         assert_eq!(verdict_of(&j, "imds").verdict, Verdict::Recorded);
         assert!(j.summary().starts_with("allowed=pass direct-name=pass") && j.summary().contains("imds=recorded:401") && j.summary().ends_with("allowed-last=pass"), "{}", j.summary());
         assert!(j.failures().is_empty());
+        // S13 (I-T34): the relay's internet face timed out without a connection (judged closed), its private port
+        // answered (recorded, never judged); and with the relay down (refused, no connection) the run still passes.
+        assert_eq!(verdict_of(&j, "relay-other-port").verdict, Verdict::Pass);
+        assert_eq!(verdict_of(&j, "relay-port").verdict, Verdict::Recorded);
+        assert!(j.summary().contains(" relay-other-port=pass relay-port=recorded:"), "{}", j.summary());
+        let down = judged(&with("relay-port", curl("relay-port", 7, "000", "0", "000", false, false)));
+        assert!(down.passed() && verdict_of(&down, "relay-port").verdict == Verdict::Recorded, "{:?}", down.failures());
     }
 
     /// The seven S3 cases (§7.7) are judged on the status and the `<Code>`,
@@ -3129,6 +3169,10 @@ mod tests {
             ("proxy-other-port", curl("proxy-other-port", 7, "000", "0", "000", false, false), "reached the proxy host"),
             ("proxy-other-port", curl("proxy-other-port", 28, "000", "1", "000", false, false), "OPEN"),
             ("proxy-other-port", curl("proxy-other-port", 0, "200", "1", "000", false, false), "OPEN"),
+            // S13: the relay's internet face reached from a VM (a connection, an answer), or refused (the packet reached it).
+            ("relay-other-port", curl("relay-other-port", 28, "000", "1", "000", false, false), "OPEN: curl reached the relay host on port 443 (its internet face), not 7443"),
+            ("relay-other-port", curl("relay-other-port", 0, "200", "1", "000", false, false), "OPEN: curl reached the relay host on port 443 (its internet face), not 7443"),
+            ("relay-other-port", curl("relay-other-port", 7, "000", "0", "000", false, false), "reached the relay host on port 443"),
             ("proxy-ip-literal", curl("proxy-ip-literal", 0, "200", "1", "200", false, false), "opened a tunnel"),
             // Judged strictly (no allowlist proved, or github.com not on it): said, not prescribed.
             ("proxy-github", curl("proxy-github", 0, "200", "1", "200", false, false), "(github.com was not on the proxy's effective allowlist as this check read it, or that list could not be verified: ai-env egress status)"),
@@ -3214,7 +3258,7 @@ mod tests {
         assert_eq!(v.reason, "not judged: github.com is allowlisted on the proxy (its effective allowlist, as the network verification read it); curl saw HTTP 200 (rc 0, 0 bytes; 1 connect), CONNECT 200; this check does not show squid refusing it");
         assert_eq!(j.allowlisted, ["github.com"]);
         assert!(j.summary().contains(" proxy-github=recorded:allowlisted ") && j.summary().contains(" imds=recorded:401 "), "{}", j.summary());
-        assert_eq!(j.cases.iter().filter(|c| c.verdict == Verdict::Recorded).count(), 3, "imds, imds-v6, proxy-github");
+        assert_eq!(j.cases.iter().filter(|c| c.verdict == Verdict::Recorded).count(), 4, "imds, imds-v6, relay-port (S13), proxy-github");
         // A refusal (github.com added after its case ran) is recorded too: the record never claims it refused.
         let j = judge_with(&parse_markers(&transcript(&passing()), NONCE).unwrap(), &github, &S3Facts::assumed());
         let v = verdict_of(&j, "proxy-github");
@@ -3586,6 +3630,7 @@ mod tests {
         assert_eq!((rec.dns.as_str(), rec.network.as_str(), rec.squid_log.as_str(), rec.at.as_str()), ("no-dns", "21 checks ok: connector, vm-route-table", "from 10.42.1.17: 2 tunnels", "2026-10-01T10:00:00Z"));
         assert!(rec.cases.contains("denied=pass"));
         assert_eq!((rec.dns_rule, rec.egress_rule), (DNS_RULE, EGRESS_RULE), "judged by the current DNS and egress rules (§13 P0-4: the S3 cases ran)");
+        assert_eq!((rec.dns_rule, rec.egress_rule), (1, 2), "S13: the relay's cases ran (I-T35)");
         // The stub's empty reply is recorded as the run's verdict (the gate decides with the pin).
         let platform = decide(&evidence(&with("dns-platform6-udp", stub("dns-platform6-udp", "fd00:ec2::253"))), CONN, "t");
         assert!(platform.passed, "{:?}", platform.failures);

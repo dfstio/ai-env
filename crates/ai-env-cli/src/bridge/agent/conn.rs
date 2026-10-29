@@ -337,8 +337,9 @@ impl Trace {
 
 /// The frame's JSON with every value that may carry data or a secret
 /// replaced by `[masked:<len>]`: chunk `text`/`b64`, `session_token`, a
-/// `credential` frame's `secret` (S7), the values of `secrets` and `env`, and
-/// argv past argv[0].
+/// `credential` frame's `secret` (S7), the values of `secrets` and `env`,
+/// argv past argv[0], and a spawn's relay session `token` (S13, WM-R55; its
+/// `addr`, `server_name` and `ca_der_b64` are public).
 fn masked(frame: &Frame) -> serde_json::Value {
     use serde_json::Value;
     let mut v: Value = serde_json::from_str(&frame.to_json()).unwrap_or(Value::Null);
@@ -359,6 +360,9 @@ fn masked(frame: &Frame) -> serde_json::Value {
         }
         if let Some(Value::Array(argv)) = map.get_mut("argv") {
             argv.iter_mut().skip(1).for_each(mask);
+        }
+        if let Some(token) = map.get_mut("relay").and_then(|r| r.get_mut("token")) {
+            mask(token);
         }
     }
     v
@@ -541,12 +545,16 @@ mod tests {
             detach_grace_s: None,
             credential: None,
             claude: Vec::new(),
+            relay: None,
         };
         let out = Frame::Stdout { spawn_id: sid.clone(), seq: 3, data: Chunk { text: Some("private output".into()), b64: None } };
         let bin = Frame::Stdin { spawn_id: sid, seq: 4, data: Chunk { text: None, b64: Some("AP8K".into()) } };
         let cred = Frame::Credential { name: "SOME_NAME".into(), secret: Secret::new("dummy-credential-value".into()), tag: Some("seal-1".into()) };
-        let all = [masked(&hello), masked(&spawn), masked(&out), masked(&bin), masked(&cred)].map(|v| v.to_string()).join("\n");
-        for leak in ["trace-session-token", "--print", "the prompt", "C.UTF-8", "dummy-secret-value", "private output", "AP8K", "dummy-credential-value"] {
+        // S13 (WM-R55): a spawn's relay session keeps its public parts; its token is masked.
+        let session = crate::wire::relay::RelaySpawn { token: Secret::new("v1.trace-relay-token.sig".into()), addr: "10.42.0.20:7443".into(), server_name: "10.42.0.20".into(), ca_der_b64: "MA==".into() };
+        let relayed = Frame::Spawn { spawn_id: SpawnId("0192f1e0-2b7c-7c3a-9a1b-4d5e6f708193".into()), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), relay: Some(session) };
+        let all = [masked(&hello), masked(&spawn), masked(&out), masked(&bin), masked(&cred), masked(&relayed)].map(|v| v.to_string()).join("\n");
+        for leak in ["trace-session-token", "--print", "the prompt", "C.UTF-8", "dummy-secret-value", "private output", "AP8K", "dummy-credential-value", "trace-relay-token"] {
             assert!(!all.contains(leak), "{leak}: {all}");
         }
         assert_eq!(masked(&spawn)["argv"], serde_json::json!(["/usr/bin/claude", "[masked:7]", "[masked:10]"]));
@@ -555,6 +563,8 @@ mod tests {
         assert_eq!(masked(&out)["seq"], 3);
         assert_eq!(masked(&hello)["session_token"], "[masked:19]");
         assert_eq!((masked(&cred)["secret"].as_str(), masked(&cred)["name"].as_str(), masked(&cred)["tag"].as_str()), (Some("[masked:22]"), Some("SOME_NAME"), Some("seal-1")));
+        assert_eq!(masked(&relayed)["relay"], serde_json::json!({"token": "[masked:24]", "addr": "10.42.0.20:7443", "server_name": "10.42.0.20", "ca_der_b64": "MA=="}));
+        assert!(masked(&spawn)["relay"].is_null(), "no session, nothing to mask");
     }
 
     #[test]

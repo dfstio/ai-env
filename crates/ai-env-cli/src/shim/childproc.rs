@@ -10,7 +10,9 @@
 //!
 //! S9: curl, which moves the transcript store's bytes ([`spawn_curl`]),
 //! starts through the same setup as `ai-env-net` (uid and gid 999), in `/`,
-//! its configuration (the presigned URL in it) on fd 3 alone.
+//! its configuration (the presigned URL in it) on fd 3 alone. S13: a relay
+//! spawn's relay client ([`spawn_relay_client`]) the same way, its session
+//! (the token in it) on fd 3 alone.
 use std::ffi::CString;
 use std::io;
 
@@ -229,6 +231,45 @@ pub(crate) fn spawn_curl(program: &std::path::Path, ids: Option<(u32, u32)>, con
     spawned
 }
 
+/// The relay client's `PATH` (its environment is otherwise cleared).
+const RELAY_CLIENT_PATH: &str = "/usr/bin:/bin";
+
+/// S13: a spawn's relay client (`shim::relay`): `program <args>`, as `ids` (`ai-env-net`) when given, its
+/// environment `PATH=/usr/bin:/bin` and `LC_ALL=C` alone, stdin and stdout `/dev/null`, stderr piped to the shim, and
+/// `session` (the token is in it) on fd 3 from a pipe that already holds it whole and is theirs ([`preloaded_pipe`],
+/// `fchown`): never an argv, an environment or a file. Started through [`child_setup`] in `/`: setsid,
+/// NO_NEW_PRIVS, the signal dispositions, every other descriptor from 3 close-on-exec. Killed when dropped.
+pub(crate) fn spawn_relay_client(program: &std::path::Path, args: &[String], ids: Option<(u32, u32)>, session: &[u8]) -> io::Result<tokio::process::Child> {
+    use std::os::fd::AsRawFd as _;
+    use std::process::Stdio;
+    let pipe = preloaded_pipe(session)?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args).env_clear().env("PATH", RELAY_CLIENT_PATH).env("LC_ALL", "C").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Some((uid, gid)) = ids {
+        // SAFETY: fchown(2) on the pipe's read end, a valid fd this function owns.
+        if unsafe { libc::fchown(pipe.as_raw_fd(), uid, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        cmd.gid(gid);
+        cmd.uid(uid);
+    }
+    let (fd, fd_walk) = (pipe.as_raw_fd(), fd_walk_end());
+    // SAFETY: the closure runs in the forked child, after std applied the
+    // stdio and the uid/gid, before exec; it makes only async-signal-safe
+    // calls on data prepared here (no allocation, no lock).
+    unsafe {
+        cmd.pre_exec(move || child_setup(&[], Some(fd), fd_walk));
+    }
+    let spawned = {
+        #[cfg(test)]
+        let _fork = crate::test_locks::forking();
+        cmd.spawn()
+    };
+    // The parent's read end: the child has its own on fd 3.
+    drop(pipe);
+    spawned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +308,43 @@ mod tests {
             assert!(facts.ends_with("leader=yes"), "its own session: {facts}");
         }
         assert_eq!(lines.collect::<Vec<_>>(), ["url = \"https://example.invalid/k\"", "silent", "from stdin"], "fd 3's configuration, then stdin");
+    }
+
+    /// S13: the relay client's start, as curl's above, with a script for the
+    /// program (writing its facts to stderr, the one pipe it has): its argv
+    /// is the given one, its descriptors past 2 are exactly `3`, its
+    /// environment `LC_ALL` and `PATH` (`/usr/bin:/bin`), its working
+    /// directory `/`, its own session, fd 3's bytes the session; stdout is
+    /// `/dev/null` (`child.stdout` is `None`).
+    #[tokio::test]
+    async fn the_relay_client_starts_with_its_session_on_fd_3_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::AsyncReadExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("ai-env-relay-client");
+        let body = "fds=''\nfor n in $(seq 3 63); do [ -e /dev/fd/$n ] && fds=\"$fds$n,\"; done\nvars=$(env | cut -d= -f1 | grep -v -e '^PWD$' -e '^SHLVL$' -e '^_$' -e '^OLDPWD$' | sort | tr '\\n' ,)\nsid=$(ps -o sess= -p $$ 2>/dev/null | tr -d ' ')\nprintf 'argv=%s|fds=%s|vars=%s|path=%s|cwd=%s|leader=%s\\n' \"$*\" \"$fds\" \"$vars\" \"$PATH\" \"$(pwd)\" \"$([ \"$sid\" = $$ ] && echo yes || echo no)\" >&2\ncat <&3 >&2\n";
+        std::fs::write(&script, format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let warmed = {
+            let _fork = crate::test_locks::forking();
+            std::process::Command::new(&script).arg("warm").status().unwrap()
+        };
+        assert!(warmed.success());
+        // A run-time token (no committed value under `token`, §V-vm's conventions).
+        let session = format!(r#"{{"v":1,"token":"relay-test-{:08x}","addr":"10.42.0.20:7443","server_name":"10.42.0.20","ca_der_b64":"MA=="}}"#, std::process::id());
+        let session = session.as_bytes();
+        let args: Vec<String> = ["serve", "--leader", "42", "--socket", "/run/ai-env/relay/42.sock", "--agent-uid", "1000"].map(str::to_string).to_vec();
+        let mut child = spawn_relay_client(&script, &args, None, session).unwrap();
+        assert!(child.stdout.is_none() && child.stdin.is_none(), "stdin and stdout are /dev/null");
+        let mut err = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut err).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let (facts, fd3) = err.split_once('\n').unwrap();
+        assert!(facts.starts_with("argv=serve --leader 42 --socket /run/ai-env/relay/42.sock --agent-uid 1000|fds=3,|vars=LC_ALL,PATH,|path=/usr/bin:/bin|cwd=/|"), "{facts}");
+        if cfg!(target_os = "linux") || facts.ends_with("leader=yes") {
+            assert!(facts.ends_with("leader=yes"), "its own session: {facts}");
+        }
+        assert_eq!(fd3.as_bytes(), session, "fd 3 holds the session, byte for byte");
     }
 
     #[test]

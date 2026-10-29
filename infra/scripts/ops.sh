@@ -337,10 +337,12 @@ cmd_delete_image() {
 }
 
 cmd_checklist() {
-    local vpc log_group prefix
+    local vpc log_group prefix relay_prefix relay_group
     vpc=$(econf vpcCidr)
     log_group=$(econf logGroup)
     prefix=$(econf parameterPrefix)
+    relay_prefix=$(econf relayParameterPrefix)
+    relay_group=$(econf relayLogGroup)
     # Pasted into zsh (no INTERACTIVE_COMMENTS by default: a `#` is an argument, an unquoted `(` syntax), so no command
     # line carries a comment or anything unquoted beyond its words: what it should show is on its step's numbered line.
     cat <<EOF
@@ -377,13 +379,21 @@ operator users are gone): paste each command line on its own; its step's numbere
  11. all four parameters listed as invalid (none exists), and no $log_group (nor ${log_group%/*}/dns):
      aws ssm get-parameters --names $prefix/squid.conf $prefix/allow $prefix/extras $prefix/suspended --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com
      aws logs describe-log-groups --log-group-name-prefix ${log_group%/*} --region $region --endpoint-url https://logs.$region.amazonaws.com
- 12. NoSuchEntity for each:
+ 12. the relay instance, terminated only, and no Elastic IP of the stack left (one still allocated is billed):
+     aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-relay --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region $region --endpoint-url $ec2_url
+     aws ec2 describe-addresses --filters Name=tag:Name,Values=ai-env-relay --query 'Addresses[].[AllocationId,PublicIp]' --output text --region $region --endpoint-url $ec2_url
+ 13. no relay log group; the relay's artifact parameter listed as invalid; the four ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):
+     aws logs describe-log-groups --log-group-name-prefix $relay_group --region $region --endpoint-url https://logs.$region.amazonaws.com
+     aws ssm get-parameters --names $relay_prefix/artifact $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/tls --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com
+     aws ssm delete-parameters --names $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/tls --region $region --endpoint-url https://ssm.$region.amazonaws.com
+ 14. NoSuchEntity for each:
      aws iam get-role --role-name $(econf operatorRoleName) --region $region; aws iam get-role --role-name $(econf proxyRoleName) --region $region; aws iam get-instance-profile --instance-profile-name $(econf proxyInstanceProfileName) --region $region
- 13. bridge.toml [aws]: clear image_arn, execution_role_arn and budget_name, and remove egress_connector_arn and proxy_private_ip, by hand; delete state/infra.toml (infra status refuses a stack without outputs, so nothing rewrites it)
+     aws iam get-role --role-name ai-env-relay --region $region; aws iam get-instance-profile --instance-profile-name ai-env-relay --region $region
+ 15. bridge.toml [aws]: clear image_arn, execution_role_arn and budget_name, and remove egress_connector_arn and proxy_private_ip, by hand; delete state/infra.toml (infra status refuses a stack without outputs, so nothing rewrites it)
      $(verified_note)
- 14. optional, the stack's own record in the Pulumi backend:
+ 16. optional, the stack's own record in the Pulumi backend:
      cd infra && pulumi stack rm $stack
- 15. the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README "Break-glass"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)
+ 17. the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README "Break-glass"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)
 EOF
 }
 
@@ -725,9 +735,11 @@ cmd_connector_delete() {
 # could never pass again), while a leftover probe connector pins the VM subnet too. A replaced proxy instance is
 # allowed and named: any change to a file embedded in its user-data replaces it by design. The same rule holds for a
 # VPC step turning enableDnsSupport or enableDnsHostnames from off (or unknown) to on (dnsMode none -> firewall): the
-# VPC's Amazon DNS answers the VMs before the DNS Firewall exists, so not while a connector exists.
+# VPC's Amazon DNS answers the VMs before the DNS Firewall exists, so not while a connector exists. S13: a replaced
+# relay instance is allowed and named (its user data, as the proxy's); a replaced Elastic IP is refused whatever the
+# connectors (every worker's relay URL names its address; the program can no longer plan one, so only drift could).
 cmd_replace_guard() {
-    local plan verdict guarded proxies dns list
+    local plan verdict guarded proxies relays eips dns list
     plan=$(cat)
     verdict=$(printf '%s' "$plan" | node -e '
 let plan;
@@ -751,16 +763,29 @@ for (const s of plan.steps) {
     if (!replacing.has(s.op) || seen.has(s.urn)) continue;
     seen.add(s.urn);
     if (guarded.has(type)) console.log(`guarded\t${what}`);
+    else if (type === "aws:ec2/instance:Instance" && parts[parts.length - 1] === "ai-env-relay") console.log(`relay\t${what}\t${(s.replaceReasons || []).join(", ")}`);
     else if (type === "aws:ec2/instance:Instance") console.log(`proxy\t${what}\t${(s.replaceReasons || []).join(", ")}`);
+    else if (type === "aws:ec2/eip:Eip") console.log(`eip\t${what}`);
 }
 ') || { echo "replacement guard: cannot read the plan: refusing"; exit 1; }
     proxies=$(awk -F'\t' '$1 == "proxy" { print $2 "\t" $3 }' <<<"$verdict")
+    relays=$(awk -F'\t' '$1 == "relay" { print $2 "\t" $3 }' <<<"$verdict")
+    eips=$(awk -F'\t' '$1 == "eip" { printf "%s%s", (n++ ? ", " : ""), $2 }' <<<"$verdict")
     guarded=$(awk -F'\t' '$1 == "guarded" { printf "%s%s", (n++ ? ", " : ""), $2 }' <<<"$verdict")
     dns=$(awk -F'\t' '$1 == "dns" { printf "%s%s", (n++ ? " and " : ""), $2 }' <<<"$verdict")
     if [ -n "$proxies" ]; then
         while IFS=$'\t' read -r p why; do
             echo "replacement guard: $p will be replaced (${why:-the plan names no reason}; a change to a file embedded in its user-data is one): vpc VMs have no egress until the new instance serves; it reads its parameters at boot"
         done <<<"$proxies"
+    fi
+    if [ -n "$relays" ]; then
+        while IFS=$'\t' read -r p why; do
+            echo "replacement guard: $p will be replaced (${why:-the plan names no reason}): the relay is down until the new instance boots and its reload unit installs the binary (a few minutes): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"
+        done <<<"$relays"
+    fi
+    if [ -n "$eips" ]; then
+        echo "replacement guard: $eips would be replaced: every worker's relay URL names its address: refused (a new address is the account root's, after make destroy)"
+        exit 1
     fi
     if [ -z "$guarded" ] && [ -z "$dns" ]; then
         echo "replacement guard: nothing the connector's ENIs pin is replaced, and the VPC's Amazon DNS stays as it is"
@@ -852,9 +877,10 @@ for (const d of j.diagnostics || []) if (d.severity === "error") process.stderr.
 # ids and hashes the ai-env egress commands read from it, S9's transcript store included: a deploy that only changes
 # the S3 endpoint's policy is lag, never drift; S10: the connector, which egress status judges by the ARN the file
 # records, compared as egress status compares connectors (a final :N version dropped: the file holds the live read's
-# ARN), and the names of the proxy documents, which every egress command holds to the ones it sends), space-separated;
-# "-" when the file does not exist. Only keys whose lag egress status would call drift belong here: each one listed
-# skips post-deploy's drift check until make infra-status WRITE=1.
+# ARN), and the names of the proxy documents, which every egress command holds to the ones it sends; S13: the relay's
+# instance, addresses and security group, which egress status's relay rows read), space-separated; "-" when the file
+# does not exist. Only keys whose lag egress status would call drift belong here: each one listed skips post-deploy's
+# drift check until make infra-status WRITE=1.
 infra_state_lag() {
     printf '%s' "$1" | node -e '
 const fs = require("fs");
@@ -869,7 +895,8 @@ const keys = { proxyInstanceId: "proxy_instance_id", proxyPrivateIp: "proxy_priv
     transcriptsBucket: "transcripts_bucket", s3EndpointId: "s3_endpoint_id", s3EndpointPolicySha256: "s3_endpoint_policy_sha256",
     transcriptsBucketPolicySha256: "transcripts_bucket_policy_sha256", proxyRouteTableId: "proxy_route_table_id",
     connectorArn: "connector_arn", proxyReloadDocument: "proxy_reload_document", proxyStatusDocument: "proxy_status_document",
-    proxyPatchDocument: "proxy_patch_document" };
+    proxyPatchDocument: "proxy_patch_document", relayInstanceId: "relay_instance_id", relayPrivateIp: "relay_private_ip", relayPublicIp: "relay_public_ip",
+    relaySecurityGroupId: "relay_security_group_id" };
 // normalize_connector (src/bridge/egress/mod.rs): trimmed, a final all-digit segment after the resource name dropped.
 const connector = (a) => { const p = a.trim().split(":"); return p.length >= 8 && /^[0-9]+$/.test(p[p.length - 1]) ? p.slice(0, -1).join(":") : a.trim(); };
 const same = (k, a, b) => (k === "connectorArn" ? connector(a) === connector(b) : a === b);

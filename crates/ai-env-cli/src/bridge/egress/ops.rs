@@ -129,9 +129,14 @@ pub fn subnet_network_acls(subnet: &str) -> Result<Value, String> {
     aws_json("ec2", &["describe-network-acls", "--filters", &format!("Name=association.subnet-id,Values={subnet}")])
 }
 
-/// Every security group of `vpc` (the VM's, the proxy's and the default one).
+/// Every security group of `vpc` (the VM's, the proxy's, S13's relay's and the default one).
 pub fn security_groups(vpc: &str) -> Result<Value, String> {
     aws_json("ec2", &["describe-security-groups", "--filters", &format!("Name=vpc-id,Values={vpc}")])
+}
+
+/// S13: the interfaces of `vpc` holding `ip` as a private address (who answers on the relay's address).
+pub fn enis_holding(vpc: &str, ip: &str) -> Result<Value, String> {
+    aws_json("ec2", &["describe-network-interfaces", "--filters", &format!("Name=vpc-id,Values={vpc}"), &format!("Name=addresses.private-ip-address,Values={ip}")])
 }
 
 /// The VPC itself (CIDRs, IPv6 associations, DHCP option set).

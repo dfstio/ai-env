@@ -70,7 +70,8 @@ pub fn capture(mut cmd: Command, stdin: Option<&[u8]>, timeout: Duration) -> Res
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("{program}: {e}"))?;
     if let (Some(bytes), Some(mut w)) = (stdin, child.stdin.take()) {
-        let bytes = bytes.to_vec();
+        // Zeroizing: the bytes may be a secret (S13: the relay's `tls` value goes to `aws ssm put-parameter` this way).
+        let bytes = zeroize::Zeroizing::new(bytes.to_vec());
         std::thread::spawn(move || {
             let _ = w.write_all(&bytes);
             // `w` drops here: the child sees EOF.
@@ -1493,6 +1494,72 @@ pub fn row_proxy(configured_ip: Option<&str>, state: &Result<Option<InfraState>,
     }
 }
 
+/// S13: whether [`rows`] makes the relay row's one call, and for which instance (as [`proxy_call`]): only with an
+/// operator identity and a recorded `relay_instance_id` that is an instance id ([`is_instance_id`]); `None`: no call.
+#[must_use]
+pub fn relay_call(identity: bool, state: Option<&InfraState>) -> Option<&str> {
+    identity.then_some(())?;
+    state?.relay_instance_id.as_deref().filter(|id| is_instance_id(id))
+}
+
+/// `aws ec2 <these>` through [`aws_cmd_as`], as the proxy row's: the relay row's one operator call.
+fn relay_describe_args(id: &str) -> [&str; 3] {
+    ["describe-instances", "--instance-ids", id]
+}
+
+/// S13: the relay (I-R73), from `state/infra.toml`'s `relay_instance_id` and
+/// one `ec2 describe-instances` of it (`described`: `None` when not made, as
+/// the proxy row's). No id recorded is `[-  ]` (a stack before S13), an id
+/// that is not one `[!! ]` without a call. Running is `[ok ]` at
+/// [`RELAY_IP`](crate::bridge::egress::RELAY_IP) and, when recorded, at the
+/// recorded public address (workers dial it); either other address is
+/// `[!! ]`. Unlike the proxy, the relay is meant to run all the time: stopped
+/// or stopping is `[!! ]` (workers cannot connect, VM relay calls fail);
+/// pending is `[-  ]`; any other state `[!! ]`; a failed call `[!! ] not
+/// checked`. Never `[NO ]`: nothing local breaks without the relay.
+#[must_use]
+pub fn row_relay(state: &Result<Option<InfraState>, BridgeError>, described: Option<Result<&str, &str>>) -> DoctorLine {
+    let s = match state {
+        Ok(s) => s.as_ref(),
+        Err(e) => return DoctorLine::row(Tag::Skip, format!("relay not checked (state/infra.toml unreadable: {e})  <- {INFRA_STATUS_HINT}")),
+    };
+    let Some(id) = s.and_then(|s| s.relay_instance_id.as_deref()).filter(|id| !id.trim().is_empty()) else {
+        let why = if s.is_some() { "state/infra.toml has no relay_instance_id" } else { "no state/infra.toml" };
+        return DoctorLine::row(Tag::Skip, format!("relay: none recorded ({why})  <- {INFRA_STATUS_HINT} after the S13 deploy"));
+    };
+    if !is_instance_id(id) {
+        return DoctorLine::row(Tag::Warn, format!("relay: relay_instance_id {id:?} in state/infra.toml is not an instance id; not checked  <- {INFRA_STATUS_HINT}"));
+    }
+    let name = format!("relay {id}");
+    let json = match described {
+        None => return DoctorLine::row(Tag::Skip, format!("{name} not checked ({NO_OPERATOR_ROW})")),
+        Some(Err(e)) => return DoctorLine::row(Tag::Warn, format!("{name} not checked: {e}")),
+        Some(Ok(json)) => json,
+    };
+    let doc = serde_json::from_str::<serde_json::Value>(json).ok();
+    let instance = doc.as_ref().and_then(|v| v.get("Reservations")?.as_array()).into_iter().flatten().filter_map(|r| r.get("Instances")?.as_array()).flatten().find(|i| i.get("InstanceId").and_then(|x| x.as_str()) == Some(id));
+    let Some(instance) = instance else {
+        return DoctorLine::row(Tag::Warn, format!("{name} not checked: the describe-instances output does not list it"));
+    };
+    let st = instance.get("State").and_then(|s| s.get("Name")).and_then(|n| n.as_str()).unwrap_or("in no state");
+    let private = instance.get("PrivateIpAddress").and_then(|x| x.as_str()).unwrap_or("no private address");
+    let public = instance.get("PublicIpAddress").and_then(|x| x.as_str());
+    let recorded = s.and_then(|s| s.relay_public_ip.as_deref()).map(str::trim).filter(|p| !p.is_empty());
+    let relay_ip = crate::bridge::egress::RELAY_IP;
+    match st {
+        "running" if private != relay_ip => DoctorLine::row(Tag::Warn, format!("{name} running at {private}, but the VMs' rules name {relay_ip}  <- redeploy the stack's relay, then {INFRA_STATUS_HINT}")),
+        "running" => match recorded {
+            Some(rec) if public != Some(rec) => {
+                DoctorLine::row(Tag::Warn, format!("{name} running at {}, but state/infra.toml records {rec} (workers dial it)  <- {INFRA_STATUS_HINT}", public.unwrap_or("no public address")))
+            }
+            _ => DoctorLine::row(Tag::Ok, format!("{name} running ({relay_ip}, {})", public.unwrap_or("no public address"))),
+        },
+        "stopped" | "stopping" => DoctorLine::row(Tag::Warn, format!("{name} {st}: workers cannot connect and VM relay calls fail  <- ai-env relay start")),
+        "pending" => DoctorLine::row(Tag::Skip, format!("{name} pending (starting)")),
+        other => DoctorLine::row(Tag::Warn, format!("{name} is {other}: workers cannot connect  <- redeploy the stack's relay, then {INFRA_STATUS_HINT}")),
+    }
+}
+
 /// Row for a `settings.json` that could not be parsed at all.
 #[must_use]
 pub fn row_settings_unparseable(path: &Path, err: &str) -> DoctorLine {
@@ -2007,6 +2074,9 @@ pub fn rows(store: &Keystore) -> BridgeDoctor {
             // adds one operator call, for a recorded proxy and an identity.
             let described = op.and_then(|op| proxy_call(true, recorded).map(|id| aws_cmd_as("ec2", &proxy_describe_args(id), op).and_then(|cmd| run_capture_cmd(cmd, None, Duration::from_secs(15)))));
             lines.push(row_proxy(cfg.aws.proxy_private_ip.as_deref(), &state, described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
+            // S13: the relay row, one more operator call for a recorded relay (a state without it makes none).
+            let relay_described = op.and_then(|op| relay_call(true, recorded).map(|id| aws_cmd_as("ec2", &relay_describe_args(id), op).and_then(|cmd| run_capture_cmd(cmd, None, Duration::from_secs(15)))));
+            lines.push(row_relay(&state, relay_described.as_ref().map(|r| r.as_deref().map_err(String::as_str))));
             lines.push(match &vms {
                 Ok(vms) => row_vm_registry(vms, unix_now()),
                 Err(e) => DoctorLine::row(Tag::Warn, format!("vm registry unreadable: {e}")),
@@ -2708,6 +2778,74 @@ mod tests {
             assert!(t.starts_with(&format!("egress proxy i-0123456789abcdef0 is {st}: vpc VMs have no way out  <- ")), "{t}");
             assert_eq!(crate::commands::doctor_exit_code(&[row], false), 0);
         }
+    }
+
+    const RELAY_ID: &str = "i-0123456789abcdef1";
+
+    fn described_relay(state: &str, private: Option<&str>, public: Option<&str>) -> String {
+        let mut i = serde_json::json!({"InstanceId": RELAY_ID, "InstanceType": "t4g.nano", "State": {"Code": 16, "Name": state}, "SubnetId": "subnet-0123456789abcdef0", "VpcId": "vpc-0123456789abcdef0"});
+        if let Some(ip) = private {
+            i["PrivateIpAddress"] = serde_json::json!(ip);
+        }
+        if let Some(ip) = public {
+            i["PublicIpAddress"] = serde_json::json!(ip);
+        }
+        serde_json::json!({"Reservations": [{"ReservationId": "r-0123456789abcdef1", "OwnerId": "123456789012", "Instances": [i]}]}).to_string()
+    }
+
+    /// S13 (I-T37): the relay row, every case with its text and tag; the
+    /// relay runs all the time, so a stopped one is a warning, never `[NO ]`;
+    /// and the one call needs an identity and a recorded instance id.
+    #[test]
+    fn row_relay_running_is_ok_and_a_stopped_relay_is_a_warning() {
+        let relay = InfraState { relay_instance_id: Some(RELAY_ID.into()), relay_public_ip: Some("203.0.113.20".into()), ..active_state() };
+        let s = ok(relay.clone());
+        let row = |s: &Result<Option<InfraState>, BridgeError>, d: Option<Result<&str, &str>>| text(&row_relay(s, d));
+        let running = described_relay("running", Some("10.42.0.20"), Some("203.0.113.20"));
+        assert_eq!(row(&s, Some(Ok(&running))), (Tag::Ok, format!("relay {RELAY_ID} running (10.42.0.20, 203.0.113.20)")));
+        // No public address recorded: the instance's, or none.
+        let unrecorded = ok(InfraState { relay_public_ip: None, ..relay.clone() });
+        assert_eq!(row(&unrecorded, Some(Ok(&described_relay("running", Some("10.42.0.20"), None)))), (Tag::Ok, format!("relay {RELAY_ID} running (10.42.0.20, no public address)")));
+        assert_eq!(
+            row(&s, Some(Ok(&described_relay("running", Some("10.42.0.21"), Some("203.0.113.20"))))),
+            (Tag::Warn, format!("relay {RELAY_ID} running at 10.42.0.21, but the VMs' rules name 10.42.0.20  <- redeploy the stack's relay, then make infra-status WRITE=1"))
+        );
+        assert_eq!(
+            row(&s, Some(Ok(&described_relay("running", Some("10.42.0.20"), Some("198.51.100.7"))))),
+            (Tag::Warn, format!("relay {RELAY_ID} running at 198.51.100.7, but state/infra.toml records 203.0.113.20 (workers dial it)  <- make infra-status WRITE=1"))
+        );
+        for st in ["stopped", "stopping"] {
+            let line = row_relay(&s, Some(Ok(&described_relay(st, Some("10.42.0.20"), None))));
+            assert_eq!(text(&line), (Tag::Warn, format!("relay {RELAY_ID} {st}: workers cannot connect and VM relay calls fail  <- ai-env relay start")));
+            assert_eq!(crate::commands::doctor_exit_code(&[line], false), 0, "{st} is a warning, never [NO ]");
+        }
+        assert_eq!(row(&s, Some(Ok(&described_relay("pending", None, None)))), (Tag::Skip, format!("relay {RELAY_ID} pending (starting)")));
+        for st in ["terminated", "shutting-down"] {
+            assert_eq!(
+                row(&s, Some(Ok(&described_relay(st, None, None)))),
+                (Tag::Warn, format!("relay {RELAY_ID} is {st}: workers cannot connect  <- redeploy the stack's relay, then make infra-status WRITE=1"))
+            );
+        }
+        assert_eq!(row(&s, None), (Tag::Skip, format!("relay {RELAY_ID} not checked ({NO_OPERATOR_ROW})")));
+        assert_eq!(row(&s, Some(Err("aws: timed out after 15s"))), (Tag::Warn, format!("relay {RELAY_ID} not checked: aws: timed out after 15s")));
+        assert_eq!(row(&s, Some(Ok(&described("running", Some("10.42.0.10"))))), (Tag::Warn, format!("relay {RELAY_ID} not checked: the describe-instances output does not list it")));
+        // No relay recorded: a stack before S13, no call.
+        assert_eq!(row(&ok(active_state()), None), (Tag::Skip, "relay: none recorded (state/infra.toml has no relay_instance_id)  <- make infra-status WRITE=1 after the S13 deploy".to_string()));
+        assert_eq!(row(&Ok(None), None), (Tag::Skip, "relay: none recorded (no state/infra.toml)  <- make infra-status WRITE=1 after the S13 deploy".to_string()));
+        let unreadable: Result<Option<InfraState>, BridgeError> = Err(BridgeError::Config("state/infra.toml: bad".into()));
+        let (tag, t) = row(&unreadable, None);
+        assert!(tag == Tag::Skip && t.starts_with("relay not checked (state/infra.toml unreadable: ") && t.ends_with(")  <- make infra-status WRITE=1"), "{t}");
+        let bad = ok(InfraState { relay_instance_id: Some("--dry-run".into()), ..relay.clone() });
+        assert_eq!(row(&bad, None), (Tag::Warn, "relay: relay_instance_id \"--dry-run\" in state/infra.toml is not an instance id; not checked  <- make infra-status WRITE=1".to_string()));
+        // The call: an identity and a valid recorded id, nothing else.
+        assert_eq!(relay_call(true, Some(&relay)), Some(RELAY_ID));
+        assert_eq!(relay_call(false, Some(&relay)), None, "no operator identity: no call");
+        assert_eq!(relay_call(true, Some(&active_state())), None, "a state without relay_instance_id makes no call");
+        assert_eq!(relay_call(true, None), None);
+        for bad in ["--dry-run", "i-0123456789ABCDEF1", " i-0123456789abcdef1", "sg-0123456789abcdef1"] {
+            assert_eq!(relay_call(true, Some(&InfraState { relay_instance_id: Some(bad.into()), ..relay.clone() })), None, "{bad}: never on the aws command line");
+        }
+        assert_eq!(relay_describe_args(RELAY_ID), ["describe-instances", "--instance-ids", RELAY_ID]);
     }
 
     /// Whether `rows` makes the one call: an identity and a valid recorded id, nothing else.

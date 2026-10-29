@@ -1727,7 +1727,12 @@ fn holding(dirs: &[&Path], needles: &[String]) -> Vec<String> {
 /// placed after `TERM` below, so the forwarded slice is `cursor`'s first 10)
 /// arrive with Cursor's values; the host refresh names Cursor sets
 /// (`CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH`, `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH`)
-/// never do: no list names them.
+/// never do: no list names them. S13 (A6): of extension 2.1.312's three names,
+/// `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS` (index 9, after the S12
+/// two: the forwarded slice is now `cursor`'s first 11) arrives with Cursor's
+/// value; `CLAUDE_CODE_SDK_READS_STARTUP_MARKS` and
+/// `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` never do (reviewed, never forwarded by
+/// default). The proxy variables' `no_proxy` is `egress::NO_PROXY` (I-R69).
 #[test]
 fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
     use ai_env_cli::bridge::egress::{proxy_url, PROXY_IP, PROXY_PORT};
@@ -1748,8 +1753,11 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
         ("TERM", "xterm-256color"),
         ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
         ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+        ("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"),
         ("MY_FLAG", "on"),
         ("DISABLE_TELEMETRY", "0"),
+        ("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "1"),
+        ("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1"),
         ("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1"),
         ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "1"),
         ("HTTPS_PROXY", "http://proxy.cursor.invalid:8080"),
@@ -1771,7 +1779,7 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
     let mut env = dumps[0].clone();
     let path = env.remove("PATH").expect("the shim's PATH");
     assert!(!path.contains(&rig.root().display().to_string()), "the shim's own PATH, never the wrapper's: {path}");
-    let (proxy, local) = (proxy_url(PROXY_IP, PROXY_PORT), "localhost,127.0.0.1,::1");
+    let (proxy, local) = (proxy_url(PROXY_IP, PROXY_PORT), ai_env_cli::bridge::egress::NO_PROXY);
     let (home, config) = (rig.vm_home().display().to_string(), rig.vm_home().join(".claude").display().to_string());
     let mut want: BTreeMap<String, String> = [
         // The shim's own.
@@ -1798,10 +1806,14 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
     .collect();
     // The env_forward names Cursor set, and env_extra's MY_FLAG (its DISABLE_TELEMETRY is the wrapper's, above).
-    want.extend(cursor[..10].iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())));
+    want.extend(cursor[..11].iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())));
     assert_eq!(env, want, "the VM's environment");
     for refresh in ["CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"] {
         assert!(!env.contains_key(refresh), "{refresh} reached the VM");
+    }
+    // S13 (A6-4, A6-5): the two start-up names are reviewed, never forwarded by default.
+    for startup in ["CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "CLAUDE_CODE_STARTUP_FAILURE_RESULTS"] {
+        assert!(!env.contains_key(startup), "{startup} reached the VM");
     }
     for (name, value) in &dumps[0] {
         assert!(!name.starts_with("AWS_"), "{name} reached the VM");
@@ -1911,6 +1923,115 @@ fn the_fake_emits_its_state_frames_as_claude_2_1_310_does() {
     let want = ["control_response", "system/init", "user", "running", "assistant", "requires_action", "control_request", "control_response", "control_cancel_request", "result", "idle"];
     assert_eq!(kinds, want, "{out:#?}");
     assert_eq!(frames[9]["subtype"].as_str(), Some("error_during_execution"), "the interrupted turn's error result: {}", frames[9]);
+}
+
+/// S13 (A6, §B-away-a6.4): the fake's 2.1.312 frames, as the CLI emits them.
+/// (a) With `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS=1` and a hook
+/// (`FAKE_PROMPT_HOOK`), and `CLAUDE_CODE_SDK_READS_STARTUP_MARKS=1`: the two
+/// start-up marks before the initialize answer, then the turn's hook_started
+/// and hook_response right after its echo, byte for byte (`hook_id` kind 2200,
+/// uuids kinds 2000 and 2100, turn 1 and generation 1, the fixed session).
+/// (b) Without the variable, or without the hook: no hook frame, every other
+/// line as in (a). (c) Without the marks variable: no `keep_alive` line.
+/// (d) A claude that dies before its init prints the first mark first. (e) An
+/// option refused by commander comes before any mark.
+#[test]
+fn the_fake_emits_the_2_1_312_frames() {
+    let sid = common::fake_fixed_sid();
+    let u1 = common::uuid(0x8861);
+    let stdin = format!("{INIT}\n{}\n", user(&u1));
+    let hook = [("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"), ("FAKE_PROMPT_HOOK", "fake-hook")];
+    let marks = ("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "1");
+    let mark = |m: &str| format!(r#"{{"type":"keep_alive","startup_mark":"{m}"}}"#);
+    let hook_started = format!(r#"{{"type":"system","subtype":"hook_started","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","uuid":"00000001-0000-4000-2000-000000000001","session_id":"{sid}"}}"#);
+    let response = format!(
+        r#"{{"type":"system","subtype":"hook_response","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,"outcome":"success","uuid":"00000001-0000-4000-2100-000000000001","session_id":"{sid}"}}"#
+    );
+    // Each run's own: the answer's pid and the init's cwd (a fake of its own per run).
+    let same = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                let mut v: Value = serde_json::from_str(l).unwrap();
+                if v["type"] == "control_response" {
+                    v["response"]["response"]["pid"] = Value::Null;
+                }
+                if v["type"] == "system" && v["subtype"] == "init" {
+                    v["cwd"] = Value::Null;
+                }
+                v.to_string()
+            })
+            .collect()
+    };
+    // (a)
+    let all: Vec<(&str, &str)> = hook.iter().copied().chain([marks]).collect();
+    let f = Fake::new();
+    let (code, out, err) = f.run(&[], &all, &stdin);
+    assert_eq!(code, Some(0), "{err}");
+    let kinds: Vec<String> = json_lines(&out).iter().map(frame_kind).collect();
+    assert_eq!(kinds, ["keep_alive", "keep_alive", "control_response", "system/init", "user", "system/hook_started", "system/hook_response", "assistant", "result"], "{out:#?}");
+    assert_eq!((out[0].as_str(), out[1].as_str()), (mark("action_handler_start").as_str(), mark("stdin_listen_started").as_str()), "the marks, byte for byte");
+    assert_eq!((&out[5], &out[6]), (&hook_started, &response), "the hook frames, byte for byte");
+    // (b) Without the variable, or without the hook: no hook frame, the rest as in (a).
+    for knobs in [vec![("FAKE_PROMPT_HOOK", "fake-hook"), marks], vec![("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"), marks]] {
+        let g = Fake::new();
+        let (code, rest, err) = g.run(&[], &knobs, &stdin);
+        assert_eq!(code, Some(0), "{knobs:?}: {err}");
+        assert!(!rest.iter().any(|l| l.contains("hook_")), "{knobs:?}: {rest:#?}");
+        let mut want = out.clone();
+        want.retain(|l| l != &hook_started && l != &response);
+        assert_eq!(same(&rest), same(&want), "{knobs:?}: every other line as in (a)");
+    }
+    // (c) Without the marks variable: no keep_alive line.
+    let h = Fake::new();
+    let (code, rest, err) = h.run(&[], &hook, &stdin);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(!rest.iter().any(|l| l.contains("keep_alive")), "{rest:#?}");
+    assert_eq!(same(&rest), same(&out[2..]), "the rest as in (a)");
+    // (d) A claude that dies before its init prints the first mark first.
+    let d = Fake::new();
+    let (code, rest, err) = d.run(&[], &[marks, ("FAKE_DIE_BEFORE_INIT", "1")], &stdin);
+    assert_eq!((code, rest), (Some(1), vec![mark("action_handler_start")]));
+    assert!(err.contains("fake claude: died before init"), "{err}");
+    // (e) Commander refuses an unknown option before preAction: no mark.
+    let e = Fake::new();
+    let (code, rest, err) = e.run(&["--verbose"], &[marks, ("FAKE_REJECT_OPTION", "--verbose")], &stdin);
+    assert_eq!((code, rest), (Some(1), Vec::<String>::new()), "{err}");
+}
+
+/// S13 (A6-2): a UserPromptSubmit hook's frames reach the host only when the
+/// wrapper forwards `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS`.
+/// Cursor's environment holds it, and the VM's fake has a hook
+/// (`FAKE_PROMPT_HOOK`, a VM knob): with the default `[wrapper]` one turn's host
+/// lines hold exactly the fake's two hook frames, byte for byte, after the
+/// turn's echo and before its result; with `env_forward = ["LANG"]`, none.
+#[test]
+fn the_prompt_hook_frames_reach_the_host_only_when_forwarded() {
+    let sid = common::fake_fixed_sid();
+    let hook_started = format!(r#"{{"type":"system","subtype":"hook_started","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","uuid":"00000001-0000-4000-2000-000000000001","session_id":"{sid}"}}"#);
+    let response = format!(
+        r#"{{"type":"system","subtype":"hook_response","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,"outcome":"success","uuid":"00000001-0000-4000-2100-000000000001","session_id":"{sid}"}}"#
+    );
+    let envs = [("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"), ("FAKE_PROMPT_HOOK", "fake-hook")];
+    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &envs);
+    started(&mut h);
+    let u = h.send_user("hello");
+    h.expect_out(|v| is_result_for(v, &u), T);
+    closed(&mut h);
+    let lines = h.out_lines();
+    let hooks: Vec<&String> = lines.iter().filter(|l| l.contains("\"hook_event\"")).collect();
+    assert_eq!(hooks, [&hook_started, &response], "{}", h.transcript());
+    let at = |pred: &dyn Fn(&Value) -> bool| lines.iter().position(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| pred(&v))).unwrap_or_else(|| panic!("{}", h.transcript()));
+    let (echo, result) = (at(&|v| is_echo_of(v, &u)), at(&|v| is_result_for(v, &u)));
+    let (first, second) = (lines.iter().position(|l| *l == hook_started).unwrap(), lines.iter().position(|l| *l == response).unwrap());
+    assert!(echo < first && first < second && second < result, "after the echo, before the result: {echo} {first} {second} {result}");
+    let mut p = Harness::prepare();
+    add_config(p.rig(), "[wrapper]\nenv_forward = [\"LANG\"]\n");
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &envs);
+    started(&mut h);
+    turn(&mut h, "hello");
+    closed(&mut h);
+    assert!(!h.out_lines().iter().any(|l| l.contains("hook_event")), "not forwarded, no frame: {}", h.transcript());
 }
 
 /// S12 (R2-1, R2-9): the state frames reach the host only when the wrapper
@@ -5154,6 +5275,67 @@ fn a_cached_claude_dead_before_init_respawns_on_the_live_shim() {
     assert_eq!(row.claude_bad, std::slice::from_ref(&v.sha256));
 }
 
+/// S13 (A6-4, A6-5): the two start-up names Cursor sets never cost S11's start-up respawn: with both in
+/// Cursor's environment and the default `[wrapper]` neither reaches the VM, so the cached claude that dies before
+/// its init (`a_cached_claude_dead_before_init_respawns_on_the_live_shim`'s recipe) still respawns once on the
+/// image's (`respawns:1`, `image(start_failed)`, one `claude_start_failed` naming V's sha256), and no host line
+/// of the chat holds a mark.
+#[test]
+fn the_startup_names_cursor_sets_never_cost_the_start_up_respawn() {
+    let mut p = Harness::prepare();
+    let v = p.rig().stage_claude("2.1.310", &[("FAKE_DIE_BEFORE_INIT", "1")]);
+    let cursor = [("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "1"), ("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1")];
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper_for_bundle(&v.version, &[], &cursor), rig.wrapper_for_bundle(&v.version, &[], &cursor))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    first.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    closed(&mut first);
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    started(&mut second);
+    turn(&mut second, "two");
+    closed(&mut second);
+    let note = end_note_of(&first, second.pid());
+    assert_eq!(part_of(&note, "claude_src").as_deref(), Some("image(start_failed)"), "{note}");
+    assert!(note.split("; ").any(|p| p == "respawns:1"), "{note}");
+    let failed = first.audit_events("claude_start_failed");
+    assert_eq!((failed.len(), failed[0]["detail"]["sha256"].as_str()), (1, Some(v.sha256.as_str())));
+    assert!(!second.out_lines().iter().any(|l| l.contains("startup_mark")), "{}", second.transcript());
+}
+
+/// S13 (A6-4, A6-7): a list that names `CLAUDE_CODE_SDK_READS_STARTUP_MARKS` forwards it, and pays for it: the
+/// same recipe with `[wrapper] env_extra` naming it, the cached claude prints its first mark before it dies, so
+/// the pump counts the generation as started. The second chat's host gets the mark byte for byte, nothing
+/// respawns (`respawns:0`, no `claude_start_failed`), and the wrapper exits with the CLI's own code, 1.
+#[test]
+fn a_startup_mark_the_vm_prints_counts_as_its_start() {
+    let mut p = Harness::prepare();
+    add_config(p.rig(), "[wrapper]\nenv_extra = [\"CLAUDE_CODE_SDK_READS_STARTUP_MARKS\"]\n");
+    let v = p.rig().stage_claude("2.1.310", &[("FAKE_DIE_BEFORE_INIT", "1")]);
+    let cursor = [("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "1"), ("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1")];
+    let (first_cmd, second_cmd) = {
+        let rig = p.rig();
+        (rig.wrapper_for_bundle(&v.version, &[], &cursor), rig.wrapper_for_bundle(&v.version, &[], &cursor))
+    };
+    let mut first = p.launch_wrapper(first_cmd);
+    started(&mut first);
+    turn(&mut first, "one");
+    first.wait_until("V fetched into the VM", T, |h| h.audit_events("claude_fetch").iter().any(|r| r["detail"]["outcome"] == "fetched"));
+    closed(&mut first);
+    let mut second = Harness::prepare().launch_wrapper(second_cmd);
+    let _init = second.send_initialize();
+    let (status, _) = second.wait(EXIT);
+    assert_eq!(status.code(), Some(1), "the CLI's own code: {}", second.transcript());
+    let mark = r#"{"type":"keep_alive","startup_mark":"action_handler_start"}"#;
+    assert!(second.out_lines().iter().any(|l| l == mark), "{}", second.transcript());
+    let note = end_note_of(&first, second.pid());
+    assert!(note.split("; ").any(|p| p == "respawns:0"), "{note}");
+    assert!(first.audit_events("claude_start_failed").is_empty(), "nothing respawned");
+}
+
 /// I1 (A1's cache, A2's stager): `vm warm` stages an admitted, unstaged V, then fetches it into the warmed VM and
 /// says so in a line.
 #[test]
@@ -5720,4 +5902,282 @@ fn i2_a_renamed_remote_chat_moved_and_closed_within_the_budget() {
     assert!(taken == [renamed] || taken == [older, renamed], "the names the row took, by length ({older}: Cursor's, {renamed}: the rename): {taken:?}\n{log}");
     let note = h.end_note();
     assert!(common::note_has(&note, "moves:readdress=1,respawn=0,migrate=0"), "{note}");
+}
+
+// ---- S13 I2 (the lead): WM-J1, a VM chat's relay session token (plans/s13-contracts.md §WM-worker-mac.8.5, §X.3) ----
+
+/// The fake relay client the rig's shims start for a relay session (§V-vm.9): it binds nothing and records, beside
+/// its `--socket` path, its argv, its descriptors, its variables' names and fd 3's bytes (`.session`).
+const RELAY_FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/relay-client.sh");
+/// WM-J1's bridge.toml `[relay].grant`, and this Mac's id (`[relay].worker_id`'s default): the tokens' `kid`.
+const RELAY_GRANT: &str = "default";
+const RELAY_MAC: &str = "mac";
+/// Set on the child of this test binary that runs WM-J1's sessions: a directory the child leaves the minted token
+/// (`token`) and the two spawn ids (`spawns`) in, for the parent's scan of the child's own stderr.
+const WMJ1_CHILD: &str = "AI_ENV_TEST_WMJ1_CHILD";
+
+/// WM-J1's `[vm].max_duration_s`: the VM's wall 2 h after its start, so it bounds the session token's `exp` by
+/// hours below `now + 8 h` (the default 8 h wall is within a second of it), and stays above the default 1200 s
+/// migration margin, so the rig's next chat still reuses the VM.
+const WMJ1_VM_WALL_S: i64 = 7200;
+
+/// WM-J1's relay agent: M's own `ai-env relay agent --hours 1`, run by the rig's `ai-env` (its fake age, its
+/// `AI_ENV_DIR`, its bridge) once `relay keygen` sealed this Mac's keys, its stdout and stderr piped; killed and
+/// reaped when dropped still running (a failed test).
+struct RelayAgent {
+    child: Option<std::process::Child>,
+}
+
+impl RelayAgent {
+    /// The agent started, once its socket (`state/relay-agent.sock`) is there; an agent that ends first fails
+    /// the test with its stderr.
+    fn start(rig: &common::remote::RemoteRig) -> RelayAgent {
+        let socket = rig.paths().relay_agent_socket();
+        let child = rig.ai_env(&["relay", "agent", "--hours", "1"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("ai-env relay agent");
+        let mut agent = RelayAgent { child: Some(child) };
+        let t = std::time::Instant::now();
+        while !socket.exists() {
+            if agent.child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some()) {
+                let out = common::bounded::finish_within(agent.child.take().expect("the agent"), EXIT, "ai-env relay agent");
+                panic!("ai-env relay agent ended ({}) before its socket {}:\n{}", out.status, socket.display(), String::from_utf8_lossy(&out.stderr));
+            }
+            assert!(t.elapsed() < T, "the relay agent's socket {}: not within {T:?}", socket.display());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        agent
+    }
+
+    /// SIGTERM, then its end within [`EXIT`]: its output.
+    fn stop(&mut self) -> std::process::Output {
+        let child = self.child.take().expect("a running relay agent");
+        // SAFETY: kill(2) of our own child, which has not been waited for.
+        assert_eq!(unsafe { libc::kill(i32::try_from(child.id()).expect("a pid"), libc::SIGTERM) }, 0, "SIGTERM to the relay agent");
+        common::bounded::finish_within(child, EXIT, "ai-env relay agent")
+    }
+}
+
+impl Drop for RelayAgent {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The names in `dir` ending `suffix`, sorted; none when `dir` is missing.
+fn names_ending(dir: &Path, suffix: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<String> = entries.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(suffix)).collect();
+    out.sort();
+    out
+}
+
+/// The VM's fake claude's argv log (`<tmp>/argv.log`): each generation's arguments, in spawn order.
+fn argv_generations(root: &Path) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for line in std::fs::read_to_string(root.join("argv.log")).unwrap_or_default().lines() {
+        if line.starts_with("--- gen ") {
+            out.push(Vec::new());
+        } else if let Some(args) = out.last_mut() {
+            args.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// Every regular file under `dir` (links not followed; sockets and FIFOs never opened) whose bytes hold one of
+/// `needles`, sorted.
+fn regular_files_holding(dir: &Path, needles: &[&str]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, needles: &[&str], out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.filter_map(Result::ok) {
+            let path = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(&path, needles, out),
+                Ok(t) if t.is_file() => {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    if needles.iter().any(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes())) {
+                        out.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, needles, &mut out);
+    out.sort();
+    out
+}
+
+/// WM-J1 (with V; §WM-worker-mac.8.5, §X.3). The rig's shim names `relay_v1` (the fake relay client and an MCP
+/// config planted before it: `common::remote::RELAY_CLIENT`), bridge.toml names `[relay] grant = "default"` and
+/// a 2 h VM wall ([`WMJ1_VM_WALL_S`]), `state/relay-ca.der` holds a relay CA W's `certs` made at run time, and
+/// M's own agent ([`RelayAgent`]: `ai-env relay keygen`, then `ai-env relay agent`, with the rig's fake age)
+/// answers on `state/relay-agent.sock`, so its socket, its peer check and its `mint` checks (a live vpc VM whose
+/// gate passed, a grant bridge.toml names, uuids, at least a minute) run on what the wrapper asks for the rig's
+/// real VM. A new chat's spawn asks it once; `session_remote_start` says `relay=minted`, and the agent's stderr
+/// names one mint, for the chat's VM, its spawn and the grant. The relay client the shim starts for the spawn's
+/// leader gets, on fd 3 alone (`PATH` and `LC_ALL` its only variables), the session JSON of a token with the
+/// relay's private face `10.42.0.20:7443`, its name `10.42.0.20` and the CA's DER; the token verifies with the
+/// session key `relay keygen` sealed (as `relay pubkey --session` prints it) and names the VM
+/// (`session_remote_start`'s `id`), the spawn (its `spawn`, the spawn whose pid leads the client), no chat id
+/// (a new chat), the grant, and this Mac (`[relay].worker_id`) as `kid` and `caller_id`; its `exp` is the VM's
+/// wall, hours before `iat + 8 h`; claude's argv[1] is the MCP config. No other file of the rig (argv,
+/// environment and stdin logs, the VM's disk, the audit, the census, the wrapper's log, the sealed keys) and
+/// nothing the wrapper or the agent said holds the token. Then the agent stops (SIGTERM: exit 0, its socket gone,
+/// `0 signed, 1 minted`), and the rig's next chat says `relay=no_agent` with WM-R53's note in the wrapper's log,
+/// and its spawn held no token: no relay client and no `--mcp-config` for it. The in-process shim speaks on this
+/// process's stderr, so the sessions run in a child of this test binary ([`WMJ1_CHILD`]), the parent holding a
+/// rig's share of the binary's wall-clock lane meanwhile: its stderr holds the shim's relay and spawn lines (the
+/// minted spawn's naming its client, the other's none) and never the token.
+#[test]
+fn a_vm_chat_gets_its_session_token_through_the_shim() {
+    use ai_env_cli::bridge::egress::{RELAY_IP, RELAY_PORT};
+    use ai_env_worker::session::{SignerKey, SESSION_AUD, SESSION_MAX_S};
+    use base64::Engine as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(out_dir) = std::env::var_os(WMJ1_CHILD).map(PathBuf::from) else {
+        // The parent: the sessions in a child, then its stderr (the in-process shim's lines) scanned. The child
+        // runs a rig's whole session, so the parent holds a rig's share of the lane meanwhile: no test of this
+        // binary measures a close budget alone beside it.
+        let _share = common::remote::lane_share();
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"));
+        child.args(["--exact", "a_vm_chat_gets_its_session_token_through_the_shim", "--nocapture", "--test-threads=1"]).env(WMJ1_CHILD, dir.path());
+        let out = common::bounded::run_within(child, None, Duration::from_secs(300), "WM-J1's child");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && stdout.contains("1 passed"), "WM-J1's child: {}\n{stdout}\n{stderr}", out.status);
+        let token = read(&dir.path().join("token"));
+        let signature = token.rsplit('.').next().expect("the token's signature");
+        let spawns: Vec<String> = read(&dir.path().join("spawns")).lines().map(str::to_string).collect();
+        assert_eq!(spawns.len(), 2, "{spawns:?}");
+        let line_of = |spawn: &str| stderr.lines().find(|l| l.starts_with(&format!("ai-env: spawn {spawn} pid="))).unwrap_or_else(|| panic!("the shim's spawn line of {spawn}:\n{stderr}")).to_string();
+        let (minted, unminted) = (line_of(&spawns[0]), line_of(&spawns[1]));
+        let client = minted.rsplit_once(" relay=").map(|(_, pid)| pid.to_string()).unwrap_or_else(|| panic!("the minted spawn names its relay client: {minted}"));
+        assert!(stderr.lines().any(|l| l.starts_with(&format!("ai-env: relay {} client pid={client} ", spawns[0]))), "the shim's line of the client it started:\n{stderr}");
+        assert!(!unminted.contains(" relay="), "no relay session, no client: {unminted}");
+        for (name, text) in [("stderr", &stderr), ("stdout", &stdout)] {
+            assert!(!text.contains(token.as_str()) && !text.contains(signature), "the token in the child's {name} (the shim's lines among it):\n{text}");
+        }
+        return;
+    };
+    // The child: the sessions.
+    let t0 = ai_env_cli::wire::time::unix_now();
+    let mut p = Harness::prepare();
+    let client = p.write_file(common::remote::RELAY_CLIENT, &read(Path::new(RELAY_FAKE)));
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).expect("chmod the fake relay client");
+    // macOS assesses a new file's first exec (about 200 ms): here, not while a spawn waits on it (no --socket: 64).
+    assert_eq!(Command::new(&client).stderr(Stdio::null()).status().expect("the fake relay client").code(), Some(64));
+    let config = p.write_file(common::remote::RELAY_MCP_CONFIG, &format!("{}\n", ai_env_cli::wire::relay::MCP_CONFIG_JSON));
+    let (mut agent, session_key, ca_der, env_dump) = {
+        let rig = p.rig();
+        assert!(rig.shim.serves_relay(), "the rig's shim names relay_v1 with its relay files");
+        assert!(rig.fake().health_caps.iter().any(|c| c == ai_env_cli::wire::frame::CAP_RELAY_V1), "and the VM's /health with it");
+        rig.config(|doc| {
+            common::remote::toml_table(doc, "relay").insert("grant".into(), RELAY_GRANT.into());
+            common::remote::toml_table(doc, "vm").insert("max_duration_s".into(), WMJ1_VM_WALL_S.into());
+        });
+        // This Mac's relay keys (no Touch ID), and the session key as their notes hold it (WM-T44's text form).
+        let o = rig.run(&["relay", "keygen"], None);
+        assert!(o.status.success(), "relay keygen: {}\n{}", o.status, String::from_utf8_lossy(&o.stderr));
+        let o = rig.run(&["relay", "pubkey", "--session"], None);
+        assert!(o.status.success(), "relay pubkey --session: {}\n{}", o.status, String::from_utf8_lossy(&o.stderr));
+        let session_key = ai_env_worker::keys::PublicKey::parse_text(String::from_utf8_lossy(&o.stdout).trim()).expect("the sealed session key");
+        let ca = ai_env_worker::certs::relay_ca(t0).expect("a relay CA");
+        let state = rig.bridge().join("state");
+        std::fs::create_dir_all(&state).expect("mkdir state/");
+        std::fs::write(state.join("relay-ca.der"), &ca.cert_der).expect("write state/relay-ca.der");
+        (RelayAgent::start(rig), session_key, ca.cert_der.clone(), rig.vm_env_log().display().to_string())
+    };
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &[("FAKE_ENV_DUMP", env_dump.as_str())]);
+    started(&mut h);
+    turn(&mut h, "hello");
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    let d = &starts[0]["detail"];
+    assert_eq!(d["relay"].as_str(), Some("minted"), "{d}");
+    let (vm, spawn) = (d["id"].as_str().expect("the VM").to_string(), d["spawn"].as_str().expect("the spawn").to_string());
+    // While its CLI lives: the spawn's leader on the VM's shim, and the client the shim started for it.
+    let leader = h.rig().vm_spawns().iter().find(|s| s.spawn_id.to_string() == spawn).map(|s| s.pid).unwrap_or_else(|| panic!("spawn {spawn} on the VM's shim"));
+    let relay_dir = h.rig().vm_root_of(&vm).join("run/ai-env/relay");
+    let sock = relay_dir.join(format!("{leader}.sock"));
+    let fact = |name: &str| PathBuf::from(format!("{}.{name}", sock.display()));
+    wait_for("the relay client's fd 3 recorded", T, || fact("session").exists());
+    closed(&mut h);
+    let rig = h.rig();
+    // The seam: one client, the spawn's leader its --leader, the session on fd 3 alone, nothing in its environment.
+    assert_eq!(names_ending(&relay_dir, ".session"), [format!("{leader}.sock.session")], "one relay client, the spawn's");
+    let uid = rig.shim.opts.uid.to_string();
+    assert_eq!(read(&fact("argv")).lines().collect::<Vec<_>>(), ["serve", "--leader", &leader.to_string(), "--socket", sock.to_str().expect("a UTF-8 path"), "--agent-uid", uid.as_str()]);
+    assert_eq!(read(&fact("fds")).trim(), "3", "fd 3 alone");
+    assert_eq!(read(&fact("env")).lines().collect::<Vec<_>>(), ["LC_ALL", "PATH"], "no token variable");
+    let session: Value = serde_json::from_slice(&std::fs::read(fact("session")).expect("the client's fd 3")).expect("the session JSON");
+    let token = session["token"].as_str().expect("the session's token").to_string();
+    let signature = token.rsplit('.').next().expect("the token's signature").to_string();
+    let ca_b64 = base64::engine::general_purpose::STANDARD.encode(&ca_der);
+    let want = serde_json::json!({ "v": 1, "token": token, "addr": format!("{RELAY_IP}:{RELAY_PORT}"), "server_name": RELAY_IP, "ca_der_b64": ca_b64 });
+    assert_eq!(session, want, "a token, the relay's private face, its name and the CA");
+    assert_eq!((RELAY_IP, RELAY_PORT), ("10.42.0.20", 7443));
+    // The token: the session key `relay keygen` sealed verifies it (the agent's own); it names the VM, the spawn,
+    // no chat id (a new chat), the grant, and this Mac as the agent's `kid` and `caller_id`.
+    let now = ai_env_cli::wire::time::unix_now();
+    let lookup = |kid: &str| (kid == RELAY_MAC).then_some(SignerKey { public_key: session_key, not_after: now + 86_400 });
+    let claims = ai_env_worker::session::verify(&token, now, &lookup).expect("the token verifies with the sealed session key").claims;
+    assert_eq!(ai_env_worker::session::peek(&token).expect("peek"), claims);
+    assert_eq!(
+        (claims.kid.as_str(), claims.aud.as_str(), claims.caller_id.as_str(), claims.vm_id.as_str(), claims.session_id.as_str(), claims.chat_id.as_deref(), claims.grant_id.as_str()),
+        (RELAY_MAC, SESSION_AUD, RELAY_MAC, vm.as_str(), spawn.as_str(), None, RELAY_GRANT)
+    );
+    // Its bounds: `iat` within the chat, `exp` the VM's 2 h wall, which binds it by hours below `iat + 8 h`.
+    let wall = ai_env_cli::bridge::vm::registry::read_row(&rig.paths(), &vm).expect("the registry").expect("the VM's row").wall_deadline.expect("the VM's wall");
+    assert!(t0 <= claims.iat && claims.iat <= now, "iat {} in [{t0}, {now}]", claims.iat);
+    assert!(claims.exp == wall && claims.exp + 3600 < claims.iat + SESSION_MAX_S, "exp {} is the VM's wall {wall}, hours before iat + 8 h ({})", claims.exp, claims.iat + SESSION_MAX_S);
+    // Claude: the MCP config as its argv[1], once.
+    let gens = argv_generations(rig.root());
+    assert_eq!(gens.len(), 1, "one generation: {gens:?}");
+    assert_eq!(gens[0].first().map(String::as_str), Some(format!("--mcp-config={}", config.display()).as_str()), "{gens:?}");
+    assert_eq!(gens[0].iter().filter(|a| a.starts_with("--mcp-config")).count(), 1, "{gens:?}");
+    assert!(gens[0].iter().all(|a| !a.contains(token.as_str())), "the token in claude's argv");
+    let dumps = rig.vm_env_dumps();
+    let names: Vec<Vec<&String>> = dumps.iter().map(|d| d.keys().collect()).collect();
+    assert!(dumps.len() == 1 && dumps[0].contains_key("HOME") && dumps[0].values().all(|v| !v.contains(token.as_str())), "claude's environment (FAKE_ENV_DUMP) holds no token: {names:?}");
+    std::fs::write(out_dir.join("token"), &token).expect("the token for the parent's scan");
+    let note = "relay: no relay agent answers on this Mac (ai-env relay agent): this chat runs without relay tools";
+    assert!(!h.wrapper_log().contains(note), "no WM-R53 note with the agent");
+    // The agent: SIGTERM ends it cleanly, its socket gone; it minted once, for this chat's VM, spawn and grant,
+    // until the token's exp, and said no token.
+    let out = agent.stop();
+    let (agent_out, agent_err) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+    assert_eq!(out.status.code(), Some(0), "ai-env relay agent: {}\n{agent_err}", out.status);
+    assert!(!rig.paths().relay_agent_socket().exists(), "the agent's socket is gone");
+    let mints: Vec<&str> = agent_err.lines().filter(|l| l.contains("minted a session token")).collect();
+    let mint = format!("relay agent: minted a session token for {vm} (spawn {spawn}, grant {RELAY_GRANT}, until {})", ai_env_cli::wire::time::rfc3339_utc(claims.exp));
+    assert_eq!(mints, [mint.as_str()], "one mint, this chat's:\n{agent_err}");
+    assert!(agent_err.contains("relay agent: stopped (0 signed, 1 minted)"), "{agent_err}");
+    for (name, text) in [("stdout", &agent_out), ("stderr", &agent_err)] {
+        assert!(!text.contains(token.as_str()) && !text.contains(signature.as_str()), "the token in the agent's {name}:\n{text}");
+    }
+    // Without the agent: the rig's next chat.
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[], &[]));
+    started(&mut second);
+    closed(&mut second);
+    let starts = h.audit_events("session_remote_start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    let d2 = &starts[1]["detail"];
+    assert_eq!(d2["relay"].as_str(), Some("no_agent"), "{d2}");
+    let (vm2, spawn2) = (d2["id"].as_str().expect("the VM").to_string(), d2["spawn"].as_str().expect("the spawn").to_string());
+    assert!(h.wrapper_log().contains(note), "WM-R53's note in the wrapper's log:\n{}", h.wrapper_log());
+    let gens = argv_generations(rig.root());
+    assert!(gens.len() >= 2 && gens[1..].iter().flatten().all(|a| !a.starts_with("--mcp-config")), "no MCP config without a session: {gens:?}");
+    for dir in [relay_dir.clone(), rig.vm_root_of(&vm2).join("run/ai-env/relay")] {
+        assert_eq!(names_ending(&dir, ".argv"), if dir == relay_dir { vec![format!("{leader}.sock.argv")] } else { Vec::new() }, "no relay client for the token-less spawn ({})", dir.display());
+    }
+    std::fs::write(out_dir.join("spawns"), format!("{spawn}\n{spawn2}\n")).expect("the spawns for the parent");
+    // No file of the rig but the client's fd-3 record holds the token; nothing either wrapper said does.
+    assert_eq!(regular_files_holding(rig.root(), &[token.as_str(), signature.as_str()]), [fact("session")], "the token only where the client's fd 3 was recorded");
+    for text in [h.transcript(), second.transcript()] {
+        assert!(!text.contains(token.as_str()) && !text.contains(signature.as_str()), "the token in a wrapper's output:\n{text}");
+    }
 }

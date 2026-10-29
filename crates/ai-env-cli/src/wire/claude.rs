@@ -639,6 +639,30 @@ mod tests {
         assert_ne!(ChildFrame::Assistant { uuid: None, top_level: true }, ChildFrame::Assistant { uuid: None, top_level: false });
     }
 
+    /// S13 (A6-11, a control): the premises of extension 2.1.312's three names. A `keep_alive` carrying a
+    /// `startup_mark` is `KeepAlive` (A6-4); the CLI's result on a known start-up failure is a plain error
+    /// `Result`, neither a resume miss nor a cut miss (A6-5); a UserPromptSubmit hook's `hook_started` and
+    /// `hook_response` frames are `Other`, forwarded untouched (A6-2). Its uuids are low-entropy placeholders.
+    #[test]
+    fn the_2_1_312_names_frames_classify() {
+        assert_eq!(classify_child(br#"{"type":"keep_alive","startup_mark":"action_handler_start"}"#), ChildFrame::KeepAlive);
+        let failed = br#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"total_cost_usd":0,"usage":{},"modelUsage":{},"permission_denials":[],"errors":["The working directory was deleted"],"startup_failure_reason":"cwd_unavailable","result_index":0,"uuid":"0199a1b2-0000-7000-8000-000000000001","session_id":"0199a1b2-0000-7000-8000-000000000002"}"#;
+        let frame = classify_child(failed);
+        assert_eq!(
+            frame,
+            ChildFrame::Result { subtype: Some("error_during_execution".into()), is_error: true, first_error: Some("The working directory was deleted".into()), user_message_uuid: None, user_message_uuids: vec![] }
+        );
+        assert!(!is_resume_miss(&frame) && !is_cut_miss(&frame));
+        let sid = "00000bee-0000-4000-8000-000000000bee";
+        let started = format!(r#"{{"type":"system","subtype":"hook_started","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","uuid":"00000001-0000-4000-2000-000000000001","session_id":"{sid}"}}"#);
+        let response = format!(
+            r#"{{"type":"system","subtype":"hook_response","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,"outcome":"success","uuid":"00000001-0000-4000-2100-000000000001","session_id":"{sid}"}}"#
+        );
+        for line in [&started, &response] {
+            assert_eq!(classify_child(line.as_bytes()), ChildFrame::Other, "{line}");
+        }
+    }
+
     /// A1: `rate_limit_event` classifies with its info kept raw (B16's
     /// trimmed line, the constructed full one), compared by its text; one
     /// with no info has none; the host never sends one (`Other` there).

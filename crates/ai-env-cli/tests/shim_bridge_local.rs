@@ -4800,7 +4800,7 @@ mod fix_wave_2_gate {
         edit_verified(&w, |v| v.records[0].egress_rule = 0);
         for args in [vec!["vm", "warm", ws.as_str()], vec!["vm", "smoke", "--exec", "--with-credential", "--json"]] {
             let (err, gate) = local_refusal(&w, &args, &token);
-            assert!(err.contains("no credential for a vpc VM of image version 1.0") && err.contains("before the transcript store's cases") && err.contains("run `ai-env egress check`"), "{args:?}: {err}");
+            assert!(err.contains("no credential for a vpc VM of image version 1.0") && err.contains("before the relay path's cases") && err.contains("and the transcript store's (S9)") && err.contains("run `ai-env egress check`"), "{args:?}: {err}");
             assert_eq!((gate["condition"].as_str(), gate["image_version"].as_str(), gate["half"].as_str()), (Some("egress_rule"), Some("1.0"), Some("local")), "{args:?}");
         }
         edit_verified(&w, |v| v.records[0].egress_rule = ai_env_cli::bridge::egress::EGRESS_RULE);

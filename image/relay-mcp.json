@@ -1,0 +1,1 @@
+{"mcpServers":{"ai-env-relay":{"type":"stdio","command":"/usr/local/bin/ai-env-relay-mcp","args":[],"env":{}}}}

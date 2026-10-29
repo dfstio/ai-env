@@ -21,6 +21,9 @@
 //! [`CAP_CLAUDE_STAGE_V1`]), a spawn's staged claudes (`spawn.claude`, sent
 //! only behind `CAP_CLAUDE_STAGE_V1`), and two reply fields a reader may
 //! ignore (`spawned.claude_sha256`, `HealthDetail.claude_cache`).
+//!
+//! S13 (plans/s13-contracts.md §V-vm) adds `relay_v1` ([`CAP_RELAY_V1`]) and a spawn's relay session
+//! (`spawn.relay`, sent only behind it).
 use crate::wire::redact::Secret;
 use crate::wire::workspace::{ClaudeCacheView, ClaudeRef, WorkspaceView};
 use serde::{Deserialize, Serialize};
@@ -152,12 +155,18 @@ pub const CAP_TRANSCRIPT_GZIP_V1: &str = "transcript_gzip_v1";
 /// has a store (the shim is root, or runs with `--fs-root`).
 pub const CAP_CLAUDE_STAGE_V1: &str = "claude_stage_v1";
 
+/// S13 (§V-vm): the shim runs a spawn's relay session (`spawn.relay`): the spawn's relay client as `ai-env-net`,
+/// and a `claude` argv[0] with the image's relay MCP config. Named, with or without a helper, when
+/// `shim::relay::SERVED` holds and the shim found its client and config at start (`ShimState::serves_relay`). The
+/// Mac sends `spawn.relay` only on a socket whose `hello_ok.caps` names it.
+pub const CAP_RELAY_V1: &str = "relay_v1";
+
 /// The stage whose image first names `cap` (what `BridgeError::NoCapability`
 /// and `remote::Failure::OldImage` say an older image predates):
 /// `credential_cache` S7, `workspace_v1` S8, `git_http_v1` and
 /// `transcript_s3_v1` S9, `park_v1` S10, `codeout_manifest_v1`,
-/// `view_parent_v1`, `transcript_gzip_v1` and `claude_stage_v1` S11, any
-/// other `this ai-env`.
+/// `view_parent_v1`, `transcript_gzip_v1` and `claude_stage_v1` S11, `relay_v1`
+/// S13, any other `this ai-env`.
 #[must_use]
 pub fn cap_stage(cap: &str) -> &'static str {
     match cap {
@@ -166,6 +175,7 @@ pub fn cap_stage(cap: &str) -> &'static str {
         CAP_GIT_HTTP_V1 | CAP_TRANSCRIPT_S3_V1 => "S9",
         CAP_PARK_V1 => "S10",
         CAP_CODEOUT_MANIFEST_V1 | CAP_VIEW_PARENT_V1 | CAP_TRANSCRIPT_GZIP_V1 | CAP_CLAUDE_STAGE_V1 => "S11",
+        CAP_RELAY_V1 => "S13",
         _ => "this ai-env",
     }
 }
@@ -546,6 +556,11 @@ pub enum Frame {
         /// shim naming [`CAP_CLAUDE_STAGE_V1`]; left out when empty, so a spawn naming none is written as S10's.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         claude: Vec<ClaudeRef>,
+        /// S13 (§V-vm): the spawn's relay session. The shim starts the spawn's relay client with it and keeps no
+        /// copy; a `claude` argv[0] gets `--mcp-config=<the image's relay config>` as its argv[1]. Sent only to a shim
+        /// naming [`CAP_RELAY_V1`]; left out when `None`, so a spawn without one is written as S12's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay: Option<crate::wire::relay::RelaySpawn>,
     },
     Spawned {
         spawn_id: SpawnId,
@@ -1218,6 +1233,7 @@ mod tests {
                 detach_grace_s: Some(60),
                 credential: None,
                 claude: vec![ClaudeRef { version: "2.1.308".into(), sha256: "5a".repeat(32) }],
+                relay: None,
             },
             Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.308".into()), claude_sha256: Some("5a".repeat(32)) },
             Frame::SpawnErr { spawn_id: sid(), code: SpawnErrCode::Exec, message: "boom".into() },
@@ -1317,7 +1333,7 @@ mod tests {
         let no_cred = Frame::from_json(&format!("{{\"v\":1,\"t\":\"spawn_err\",\"spawn_id\":\"{SID}\",\"code\":\"no_credential\",\"message\":\"m\"}}")).unwrap();
         assert!(matches!(no_cred, Frame::SpawnErr { code: SpawnErrCode::NoCredential, .. }));
         // A spawn naming a credential carries the name only.
-        let spawn = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: Some("X_TOKEN".into()), claude: Vec::new() };
+        let spawn = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: Some("X_TOKEN".into()), claude: Vec::new(), relay: None };
         assert!(spawn.to_json().ends_with(",\"credential\":\"X_TOKEN\"}"), "{}", spawn.to_json());
         // An S6 shim's hello_ok: no caps, no view; and it serialises back without them.
         let s6 = "{\"v\":1,\"t\":\"hello_ok\",\"wire\":1,\"shim_version\":\"0.1.0\",\"claude_version\":null,\"microvm_id\":null,\"image_version\":null,\"boot_nonce\":\"n\",\"owner\":null,\"has_credentials\":false,\"uptime_s\":1,\"run_hook_seen\":true,\"spawns\":[],\"resumed\":[]}";
@@ -1496,6 +1512,36 @@ mod tests {
         assert_eq!(new.caps[..5], h.caps[..], "an S10 shim's list is a prefix of an S11 one's");
     }
 
+    /// S13 (§V-vm, V-R1): S11's `bare` spawn still serializes to its S10 JSON with no `relay` key; one with a relay
+    /// ends with it (last) and round-trips; S12's JSON parses back to `relay: None`; the frame's `Debug` holds no
+    /// token.
+    #[test]
+    fn a_spawn_without_relay_is_written_as_s12s() {
+        let bare = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: Vec::new(), relay: None };
+        let s10_spawn = format!("{{\"v\":1,\"t\":\"spawn\",\"spawn_id\":\"{SID}\",\"argv\":[\"claude\"],\"env\":{{}},\"deliver_secret\":\"fd\",\"detach_grace_s\":900}}");
+        assert_eq!(bare.to_json(), s10_spawn, "no relay key");
+        assert!(matches!(Frame::from_json(&s10_spawn).unwrap(), Frame::Spawn { relay: None, .. }), "an S12 spawn reads as no relay");
+        let token = format!("relay-test-{}", "0199a1b2-0000-7000-8000-00000000000d");
+        let relay = crate::wire::relay::RelaySpawn { token: Secret::new(token.clone()), addr: "10.42.0.20:7443".into(), server_name: "10.42.0.20".into(), ca_der_b64: "MA==".into() };
+        let Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential, claude, .. } = bare else { unreachable!() };
+        let with = Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential, claude, relay: Some(relay) };
+        let json = with.to_json();
+        assert!(json.ends_with(&format!(",\"relay\":{{\"token\":\"{token}\",\"addr\":\"10.42.0.20:7443\",\"server_name\":\"10.42.0.20\",\"ca_der_b64\":\"MA==\"}}}}")), "the relay last: {json}");
+        assert_eq!(Frame::from_json(&json).unwrap(), with, "round-trips");
+        let d = format!("{with:?}");
+        assert!(!d.contains(&token), "{d}");
+    }
+
+    /// S13 (V-R5): `relay_v1`, named by its stage; with S7 to S11's nine, the ten are unique.
+    #[test]
+    fn the_s13_cap_is_named_by_its_stage() {
+        assert_eq!(CAP_RELAY_V1, "relay_v1");
+        assert_eq!(cap_stage(CAP_RELAY_V1), "S13");
+        let all = [CAP_CREDENTIAL_CACHE, CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1, CAP_PARK_V1, CAP_CODEOUT_MANIFEST_V1, CAP_VIEW_PARENT_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_CLAUDE_STAGE_V1, CAP_RELAY_V1];
+        assert_eq!(all.iter().collect::<std::collections::BTreeSet<_>>().len(), 10, "unique");
+        assert_eq!(cap_stage("relay_v2"), "this ai-env");
+    }
+
     /// S11 (A §1.5): `spawn.claude` and `spawned.claude_sha256` are
     /// additive: an S10 `spawned` parses (both fields absent) and is written
     /// back byte for byte; a spawn naming no ref is written as S10's; set,
@@ -1509,12 +1555,12 @@ mod tests {
         let cached = Frame::Spawned { spawn_id: sid(), pid: 42, pgid: 42, claude_version: Some("2.1.308".into()), claude_sha256: Some("5a".repeat(32)) };
         assert!(cached.to_json().ends_with(&format!(",\"claude_version\":\"2.1.308\",\"claude_sha256\":\"{}\"}}", "5a".repeat(32))), "{}", cached.to_json());
         assert_eq!(Frame::from_json(&cached.to_json()).unwrap(), cached);
-        let bare = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: Vec::new() };
+        let bare = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: Vec::new(), relay: None };
         let s10_spawn = format!("{{\"v\":1,\"t\":\"spawn\",\"spawn_id\":\"{SID}\",\"argv\":[\"claude\"],\"env\":{{}},\"deliver_secret\":\"fd\",\"detach_grace_s\":900}}");
         assert_eq!(bare.to_json(), s10_spawn, "no refs: S10's spawn");
         assert_eq!(Frame::from_json(&s10_spawn).unwrap(), bare);
         let refs = vec![ClaudeRef { version: "2.1.308".into(), sha256: "5a".repeat(32) }, ClaudeRef { version: "2.1.307".into(), sha256: "6b".repeat(32) }];
-        let named = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: refs.clone() };
+        let named = Frame::Spawn { spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(900), credential: None, claude: refs.clone(), relay: None };
         let json = named.to_json();
         assert!(json.ends_with(&format!(",\"claude\":[{{\"version\":\"2.1.308\",\"sha256\":\"{}\"}},{{\"version\":\"2.1.307\",\"sha256\":\"{}\"}}]}}", "5a".repeat(32), "6b".repeat(32))), "{json}");
         assert!(matches!(Frame::from_json(&json).unwrap(), Frame::Spawn { claude, .. } if claude == refs));
@@ -1531,7 +1577,7 @@ mod tests {
         let spawned = format!("{:?}", all[4]);
         assert_eq!(spawned, format!("spawned({SID}, pid=42, pgid=42)"));
         let Frame::Spawn { claude, .. } = &all[3] else { panic!("spawn") };
-        let three = Frame::Spawn { claude: vec![claude[0].clone(); 3], spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None };
+        let three = Frame::Spawn { claude: vec![claude[0].clone(); 3], spawn_id: sid(), argv: vec!["claude".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, relay: None };
         assert!(format!("{three:?}").ends_with(", credential=None, claude=3)"), "{three:?}");
     }
 

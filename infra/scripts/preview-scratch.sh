@@ -12,21 +12,23 @@
 #
 # The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
 # the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
-# and name (75 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, S8 operators' 13, the users
+# and name (94 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, S8 operators' 13, the users
 # ai-env-deployer and ai-env-ops, the policies ai-env-deployer and ai-env-ops, the six user policy attachments and
-# the proxy's three SSM documents, and S9's 8, the transcripts bucket with its six settings and the S3 gateway
-# endpoint; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 80), the pinned
+# the proxy's three SSM documents, S9's 8, the transcripts bucket with its six settings and the S3 gateway
+# endpoint, and S13's 19, the relay; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 99), the pinned
 # providers, every egress input and reference, every IAM document (for the caller's account, read once from `aws sts
 # get-caller-identity` into a shell variable), who holds which policy, the documents' content (the files) and no
-# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 30 outputs `ai-env infra
-# status` reads (S5's 14 egress outputs, S8 operators' 11, S9's 5) are checked in the text preview, squidConfSha256 and
-# allowSha256 against the SHA-256 of the planned parameter values, s3EndpointPolicySha256 against the canonical hash of
-# the planned endpoint policy. Then the same plan, rewritten in memory into the
+# update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 40 outputs `ai-env infra
+# status` reads (S5's 14 egress outputs, S8 operators' 11, S9's 5, S13's 10) are checked in the text preview,
+# squidConfSha256 and allowSha256 against the SHA-256 of the planned parameter values, s3EndpointPolicySha256 against
+# the canonical hash of the planned endpoint policy, relayPrivateIp and relayPort against the constants, and
+# relayArtifactSha256 against the binary previewed (S13: unless RELAY_JSON names an existing relay.json, a planted
+# 1 024-byte zero file: a preview uploads nothing, and no cross-build runs). Then the same plan, rewritten in memory into the
 # shape `pulumi preview --json` gives for the stack once it exists (every step same, or the VM subnet, VM security
 # group and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must
 # pass too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same) and
 # as the bootstrap (the stack before S8 operators: no user ai-env-deployer in the old state, the 13 creates, the three
-# deploy policies replaced for their frozen descriptions, which check-plan allows only then: D12), and twenty-one
+# deploy policies replaced for their frozen descriptions, which check-plan allows only then: D12), and twenty-five
 # tampered copies of it must be refused: the deploy policy's CreateNetworkConnector condition or the operator role's
 # Deny naming the proxy subnet, the Deny also on that create step, where its document left unknown is refused too; the
 # connector on the proxy subnet or the proxy's security group, the connector passed another role; ai-env-ops' policy
@@ -36,7 +38,9 @@
 # which the plan check accepts there); the aws provider replaced; ai-env-deploy's attachment binding ai-env-ops; an
 # attachment of the deployer replaced; the user ai-env-deployer replaced; the bootstrap creating ai-env-deployer before
 # its five policies; the status document's content carrying a duplicate key (it parses to the file, but is not the file);
-# MacRuntimePolicy bound to ai-env-ops (the daily key would hold the runtime grants).
+# MacRuntimePolicy bound to ai-env-ops (the daily key would hold the runtime grants); S13: ai-env-ops sending commands to
+# the relay instance, or reading its TLS pair; the relay role without NoOtherDecrypt; the relay's artifact parameter
+# naming another key than the object's.
 # A fresh scratch stack only creates, and a check that saw only creates once
 # refused every deploy after the first. The operator role's Deny is proven compared there only: in a fresh preview its
 # document is unknown (the subnet and group ids are), which the plan check accepts only while a resource it depends
@@ -99,8 +103,16 @@
 #                    S9: the bucket policy built without the S3 gateway endpoint (another endpoint's id in its
 #                    aws:SourceVpce conditions): guard (a known document while the endpoint's id is not), plan (not
 #                    built from the endpoint, by URN; not policies.ts's document)
+#   relay-sg-open    S13: an ingress TCP 7443 from 0.0.0.0/0 added to the relay group's spec: spec, guard, plan
+#   vm-relay-wide    S13: the VM group's rule to the relay widened to the proxy subnet: spec, guard, plan
+#   relay-nacl-wide  S13: the NACL's relay egress entry widened to 10.42.0.0/16: spec, guard, plan
+#   relay-imds       S13: the relay instance's IMDS hop limit 2: guard, plan
+#   relay-eip-elsewhere
+#                    S13: the Elastic IP associated with the proxy instance: plan (the ids are unknown in a preview)
+#   relay-role-widen S13: the relay role's policy reading every parameter under its prefix (<prefix>/*): plan
 #
-# Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), SCRATCH, NEGATIVE, EGRESS_MODE.
+# Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, IMAGE_JSON (absolute), RELAY_JSON (absolute), SCRATCH, NEGATIVE,
+# EGRESS_MODE.
 set -euo pipefail
 
 root=${AI_ENV_REPO_ROOT:?}
@@ -110,7 +122,7 @@ negative=${NEGATIVE:-}
 mode=${EGRESS_MODE:-}
 real_image_json=${IMAGE_JSON:?}
 
-negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset identity-widen document-widen endpoint-on-vm-table endpoint-policy-widen bucket-policy-no-vpce"
+negatives="no-logging no-logging-cast region vm-sg-open private-route nacl-open dns-support-on-in-none-mode stray-rule stray-type late-transform early-transform dns-firewall-qtype miswired iam-widen owned-param-reset identity-widen document-widen endpoint-on-vm-table endpoint-policy-widen bucket-policy-no-vpce relay-sg-open vm-relay-wide relay-nacl-wide relay-imds relay-eip-elsewhere relay-role-widen"
 case " $negatives " in *" $negative "*) ;; *) test -z "$negative" || { echo "preview-scratch: unknown NEGATIVE=$negative ($negatives)" >&2; exit 2; } ;; esac
 case "$mode" in "" | none | firewall) ;; *) echo "preview-scratch: unknown EGRESS_MODE=$mode (none, firewall)" >&2; exit 2 ;; esac
 if [ "$mode" = firewall ] && [ -n "$negative" ]; then echo "preview-scratch: EGRESS_MODE=firewall is a positive preview; run the negatives without it" >&2; exit 2; fi
@@ -157,6 +169,20 @@ if [ ! -f "$image_json" ]; then
     echo "preview-scratch: $real_image_json absent, previewing a dummy zip"
 fi
 export IMAGE_JSON="$image_json"
+# ---- relay.json (S13): the real one when `make relay-artifact` ran, else a planted 1 024-byte zero file (never uploaded) ----
+relay_json=${RELAY_JSON:-}
+if [ -z "$relay_json" ] || [ ! -f "$relay_json" ]; then
+    mkdir -p "$scratch/dummy"
+    head -c 1024 /dev/zero >"$scratch/dummy/ai-env-relay"
+    sha=$(shasum -a 256 "$scratch/dummy/ai-env-relay" | cut -d' ' -f1)
+    printf '{"binary":"%s","sha256":"%s","key":"relay/ai-env-relay-%s","version":"0.0.0-scratch"}\n' "$scratch/dummy/ai-env-relay" "$sha" "${sha:0:16}" \
+        >"$scratch/dummy/relay.json"
+    relay_json="$scratch/dummy/relay.json"
+    echo "preview-scratch: ${RELAY_JSON:-relay.json} absent, previewing a planted relay binary"
+fi
+export RELAY_JSON="$relay_json"
+relay_sha=$(sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p' "$relay_json")
+test -n "$relay_sha" || fail "$relay_json holds no sha256"
 
 cd "$scratch/infra"
 out=$(pulumi stack init scratch --non-interactive 2>&1) || { echo "$out"; fail "pulumi stack init scratch failed"; }
@@ -252,13 +278,19 @@ expect_plan_refusal() {
 # of its supplement replaced) | deployer-replaced (the user ai-env-deployer replaced, delete before replace) |
 # bootstrap-unordered (the bootstrap with ai-env-deployer depending on none of its five policies) |
 # document-duplicate-key (the status document's content with a second runCommand key before its own) |
-# runtime-policy-on-ops (MacRuntimePolicy binds ai-env-ops, by value and by URN).
+# runtime-policy-on-ops (MacRuntimePolicy binds ai-env-ops, by value and by URN) | S13: ops-relay-commands (ai-env-ops may
+# send commands to the relay instance) | ops-reads-tls (it may read the relay's TLS pair) | relay-no-other-decrypt (the
+# relay role without NoOtherDecrypt) | artifact-other-key (the artifact parameter names another key than the object's).
+# The relay's artifact parameter, unknown in a fresh preview (the bucket and the object are created), is rendered from
+# them and $RELAY_JSON, as the program renders it.
 existing_plan() {
     ACCOUNT_ID="$acct" node -e '
 const fs = require("fs");
 const [out, egressConfig, imageConfig, variant] = process.argv.slice(1);
 const pol = require(`${out}/policies.js`);
 const spec = require(`${out}/egress-spec.js`);
+const relaySpec = require(`${out}/relay-spec.js`);
+const relayJson = JSON.parse(fs.readFileSync(process.env.RELAY_JSON, "utf-8"));
 const cfg = spec.loadEgressConfig(egressConfig);
 const img = JSON.parse(fs.readFileSync(imageConfig, "utf-8"));
 const plan = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -291,14 +323,18 @@ const s3EndpointId = ids.get(byName("aws:ec2/vpcEndpoint:VpcEndpoint", spec.NET.
 // The connector ARN (the runtime policy, S7 D5) and the proxy instance id (the ops policy, S8 operators).
 const connectorArn = ids.get(byName("aws-native:lambda:NetworkConnector", cfg.connectorName).urn);
 const proxyInstanceId = ids.get(byName("aws:ec2/instance:Instance", "ai-env-egress-proxy").urn);
+// S13: the id of the relay instance (RelayInstance of the ops policy).
+const relayInstanceId = ids.get(byName("aws:ec2/instance:Instance", spec.NET.relayInstance).urn);
 const names = (subnet) => ({ accountId: acct, region: pol.REGION, bucket, imageName: img.imageName, logGroup: img.logGroup,
-    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg, connectorArn, proxyInstanceId },
+    egress: { ...spec.egressNames(cfg), vmSubnetId: subnet, vmSecurityGroupId: vmSg, connectorArn, proxyInstanceId, relayInstanceId },
     transcriptsBucket: pol.transcriptsBucketName(acct), s3EndpointId });
 const docs = (subnet) => new Map(pol.allPolicies(names(subnet)).map((d) => [d.name, JSON.stringify(d.document)]));
 const good = docs(vmSubnet), bad = docs(proxySubnet);
 // Which document each IAM input is (print-policies names).
-const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust" },
-    "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy", [cfg.operatorRoleName]: "operator" },
+const doc = { "aws:iam/role:Role": { "ai-env-image-build": "build-trust", "ai-env-vm-exec": "execution-trust", [cfg.proxyRoleName]: "proxy-trust", [cfg.operatorRoleName]: "operator-trust",
+        [pol.RELAY_ROLE_NAME]: "relay-trust" },
+    "aws:iam/rolePolicy:RolePolicy": { "ai-env-image-build": "build", "ai-env-vm-exec": "execution", [cfg.proxyRoleName]: "proxy", [cfg.operatorRoleName]: "operator",
+        [pol.RELAY_ROLE_NAME]: "relay" },
     "aws:iam/userPolicy:UserPolicy": { MacRuntimePolicy: "runtime" },
     "aws:iam/policy:Policy": { "ai-env-deploy": "deploy", "ai-env-deploy-egress": "deploy-egress", "ai-env-deploy-dns": "deploy-dns", "ai-env-deployer": "deployer", "ai-env-ops": "ops" },
     // S9: the two resource policies (their `policy` input, as for a role policy).
@@ -310,7 +346,15 @@ const edits = {
     "ops-extras": ["ops", (d) => { statement(d, "WriteSuspendedParameter").Resource = [pol.proxyParameterArn(names(vmSubnet))]; }],
     "ops-any-instance": ["ops", (d) => { statement(d, "ProxyInstance").Resource = [`arn:aws:ec2:${pol.REGION}:${acct}:instance/*`]; }],
     "runtime-widen": ["runtime", (d) => d.Statement.push({ Sid: "Widen", Effect: "Allow", Action: ["*"], Resource: ["*"] })],
+    "ops-relay-commands": ["ops", (d) => statement(d, "ProxyCommands").Resource.push(pol.relayInstanceArn(names(vmSubnet)))],
+    "ops-reads-tls": ["ops", (d) => statement(d, "ReadRelayParameters").Resource.push(pol.relayParameterArn(names(vmSubnet), pol.RELAY_TLS))],
+    "relay-no-other-decrypt": ["relay", (d) => { d.Statement = d.Statement.filter((x) => x.Sid !== "NoOtherDecrypt"); }],
 };
+// S13: the value of the artifact parameter, as relay.ts renders it from the bucket, the key of the object and relay.json.
+const relayObjectKey = byName("aws:s3/bucketObjectv2:BucketObjectv2", spec.NET.relayArtifact).newState.inputs.key;
+const artifactValue = () => variant === "artifact-other-key"
+    ? relaySpec.relayArtifactValue({ bucket, key: "relay/ai-env-relay-ffffffffffffffff", sha256: "f".repeat(64), version: relayJson.version })
+    : relaySpec.relayArtifactValue({ bucket, key: relayObjectKey, sha256: relayJson.sha256, version: relayJson.version });
 const render = (which, text) => {
     const e = edits[variant];
     if (e === undefined || e[0] !== which) return text;
@@ -338,6 +382,7 @@ for (const s of plan.steps) {
         const tampered = (variant === "deploy-proxy-subnet" && which === "deploy") || ((variant === "operator-proxy-subnet" || variant === "operator-new-proxy-subnet") && which === "operator");
         inputs[k] = which && k === iamKey ? render(which, (tampered ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
     }
+    if (st.type === "aws:ssm/parameter:Parameter" && name(s) === spec.NET.relayArtifactParameter) inputs.insecureValue = artifactValue();
     if (st.type === "aws-native:lambda:NetworkConnector") {
         // An ARN cannot be resolved from its two dependencies (the role and its attachment): it is the ARN of the operator role.
         inputs.operatorRole = pol.roleArn(names(vmSubnet), variant === "connector-operator-role" ? "ai-env-vm-exec" : cfg.operatorRoleName);
@@ -462,9 +507,17 @@ case "$negative" in
         operatorRoleArn egressLogGroup dnsMode parameterPrefix squidConfSha256 allowSha256 \
         deployerUserName deployerUserArn opsUserName opsUserArn deployerPolicyArn opsPolicyArn deployEgressPolicyArn deployDnsPolicyArn \
         proxyReloadDocument proxyStatusDocument proxyPatchDocument \
-        transcriptsBucket s3EndpointId s3EndpointPolicySha256 transcriptsBucketPolicySha256 proxyRouteTableId; do
+        transcriptsBucket s3EndpointId s3EndpointPolicySha256 transcriptsBucketPolicySha256 proxyRouteTableId \
+        relayInstanceId relayPrivateIp relayPublicIp relaySecurityGroupId relayRoleArn relayLogGroup relayParameterPrefix relayPort relayArtifactSha256 relayVersion; do
         grep -qE "^ +$k +: " <<<"$outputs" || fail "the preview plans no stack output $k"
     done
+    # S13: the relay's address and port are the constants the VMs' rules and the Mac name; its binary is the one previewed.
+    got=$(sed -n 's/^ *relayPrivateIp *: "\(.*\)"$/\1/p' <<<"$outputs")
+    test "$got" = 10.42.0.20 || fail "output relayPrivateIp (${got:-none}) is not 10.42.0.20"
+    got=$(sed -n 's/^ *relayPort *: \([0-9]*\)$/\1/p' <<<"$outputs")
+    test "$got" = 7443 || fail "output relayPort (${got:-none}) is not 7443"
+    got=$(sed -n 's/^ *relayArtifactSha256 *: "\([0-9a-f]\{64\}\)"$/\1/p' <<<"$outputs")
+    test "$got" = "$relay_sha" || fail "output relayArtifactSha256 (${got:-none}) is not the previewed binary's ($relay_sha)"
     # S9: the endpoint policy's canonical hash (known in a preview: the policy is built from the account) is the planned
     # policy's, as policies.ts computes it (the compiled copy plan_check left).
     got=$(sed -n 's/^ *s3EndpointPolicySha256 *: "\([0-9a-f]\{64\}\)"$/\1/p' <<<"$outputs")
@@ -494,7 +547,8 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
     done
     for v in deploy-proxy-subnet operator-proxy-subnet operator-new-proxy-subnet operator-new-unknown connector-proxy-subnet connector-proxy-sg connector-operator-role \
         ops-runshell ops-extras ops-any-instance ops-attach-admin policy-replaced deployer-detached runtime-widen provider-replaced ops-holds-deploy \
-        attachment-replaced deployer-replaced bootstrap-unordered document-duplicate-key runtime-policy-on-ops; do
+        attachment-replaced deployer-replaced bootstrap-unordered document-duplicate-key runtime-policy-on-ops \
+        ops-relay-commands ops-reads-tls relay-no-other-decrypt artifact-other-key; do
         t2=
         case "$v" in
         deploy-proxy-subnet) t="aws:iam/policy:Policy ai-env-deploy: policy is not policies.ts deployPolicy()" ;;
@@ -530,6 +584,9 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
             t="aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user depends on aws:iam/user:User::ai-env-ops, expected aws:iam/user:User::ai-env-runtime"
             t2="aws:iam/userPolicy:UserPolicy MacRuntimePolicy: user ai-env-ops is not ai-env-runtime"
             ;;
+        ops-relay-commands | ops-reads-tls) t="aws:iam/policy:Policy ai-env-ops: policy is not policies.ts opsPolicy(); a statement differs" ;;
+        relay-no-other-decrypt) t="aws:iam/rolePolicy:RolePolicy ai-env-relay: policy is not policies.ts relayRolePolicy(); missing NoOtherDecrypt" ;;
+        artifact-other-key) t="relay artifact parameter: key relay/ai-env-relay-ffffffffffffffff is not the artifact object's key" ;;
         *) fail "existing stack, $v: no expected refusal" ;;
         esac
         tampered=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
@@ -540,7 +597,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
             echo "existing stack, $v: $diag"
         done
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 30 egress, operator and transcript store outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-one tampered copies were refused)"
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 40 egress, operator, transcript store and relay outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-five tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'
@@ -583,12 +640,12 @@ region)
 vm-sg-open)
     edit_file egress-spec.ts 's|^\( *\)], // scratch:vm-rules$|\1{ direction: "egress", protocol: "tcp", port: 443, peer: { cidr: "0.0.0.0/0" }, description: "open" }], // scratch:vm-rules|'
     grep -qF 'description: "open" }], // scratch:vm-rules' egress-spec.ts || fail "the scratch:vm-rules marker no longer adds a rule to the VM security group"
-    expect_refusal spec "the VM security group allows exactly one rule, egress TCP 3128 to 10.42.0.10/32"
+    expect_refusal spec "the VM security group allows exactly two rules, egress TCP 3128 to 10.42.0.10/32 and TCP 7443 to 10.42.0.20/32"
     no_spec
     expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupEgressRule:SecurityGroupEgressRule ai-env-vm-egress-to-0.0.0.0-0-tcp-443"
     no_guard
     expect_plan_refusal "not in the stack inventory: ai-env-vm-egress-to-0.0.0.0-0-tcp-443" \
-        "ai-env-vm-egress-to-0.0.0.0-0-tcp-443: ai-env-vm-egress egress tcp 443 0.0.0.0/0: the VM security group allows exactly one rule"
+        "ai-env-vm-egress-to-0.0.0.0-0-tcp-443: ai-env-vm-egress egress tcp 443 0.0.0.0/0: the VM security group allows exactly two rules"
     echo "$label: ok (spec, guard and plan each refused an open VM security group)"
     ;;
 private-route)
@@ -605,11 +662,11 @@ private-route)
 nacl-open)
     edit_file egress-spec.ts 's|^\( *\)], // scratch:nacl-egress$|\1{ ruleNo: 200, protocol: "tcp", action: "allow", cidr: "0.0.0.0/0", fromPort: 443, toPort: 443 }], // scratch:nacl-egress|'
     grep -qF 'fromPort: 443, toPort: 443 }], // scratch:nacl-egress' egress-spec.ts || fail "the scratch:nacl-egress marker no longer adds a rule to the VM subnet's NACL"
-    expect_refusal spec "the VM subnet's network ACL must allow exactly one egress rule"
+    expect_refusal spec "the VM subnet's network ACL must allow exactly two egress rules"
     no_spec
-    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/networkAcl:NetworkAcl ai-env-egress-vms: the VM subnet's network ACL must allow exactly one egress rule"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/networkAcl:NetworkAcl ai-env-egress-vms: the VM subnet's network ACL must allow exactly two egress rules"
     no_guard
-    expect_plan_refusal "network ACL ai-env-egress-vms: the VM subnet's network ACL must allow exactly one egress rule"
+    expect_plan_refusal "network ACL ai-env-egress-vms: the VM subnet's network ACL must allow exactly two egress rules"
     echo "$label: ok (spec, guard and plan each refused an extra allow rule on the VM subnet's NACL)"
     ;;
 dns-support-on-in-none-mode)
@@ -744,9 +801,10 @@ miswired)
     # S8 operators: ai-env-ops' document is unknown in this preview as well (accepted while what it depends on is
     # created), so only its URNs tell that it names something other than the proxy instance (any instance, say).
     restore egress.ts
-    edit_file index.ts '/scratch:ops-names/s|pulumi.all(\[names, net.instance.id\])|pulumi.all([names, net.vmSubnet.id])|'
-    grep -qF 'pulumi.all([names, net.vmSubnet.id]).apply(([n, proxyInstanceId]) => ({ // scratch:ops-names' index.ts || fail "the scratch:ops-names marker no longer builds the ops policy from the VM subnet's id"
-    expect_plan_refusal "aws:iam/policy:Policy ai-env-ops: policy does not depend on aws:ec2/instance:Instance::ai-env-egress-proxy"
+    edit_file index.ts '/scratch:ops-names/s|pulumi.all(\[names, net.instance.id, relay.instance.id\])|pulumi.all([names, net.vmSubnet.id, net.vmSubnet.id])|'
+    grep -qF 'pulumi.all([names, net.vmSubnet.id, net.vmSubnet.id]).apply(([n, proxyInstanceId, relayInstanceId]) => ({ // scratch:ops-names' index.ts || fail "the scratch:ops-names marker no longer builds the ops policy from the VM subnet's id"
+    expect_plan_refusal "aws:iam/policy:Policy ai-env-ops: policy does not depend on aws:ec2/instance:Instance::ai-env-egress-proxy" \
+        "aws:iam/policy:Policy ai-env-ops: policy does not depend on aws:ec2/instance:Instance::ai-env-relay"
     echo "$label: ok (the plan check refused swapped route table associations, rules on the wrong group, a self-referencing rule, an operator role Deny built from the proxy subnet and an ops policy built from the VM subnet)"
     ;;
 iam-widen)
@@ -951,5 +1009,64 @@ bucket-policy-no-vpce)
     expect_plan_refusal "aws:s3/bucketPolicy:BucketPolicy ai-env-transcripts: policy does not depend on aws:ec2/vpcEndpoint:VpcEndpoint::ai-env-s3" \
         "aws:s3/bucketPolicy:BucketPolicy ai-env-transcripts: policy is not policies.ts transcriptsBucketPolicy()"
     echo "$label: ok (guard and plan each refused a bucket policy not bound to the S3 gateway endpoint)"
+    ;;
+relay-sg-open)
+    # S13: the relay's private port open to the internet (only the VM group may reach it).
+    edit_file egress-spec.ts 's|^\( *\)], // scratch:relay-rules$|\1{ direction: "ingress", protocol: "tcp", port: 7443, peer: { cidr: "0.0.0.0/0" }, description: "open" }], // scratch:relay-rules|'
+    grep -qF 'description: "open" }], // scratch:relay-rules' egress-spec.ts || fail "the scratch:relay-rules marker no longer adds a rule to the relay security group"
+    expect_refusal spec "ai-env-relay ingress tcp 7443 0.0.0.0/0: the relay security group allows only"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule ai-env-relay-from-0.0.0.0-0-tcp-7443"
+    no_guard
+    expect_plan_refusal "not in the stack inventory: ai-env-relay-from-0.0.0.0-0-tcp-7443" \
+        "ai-env-relay-from-0.0.0.0-0-tcp-7443: ai-env-relay ingress tcp 7443 0.0.0.0/0: the relay security group allows only"
+    echo "$label: ok (spec, guard and plan each refused the relay's private port open to anywhere)"
+    ;;
+vm-relay-wide)
+    # S13: the VM group's rule to the relay widened from its address to the proxy subnet (the proxy's other ports, any host there).
+    edit_file egress-spec.ts '/scratch:vm-relay-rule/s|peer: { cidr: relayCidr(cfg) }|peer: { cidr: cfg.proxySubnetCidr }|'
+    grep -qF 'peer: { cidr: cfg.proxySubnetCidr }, description: "to the relay'"'"'s private port" }, // scratch:vm-relay-rule' egress-spec.ts || fail "the scratch:vm-relay-rule marker no longer widens the VM group's rule to the relay"
+    expect_refusal spec "ai-env-vm-egress egress tcp 7443 10.42.0.0/24: the VM security group allows exactly two rules"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupEgressRule:SecurityGroupEgressRule ai-env-vm-egress-to-10.42.0.0-24-tcp-7443"
+    no_guard
+    expect_plan_refusal "not in the stack inventory: ai-env-vm-egress-to-10.42.0.0-24-tcp-7443" \
+        "ai-env-vm-egress-to-10.42.0.0-24-tcp-7443: ai-env-vm-egress egress tcp 7443 10.42.0.0/24: the VM security group allows exactly two rules"
+    echo "$label: ok (spec, guard and plan each refused the VM group's relay rule widened to the proxy subnet)"
+    ;;
+relay-nacl-wide)
+    # S13: the NACL's relay egress entry widened to the VPC (the entry right above the scratch:nacl-egress marker).
+    edit_file egress-spec.ts '/RELAY_NACL_RULE_NO.*fromPort: cfg.relayPort/s|cidr: relayCidr(cfg)|cidr: "10.42.0.0/16"|'
+    grep -qF 'cidr: "10.42.0.0/16", fromPort: cfg.relayPort, toPort: cfg.relayPort },' egress-spec.ts || fail "the NACL's relay egress entry above scratch:nacl-egress can no longer be widened"
+    expect_refusal spec "the VM subnet's network ACL must allow exactly two egress rules"
+    no_spec
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/networkAcl:NetworkAcl ai-env-egress-vms: the VM subnet's network ACL must allow exactly two egress rules"
+    no_guard
+    expect_plan_refusal "network ACL ai-env-egress-vms: the VM subnet's network ACL must allow exactly two egress rules"
+    echo "$label: ok (spec, guard and plan each refused the NACL's relay entry widened to the VPC)"
+    ;;
+relay-imds)
+    # S13: the relay instance's IMDS reachable through one more hop (a container on it could reach the role).
+    edit_file relay.ts '/scratch:relay-imds/s|httpPutResponseHopLimit: 1|httpPutResponseHopLimit: 2|'
+    grep -qF 'httpPutResponseHopLimit: 2, instanceMetadataTags: "disabled" }, // scratch:relay-imds' relay.ts || fail "the scratch:relay-imds marker no longer raises the relay's hop limit"
+    expect_refusal guard "egress guard (infra/egress.ts) refused aws:ec2/instance:Instance ai-env-relay: metadataOptions must require IMDSv2 with hop limit 1"
+    no_guard
+    expect_plan_refusal 'relay instance IMDS: ["required",2], expected ["required",1]'
+    echo "$label: ok (guard and plan each refused the relay's IMDS hop limit 2)"
+    ;;
+relay-eip-elsewhere)
+    # S13: the relay's Elastic IP on the proxy (every worker would dial the proxy). The ids are unknown in a preview:
+    # only the plan check, by URN, sees it.
+    edit_file relay.ts '/scratch:relay-eip/s|instanceId: instance.id|instanceId: net.instance.id|'
+    grep -qF 'instanceId: net.instance.id }, opts); // scratch:relay-eip' relay.ts || fail "the scratch:relay-eip marker no longer moves the Elastic IP to the proxy"
+    expect_plan_refusal "aws:ec2/eipAssociation:EipAssociation ai-env-relay: instanceId depends on aws:ec2/instance:Instance::ai-env-egress-proxy, expected aws:ec2/instance:Instance::ai-env-relay"
+    echo "$label: ok (the plan check refused the relay's Elastic IP on another instance)"
+    ;;
+relay-role-widen)
+    # S13: the relay role reading every parameter under its prefix (Track B's /ai-env/away/* would be next to it).
+    edit_file relay.ts '/scratch:relay-policy/s|JSON.stringify(relayRolePolicy(n))|JSON.stringify(relayRolePolicy(n)).split(`parameter${n.egress.relayParameterPrefix}/artifact"`).join(`parameter${n.egress.relayParameterPrefix}/*"`)|'
+    grep -qF '/*"`)) }, opts); // scratch:relay-policy' relay.ts || fail "the scratch:relay-policy marker no longer widens the relay role's parameters"
+    expect_plan_refusal "aws:iam/rolePolicy:RolePolicy ai-env-relay: policy is not policies.ts relayRolePolicy(); a statement differs"
+    echo "$label: ok (the plan check refused the relay role widened to every parameter under its prefix)"
     ;;
 esac

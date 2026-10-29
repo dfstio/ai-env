@@ -104,15 +104,16 @@ function sha256Of(bytes: Buffer): string {
 }
 
 /**
- * The upload source: a content-addressed copy `<dir>/<sha256>.zip` of bytes already hashed in memory, created
+ * The upload source: a content-addressed copy `<dir>/<sha256><suffix>` of bytes already hashed in memory, created
  * exclusively (a complete temporary file hard-linked into place, mode 0444) or reused when it is already there as a
  * regular file with the same hash, and hashed again from disk. Why: the FileAsset reads its path again at upload
  * time, and `make image-zip` rewrites image.zip in place; this path is never rewritten, so what was verified is what
- * gets uploaded. The only thing the program writes, also under `pulumi preview`.
+ * gets uploaded. The only thing the program writes, also under `pulumi preview`. S13: the relay's binary too
+ * (relay.ts loadRelayJson, suffix "").
  */
-function uploadCopy(file: string, bytes: Buffer, sha256: string, dir: string): string {
+export function uploadCopy(file: string, bytes: Buffer, sha256: string, dir: string, suffix = ".zip"): string {
     fs.mkdirSync(dir, { recursive: true });
-    const copy = path.join(dir, `${sha256}.zip`);
+    const copy = path.join(dir, `${sha256}${suffix}`);
     if (!fs.existsSync(copy)) {
         const tmp = path.join(dir, `.${sha256}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`);
         try {
@@ -164,6 +165,8 @@ export function loadImageJson(): ImageJson {
 
 export interface Artifacts {
     bucket: aws.s3.Bucket;
+    /** S13: the relay's artifact object is created after it too (relay.ts). */
+    publicAccess: aws.s3.BucketPublicAccessBlock;
     zip: aws.s3.BucketObjectv2;
     logGroup: aws.cloudwatch.LogGroup;
 }
@@ -181,7 +184,7 @@ export function createArtifacts(cfg: ImageConfig, image: ImageJson, tags: Record
     }, { provider, dependsOn: [publicAccess] });
     // Created before the image (D21) so the platform never creates it without retention.
     const logGroup = new aws.cloudwatch.LogGroup("image-log-group", { name: cfg.logGroup, retentionInDays: cfg.logRetentionDays, tags }, { provider });
-    return { bucket, zip, logGroup };
+    return { bucket, publicAccess, zip, logGroup };
 }
 
 export interface ImageDeps {

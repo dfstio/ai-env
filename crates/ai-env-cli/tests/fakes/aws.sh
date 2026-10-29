@@ -78,7 +78,25 @@
 #                          without --overwrite is ParameterAlreadyExists);
 #                          get-parameter --name N and get-parameters --names N…
 #                          answer the real JSON shape (missing names under
-#                          InvalidParameters).
+#                          InvalidParameters); get-parameters takes
+#                          --with-decryption (S13: the relay's reload unit)
+#                          and answers the same.
+#                          S13 (M, §Q.8 F5): a put naming --type keeps it in
+#                          /a/b.type; an overwrite naming another type than
+#                          that file's is HierarchyTypeMismatchException, exit
+#                          254 (the real Parameter Store never changes a
+#                          parameter's type), the value untouched. A put whose
+#                          --value is file:///dev/stdin while
+#                          AWS_CLI_AUTO_PROMPT is on fails, exit 255: the real
+#                          CLI's prompt would read its keystrokes from that
+#                          stdin (no other call models the prompt).
+# S13 (the relay's reload unit, infra/relay/reload.py):
+#   aws s3api get-object --bucket B --key K OUTFILE   FAKE_AWS_S3_DIR/B/K copied to
+#                          OUTFILE (the last argument) with the real answer's
+#                          JSON; missing: NoSuchKey, exit 254. s3api calls are
+#                          pinned as sts: --endpoint-url https://s3.eu-central-1.amazonaws.com,
+#                          a wrong one refused (252), a missing one too with
+#                          FAKE_AWS_PIN_ALL=1.
 # S8 operators (plans/s8-operators-contracts.md §10.1, §10.2). A fake key id is
 # AKIAFAKE and 12 digits; its last four are its tail (9001 the deployer, 9002
 # ops, 9003 runtime).
@@ -174,6 +192,7 @@ endpoint=
 param_name=
 param_value=
 param_value_set=0
+param_type=
 overwrite=0
 names=
 actions=
@@ -184,6 +203,8 @@ doc_set=0
 doc_version=
 params=
 params_set=0
+s3_bucket=
+s3_key=
 multi=
 prev=
 for a in "$@"; do
@@ -213,6 +234,7 @@ $a" ;;
     --endpoint-url) endpoint=$a ;;
     --name) param_name=$a ;;
     --value) param_value=$a; param_value_set=1 ;;
+    --type) param_type=$a ;;
     --region) region=$a ;;
     --user-name) user=$a ;;
     --image-identifier) image=$a ;;
@@ -226,6 +248,8 @@ $a" ;;
     --document-name) doc_name=$a; doc_set=1 ;;
     --document-version) doc_version=$a ;;
     --parameters) params=$a; params_set=1 ;;
+    --bucket) s3_bucket=$a ;;
+    --key) s3_key=$a ;;
   esac
   prev=$a
 done
@@ -237,9 +261,10 @@ want_endpoint=
 case "${1:-}" in
   lambda-core) want_endpoint=https://lambda.eu-central-1.amazonaws.com ;;
   ec2|ssm|logs|cloudtrail|sts|route53resolver) want_endpoint="https://$1.eu-central-1.amazonaws.com" ;;
+  s3api) want_endpoint=https://s3.eu-central-1.amazonaws.com ;;
 esac
 if [ -n "$want_endpoint" ] && [ "$endpoint" != "$want_endpoint" ]; then
-  if [ -n "$endpoint" ] || [ "${1:-}" != sts ] || [ "${FAKE_AWS_PIN_ALL:-0}" = 1 ]; then
+  if [ -n "$endpoint" ] || { [ "${1:-}" != sts ] && [ "${1:-}" != s3api ]; } || [ "${FAKE_AWS_PIN_ALL:-0}" = 1 ]; then
     echo "fake aws: $1 calls must carry --endpoint-url $want_endpoint (got '${endpoint}')" >&2
     exit 252
   fi
@@ -547,6 +572,11 @@ case "${1:-} ${2:-}" in
     if [ -z "${FAKE_AWS_SSM_DIR:-}" ]; then echo "fake aws: FAKE_AWS_SSM_DIR is not set" >&2; exit 2; fi
     f=$(ssm_file "$param_name") || { printf '\nAn error occurred (ValidationException) when calling the PutParameter operation: bad name %s\n' "$param_name" >&2; exit 254; }
     if [ "$param_value_set" != 1 ]; then echo "fake aws: put-parameter needs --value" >&2; exit 252; fi
+    if [ "$param_value" = file:///dev/stdin ]; then
+      case "${AWS_CLI_AUTO_PROMPT:-}" in
+        [Oo][Nn]) echo "fake aws: AWS_CLI_AUTO_PROMPT is on: the prompt would read its keystrokes from stdin, which holds the value" >&2; exit 255 ;;
+      esac
+    fi
     tmp="$f.new.$$"
     mkdir -p "$(dirname "$f")"
     case "$param_value" in
@@ -564,9 +594,15 @@ case "${1:-} ${2:-}" in
       printf '\nAn error occurred (ParameterAlreadyExists) when calling the PutParameter operation: The parameter already exists. To overwrite this value, set the overwrite option in the request to true.\n' >&2
       exit 254
     fi
+    if [ -f "$f" ] && [ -n "$param_type" ] && [ -f "$f.type" ] && [ "$(cat "$f.type")" != "$param_type" ]; then
+      rm -f "$tmp"
+      printf '\nAn error occurred (HierarchyTypeMismatchException) when calling the PutParameter operation: %s is a %s, and a parameter type cannot be changed.\n' "$param_name" "$(cat "$f.type")" >&2
+      exit 254
+    fi
     v=$(( $(cat "$f.version" 2>/dev/null || echo 0) + 1 ))
     mv "$tmp" "$f"
     echo "$v" > "$f.version"
+    if [ -n "$param_type" ]; then printf '%s\n' "$param_type" > "$f.type"; fi
     printf '{\n    "Version": %s,\n    "Tier": "Standard"\n}\n' "$v" ;;
   "ssm get-parameter")
     if [ -z "${FAKE_AWS_SSM_DIR:-}" ]; then echo "fake aws: FAKE_AWS_SSM_DIR is not set" >&2; exit 2; fi
@@ -588,6 +624,22 @@ case "${1:-} ${2:-}" in
       fi
     done
     printf '{\n    "Parameters": [%s],\n    "InvalidParameters": [%s]\n}\n' "$found" "$missing" ;;
+  "s3api get-object")
+    if [ -z "${FAKE_AWS_S3_DIR:-}" ]; then echo "fake aws: FAKE_AWS_S3_DIR is not set" >&2; exit 2; fi
+    for s3_out; do :; done
+    case "$s3_bucket/$s3_key" in
+      /*|*/|*..*|*//*) printf '\nAn error occurred (InvalidRequest) when calling the GetObject operation: bad bucket or key\n' >&2; exit 254 ;;
+    esac
+    case "$s3_out" in
+      ''|--*) echo 'aws: error: the following arguments are required: outfile' >&2; exit 252 ;;
+    esac
+    s3_file="$FAKE_AWS_S3_DIR/$s3_bucket/$s3_key"
+    if [ ! -f "$s3_file" ]; then
+      printf '\nAn error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist.\n' >&2
+      exit 254
+    fi
+    cat "$s3_file" > "$s3_out" || exit 255
+    printf '{\n    "AcceptRanges": "bytes",\n    "ContentLength": %s,\n    "ContentType": "application/octet-stream"\n}\n' "$(wc -c < "$s3_file" | tr -d ' ')" ;;
   *)
     echo "fake aws: unsupported command: $*" >&2
     exit 2 ;;

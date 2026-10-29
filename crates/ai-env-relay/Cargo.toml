@@ -1,0 +1,83 @@
+[package]
+name = "ai-env-relay"
+version.workspace = true
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository.workspace = true
+description = "The ai-env relay: the always-on gRPC rendezvous between data-source workers and MicroVM agents."
+publish = false
+autobins = false
+autotests = false
+autoexamples = false
+
+[lib]
+name = "ai_env_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ai-env-relay"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "relay"
+path = "tests/relay.rs"
+
+[[test]]
+name = "tls"
+path = "tests/tls.rs"
+
+[[test]]
+name = "deploy"
+path = "tests/deploy.rs"
+
+[[test]]
+name = "joint"
+path = "tests/joint.rs"
+
+[[example]]
+name = "dashmap_lint_negative"
+path = "examples/dashmap_lint_negative.rs"
+required-features = ["lint-negative"]
+
+[features]
+# Only for `make lint-negative`: the example that must fail clippy (R-74).
+lint-negative = []
+
+[dependencies]
+ai-env-relay-proto = { workspace = true }
+# The protocol's constants and the handshake transcript (review A-M13: ai_env_source::wire).
+ai-env-source = { workspace = true }
+# W/M's shared formats only (globs, keys, session, policy): no runtime, no tonic channel (WM-I1, WM-I2).
+ai-env-worker = { workspace = true, default-features = false }
+aws-lc-rs = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+hex = { workspace = true }
+ipnet = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true, features = ["server", "codegen"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# WM-J2 (tests/joint.rs): W's runtime, V's client and P's testkit beside the real relay, in the tests' graph only.
+ai-env-relay-client = { workspace = true }
+ai-env-source = { workspace = true, features = ["testkit"] }
+ai-env-worker = { workspace = true, features = ["runtime"] }
+hyper-util = { workspace = true }
+rustls = { workspace = true, features = ["tls12"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tonic = { workspace = true, features = ["server", "codegen", "channel"] }
+tower = { workspace = true, features = ["util"] }

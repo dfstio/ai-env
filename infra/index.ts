@@ -6,7 +6,9 @@
 // policies (the deployer the three deploy policies, its supplement and ai-env-ops; ops ai-env-ops), and the proxy's
 // three SSM documents (egress.ts, from infra/proxy/documents). The account root runs the bootstrap deploy once. S9
 // (plans/s9-plan.md §5) adds the transcript store: the bucket ai-env-transcripts-<acct> with its settings
-// (transcripts.ts) and the S3 gateway endpoint on the proxy's route table (egress.ts), with five outputs.
+// (transcripts.ts) and the S3 gateway endpoint on the proxy's route table (egress.ts), with five outputs. S13
+// (plans/s13-contracts.md §I-infra) adds the relay (relay.ts): an always-on instance in the proxy subnet with an Elastic
+// IP, its role, log group, hash-pinned binary and artifact parameter, the egress rules to its private port, and ten outputs.
 //
 // Why it looks like this: the MicroVM API exists in one region only, so both providers are explicit objects with
 // the region from a constant and the program refuses a stack whose aws:region or aws-native:region says otherwise
@@ -24,6 +26,7 @@ import { assertEgressSpec, assertProxyDocuments, egressNames, egressSpec, loadEg
 import { createIam } from "./iam";
 import { createArtifacts, createImage, loadImageConfig, loadImageJson } from "./image";
 import { Names, PROJECT, REGION, canonicalPolicySha256, transcriptsBucketName } from "./policies";
+import { createRelay, loadRelayJson } from "./relay";
 import { createTranscripts } from "./transcripts";
 
 const stack = pulumi.getStack();
@@ -69,6 +72,8 @@ const guard = guardEgress(egress, imageConfig, documents);
 const envFile = path.join(__dirname, "config", `${stack}.env`);
 const budget = budgetSettings(loadEnvConfig(envFile), envFile);
 const imageJson = loadImageJson();
+// S13: the relay's binary (make relay-artifact), hashed again like the image zip.
+const relayJson = loadRelayJson();
 
 const tags: Record<string, string> = { Project: PROJECT, Stack: stack };
 const awsProvider = new aws.Provider(`aws-${REGION}`, { region: REGION });
@@ -85,6 +90,8 @@ const names: pulumi.Output<Names> = pulumi.all([accountId, artifacts.bucket.buck
 const net = createEgress(egress, guard, names, accountId, documents, tags, { aws: awsProvider, native: nativeProvider });
 // S9: the bucket's policy names the S3 gateway endpoint (its aws:SourceVpce conditions): built from that resource.
 const transcripts = createTranscripts(guard, accountId, net.s3Endpoint.id, tags, awsProvider);
+// S13: the relay, in the proxy subnet beside the proxy.
+const relay = createRelay(egress, guard, names, net, artifacts, relayJson, tags, { aws: awsProvider, native: nativeProvider });
 // The deploy policy (ai-env-deployer's) waits for the VM subnet and security group (its CreateNetworkConnector
 // condition), as does the operator role's Deny in egress.ts (its NotResource).
 const deployNames: pulumi.Output<Names> = pulumi.all([names, net.vmSubnet.id, net.vmSecurityGroup.id]).apply(([n, vmSubnetId, vmSecurityGroupId]) => ({
@@ -97,9 +104,10 @@ const runtimeNames: pulumi.Output<Names> = pulumi.all([names, net.connector.arn]
 }));
 // S8 operators: the ops policy waits for the proxy instance, whose ARN scopes start, stop and SendCommand (never a
 // tag); a replaced proxy gives the policy a new version. `make preview-scratch NEGATIVE=miswired` builds it from another
-// resource's id through the scratch:ops-names marker (check-plan holds the document to that dependency).
-const opsNames: pulumi.Output<Names> = pulumi.all([names, net.instance.id]).apply(([n, proxyInstanceId]) => ({ // scratch:ops-names
-    ...n, egress: { ...n.egress, proxyInstanceId },
+// resource's id through the scratch:ops-names marker (check-plan holds the document to that dependency). S13: and for
+// the relay instance (its start and stop, RelayInstance).
+const opsNames: pulumi.Output<Names> = pulumi.all([names, net.instance.id, relay.instance.id]).apply(([n, proxyInstanceId, relayInstanceId]) => ({ // scratch:ops-names
+    ...n, egress: { ...n.egress, proxyInstanceId, relayInstanceId },
 }));
 const iam = createIam(names, deployNames, runtimeNames, opsNames, tags, awsProvider);
 const image = createImage(imageConfig, REGION, tags, { buildRole: iam.buildRole, buildPolicy: iam.buildPolicy, artifacts }, nativeProvider);
@@ -163,3 +171,15 @@ export const s3EndpointId = net.s3Endpoint.id;
 export const s3EndpointPolicySha256 = net.s3EndpointPolicy.apply(canonicalPolicySha256);
 export const transcriptsBucketPolicySha256 = transcripts.policyDocument.apply(canonicalPolicySha256);
 export const proxyRouteTableId = net.proxyRouteTable.id;
+// S13 (plans/s13-contracts.md §I; `ai-env infra status` records them in state/infra.toml): the relay, names, ids,
+// addresses and its binary's hash only.
+export const relayInstanceId = relay.instance.id;
+export const relayPrivateIp = relay.instance.privateIp;
+export const relayPublicIp = relay.eip.publicIp;
+export const relaySecurityGroupId = net.relaySecurityGroup.id;
+export const relayRoleArn = relay.role.arn;
+export const relayLogGroup = relay.logGroup.name;
+export const relayParameterPrefix = egressConfig.relayParameterPrefix;
+export const relayPort = egressConfig.relayPort;
+export const relayArtifactSha256 = relayJson.sha256;
+export const relayVersion = relayJson.version;

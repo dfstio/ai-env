@@ -287,6 +287,33 @@ impl Paths {
         self.root.join("state").join("egress.lock")
     }
 
+    /// `credentials/relay-worker.env` (S13, LD-WM1): this Mac's two relay keys, its worker key and its session
+    /// key, in one container (`ai-env relay keygen`; one unseal, one Touch ID, for `ai-env relay agent`).
+    #[must_use]
+    pub fn relay_worker_env(&self) -> PathBuf {
+        self.credentials().join("relay-worker.env")
+    }
+
+    /// `state/relay-agent.sock` (S13, WM-R38): `ai-env relay agent`'s socket (0600), where workers on this Mac
+    /// get their handshakes signed and the remote spawns their session tokens minted.
+    #[must_use]
+    pub fn relay_agent_socket(&self) -> PathBuf {
+        self.root.join("state").join(ai_env_worker::agent::AGENT_SOCKET_FILE)
+    }
+
+    /// `state/relay-agent.lock` (S13): taken without waiting by `ai-env relay agent`, held for its life: one agent at a time.
+    #[must_use]
+    pub fn relay_agent_lock(&self) -> PathBuf {
+        self.root.join("state").join("relay-agent.lock")
+    }
+
+    /// `state/relay.lock` (S13, WM-R42): held by `ai-env relay allow|revoke|grant` around every read-modify-write
+    /// of the relay's lists.
+    #[must_use]
+    pub fn relay_lock(&self) -> PathBuf {
+        self.root.join("state").join("relay.lock")
+    }
+
     /// `state/creds.toml`: what is known against sealed credential containers
     /// (S7: a setup-token Anthropic refused, by seal id).
     #[must_use]
@@ -740,6 +767,8 @@ impl Default for WrapperCfg {
                 // S12 (R2): the question tool's preview format and the SDK's session-state frames, as the extension sets them.
                 "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
                 "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+                // S13 (A6): a UserPromptSubmit hook's hook_started and hook_response frames, as extension 2.1.312 sets it.
+                "CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS",
                 "LANG",
                 "TERM",
             ]
@@ -825,6 +854,9 @@ pub struct WorkspaceCfg {
     /// VM checks out uncommitted (default true); `box seed --no-wip`
     /// overrides it for one seed.
     pub seed_wip: bool,
+    /// S13 (WM-R46): the grant a remote chat's relay session token names in this workspace, over
+    /// `[relay].grant`; `""` gives its chats no token.
+    pub relay_grant: Option<String>,
 }
 
 impl Default for WorkspaceCfg {
@@ -837,6 +869,7 @@ impl Default for WorkspaceCfg {
             seed_allow_dirty: None,
             trust_repo_settings: false,
             seed_wip: true,
+            relay_grant: None,
         }
     }
 }
@@ -1202,6 +1235,50 @@ pub struct BridgeConfig {
     pub transcript: TranscriptCfg,
     /// S11: `[claude]`, how this Mac follows the Claude Code versions Cursor installs.
     pub claude: ClaudeCfg,
+    /// S13: `[relay]`, this Mac's side of the relay.
+    pub relay: RelayCfg,
+}
+
+/// `[relay]` (S13): this Mac's side of the relay. Checked by [`RelayCfg::validate`] where it is used (`ai-env
+/// relay keygen|pubkey|agent`, the spawn's token), never by [`BridgeConfig::parse`], as [`TranscriptCfg`] is
+/// (WM-R46).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RelayCfg {
+    /// This Mac's id: its worker's id in /ai-env/relay/workers, its token signer's id, its tokens' caller_id.
+    pub worker_id: String,
+    /// The grant a remote chat's session token names unless its [[workspace]] names relay_grant; empty: no token.
+    pub grant: String,
+    /// relay agent's life in hours, 1 to 24.
+    pub agent_hours: u32,
+}
+
+impl Default for RelayCfg {
+    fn default() -> Self {
+        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12 }
+    }
+}
+
+impl RelayCfg {
+    /// The longest life `ai-env relay agent` takes (LD-WM13: an unsealed key should not outlive a working day).
+    pub const AGENT_HOURS_MAX: u32 = 24;
+
+    /// `worker_id` an id, `grant` empty or an id (WM-R1: 1 to 64 of `[a-z0-9._-]`, starting with `[a-z0-9]`),
+    /// `agent_hours` 1 to 24; else `Config` naming the key (exit 1).
+    pub fn validate(&self) -> Result<(), BridgeError> {
+        use ai_env_worker::globs::valid_id;
+        let rule = ai_env_worker::ai_env_source::names::NAME_RULE;
+        if !valid_id(&self.worker_id) {
+            return Err(BridgeError::Config(format!("[relay].worker_id = {:?} is not an id ({rule})", crate::wire::redact::scrub(&self.worker_id))));
+        }
+        if !self.grant.is_empty() && !valid_id(&self.grant) {
+            return Err(BridgeError::Config(format!("[relay].grant = {:?} is not an id ({rule}; empty: no token)", crate::wire::redact::scrub(&self.grant))));
+        }
+        if !(1..=Self::AGENT_HOURS_MAX).contains(&self.agent_hours) {
+            return Err(BridgeError::Config(format!("[relay].agent_hours = {} is outside 1..={}", self.agent_hours, Self::AGENT_HOURS_MAX)));
+        }
+        Ok(())
+    }
 }
 
 /// `[claude]` (S11): how this Mac follows the Claude Code versions Cursor installs.
@@ -1366,6 +1443,38 @@ mod tests {
         assert!(BridgeConfig::parse("[claude]\n").unwrap().claude.auto_admit, "an empty table keeps the default");
         assert!(BridgeConfig::parse("[claude]\nkeep = 3\n").is_err(), "the keep counts are constants, not keys");
         assert!(BridgeConfig::parse("[claude]\nauto_admit = \"yes\"\n").is_err());
+    }
+
+    /// S13 (WM-T34, WM-R46): `[relay]` defaults to the worker id `mac`, no grant and a 12 h agent, with no table;
+    /// its keys and a workspace's `relay_grant` read back; an unknown `[relay]` key refuses the file; `validate`,
+    /// never the parse, refuses a worker id or a grant that is not an id and hours outside 1 to 24, naming the
+    /// key; the four paths sit under the root.
+    #[test]
+    fn the_relay_section_parses_and_validates() {
+        let d = BridgeConfig::parse("").unwrap().relay;
+        assert_eq!((d.worker_id.as_str(), d.grant.as_str(), d.agent_hours), ("mac", "", 12));
+        assert_eq!(d, RelayCfg::default());
+        d.validate().unwrap();
+        let cfg = BridgeConfig::parse("[relay]\nworker_id = \"mac-b\"\ngrant = \"default\"\n\n[[workspace]]\npath = \"/w\"\nrelay_grant = \"\"\n").unwrap();
+        assert_eq!((cfg.relay.worker_id.as_str(), cfg.relay.grant.as_str(), cfg.relay.agent_hours), ("mac-b", "default", 12));
+        assert_eq!(cfg.workspace_overrides[0].relay_grant.as_deref(), Some(""), "a workspace's own empty grant: no token");
+        cfg.relay.validate().unwrap();
+        assert_eq!(BridgeConfig::parse("[[workspace]]\npath = \"/w\"\n").unwrap().workspace_overrides[0].relay_grant, None);
+        assert!(BridgeConfig::parse("[relay]\nworker = \"mac\"\n").is_err(), "an unknown [relay] key");
+        for (body, key) in [("worker_id = \"A\"", "[relay].worker_id"), ("grant = \"a b\"", "[relay].grant"), ("agent_hours = 0", "[relay].agent_hours"), ("agent_hours = 25", "[relay].agent_hours")] {
+            let r = BridgeConfig::parse(&format!("[relay]\n{body}\n")).unwrap_or_else(|e| panic!("{body}: the parse never validates [relay]: {e}")).relay;
+            let e = r.validate().unwrap_err();
+            assert!(matches!(&e, BridgeError::Config(m) if m.starts_with(key)), "{body}: {e}");
+            assert_eq!(crate::errors::CliError::from(e).exit_code(), 1, "{body}");
+        }
+        for ok in ["agent_hours = 1", "agent_hours = 24", "grant = \"example-grant\"", "worker_id = \"w1\""] {
+            BridgeConfig::parse(&format!("[relay]\n{ok}\n")).unwrap().relay.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        let p = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        assert_eq!(p.relay_worker_env(), PathBuf::from("/r/credentials/relay-worker.env"));
+        assert_eq!(p.relay_agent_socket(), PathBuf::from("/r/state/relay-agent.sock"));
+        assert_eq!(p.relay_agent_lock(), PathBuf::from("/r/state/relay-agent.lock"));
+        assert_eq!(p.relay_lock(), PathBuf::from("/r/state/relay.lock"));
     }
 
     /// S10 (§5): `max_readdress` (3), `park` (on) and `park_after_s` (unset:

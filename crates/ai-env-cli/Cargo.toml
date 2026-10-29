@@ -266,6 +266,9 @@ bridge = [
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
+    # S13 (M): the relay's shared formats (keys, session tokens, the lists, the agent's protocol, the
+    # certificates); never the worker runtime (`make check-features`, B-11)
+    "dep:ai-env-worker",
     "tokio-tungstenite/connect",
     # This feature is the only public way to obtain `Connector::Rustls`; it pulls
     # webpki-roots 0.26 (a re-export of the pinned 1.0.9) which tls.rs never uses —
@@ -311,6 +314,8 @@ aws-config = { workspace = true, optional = true }
 aws-sdk-lambdamicrovms = { workspace = true, optional = true }
 aws-smithy-http-client = { workspace = true, optional = true } # built by src/bridge/tls.rs only (`make lint` greps)
 aws-sigv4 = { workspace = true, optional = true } # S7: GetNetworkConnector, the one call the SDK does not model
+# S13 (M): `default-features = false` in the workspace entry: the shared formats, never the runtime
+ai-env-worker = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
@@ -324,3 +329,8 @@ nix = { workspace = true, optional = true } # S3 PID-1 init, signals, prctl
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# S13 (I2, WM-J3 and WM-J4: tests/infra/relay_joint.rs): the relay, the VM's relay client and the worker runtime,
+# in the tests only; never in ai-env-cli's normal graphs (`make check-features`)
+ai-env-relay = { workspace = true }
+ai-env-relay-client = { workspace = true }
+ai-env-worker = { workspace = true, features = ["runtime"] }

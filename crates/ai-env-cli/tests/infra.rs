@@ -30,3 +30,9 @@ mod image;
 mod identity;
 #[path = "infra/handover.rs"]
 mod handover;
+#[path = "infra/relay.rs"]
+mod relay;
+#[path = "infra/relay_mac.rs"]
+mod relay_mac;
+#[path = "infra/relay_joint.rs"]
+mod relay_joint;

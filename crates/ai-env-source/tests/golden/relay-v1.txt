@@ -1,0 +1,134 @@
+file ai_env/relay/v1/relay.proto package ai_env.relay.v1 syntax proto3
+message RelayFrame
+field RelayFrame.challenge 1 Challenge oneof msg
+field RelayFrame.auth_ok 2 AuthOk oneof msg
+field RelayFrame.invoke 3 Invoke oneof msg
+field RelayFrame.cancel 4 Cancel oneof msg
+field RelayFrame.ping 5 Ping oneof msg
+field RelayFrame.close 6 Close oneof msg
+message WorkerFrame
+field WorkerFrame.hello 1 Hello oneof msg
+field WorkerFrame.auth_proof 2 AuthProof oneof msg
+field WorkerFrame.catalog 3 Catalog oneof msg
+field WorkerFrame.chunk 4 Chunk oneof msg
+field WorkerFrame.pong 5 Pong oneof msg
+message Challenge
+field Challenge.nonce 1 bytes
+field Challenge.relay_id 2 string
+field Challenge.protocol 3 uint32
+message Hello
+field Hello.worker_id 1 string
+field Hello.alg 2 SigAlg
+field Hello.public_key 3 bytes
+field Hello.protocol 4 uint32
+field Hello.sdk_version 5 string
+message AuthProof
+field AuthProof.signature 1 bytes
+message AuthOk
+field AuthOk.tunnel_id 1 string
+field AuthOk.whitelist_version 2 uint64
+message Invoke
+field Invoke.request_id 1 string
+field Invoke.source 2 string
+field Invoke.op 3 string
+field Invoke.params_json 4 bytes
+field Invoke.caller 5 Caller
+field Invoke.deadline_ms 6 uint32
+field Invoke.limits 7 Limits
+message Caller
+field Caller.caller_id 1 string
+field Caller.session_id 2 string
+field Caller.grant_id 3 string
+field Caller.vm_id 4 string
+message Limits
+field Limits.max_bytes 1 uint64
+field Limits.max_rows 2 uint32
+field Limits.max_chunks 3 uint32
+message Cancel
+field Cancel.request_id 1 string
+field Cancel.reason 2 string
+message Ping
+field Ping.seq 1 uint64
+message Pong
+field Pong.seq 1 uint64
+message Close
+field Close.code 1 uint32
+field Close.reason 2 string
+message Catalog
+field Catalog.sources 1 SourceDescriptor repeated
+message SourceDescriptor
+field SourceDescriptor.name 1 string
+field SourceDescriptor.version 2 string
+field SourceDescriptor.description 3 string
+field SourceDescriptor.kind 4 SourceKind
+field SourceDescriptor.env 5 string
+field SourceDescriptor.sensitivity 6 Sensitivity
+field SourceDescriptor.ops 7 OpDescriptor repeated
+message OpDescriptor
+field OpDescriptor.name 1 string
+field OpDescriptor.description 2 string
+field OpDescriptor.params_json_schema 3 string
+field OpDescriptor.output 4 OutputKind
+field OpDescriptor.read_only 5 bool
+field OpDescriptor.default_limits 6 Limits
+field OpDescriptor.max_limits 7 Limits
+field OpDescriptor.examples 8 string repeated
+message Error
+field Error.code 1 int32
+field Error.message 2 string
+message Chunk
+field Chunk.request_id 1 string
+field Chunk.seq 2 uint64
+field Chunk.data 3 bytes
+field Chunk.content_type 4 string
+field Chunk.final 5 bool
+field Chunk.error 6 Error
+field Chunk.truncated 7 bool
+message ListSourcesRequest
+message SourceStatus
+field SourceStatus.descriptor 1 SourceDescriptor
+field SourceStatus.available 2 bool
+field SourceStatus.last_seen_unix_ms 3 int64
+message ListSourcesResponse
+field ListSourcesResponse.sources 1 SourceStatus repeated
+message CallRequest
+field CallRequest.source 1 string
+field CallRequest.op 2 string
+field CallRequest.params_json 3 bytes
+field CallRequest.deadline_ms 4 uint32
+field CallRequest.limits 5 Limits
+message CallChunk
+field CallChunk.request_id 1 string
+field CallChunk.seq 2 uint64
+field CallChunk.data 3 bytes
+field CallChunk.content_type 4 string
+field CallChunk.final 5 bool
+field CallChunk.error 6 Error
+field CallChunk.truncated 7 bool
+enum SigAlg
+value SigAlg.SIG_ALG_UNSPECIFIED 0
+value SigAlg.SIG_ALG_ED25519 1
+enum SourceKind
+value SourceKind.SOURCE_KIND_UNSPECIFIED 0
+value SourceKind.SOURCE_KIND_SQL 1
+value SourceKind.SOURCE_KIND_HTTP_API 2
+value SourceKind.SOURCE_KIND_GRPC_API 3
+value SourceKind.SOURCE_KIND_LOGS 4
+value SourceKind.SOURCE_KIND_METRICS 5
+value SourceKind.SOURCE_KIND_HOST_STATS 6
+value SourceKind.SOURCE_KIND_OTHER 7
+enum Sensitivity
+value Sensitivity.SENSITIVITY_UNSPECIFIED 0
+value Sensitivity.SENSITIVITY_PUBLIC 1
+value Sensitivity.SENSITIVITY_INTERNAL 2
+value Sensitivity.SENSITIVITY_RESTRICTED 3
+enum OutputKind
+value OutputKind.OUTPUT_KIND_UNSPECIFIED 0
+value OutputKind.OUTPUT_KIND_JSON 1
+value OutputKind.OUTPUT_KIND_TEXT 2
+value OutputKind.OUTPUT_KIND_STREAM 3
+service WorkerTunnel
+method WorkerTunnel/Open stream WorkerFrame stream RelayFrame
+service Relay
+method Relay/ListSources ListSourcesRequest ListSourcesResponse
+method Relay/Call CallRequest stream CallChunk

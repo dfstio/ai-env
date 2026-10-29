@@ -206,7 +206,7 @@ impl Rig {
 /// Spawn `argv` naming `refs` on `w`: its id and its `spawned`'s claude version and sha256.
 async fn spawn_claude(w: &mut Ws, argv: &[&str], refs: Vec<ClaudeRef>) -> (SpawnId, Option<String>, Option<String>) {
     let id = SpawnId::new_v7();
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: refs };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: refs, relay: None };
     send_frame(w, &spawn).await;
     match next_frame(w).await {
         Ok(Frame::Spawned { spawn_id, claude_version, claude_sha256, .. }) if spawn_id == id => (id, claude_version, claude_sha256),

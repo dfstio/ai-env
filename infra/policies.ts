@@ -32,6 +32,14 @@
 // the S3 gateway endpoint's (s3EndpointPolicy: our `v1/*` for the runtime user only, plus the AL2023 repository bucket
 // the proxy's dnf reads) and the bucket's own, Deny only (transcriptsBucketPolicy). Their canonical hashes
 // (canonicalPolicySha256) are stack outputs, which `ai-env egress status` compares with the live documents.
+//
+// S13 (plans/s13-contracts.md §I-infra.4.6) adds the relay: its role ai-env-relay (relayTrustPolicy, EC2 only;
+// relayRolePolicy: its five parameters by name, the decryption of its TLS pair alone, its binary in the artifacts
+// bucket, its log group; the AWS managed SSM agent policy beside it), a third statement of the S3 gateway endpoint's
+// policy (the relay role's binary through the endpoint), the deployer's rights to build it (the Elastic IP, the VM
+// subnet's NACL entries, its parameters, log group, instance profile and role) and ai-env-ops' (start, stop, its
+// non-secret parameters and its log group: never the TLS pair, never a command or a session). Its root units read
+// the parameters and ship the logs; the internet-facing relay process holds no credential at all (LD-I2).
 
 import * as crypto from "crypto";
 
@@ -120,6 +128,16 @@ export const AL2023_REPO_BUCKET = "al2023-repos-eu-central-1-de612dc2";
 /** S9: the S3 gateway endpoint's service in the region. */
 export const S3_ENDPOINT_SERVICE = "com.amazonaws.eu-central-1.s3";
 
+/** S13: the relay's role and instance profile, named by the stack (LD-I1). */
+export const RELAY_ROLE_NAME = "ai-env-relay";
+export const RELAY_INSTANCE_PROFILE_NAME = "ai-env-relay";
+/** S13: the relay's binary in the artifacts bucket, `relay/ai-env-relay-<sha256[:16]>` (`make relay-artifact`). */
+export const RELAY_KEY_PREFIX = "relay/ai-env-relay-";
+/** S13: what the relay's reload unit fetches (infra/relay/reload.py PARAMETERS, same order); `tls` alone is a SecureString. */
+export const RELAY_PARAMETERS = ["artifact", "workers", "grants", "token-signers", "tls"] as const;
+export type RelayParameter = (typeof RELAY_PARAMETERS)[number];
+export const RELAY_TLS: RelayParameter = "tls";
+
 /** S9: the transcripts bucket of `accountId`. */
 export function transcriptsBucketName(accountId: string): string {
     return `${TRANSCRIPTS_BUCKET_PREFIX}${accountId}`;
@@ -186,6 +204,14 @@ export interface EgressNames {
      * instance into ops' reach), so the ops policy gets a new version whenever the proxy is replaced.
      */
     proxyInstanceId?: string;
+    /** S13: the relay's SSM prefix and log group (egress-config.json). */
+    relayParameterPrefix: string;
+    relayLogGroup: string;
+    /**
+     * S13: the relay instance's id, which exists only once the stack created it: opsPolicy's RelayInstance scopes
+     * start and stop to exactly this instance's ARN, as ProxyInstance does the proxy's.
+     */
+    relayInstanceId?: string;
 }
 
 export interface Names {
@@ -265,6 +291,23 @@ export function proxyInstanceArn(n: Names): string {
     return `arn:aws:ec2:${n.region}:${n.accountId}:instance/${id}`;
 }
 
+/** S13: a relay parameter, `arn:aws:ssm:<region>:<acct>:parameter<relayParameterPrefix>/<name>` (`*` for all of them). */
+export function relayParameterArn(n: Names, name: string): string {
+    return `arn:aws:ssm:${n.region}:${n.accountId}:parameter${n.egress.relayParameterPrefix}/${name}`;
+}
+
+/** S13: the relay's log group and its `:*`. */
+export function relayLogGroupArns(n: Names): string[] {
+    return groupArns(n, n.egress.relayLogGroup);
+}
+
+/** S13: the relay instance's ARN (opsPolicy's RelayInstance); throws without the instance id. */
+export function relayInstanceArn(n: Names): string {
+    const id = n.egress.relayInstanceId;
+    if (id === undefined) throw new Error("opsPolicy: the relay instance id is required (RelayInstance)");
+    return `arn:aws:ec2:${n.region}:${n.accountId}:instance/${id}`;
+}
+
 /** An IAM user of this account. */
 export function userArn(n: Names, user: string): string {
     return `arn:aws:iam::${n.accountId}:user/${user}`;
@@ -337,6 +380,39 @@ export function proxyRolePolicy(n: Names): PolicyDocument {
         { Sid: "ReadProxyParameters", Effect: "Allow", Action: ["ssm:GetParameter", "ssm:GetParameters"], Resource: [proxyParameterArn(n)] }, // scratch:proxy-policy
         {
             Sid: "WriteSquidLogs", Effect: "Allow", Resource: egressLogGroupArns(n),
+            Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+        },
+    );
+}
+
+/** S13: trust of the relay's role ai-env-relay: EC2 only, through the instance profile. */
+export function relayTrustPolicy(): PolicyDocument {
+    return doc({ Sid: "Ec2Relay", Effect: "Allow", Principal: { Service: EC2_SERVICE }, Action: ["sts:AssumeRole"] });
+}
+
+/**
+ * S13: the relay role's inline policy (next to SSM_INSTANCE_POLICY_ARN), for its root units only: the reload unit's one
+ * get-parameters of its five parameters by name (never by path: a later /ai-env/relay/* stays out of reach), the
+ * decryption of the TLS pair through SSM, its binary in the artifacts bucket, and its log group (the CloudWatch agent).
+ * The Deny is what restricts the decryption: aws/ssm's key policy admits every principal of the account through SSM,
+ * so an Allow alone would add nothing; the Allow keeps the role working if the key ever becomes a customer managed one.
+ * No MicroVM, connector, iam:, ec2:, ssm:PutParameter, ssm:SendCommand or S3 write right (plan §A4: none in Track A).
+ */
+export function relayRolePolicy(n: Names): PolicyDocument {
+    const key = relayParameterArn(n, RELAY_TLS);
+    return doc(
+        { Sid: "ReadRelayParameters", Effect: "Allow", Action: ["ssm:GetParameters"], Resource: RELAY_PARAMETERS.map((p) => relayParameterArn(n, p)) },
+        {
+            Sid: "DecryptTheTlsKey", Effect: "Allow", Action: ["kms:Decrypt"], Resource: [`arn:aws:kms:${n.region}:${n.accountId}:key/*`],
+            Condition: { StringEquals: { "kms:EncryptionContext:PARAMETER_ARN": key, "kms:ViaService": `ssm.${n.region}.amazonaws.com` } },
+        },
+        { Sid: "NoOtherDecrypt", Effect: "Deny", Action: ["kms:Decrypt"], Resource: ["*"], Condition: { StringNotEquals: { "kms:EncryptionContext:PARAMETER_ARN": key } } },
+        {
+            Sid: "ReadRelayArtifact", Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${n.bucket}/${RELAY_KEY_PREFIX}*`],
+            Condition: { StringEquals: { "s3:ResourceAccount": n.accountId } },
+        },
+        {
+            Sid: "WriteRelayLogs", Effect: "Allow", Resource: relayLogGroupArns(n),
             Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
         },
     );
@@ -458,6 +534,9 @@ export function runtimePolicy(n: Names): PolicyDocument {
  * account's bucket, only `v1/*` (reads by version and writes), plus anonymous reads of the AL2023 repository bucket
  * the proxy's dnf needs. Everything else through the endpoint — another bucket by its virtual-hosted name or path
  * style (fronting), our bucket outside `v1/`, the VM's own IMDS role credentials — is denied by the endpoint itself.
+ * S13: and the relay role's reads of its binary, `relay/ai-env-relay-*` of the artifacts bucket (the relay shares the
+ * proxy's subnet and route table, so its S3 reads go through the endpoint too); nobody else reads `relay/`, and nobody
+ * writes there, through it.
  */
 export function s3EndpointPolicy(n: Pick<Names, "accountId" | "transcriptsBucket">): PolicyDocument {
     return doc(
@@ -467,6 +546,10 @@ export function s3EndpointPolicy(n: Pick<Names, "accountId" | "transcriptsBucket
             Condition: { ArnEquals: { "aws:PrincipalArn": `arn:aws:iam::${n.accountId}:user/${RUNTIME_USER_NAME}` }, StringEquals: { "s3:ResourceAccount": n.accountId } },
         },
         { Sid: "Al2023Repos", Effect: "Allow", Principal: "*", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${AL2023_REPO_BUCKET}/*`] },
+        {
+            Sid: "RelayArtifactOfTheRelayRole", Effect: "Allow", Principal: "*", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${BUCKET_PREFIX}-*/${RELAY_KEY_PREFIX}*`],
+            Condition: { ArnEquals: { "aws:PrincipalArn": `arn:aws:iam::${n.accountId}:role/${RELAY_ROLE_NAME}` }, StringEquals: { "s3:ResourceAccount": n.accountId } },
+        },
     );
 }
 
@@ -634,7 +717,12 @@ export function deployPolicy(n: Names): PolicyDocument {
  * profile, parameters and log group, and the operator role; S9 the S3 gateway endpoint; S8 operators adds the proxy's three SSM documents
  * (ProxyDocuments: their whole lifecycle, never ssm:ModifyDocumentPermission, so a document can never be shared).
  * Held by ai-env-deployer like ai-env-deploy; names proven by Access Analyzer, not sufficiency. Sending the documents
- * is ai-env-ops' (opsPolicy's ProxyCommands), which the deployer holds too: one source of truth.
+ * is ai-env-ops' (opsPolicy's ProxyCommands), which the deployer holds too: one source of truth. S13: the relay (its
+ * Elastic IP, the VM subnet's NACL entries to it, its parameters, log group, instance profile and role; Sids unchanged:
+ * preview-scratch's tampers find statements by Sid), and AttachRelayManagedPolicy, which lets the relay role hold the
+ * SSM agent's managed policy and nothing else (Q-I12: AttachManagedPolicies also admits the connector's operator
+ * policy). The relay role's own lifecycle, its inline policy and its artifact object are deployPolicy's (Roles,
+ * ArtifactsObjects).
  */
 export function deployEgressPolicy(n: Names): PolicyDocument {
     const acct = n.accountId;
@@ -646,7 +734,7 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
                 "ec2:DescribeRouteTables", "ec2:DescribeSecurityGroups", "ec2:DescribeSecurityGroupRules", "ec2:DescribeNetworkAcls", "ec2:DescribeInstances",
                 "ec2:DescribeInstanceAttribute", "ec2:DescribeInstanceStatus", "ec2:DescribeInstanceTypes", "ec2:DescribeInstanceCreditSpecifications",
                 "ec2:DescribeVolumes", "ec2:DescribeNetworkInterfaces", "ec2:DescribeImages", "ec2:DescribeTags", "ec2:DescribeAvailabilityZones",
-                "ec2:DescribeAccountAttributes", "ec2:DescribePrefixLists", "ec2:DescribeVpcEndpoints"],
+                "ec2:DescribeAccountAttributes", "ec2:DescribePrefixLists", "ec2:DescribeVpcEndpoints", "ec2:DescribeAddresses", "ec2:DescribeAddressesAttribute"],
         },
         {
             Sid: "Ec2EgressNetwork", Effect: "Allow", Resource: [`arn:aws:ec2:${n.region}:${acct}:*`, `arn:aws:ec2:${n.region}::image/*`],
@@ -660,10 +748,14 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
                 "ec2:RunInstances", "ec2:TerminateInstances", "ec2:StopInstances", "ec2:StartInstances", "ec2:ModifyInstanceAttribute",
                 "ec2:ModifyInstanceMetadataOptions", "ec2:ModifyInstanceCreditSpecification", "ec2:CreateTags", "ec2:DeleteTags",
                 // S9: the S3 gateway endpoint on the proxy's route table.
-                "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint", "ec2:DeleteVpcEndpoints"],
+                "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint", "ec2:DeleteVpcEndpoints",
+                // S13: the relay's Elastic IP, and the VM subnet's NACL entries to the relay
+                "ec2:AllocateAddress", "ec2:ReleaseAddress", "ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:CreateNetworkAclEntry",
+                "ec2:DeleteNetworkAclEntry", "ec2:ReplaceNetworkAclEntry"],
         },
+        // S13: also the relay's parameters (Pulumi's `artifact`, and every write of `ai-env relay` as the deployer).
         {
-            Sid: "ProxyParameters", Effect: "Allow", Resource: [proxyParameterArn(n)],
+            Sid: "ProxyParameters", Effect: "Allow", Resource: [proxyParameterArn(n), relayParameterArn(n, "*")],
             Action: ["ssm:PutParameter", "ssm:GetParameter", "ssm:GetParameters", "ssm:DeleteParameter", "ssm:AddTagsToResource",
                 "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"],
         },
@@ -677,12 +769,12 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
                 "ssm:DescribeDocumentPermission", "ssm:ListDocumentVersions", "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"],
         },
         {
-            Sid: "EgressLogGroup", Effect: "Allow", Resource: egressLogGroupArns(n),
+            Sid: "EgressLogGroup", Effect: "Allow", Resource: [...egressLogGroupArns(n), ...relayLogGroupArns(n)],
             Action: ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy", "logs:TagResource", "logs:UntagResource",
                 "logs:ListTagsForResource", "logs:DescribeLogStreams", "logs:GetLogEvents", "logs:FilterLogEvents", "logs:StartLiveTail"],
         },
         {
-            Sid: "ProxyInstanceProfile", Effect: "Allow", Resource: [instanceProfileArn(n, n.egress.proxyInstanceProfileName)],
+            Sid: "ProxyInstanceProfile", Effect: "Allow", Resource: [instanceProfileArn(n, n.egress.proxyInstanceProfileName), instanceProfileArn(n, RELAY_INSTANCE_PROFILE_NAME)],
             Action: ["iam:CreateInstanceProfile", "iam:DeleteInstanceProfile", "iam:GetInstanceProfile", "iam:AddRoleToInstanceProfile",
                 "iam:RemoveRoleFromInstanceProfile", "iam:TagInstanceProfile", "iam:UntagInstanceProfile", "iam:ListInstanceProfileTags"],
         },
@@ -690,8 +782,16 @@ export function deployEgressPolicy(n: Names): PolicyDocument {
             Sid: "AttachManagedPolicies", Effect: "Allow", Resource: [roleArn(n, n.egress.proxyRoleName), roleArn(n, n.egress.operatorRoleName)],
             Action: ["iam:AttachRolePolicy", "iam:DetachRolePolicy"], Condition: { ArnEquals: { "iam:PolicyARN": MANAGED_POLICY_ARNS } },
         },
+        // S13 (Q-I12): the relay role holds the SSM agent's managed policy alone, never the connector's operator policy.
+        {
+            Sid: "AttachRelayManagedPolicy", Effect: "Allow", Resource: [roleArn(n, RELAY_ROLE_NAME)],
+            Action: ["iam:AttachRolePolicy", "iam:DetachRolePolicy"], Condition: { ArnEquals: { "iam:PolicyARN": [SSM_INSTANCE_POLICY_ARN] } },
+        },
         { Sid: "ReadManagedPolicies", Effect: "Allow", Resource: MANAGED_POLICY_ARNS, Action: ["iam:GetPolicy", "iam:GetPolicyVersion"] },
-        { Sid: "PassProxyRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, n.egress.proxyRoleName)], Condition: { StringEquals: { "iam:PassedToService": EC2_SERVICE } } },
+        {
+            Sid: "PassProxyRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, n.egress.proxyRoleName), roleArn(n, RELAY_ROLE_NAME)],
+            Condition: { StringEquals: { "iam:PassedToService": EC2_SERVICE } },
+        },
         // The connector's PassRole service value is unmeasured (like RunMicrovm's, S4 T4.1): either candidate principal.
         {
             Sid: "PassOperatorRole", Effect: "Allow", Action: ["iam:PassRole"], Resource: [roleArn(n, n.egress.operatorRoleName)],
@@ -793,6 +893,9 @@ export function deployerPolicy(n: Names): PolicyDocument {
  *   - ec2:StartInstances and StopInstances on the proxy instance's ARN only (an ARN, never a tag: the deploy policy's
  *     ec2:CreateTags could tag any instance into reach); no ModifyInstanceAttribute (user data runs as root at the next
  *     start), CreateTags or any other write.
+ *   - S13: the relay instance's start and stop on its ARN only (`ai-env relay start|stop`), its four non-secret
+ *     parameters read (`ai-env relay status`; never `tls`), its log group read, and ec2:DescribeAddresses. No SSM
+ *     document and no ssm:SendCommand ever reaches the relay instance, and no statement grants ssm:StartSession.
  *   - ssm:SendCommand on exactly the three proxy documents plus that instance (SendCommand authorizes the document
  *     and every target separately): never AWS-RunShellScript, another document or instance, nor StartSession.
  *   - The four proxy parameters read; only `suspended` written (O3: widening egress, `extras`, is the deployer's).
@@ -808,6 +911,7 @@ export function deployerPolicy(n: Names): PolicyDocument {
 export function opsPolicy(n: Names): PolicyDocument {
     const acct = n.accountId;
     const instance = proxyInstanceArn(n);
+    const relay = relayInstanceArn(n);
     return doc(
         {
             Sid: "OpsUnscoped", Effect: "Allow", Resource: ["*"],
@@ -818,9 +922,12 @@ export function opsPolicy(n: Names): PolicyDocument {
                 "route53resolver:ListFirewallRuleGroupAssociations",
                 "lambda:ListNetworkConnectors", "lambda:ListMicrovmImages", "lambda:ListManagedMicrovmImages", "lambda:ListManagedMicrovmImageVersions", "lambda:ListMicrovms",
                 "logs:DescribeLogGroups", "cloudtrail:DescribeTrails", "cloudtrail:GetEventSelectors", "cloudtrail:ListChannels", "cloudtrail:GetChannel",
-                "iam:GetAccountSummary", "access-analyzer:ValidatePolicy", "iam:SimulateCustomPolicy"],
+                "iam:GetAccountSummary", "access-analyzer:ValidatePolicy", "iam:SimulateCustomPolicy", "ec2:DescribeAddresses"],
         },
         { Sid: "ProxyInstance", Effect: "Allow", Resource: [instance], Action: ["ec2:StartInstances", "ec2:StopInstances"] },
+        // S13: `ai-env relay start|stop`, and `ai-env relay status`'s reads (never the TLS pair).
+        { Sid: "RelayInstance", Effect: "Allow", Resource: [relay], Action: ["ec2:StartInstances", "ec2:StopInstances"] },
+        { Sid: "ReadRelayParameters", Effect: "Allow", Resource: RELAY_PARAMETERS.filter((p) => p !== RELAY_TLS).map((p) => relayParameterArn(n, p)), Action: ["ssm:GetParameters"] },
         { Sid: "ProxyCommands", Effect: "Allow", Resource: [...proxyDocumentArns(n), instance], Action: ["ssm:SendCommand"] },
         { Sid: "ReadProxyParameters", Effect: "Allow", Resource: PROXY_PARAMETERS.map((p) => proxyParameterArn(n, p)), Action: ["ssm:GetParameters", "ssm:GetParameterHistory"] },
         { Sid: "WriteSuspendedParameter", Effect: "Allow", Resource: [proxyParameterArn(n, "suspended")], Action: ["ssm:PutParameter"] },
@@ -833,7 +940,7 @@ export function opsPolicy(n: Names): PolicyDocument {
             Sid: "ReadImage", Effect: "Allow", Resource: [imageArn(n)],
             Action: ["lambda:GetMicrovmImage", "lambda:GetMicrovmImageVersion", "lambda:ListMicrovmImageVersions", "lambda:ListMicrovmImageBuilds"],
         },
-        { Sid: "ReadLogs", Effect: "Allow", Resource: [...logGroupArns(n), ...egressLogGroupArns(n), ...dnsQueryLogGroupArns(n)], Action: ["logs:FilterLogEvents", "logs:StartLiveTail"] },
+        { Sid: "ReadLogs", Effect: "Allow", Resource: [...logGroupArns(n), ...egressLogGroupArns(n), ...dnsQueryLogGroupArns(n), ...relayLogGroupArns(n)], Action: ["logs:FilterLogEvents", "logs:StartLiveTail"] },
         { Sid: "ReadQuotas", Effect: "Allow", Resource: [MICROVM_MEMORY_QUOTA, VPC_QUOTA].map((q) => `arn:aws:servicequotas:${n.region}:${acct}:${q}`), Action: ["servicequotas:GetServiceQuota"] },
         // S11 (L8): doctor's budget row reads the stack's one budget (describe-budget), never another, never a write.
         { Sid: "ViewBudget", Effect: "Allow", Resource: [`arn:aws:budgets::${acct}:budget/${BUDGET_NAME}`], Action: ["budgets:ViewBudget"] },
@@ -880,6 +987,9 @@ export function allPolicies(n: Names): NamedPolicy[] {
         { name: "proxy", kind: "identity", document: proxyRolePolicy(n) },
         { name: "operator-trust", kind: "trust", document: operatorTrustPolicy() },
         { name: "operator", kind: "identity", document: operatorRolePolicy(n) },
+        // S13: the relay's role.
+        { name: "relay-trust", kind: "trust", document: relayTrustPolicy() },
+        { name: "relay", kind: "identity", document: relayRolePolicy(n) },
         { name: "s3-endpoint", kind: "resource", document: s3EndpointPolicy(n) },
         { name: "transcripts-bucket", kind: "resource", document: transcriptsBucketPolicy(n) },
     ];

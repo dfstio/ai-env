@@ -81,7 +81,8 @@ pub struct EventSpec {
 }
 
 /// The constants of the 42 events written as string literals before S11, then
-/// part B's two (`vm_observed`, `panel_serve`). `remote::audit_event` and
+/// part B's two (`vm_observed`, `panel_serve`), then S13's seven (`relay_*`,
+/// plans/s13-contracts.md §WM-worker-mac.6.7). `remote::audit_event` and
 /// `accounts::audit_event` keep theirs.
 pub mod event {
     pub const VM_RUN: &str = "vm_run";
@@ -130,8 +131,24 @@ pub mod event {
     pub const VM_OBSERVED: &str = "vm_observed";
     /// S11 (B1): `panel serve` bound (`started`) or stopped: `port`, `outcome`.
     pub const PANEL_SERVE: &str = "panel_serve";
+    /// S13 (WM-R36): `relay keygen` sealed this Mac's two relay keys: `worker_id`, `worker_fp`, `session_fp`
+    /// (`replaced` when a container was there).
+    pub const RELAY_KEYGEN: &str = "relay_keygen";
+    /// S13 (WM-R43): `relay allow` (the deployer): `kind` (`worker`, `token_signer`), `id`, `fp`, `outcome`
+    /// (`added`, `replaced`, `unchanged`); `version`, `sources` (a count), `not_after`.
+    pub const RELAY_ALLOW: &str = "relay_allow";
+    /// S13 (WM-R44): `relay revoke`: `kind`, `id`, `outcome` (`revoked`, `absent`); `version`.
+    pub const RELAY_REVOKE: &str = "relay_revoke";
+    /// S13 (WM-R45): `relay grant`: `id`, `outcome` (`set`, `unchanged`, `removed`, `absent`); `rules` (a count), `version`.
+    pub const RELAY_GRANT: &str = "relay_grant";
+    /// S13 (WM-R48): `relay start`: `id` (the instance), `outcome`; `ms`.
+    pub const RELAY_START: &str = "relay_start";
+    /// S13 (WM-R49): `relay stop`: `id`, `outcome`; `ms`.
+    pub const RELAY_STOP: &str = "relay_stop";
+    /// S13 (WM-R38, WM-R40): `relay agent` started, stopped or expired: `outcome`; `hours`, `signed`, `minted`.
+    pub const RELAY_AGENT: &str = "relay_agent";
     /// Every event above, in the registry's order.
-    pub const ALL: [&str; 44] = [
+    pub const ALL: [&str; 51] = [
         VM_RUN,
         VM_REUSE,
         VM_ADOPT,
@@ -176,6 +193,13 @@ pub mod event {
         AS_IDENTITY,
         VM_OBSERVED,
         PANEL_SERVE,
+        RELAY_KEYGEN,
+        RELAY_ALLOW,
+        RELAY_REVOKE,
+        RELAY_GRANT,
+        RELAY_START,
+        RELAY_STOP,
+        RELAY_AGENT,
     ];
 }
 
@@ -209,10 +233,11 @@ const fn ev(name: &'static str, required: &'static [&'static str], optional: &'s
 
 use SessionFrom::{Detail, Envelope, None as NoSession};
 
-/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (44).
+/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (51).
 pub static EVENTS: &[EventSpec] = &[
     // ---- remote::audit_event (S8 to S10, A1; then S11 part A's six) ----
-    ev("session_remote_start", &["id", "spawn", "gen", "why"], &["account"], &["id"], NoSession, &[always(Effect::SpanOpen)]),
+    // S13 (WM-R53): `relay`, the spawn's session-token word (`minted`, `no_agent`, …), unless it is `off`.
+    ev("session_remote_start", &["id", "spawn", "gen", "why"], &["account", "relay"], &["id"], NoSession, &[always(Effect::SpanOpen)]),
     ev("session_remote_end", &["vm", "spawn", "gen", "exit", "end", "close_ms", "last_acked_seq"], NO, &["vm"], Envelope, &[always(Effect::SpanClose)]),
     ev("session_remote_failed", &["step", "code", "why"], &["gen", "id"], &["id"], NoSession, NONE),
     ev("vm_select", &["id", "choice"], &["how", "ms", "gen", "avoid"], &["id"], NoSession, &[always(Effect::Activity), is(Effect::Resume, "how", "resumed")]),
@@ -311,6 +336,14 @@ pub static EVENTS: &[EventSpec] = &[
     ev("as_identity", &["identity", "command"], &["key_id_last4", "account"], NO, NoSession, NONE),
     ev("vm_observed", &["id", "state", "was", "via"], NO, &["id"], NoSession, &[always(Effect::Observed)]),
     ev("panel_serve", &["port", "outcome"], NO, NO, NoSession, NONE),
+    // S13 (§WM-worker-mac.6.7): ids, words, numbers and 16-hex fingerprints only (WM-R57); no VM key, no cost effect.
+    ev("relay_keygen", &["worker_id", "worker_fp", "session_fp"], &["replaced"], NO, NoSession, NONE),
+    ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after"], NO, NoSession, NONE),
+    ev("relay_revoke", &["kind", "id", "outcome"], &["version"], NO, NoSession, NONE),
+    ev("relay_grant", &["id", "outcome"], &["rules", "version"], NO, NoSession, NONE),
+    ev("relay_start", &["id", "outcome"], &["ms"], NO, NoSession, NONE),
+    ev("relay_stop", &["id", "outcome"], &["ms"], NO, NoSession, NONE),
+    ev("relay_agent", &["outcome"], &["hours", "signed", "minted"], NO, NoSession, NONE),
 ];
 
 /// The registered event `name`.
@@ -408,7 +441,7 @@ mod tests {
         let modules: Vec<&str> = crate::bridge::remote::audit_event::ALL.iter().chain(crate::bridge::accounts::audit_event::ALL.iter()).chain(event::ALL.iter()).copied().collect();
         let names: Vec<&str> = EVENTS.iter().map(|s| s.name).collect();
         assert_eq!(names, modules, "EVENTS is remote::audit_event::ALL, then accounts::audit_event::ALL, then event::ALL");
-        assert_eq!(EVENTS.len(), 87);
+        assert_eq!(EVENTS.len(), 94);
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "unique names");
         for s in EVENTS {

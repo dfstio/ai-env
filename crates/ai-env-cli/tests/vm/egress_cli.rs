@@ -4,7 +4,8 @@
 //! allowlist grammar and the 4 KB cap, drift in `egress status`.
 //!
 //! Each test gets a [`World`] (its own bridge root) with `[aws]
-//! egress_connector_arn` and a `state/infra.toml` of S5 ids, a temp bin with
+//! egress_connector_arn` and a `state/infra.toml` of S5 ids (S13: and the
+//! relay's, which the fixtures carry too), a temp bin with
 //! the fake as `aws` (`PATH=<bin>:/usr/bin:/bin`, `FAKE_AWS_PIN_ALL=1`), a
 //! `FAKE_AWS_ANSWERS` directory seeded from tests/fixtures/egress (the golden
 //! connector) and tests/fixtures/egress/ops (a stack without drift, in the
@@ -33,6 +34,14 @@ const VPC: &str = "vpc-0123456789abcdef0";
 const VM_SUBNET: &str = "subnet-0aaa1111bbbb2222c";
 const VM_SG: &str = "sg-0ddd3333eeee4444f";
 const PROXY_SG: &str = "sg-0fff5555aaaa6666b";
+/// S13: the relay as `make infra-status WRITE=1` records it, and the interface holding its address
+/// (tests/fixtures/egress/ops/ec2.describe-network-interfaces.2.json, the second interface read of a status run).
+const RELAY_INSTANCE: &str = "i-0123456789abcdef1";
+const RELAY_SG: &str = "sg-0ccc9999dddd0000e";
+const RELAY_ENI: &str = "eni-0bbb00000000000b1";
+const RELAY_EIP: &str = "203.0.113.20";
+/// What `egress status` reads for the relay's address (I-R60).
+const RELAY_ENIS: &str = "ec2 describe-network-interfaces --filters Name=vpc-id,Values=vpc-0123456789abcdef0 Name=addresses.private-ip-address,Values=10.42.0.20 ";
 const STILL_ALLOWED: &str = "STILL ALLOWED on the proxy; `make proxy-stop` to fail closed";
 const STATE_UNKNOWN: &str = "the proxy's state is unknown: `make proxy-stop` to fail closed";
 const SQUID_CONF: &str = "http_port 10.42.0.10:3128\n";
@@ -146,6 +155,10 @@ impl Eg {
             connector_state: Some("ACTIVE".into()),
             squid_conf_sha256: Some(value_sha256(SQUID_CONF)),
             allow_sha256: Some(value_sha256(ALLOW)),
+            relay_instance_id: Some(RELAY_INSTANCE.into()),
+            relay_security_group_id: Some(RELAY_SG.into()),
+            relay_private_ip: Some("10.42.0.20".into()),
+            relay_public_ip: Some(RELAY_EIP.into()),
             ..InfraState::default()
         };
         f(&mut s);
@@ -398,13 +411,15 @@ fn row(o: &Output, check: &str) -> String {
     stdout(o).lines().find(|l| l.split_whitespace().nth(1) == Some(check)).unwrap_or_default().to_string()
 }
 
-const GREEN_ROWS: [&str; 19] = [
+/// I-R60's rows of a stack in dnsMode none without the transcript store.
+const GREEN_ROWS: [&str; 21] = [
     "connector",
     "connector-enis",
     "vm-route-table",
     "vm-nacl",
     "vm-sg",
     "proxy-sg",
+    "relay-sg",
     "default-sg",
     "vpc",
     "vpc-dns",
@@ -412,6 +427,7 @@ const GREEN_ROWS: [&str; 19] = [
     "vpc-endpoints",
     "vpc-peering",
     "nat-gateways",
+    "relay-endpoint",
     "proxy-instance",
     "proxy-ssm",
     "squid-rpm",
@@ -442,6 +458,13 @@ fn status_all_green_checks_every_part_and_pins_every_call() {
     assert!(calls.iter().any(|l| l.starts_with("ec2 describe-network-interfaces --include-managed-resources --filters Name=subnet-id,Values=subnet-0aaa1111bbbb2222c ")), "{calls:?}");
     assert!(calls.iter().any(|l| l.starts_with("ec2 describe-network-acls --filters Name=association.subnet-id,Values=subnet-0aaa1111bbbb2222c ")), "{calls:?}");
     assert!(calls.iter().any(|l| l.starts_with(&format!("lambda-core get-network-connector --identifier {CONNECTOR} "))), "{calls:?}");
+    // S13 (I-T40): one read of who holds the relay's address, after the VM subnet's interfaces; the relay's rows.
+    let vm_enis = calls.iter().position(|l| l.starts_with("ec2 describe-network-interfaces --include-managed-resources ")).unwrap();
+    let relay_enis: Vec<usize> = calls.iter().enumerate().filter(|(_, l)| l.starts_with(RELAY_ENIS)).map(|(i, _)| i).collect();
+    assert!(relay_enis.len() == 1 && relay_enis[0] > vm_enis, "{calls:?}");
+    assert!(row(&o, "relay-endpoint").contains(&format!("{RELAY_ENI} of {RELAY_INSTANCE}: 10.42.0.20, [{RELAY_SG}], public {RELAY_EIP}")), "{}", stdout(&o));
+    assert!(row(&o, "relay-sg").contains(&format!("{RELAY_SG}: ingress tcp 443 from 0.0.0.0/0, tcp 7443 from {VM_SG}")), "{}", stdout(&o));
+    assert!(row(&o, "vm-sg").contains("and tcp 7443 → 10.42.0.20/32 only") && row(&o, "vm-nacl").contains("and tcp 7443 to 10.42.0.20/32"), "{}", stdout(&o));
     let send: Vec<&String> = calls.iter().filter(|l| l.starts_with("ssm send-command")).collect();
     assert_eq!(send.len(), 1, "{calls:?}");
     assert!(send[0].contains(STATUS_SCRIPT) && send[0].contains(" --comment ai-env egress status --timeout-seconds 60 ") && !send[0].contains("--parameters"), "{}", send[0]);
@@ -503,6 +526,22 @@ fn status_flags_drift_by_name_and_exits_1() {
     });
     drift(&t.run(&["egress", "status"]), "proxy-sg", "ingress: unexpected tcp 22 cidr:0.0.0.0/0");
     t.restore("ec2.describe-security-groups.json");
+    // S13 (I-T41): the relay's private port open to anywhere; the VM group's relay rule widened to the proxy subnet; the
+    // relay's address held by another instance; the NACL's relay egress entry gone.
+    t.mutate("ec2.describe-security-groups.json", |d| {
+        let relay = d["SecurityGroups"].as_array_mut().unwrap().iter_mut().find(|g| g["GroupId"] == RELAY_SG).unwrap();
+        relay["IpPermissions"][1]["IpRanges"] = json!([{"CidrIp": "0.0.0.0/0"}]);
+    });
+    drift(&t.run(&["egress", "status"]), "relay-sg", "ingress: unexpected tcp 7443 cidr:0.0.0.0/0");
+    t.mutate("ec2.describe-security-groups.json", |d| d["SecurityGroups"][0]["IpPermissionsEgress"][1]["IpRanges"][0]["CidrIp"] = json!("10.42.0.0/24"));
+    drift(&t.run(&["egress", "status"]), "vm-sg", "egress: unexpected tcp 7443 cidr:10.42.0.0/24; missing tcp 7443 cidr:10.42.0.20/32");
+    t.restore("ec2.describe-security-groups.json");
+    t.mutate("ec2.describe-network-interfaces.2.json", |d| d["NetworkInterfaces"][0]["Attachment"]["InstanceId"] = json!("i-0fedcba9876543210"));
+    drift(&t.run(&["egress", "status"]), "relay-endpoint", &format!("{RELAY_ENI} holds 10.42.0.20 for i-0fedcba9876543210, not the relay instance {RELAY_INSTANCE}"));
+    t.restore("ec2.describe-network-interfaces.2.json");
+    t.mutate("ec2.describe-network-acls.json", |d| d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().retain(|e| !(e["Egress"] == true && e["RuleNumber"] == 110)));
+    drift(&t.run(&["egress", "status"]), "vm-nacl", "acl-0123456789abcdef0: missing egress allow tcp 7443 cidr:10.42.0.20/32");
+    t.restore("ec2.describe-network-acls.json");
     // DNS support on in dnsMode none; a VPC endpoint; the connector still PENDING; an ACTIVE connector without ENIs.
     t.answer("ec2.describe-vpc-attribute.1.json", &json!({"VpcId": VPC, "EnableDnsSupport": {"Value": true}}));
     drift(&t.run(&["egress", "status"]), "vpc-dns", "enableDnsSupport true");
@@ -548,6 +587,48 @@ fn status_flags_drift_by_name_and_exits_1() {
     t.set_param("squid.conf", SQUID_CONF);
     t.status_answer(" applied=yes");
     assert_eq!(code(&t.run(&["egress", "status"])), 0, "green again");
+}
+
+/// S13 (I-T42): before the relay's deploy (`state/infra.toml` without its keys, the network as S12 left it: no relay
+/// group, rule or NACL entries) status keeps S12's expectations and skips the relay's rows, shown unknown with I-R57's
+/// text, and reads nothing of the relay's address: exit 0. The S13 network under that state is drift of the VM group's
+/// and the NACL's relay rules.
+#[test]
+fn status_before_the_relay_deploy_keeps_s12s_rules_and_skips_the_relay_rows() {
+    let t = Eg::new();
+    t.write_state(|s| {
+        s.relay_instance_id = None;
+        s.relay_security_group_id = None;
+        s.relay_private_ip = None;
+        s.relay_public_ip = None;
+    });
+    t.status_answer(" applied=yes");
+    t.mutate("ec2.describe-security-groups.json", |d| {
+        d["SecurityGroups"].as_array_mut().unwrap().retain(|g| g["GroupId"] != RELAY_SG);
+        d["SecurityGroups"][0]["IpPermissionsEgress"].as_array_mut().unwrap().retain(|p| p["FromPort"] != 7443);
+    });
+    t.mutate("ec2.describe-network-acls.json", |d| d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().retain(|e| e["RuleNumber"] != 110));
+    let o = t.run(&["egress", "status", "--json"]);
+    assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
+    let doc: Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let rows = doc["rows"].as_array().unwrap();
+    assert_eq!(rows.iter().map(|r| r["check"].as_str().unwrap()).collect::<Vec<_>>(), GREEN_ROWS);
+    for r in rows {
+        if r["check"] == "relay-sg" || r["check"] == "relay-endpoint" {
+            assert_eq!(r["status"], "unknown", "{r}");
+            assert_eq!(r["detail"], "no relay recorded in state/infra.toml (a stack before S13): not checked", "{r}");
+        } else {
+            assert_eq!(r["status"], "ok", "{r}");
+        }
+    }
+    assert!(doc["ok"] == true && doc["unknown"] == json!(["relay-sg", "relay-endpoint"]), "{doc}");
+    assert!(!t.calls().iter().any(|l| l.contains("addresses.private-ip-address")), "no read of the relay's address: {:?}", t.calls());
+    assert!(row(&t.run(&["egress", "status"]), "vm-sg").contains("egress tcp 3128 → 10.42.0.10/32 only"), "S12's text");
+    t.restore("ec2.describe-security-groups.json");
+    t.restore("ec2.describe-network-acls.json");
+    let o = t.run(&["egress", "status"]);
+    assert_eq!(code(&o), 1, "{}", stdout(&o));
+    assert!(stderr(&o).contains("egress status: drift in vm-nacl, vm-sg\n"), "{}", stderr(&o));
 }
 
 #[test]
@@ -1205,10 +1286,11 @@ fn env_prints_the_proxy_environment_without_any_call() {
     let o = t.run(&["egress", "env"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let url = "http://10.42.0.10:3128";
-    assert_eq!(stdout(&o), format!("https_proxy={url}\nHTTPS_PROXY={url}\nhttp_proxy={url}\nHTTP_PROXY={url}\nno_proxy=localhost,127.0.0.1,::1\nNO_PROXY=localhost,127.0.0.1,::1\n"));
+    // S13 (I-T43): the relay's address is reached directly, never through squid.
+    assert_eq!(stdout(&o), format!("https_proxy={url}\nHTTPS_PROXY={url}\nhttp_proxy={url}\nHTTP_PROXY={url}\nno_proxy=localhost,127.0.0.1,::1,10.42.0.20\nNO_PROXY=localhost,127.0.0.1,::1,10.42.0.20\n"));
     let o = t.run(&["egress", "env", "--shell"]);
     assert_eq!(stdout(&o).lines().next(), Some(format!("export https_proxy='{url}'").as_str()));
-    assert_eq!(stdout(&o).lines().last(), Some("export NO_PROXY='localhost,127.0.0.1,::1'"));
+    assert_eq!(stdout(&o).lines().last(), Some("export NO_PROXY='localhost,127.0.0.1,::1,10.42.0.20'"));
     assert!(t.calls().is_empty(), "{:?}", t.calls());
     // [aws].proxy_private_ip wins; without it the state's; without state the stack's constant.
     let toml = fs::read_to_string(t.w.bridge().join("bridge.toml")).unwrap();

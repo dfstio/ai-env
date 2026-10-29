@@ -1,7 +1,8 @@
 # ai-env — build/test driver for the classic tool and the MicroVM bridge.
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
 .PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-egress-run test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance acceptance-run clean \
-        claude-pin claude-admit-docker image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures
+        claude-pin claude-admit-docker image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures \
+        relay-proto relay-proto-check
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate, widen a live run or pick an identity (YES, KEEP,
@@ -21,6 +22,17 @@ TOOLCHAIN    ?= 1.98.1
 # ai-env-age declares rust-version = "1.88"; keep in sync with crates/ai-env-age/Cargo.toml.
 MSRV_OLD     ?= 1.88
 PKG          := ai-env-cli
+# S13 (plans/s13-contracts.md §P): the relay crates. RELAY_LIBS are what private repos depend on (they build on
+# MSRV_OLD); RELAY_PINNED trust the pinned relay CA alone.
+RELAY_LIBS   := ai-env-relay-proto ai-env-source ai-env-worker
+RELAY_CRATES := $(RELAY_LIBS) ai-env-relay
+RELAY_PINNED := ai-env-worker ai-env-relay-client
+# S13: the relay's VM side (crates/ai-env-relay-client), cross-built beside the shim into image/.
+RELAY_PKG    := ai-env-relay-client
+VM_BINS      := ai-env ai-env-relay-client ai-env-relay-mcp
+# The workspace's version ([workspace.package]): every bin's, and the image's three. Silent where no Cargo.toml is
+# (the tests' planted trees run this Makefile with -f from a directory of their own).
+WS_VERSION   := $(shell sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)".*/\1/p' Cargo.toml 2>/dev/null)
 TARGET       ?= aarch64-unknown-linux-gnu
 # AL2023 ships glibc 2.34; cargo-lambda's arm64 build targets an older glibc (2.30 observed).
 GLIBC_MAX    ?= 2.34
@@ -93,6 +105,7 @@ build: ## Build ai-env (+ ai-env-claude) in all four feature sets: default, none
 	$(CARGO) build -p $(PKG) --no-default-features
 	$(CARGO) build -p $(PKG) --no-default-features --features shim
 	$(CARGO) build -p $(PKG) --no-default-features --features bridge
+	$(CARGO) build -p $(RELAY_PKG)
 	@d=$${CARGO_TARGET_DIR:-target}; test -x "$$d/debug/ai-env" && test -x "$$d/debug/ai-env-claude" && echo "build: ok (both bins)"
 
 check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; explicit --bin ai-env-claude is refused without bridge
@@ -115,14 +128,18 @@ check-bins: ## T0.1/T0.1b: shim-only and no-feature builds yield ai-env only; ex
 	@out=$$($(CARGO) build -p $(PKG) --bin ai-env-claude --no-default-features --features shim 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-claude built without bridge"; exit 1; }; \
 	  grep -qF 'target `ai-env-claude` in package `ai-env-cli` requires the features: `bridge`' <<<"$$out" || { echo "$$out"; exit 1; }
+	CARGO_TARGET_DIR=target/matrix/relay $(CARGO) build -p $(RELAY_PKG)
+	@test -x target/matrix/relay/debug/ai-env-relay-client && test -x target/matrix/relay/debug/ai-env-relay-mcp && test ! -e target/matrix/relay/debug/ai-env || { echo "check-bins: the relay package builds ai-env-relay-client and ai-env-relay-mcp, and no ai-env"; exit 1; }
+	@for b in ai-env-relay-client ai-env-relay-mcp; do v=$$(target/matrix/relay/debug/$$b --version); test "$$v" = "$$b $(WS_VERSION)" || { echo "check-bins: $$b --version printed $$v"; exit 1; }; done
 	@echo "check-bins: ok"
 
 # S11: the integration tests hold more descriptors than macOS's default soft limit (256: `launchctl limit maxfiles`);
 # each test line raises its shell's soft limit to 10240 when it is lower (never lowers it, never fails the line).
 TEST_NOFILE = n=$$(ulimit -n); { [ "$$n" = unlimited ] || [ "$$n" -ge 10240 ]; } || ulimit -n 10240 2>/dev/null || true;
 
-test: ## Unit + integration tests in all four feature sets; S11: the audit is strict (AI_ENV_AUDIT_STRICT=1: an unregistered event or key fails its write)
+test: ## Unit + integration tests in all four feature sets; S11: the audit is strict (AI_ENV_AUDIT_STRICT=1: an unregistered event or key fails its write); S13: the worker's shared half alone too
 	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test --workspace
+	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p ai-env-worker --no-default-features --lib
 	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features
 	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features shim
 	$(TEST_NOFILE) AI_ENV_AUDIT_STRICT=1 $(CARGO) test -p $(PKG) --no-default-features --features bridge
@@ -311,7 +328,7 @@ install: ## cargo install both bins (ai-env + ai-env-claude) into $(INSTALL_ROOT
 # --lambda-dir: cargo-lambda otherwise writes under the cargo target directory (CARGO_TARGET_DIR when set), and the cp
 # below would take a stale bootstrap; the old one is removed first, so a build that writes nothing fails at the cp.
 # The cross-build runs without any operator key or marker (D18), whoever calls it.
-vm-build: ## Cross-build the VM shim binary with cargo-lambda (--arm64, shim feature only) -> image/ai-env; assert glibc <= $(GLIBC_MAX) and no getentropy
+vm-build: ## Cross-build the VM binaries with cargo-lambda (--arm64): the shim (shim feature only) -> image/ai-env, S13's relay client and MCP server -> image/ai-env-relay-client, image/ai-env-relay-mcp; each an aarch64 ELF with glibc <= $(GLIBC_MAX); no getentropy in the shim
 	@set -eu; cl="$(CARGO_LAMBDA)"; \
 	  ver() { "$$1" lambda --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }; \
 	  ok() { v=$$(ver "$$1"); test -n "$$v" && test "$$(printf '%s\n%s\n' "$(CARGO_LAMBDA_MIN)" "$$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$(CARGO_LAMBDA_MIN)"; }; \
@@ -324,45 +341,88 @@ vm-build: ## Cross-build the VM shim binary with cargo-lambda (--arm64, shim fea
 	  echo "vm-build: using $$cl $$(ver "$$cl")"; \
 	  rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' || { echo "missing target: rustup target add $(TARGET) --toolchain $(TOOLCHAIN)"; exit 1; }; \
 	  test -x $(LLVM_BIN)/llvm-nm -a -x $(LLVM_BIN)/llvm-objdump || { echo "vm-build: $(LLVM_BIN)/llvm-nm or llvm-objdump missing (brew install llvm, or set LLVM_BIN)"; exit 1; }; \
-	  rm -f target/lambda/ai-env/bootstrap; \
-	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p $(PKG) --bin ai-env --no-default-features --features shim
+	  rm -f $(foreach b,$(VM_BINS),target/lambda/$(b)/bootstrap); \
+	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p $(PKG) --bin ai-env --no-default-features --features shim; \
+	  for b in ai-env-relay-client ai-env-relay-mcp; do \
+	    $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p $(RELAY_PKG) --bin "$$b"; \
+	  done
 	mkdir -p image
-	cp target/lambda/ai-env/bootstrap image/ai-env
-	@file image/ai-env | grep -q 'ELF 64-bit.*aarch64' || { file image/ai-env; echo "vm-build: not an aarch64 ELF"; exit 1; }
-	@max=$$($(LLVM_BIN)/llvm-objdump -T image/ai-env | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -1); \
-	  echo "vm-build: max glibc symbol version $$max"; \
-	  test "$${max#GLIBC_2.}" -le $(subst 2.,,$(GLIBC_MAX)) || { echo "vm-build: glibc ceiling exceeded ($$max > GLIBC_$(GLIBC_MAX))"; exit 1; }
+	@for b in $(VM_BINS); do cp "target/lambda/$$b/bootstrap" "image/$$b" || exit 1; \
+	  file "image/$$b" | grep -q 'ELF 64-bit.*aarch64' || { file "image/$$b"; echo "vm-build: image/$$b is not an aarch64 ELF"; exit 1; }; \
+	  max=$$($(LLVM_BIN)/llvm-objdump -T "image/$$b" | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -1); \
+	  echo "vm-build: image/$$b max glibc symbol version $$max"; \
+	  test "$${max#GLIBC_2.}" -le $(subst 2.,,$(GLIBC_MAX)) || { echo "vm-build: image/$$b exceeds the glibc ceiling ($$max > GLIBC_$(GLIBC_MAX))"; exit 1; }; done
 	@n=$$($(LLVM_BIN)/llvm-nm -D image/ai-env | grep -cE ' getentropy(@|$$)' || true); \
 	  echo "vm-build: getentropy references $$n"; \
 	  test "$$n" -eq 0 || { echo "vm-build: $$n getentropy reference(s) — a glibc 2.25 symbol"; exit 1; }
-	@ls -l image/ai-env
+	@ls -l $(addprefix image/,$(VM_BINS))
 
 vm-run: ## Run the cross-built shim binary inside the AL2023 arm64 base image (docker) with ARGS, e.g. ARGS='--version'
 	docker run --rm --platform linux/arm64 --entrypoint /b/ai-env -v "$(CURDIR)/image:/b:ro" $(BASE_IMAGE) $(ARGS)
 
-check-features: ## T0.2b: no AWS/TLS crates in the shim graph; tungstenite/hyper/axum once; no ring on the Mac side
+check-features: ## T0.2b: no AWS/TLS crates in the shim graph; tungstenite/hyper/axum once; no ring on the Mac side; S13: no gRPC or relay crate in the shim graph, tonic only in the relay crates; the relay client on rustls and aws-lc-rs with none of the Mac's stacks
 	$(CARGO) tree -p $(PKG) -e normal --no-default-features --features shim --target $(TARGET) --prefix none >/dev/null
-	@out=$$($(CARGO) tree -p $(PKG) -e normal --no-default-features --features shim --target $(TARGET) --prefix none | sort -u | grep -E '^(aws-|rustls|reqwest|hyper-rustls|aws-lc|ring |webpki-roots|security-framework)'); \
+	@out=$$($(CARGO) tree -p $(PKG) -e normal --no-default-features --features shim --target $(TARGET) --prefix none | sort -u | grep -E '^(aws-|rustls|reqwest|hyper-rustls|aws-lc|ring |webpki-roots|security-framework|tonic|prost|h2 |tokio-rustls|ai-env-relay)'); \
 	  test -z "$$out" || { echo "forbidden crates in the shim graph:"; echo "$$out"; exit 1; }
 	@out=$$($(CARGO) tree -p $(PKG) -e normal -d --depth 0 | grep -E '^(tokio-tungstenite|tungstenite|hyper|axum) '); \
 	  test -z "$$out" || { echo "duplicate crates:"; echo "$$out"; exit 1; }
 	@out=$$($(CARGO) tree -p $(PKG) -e normal --prefix none | sort -u | grep -E '^ring '); \
 	  test -z "$$out" || { echo "ring in the Mac graph (aws-lc-rs must be the only provider):"; echo "$$out"; exit 1; }
+	@out=$$($(CARGO) tree -p $(PKG) -e normal,features -i tonic --prefix none 2>/dev/null | grep -E 'tonic feature "(tls-|_tls-any|transport|default|channel|server|router)'); \
+	  test -z "$$out" || { echo "S13: tonic beyond codegen in ai-env-cli's graph (the Mac holds the protocol's types, never a gRPC transport):"; echo "$$out"; exit 1; }
+	@! $(CARGO) tree -p $(PKG) -e features -i ai-env-worker -e no-dev --prefix none 2>/dev/null | grep -q 'ai-env-worker feature "runtime"' || { echo "S13: ai-env-cli enables ai-env-worker/runtime (the Mac takes the shared formats only)"; exit 1; }
+	@out=$$($(CARGO) tree -p ai-env-source -e normal --features testkit --prefix none | sort -u | grep -E '^(tonic|prost|h2 |hyper|tower|axum|rustls|tokio-rustls|aws-|ring |webpki-roots|reqwest|async-trait)'); \
+	  test -z "$$out" || { echo "S13: ai-env-source holds a gRPC, HTTP, TLS or AWS crate:"; echo "$$out"; exit 1; }
+	@out=$$($(CARGO) tree -p ai-env-relay-proto -e normal --prefix none | sort -u | grep -E '^(h2 |hyper|tower |axum|rustls|tokio-rustls|aws-|ring |webpki-roots|socket2)'); \
+	  test -z "$$out" || { echo "S13: ai-env-relay-proto holds a transport crate (codegen only):"; echo "$$out"; exit 1; }
+	@for p in $(RELAY_PINNED); do for t in "" "--target $(TARGET)"; do out=$$($(CARGO) tree -p $$p -e normal $$t --prefix none | sort -u | grep -E '^(ring |webpki-roots|rustls-native-certs|security-framework|openssl|aws-config|aws-sdk-|aws-smithy-)'); \
+	  test -z "$$out" || { echo "S13: $$p must trust the pinned relay CA alone (no public root store, no ring, no AWS SDK) $$t:"; echo "$$out"; exit 1; }; done; done
+	@for p in $(RELAY_CRATES); do out=$$($(CARGO) tree -p $$p -e normal,features -i tonic --prefix none 2>/dev/null | grep -E 'tonic feature "(tls-|_tls-any|transport|default)'); \
+	  test -z "$$out" || { echo "S13: $$p enables a tonic TLS, transport or default feature (TLS is the custom rustls config):"; echo "$$out"; exit 1; }; done
+	@for p in ai-env-worker ai-env-relay; do out=$$($(CARGO) tree -p $$p -e normal -d --depth 0 | grep -E '^(tonic|prost|h2|hyper|axum|rustls|tokio-rustls) '); \
+	  test -z "$$out" || { echo "S13: duplicate crates in $$p:"; echo "$$out"; exit 1; }; done
+	@for t in "" "--target $(TARGET)"; do out=$$($(CARGO) tree -p ai-env-relay -e normal $$t --prefix none | sort -u | grep -E '^ring '); \
+	  test -z "$$out" || { echo "S13: ring in the relay's graph (aws-lc-rs is the only provider) $$t:"; echo "$$out"; exit 1; }; done
+	@out=$$($(CARGO) tree -p ai-env-relay -e normal,features --target $(TARGET) -i rustls --prefix none 2>/dev/null | grep -E 'rustls feature "tls12"'); \
+	  test -z "$$out" || { echo "S13: rustls tls12 in the relay's graph (its faces are TLS 1.3 only, R-3):"; echo "$$out"; exit 1; }
+	@out=$$($(CARGO) tree -p $(RELAY_PKG) -e normal --target $(TARGET) --prefix none | sort -u | grep -E '^(aws-config|aws-sdk-|aws-smithy-|reqwest |hyper-rustls |ring |webpki-roots |rustls-native-certs |openssl|native-tls |security-framework|tokio-tungstenite |tungstenite |axum |ai-env-cli )'); \
+	  test -z "$$out" || { echo "forbidden crates in the relay client graph:"; echo "$$out"; exit 1; }
+	@out=$$($(CARGO) tree -p $(RELAY_PKG) -e normal --target $(TARGET) --prefix none | sort -u); \
+	  for c in rustls aws-lc-rs tonic tokio-rustls ai-env-relay-proto; do grep -qE "^$$c v" <<<"$$out" || { echo "the relay client graph lacks $$c"; exit 1; }; done
+	@out=$$($(CARGO) tree -p $(RELAY_PKG) -e normal --target $(TARGET) -d --depth 0 | grep -E '^(hyper|h2|rustls|tokio|tonic|prost|tokio-rustls|aws-lc-rs) '); \
+	  test -z "$$out" || { echo "duplicate crates in the relay client graph:"; echo "$$out"; exit 1; }
 	@echo "check-features: ok"
 
-check-deps: ## Unused-dependency scan (cargo machete); stage pins declared ahead of their code are allowlisted in crates/$(PKG)/Cargo.toml
+check-deps: ## Unused-dependency scan (cargo machete) of ai-env-cli and the relay crates; stage pins declared ahead of their code are allowlisted in each Cargo.toml
 	@command -v cargo-machete >/dev/null || { echo "cargo install cargo-machete --locked"; exit 1; }
-	cargo machete crates/$(PKG)
+	cargo machete crates/$(PKG) $(addprefix crates/,$(RELAY_CRATES))
+	cargo machete crates/$(RELAY_PKG)
 
-check-msrv: ## T0.2: ai-env-age builds on $(MSRV_OLD); ai-env-cli refuses (requires rustc 1.94.1); everything builds on $(TOOLCHAIN)
+check-msrv: ## T0.2: ai-env-age builds on $(MSRV_OLD); ai-env-cli refuses (requires rustc 1.94.1); everything builds on $(TOOLCHAIN); S13: the relay crates and the relay client build on $(MSRV_OLD) too
 	@rustup run $(MSRV_OLD) rustc --version >/dev/null 2>&1 || { echo "toolchain $(MSRV_OLD) not installed: rustup toolchain install $(MSRV_OLD)"; exit 1; }
 	cargo +$(MSRV_OLD) build -p ai-env-age
+	cargo +$(MSRV_OLD) build $(addprefix -p ,$(RELAY_LIBS))
+	cargo +$(MSRV_OLD) build -p ai-env-worker --no-default-features
+	cargo +$(MSRV_OLD) build -p ai-env-source --features testkit
+	cargo +$(MSRV_OLD) build -p ai-env-relay
+	cargo +$(MSRV_OLD) build -p $(RELAY_PKG)
 	@out=$$(cargo +$(MSRV_OLD) build -p $(PKG) 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "ai-env-cli unexpectedly builds on $(MSRV_OLD)"; exit 1; }; \
-	  grep -q 'ai-env-cli@0.11.0 requires rustc 1.94.1' <<<"$$out" || { echo "$$out"; echo "expected the MSRV refusal"; exit 1; }; \
+	  grep -q 'ai-env-cli@$(WS_VERSION) requires rustc 1.94.1' <<<"$$out" || { echo "$$out"; echo "expected the MSRV refusal"; exit 1; }; \
 	  echo "check-msrv: ai-env-cli correctly refused on $(MSRV_OLD)"
 	$(CARGO) build --workspace --all-targets
 	@head -3 Cargo.lock | grep -q '^version = 4$$' || { echo "Cargo.lock version changed; cargo $(MSRV_OLD) may not read it"; exit 1; }
+
+relay-proto: ## S13: regenerate crates/ai-env-relay-proto/src/gen from relay.proto (needs protoc on PATH); review the diff before committing
+	@command -v protoc >/dev/null || { echo "relay-proto: protoc not on PATH"; exit 1; }
+	CARGO_TARGET_DIR=target/relay-protogen $(CARGO) run --locked --manifest-path tools/relay-protogen/Cargo.toml
+
+relay-proto-check: ## S13: the committed relay bindings are exactly what relay.proto generates (needs protoc); phase 4 and every proto amendment
+	@command -v protoc >/dev/null || { echo "relay-proto-check: protoc not on PATH"; exit 1; }
+	@rm -rf target/relay-proto-check
+	CARGO_TARGET_DIR=target/relay-protogen $(CARGO) run --locked --manifest-path tools/relay-protogen/Cargo.toml -- target/relay-proto-check
+	@cmp -s crates/ai-env-relay-proto/src/gen/descriptor.bin target/relay-proto-check/descriptor.bin && cmp -s crates/ai-env-relay-proto/src/gen/ai_env.relay.v1.rs target/relay-proto-check/ai_env.relay.v1.rs || { echo "relay-proto-check: the committed bindings differ from relay.proto's (make relay-proto, review, commit)"; exit 1; }
+	@echo "relay-proto-check: ok"
 
 coverage: ## Line coverage of src/wire (S0 exit criterion: >= 90 % per file); needs cargo-llvm-cov
 	@command -v cargo-llvm-cov >/dev/null || { echo "cargo install cargo-llvm-cov --locked && rustup component add llvm-tools-preview --toolchain $(TOOLCHAIN)"; exit 1; }
@@ -374,7 +434,7 @@ fmt: ## ADVISORY rustfmt check (house style is wider than rustfmt; see rustfmt.t
 fmt-diff: ## Show the advisory rustfmt diff
 	-$(CARGO) fmt --all -- --check
 
-clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-only --target $(TARGET), bridge-only, no-feature) + ai-env-age
+clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-only --target $(TARGET), bridge-only, no-feature) + ai-env-age; S13: the relay crates (the worker's shared half alone too, the relay for $(TARGET) too) + the relay client (host and $(TARGET))
 	$(CARGO) clippy -p $(PKG) --all-targets --features bridge,shim -- -D warnings
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features --features shim -- -D warnings
 	@rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' || { echo "missing target: rustup target add $(TARGET) --toolchain $(TOOLCHAIN)"; exit 1; }
@@ -382,8 +442,15 @@ clippy: ## clippy -D warnings in every cfg world (bridge+shim, shim-only, shim-o
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features --features bridge -- -D warnings
 	$(CARGO) clippy -p $(PKG) --all-targets --no-default-features -- -D warnings
 	$(CARGO) clippy -p ai-env-age --all-targets -- -D warnings
+	$(CARGO) clippy $(addprefix -p ,$(RELAY_CRATES)) --all-targets -- -D warnings
+	$(CARGO) clippy -p ai-env-worker --lib --no-default-features -- -D warnings
+	$(CARGO) clippy -p ai-env-source --lib -- -D warnings
+	@command -v aarch64-linux-gnu-gcc >/dev/null || { echo "clippy: the relay's and the relay client's aws-lc-sys need a cross C compiler for $(TARGET): brew install aarch64-unknown-linux-gnu (it provides aarch64-linux-gnu-gcc)"; exit 1; }
+	$(CARGO) clippy -p ai-env-relay --lib --bins --target $(TARGET) -- -D warnings
+	$(CARGO) clippy -p $(RELAY_PKG) --all-targets -- -D warnings
+	$(CARGO) clippy -p $(RELAY_PKG) --lib --bins --target $(TARGET) -- -D warnings
 
-lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; no raw `ai-env:` line on the remote path, which speaks through bridge::voice; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); a listener only in src/shim and src/bridge/panel; every tests/*.rs declared)
+lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connector::Plain; no raw `ai-env:` line on the remote path, which speaks through bridge::voice; TLS/WS dialing — every client_async form — confined to $(TLS_ALLOW); a listener only in src/shim and src/bridge/panel; every tests/*.rs declared); S13: a Unix listener only in src/bridge/relay/agent.rs; the relay's map-owning modules never await; Peered built only in its tls.rs; every relay test declared; the relay client's TLS config in its tls.rs, its dialing in its dial.rs, its listener in its serve.rs, no TCP listener and no dangerous TLS
 	@bad=$$(grep -rn 'Connector::Plain' crates/$(PKG)/src || true); test -z "$$bad" || { echo "$$bad"; echo "lint: Connector::Plain is forbidden"; exit 1; }
 	@bad=$$(grep -nE '(eprintln!|eprint!|say|writeln!|write!)\(.*"ai-env: ' crates/$(PKG)/src/bridge/vm/run.rs crates/$(PKG)/src/bridge/vm/lock.rs crates/$(PKG)/src/bridge/agent/credential.rs crates/$(PKG)/src/bridge/creds.rs crates/$(PKG)/src/bridge/remote/*.rs || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the remote path speaks through bridge::voice (no raw ai-env: line in vm/run.rs, vm/lock.rs, agent/credential.rs, creds.rs, remote/)"; exit 1; }
 	@bad=$$(grep -rlE 'connect_async|client_async|Connector::Rustls|use_preconfigured_tls|ClientConfig::builder|aws_smithy_http_client' crates/$(PKG)/src | grep -vE '$(TLS_ALLOW)' || true); \
@@ -393,9 +460,22 @@ lint: clippy lint-negative ## clippy + grep guards clippy cannot express (Connec
 	  test -z "$$bad" || { echo "$$bad"; echo "lint: a listener (TcpListener::bind, axum::serve) lives only in src/shim and src/bridge/panel (test modules aside)"; exit 1; }
 	@for f in crates/$(PKG)/tests/*.rs; do n=$$(basename "$$f" .rs); \
 	  grep -qE "^name *= *\"$$n\"" crates/$(PKG)/Cargo.toml || { echo "lint: $$f has no [[test]] name = \"$$n\" entry (autotests = false: it would silently never run)"; exit 1; }; done
+	@bad=$$(for f in $$(grep -rl 'UnixListener::bind' crates/$(PKG)/src | grep -vE '^crates/$(PKG)/src/bridge/relay/agent\.rs$$'); do \
+	  awk -v f="$$f" '/^#\[cfg\((all\()?test/{t=1} t&&/^}/{t=0;next} !t&&/UnixListener::bind/{print f":"FNR": "$$0}' "$$f"; done); \
+	  test -z "$$bad" || { echo "$$bad"; echo "lint: a Unix listener lives only in src/bridge/relay/agent.rs (test modules aside)"; exit 1; }
+	@bad=$$(grep -nE '(^|[^A-Za-z0-9_])async([^A-Za-z0-9_]|$$)|\.await' crates/ai-env-relay/src/registry.rs crates/ai-env-relay/src/calls.rs crates/ai-env-relay/src/limits.rs || true); \
+	  test -z "$$bad" || { echo "$$bad"; echo "lint: the relay's map-owning modules (registry, calls, limits) hold no async and no .await (R-75)"; exit 1; }
+	@bad=$$(grep -rn 'Peered::new(' crates/ai-env-relay/src | grep -v '^crates/ai-env-relay/src/tls\.rs:' || true); \
+	  test -z "$$bad" || { echo "$$bad"; echo "lint: production builds a Peered only in crates/ai-env-relay/src/tls.rs (R-76)"; exit 1; }
+	@for f in crates/ai-env-relay/tests/*.rs; do test -e "$$f" || continue; n=$$(basename "$$f" .rs); \
+	  grep -qE "^name *= *\"$$n\"" crates/ai-env-relay/Cargo.toml || { echo "lint: $$f has no [[test]] name = \"$$n\" entry (autotests = false: it would silently never run)"; exit 1; }; done
+	@bad=$$(grep -rlE 'ClientConfig::builder|builder_with_provider' crates/$(RELAY_PKG)/src | grep -vE 'src/tls\.rs$$' || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the relay client's TLS config is built in src/tls.rs alone"; exit 1; }
+	@bad=$$(grep -rlE 'TcpStream::connect|connect_with_connector' crates/$(RELAY_PKG)/src | grep -vE 'src/dial\.rs$$' || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the relay client dials in src/dial.rs alone"; exit 1; }
+	@bad=$$(grep -rlE 'UnixListener::(bind|from_)|UnixSocket::new_stream|(\.|::)listen\(' crates/$(RELAY_PKG)/src | grep -vE 'src/serve\.rs$$' || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the relay client listens in src/serve.rs alone"; exit 1; }
+	@bad=$$(grep -rnE 'TcpListener|\.dangerous\(' crates/$(RELAY_PKG)/src || true); test -z "$$bad" || { echo "$$bad"; echo "lint: the relay client opens no TCP listener and no dangerous TLS"; exit 1; }
 	@echo "lint: ok"
 
-lint-negative: ## T0.5: clippy must REJECT examples/tls_lint_negative.rs with one diagnostic per clippy.toml disallowed-methods entry (proves every path still resolves)
+lint-negative: ## T0.5: clippy must REJECT examples/tls_lint_negative.rs with one diagnostic per clippy.toml disallowed-methods entry (proves every path still resolves); S13: and the relay's dashmap example with one per dashmap await-holding entry
 	@out=$$($(CARGO) clippy -p $(PKG) --example tls_lint_negative --features lint-negative -- -D warnings 2>&1); rc=$$?; \
 	  test $$rc -ne 0 || { echo "$$out"; echo "lint-negative: clippy accepted the disallowed methods — clippy.toml paths are stale"; exit 1; }; \
 	  paths=$$(sed -n '/^disallowed-methods/,/^\]/p' clippy.toml | grep -oE 'path *= *"[^"]+"' | sed -E 's/.*"([^"]+)"/\1/'); \
@@ -405,6 +485,12 @@ lint-negative: ## T0.5: clippy must REJECT examples/tls_lint_negative.rs with on
 	  got=$$(grep -c 'use of a disallowed method' <<<"$$out"); \
 	  test "$$got" -eq "$$n" || { echo "$$out"; echo "lint-negative: $$got diagnostics for $$n clippy.toml entries (the example must call each exactly once)"; exit 1; }; \
 	  echo "lint-negative: ok (clippy rejected all $$n disallowed methods by full path)"
+	@out=$$($(CARGO) clippy -p ai-env-relay --example dashmap_lint_negative --features lint-negative -- -D warnings 2>&1); rc=$$?; \
+	  test $$rc -ne 0 || { echo "$$out"; echo "lint-negative: clippy accepted dashmap guards held across .await (R-74: clippy.toml paths are stale)"; exit 1; }; \
+	  n=$$(sed -n '/^await-holding-invalid-types/,/^\]/p' clippy.toml | grep -c 'path *= *"dashmap::'); \
+	  got=$$(grep -c 'holding a disallowed type across an await point' <<<"$$out"); \
+	  { test "$$n" -eq 9 && test "$$got" -eq "$$n"; } || { echo "$$out"; echo "lint-negative: $$got diagnostics for $$n dashmap entries (R-74: nine, one each)"; exit 1; }; \
+	  echo "lint-negative: ok (clippy rejected all $$n dashmap guards held across .await)"
 
 # ---- S3 image: pin, stage, scan, zip, local build, Docker tests ---------------------
 
@@ -429,6 +515,10 @@ claude-admit-docker: ## (no AWS, no Touch ID) S11: the claude-facing Docker L2 t
 	$(NO_KEY) CARGO_TARGET_DIR='$(CURDIR)/target/claude-admit' AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
 	  AI_ENV_CLAUDE_UNDER_TEST='$(CLAUDE_BIN)' AI_ENV_CLAUDE_UNDER_TEST_VERSION='$(CLAUDE_VERSION)' AI_ENV_CLAUDE_UNDER_TEST_SHA256='$(CLAUDE_SHA256)' \
 	  $(CARGO) test -p $(PKG) --features bridge --test docker_exec --test shim_docker -- --ignored --exact --test-threads=1 l2_wrapper_remote_session_initializes_the_pinned_claude l2_claude_auth_status_json_is_logged_out_with_no_network l2_claude_version_matches_the_lock
+	@$(NO_KEY) CARGO_TARGET_DIR='$(CURDIR)/target/claude-admit' AI_ENV_DOCKER_TESTS=1 AI_ENV_DOCKER_BASE='$(BASE_IMAGE)' AI_ENV_DOCKER_IMAGE='$(LOCAL_IMAGE)' AI_ENV_DOCKER_SHIM='$(CURDIR)/image/ai-env' \
+	  AI_ENV_CLAUDE_UNDER_TEST='$(CLAUDE_BIN)' AI_ENV_CLAUDE_UNDER_TEST_VERSION='$(CLAUDE_VERSION)' AI_ENV_CLAUDE_UNDER_TEST_SHA256='$(CLAUDE_SHA256)' \
+	  $(CARGO) test -p $(PKG) --features bridge --test shim_docker -- --ignored --exact --test-threads=1 l2_the_pinned_claude_starts_the_relay_mcp_server \
+	  || echo "claude-admit-docker: [warn] l2_the_pinned_claude_starts_the_relay_mcp_server failed: this claude may not start the relay's MCP server (recorded, not refused)"
 
 # The tree is staged into $(STAGE).tmp and becomes $(STAGE) only after a clean scan: any failure leaves no $(STAGE)
 # (image-build-local refuses) and removes the unscanned copy. A symlink anywhere under $(IMAGE_DIR) stops it before
@@ -448,7 +538,7 @@ image-stage-scan: ## Stage $(IMAGE_DIR) per its MANIFEST (unlisted files and sym
 	    echo "$$path" >> "$$listed"; \
 	    if [ "$$kind" = dir ]; then mkdir -p "$$stage/$$path"; chmod "$$mode" "$$stage/$$path"; \
 	    elif [ "$$kind" = file ]; then \
-	      if [ ! -f "$$src/$$path" ] || [ -L "$$src/$$path" ]; then echo "image-stage-scan: $$src/$$path is missing or not a regular file"; [ "$$path" = ai-env ] && echo "  run: make vm-build"; exit 1; fi; \
+	      if [ ! -f "$$src/$$path" ] || [ -L "$$src/$$path" ]; then echo "image-stage-scan: $$src/$$path is missing or not a regular file"; case " $(VM_BINS) " in *" $$path "*) echo "  run: make vm-build";; esac; exit 1; fi; \
 	      mkdir -p "$$stage/$$(dirname "$$path")"; cp "$$src/$$path" "$$stage/$$path"; chmod "$$mode" "$$stage/$$path"; \
 	    else echo "image-stage-scan: unknown kind '$$kind' in MANIFEST"; exit 1; fi; \
 	  done < "$$src/MANIFEST"; \

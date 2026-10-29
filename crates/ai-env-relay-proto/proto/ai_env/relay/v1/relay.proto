@@ -1,0 +1,226 @@
+// ai-env relay protocol, version 1.
+//
+// The relay is a small always-on service in the owner's AWS account. It has two faces:
+//   - WorkerTunnel (internet, 443): workers that front data sources dial in, prove a
+//     whitelisted key, push their catalog and answer invocations on one stream.
+//   - Relay (private, VMs only): agents list the catalog and call sources.
+// The envelope is generic: a source is a name plus ops with JSON parameters, so no
+// concrete source ever appears in this file. Evolve it additively only: never reuse
+// or renumber a field; retire fields with `reserved`.
+syntax = "proto3";
+
+package ai_env.relay.v1;
+
+// Internet face. The relay answers the stream at once and sends a Challenge; the
+// worker replies with Hello, then AuthProof; nothing else is accepted before AuthOk.
+service WorkerTunnel {
+  rpc Open(stream WorkerFrame) returns (stream RelayFrame);
+}
+
+// Private face (VM clients). The caller's session token travels in the request
+// metadata (`x-ai-env-session`), is checked by the relay and is never forwarded.
+service Relay {
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  // A unary op answers with one final chunk; a streaming op with several.
+  rpc Call(CallRequest) returns (stream CallChunk);
+}
+
+// ---- the tunnel ----------------------------------------------------------------------
+
+message RelayFrame {
+  oneof msg {
+    Challenge challenge = 1;
+    AuthOk auth_ok = 2;
+    Invoke invoke = 3;
+    Cancel cancel = 4;
+    Ping ping = 5;
+    Close close = 6;
+  }
+}
+
+message WorkerFrame {
+  oneof msg {
+    Hello hello = 1;
+    AuthProof auth_proof = 2;
+    Catalog catalog = 3;
+    Chunk chunk = 4;
+    Pong pong = 5;
+  }
+}
+
+// Sent by the relay first. `nonce` is 32 random bytes, fresh per connection.
+message Challenge {
+  bytes nonce = 1;
+  string relay_id = 2;
+  uint32 protocol = 3;
+}
+
+enum SigAlg {
+  SIG_ALG_UNSPECIFIED = 0;
+  SIG_ALG_ED25519 = 1;
+}
+
+message Hello {
+  string worker_id = 1;
+  SigAlg alg = 2;
+  bytes public_key = 3;
+  uint32 protocol = 4;
+  string sdk_version = 5;
+}
+
+// The signature over the handshake transcript (see `ai_env_source::wire::transcript`).
+message AuthProof {
+  bytes signature = 1;
+}
+
+message AuthOk {
+  string tunnel_id = 1;
+  uint64 whitelist_version = 2;
+}
+
+message Invoke {
+  string request_id = 1;
+  string source = 2;
+  string op = 3;
+  bytes params_json = 4;
+  Caller caller = 5;
+  uint32 deadline_ms = 6;
+  Limits limits = 7;
+}
+
+// Asserted by the relay from the verified session token; never a credential.
+message Caller {
+  string caller_id = 1;
+  string session_id = 2;
+  string grant_id = 3;
+  string vm_id = 4;
+}
+
+message Limits {
+  uint64 max_bytes = 1;
+  uint32 max_rows = 2;
+  uint32 max_chunks = 3;
+}
+
+message Cancel {
+  string request_id = 1;
+  string reason = 2;
+}
+
+message Ping {
+  uint64 seq = 1;
+}
+
+message Pong {
+  uint64 seq = 1;
+}
+
+message Close {
+  uint32 code = 1;
+  string reason = 2;
+}
+
+// ---- the catalog ---------------------------------------------------------------------
+
+message Catalog {
+  repeated SourceDescriptor sources = 1;
+}
+
+enum SourceKind {
+  SOURCE_KIND_UNSPECIFIED = 0;
+  SOURCE_KIND_SQL = 1;
+  SOURCE_KIND_HTTP_API = 2;
+  SOURCE_KIND_GRPC_API = 3;
+  SOURCE_KIND_LOGS = 4;
+  SOURCE_KIND_METRICS = 5;
+  SOURCE_KIND_HOST_STATS = 6;
+  SOURCE_KIND_OTHER = 7;
+}
+
+enum Sensitivity {
+  SENSITIVITY_UNSPECIFIED = 0;
+  SENSITIVITY_PUBLIC = 1;
+  SENSITIVITY_INTERNAL = 2;
+  SENSITIVITY_RESTRICTED = 3;
+}
+
+enum OutputKind {
+  OUTPUT_KIND_UNSPECIFIED = 0;
+  OUTPUT_KIND_JSON = 1;
+  OUTPUT_KIND_TEXT = 2;
+  OUTPUT_KIND_STREAM = 3;
+}
+
+message SourceDescriptor {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+  SourceKind kind = 4;
+  // A free-form environment tag, e.g. "prod" or "test".
+  string env = 5;
+  Sensitivity sensitivity = 6;
+  repeated OpDescriptor ops = 7;
+}
+
+message OpDescriptor {
+  string name = 1;
+  string description = 2;
+  // A JSON Schema (draft 2020-12) for the op's parameters, as text.
+  string params_json_schema = 3;
+  OutputKind output = 4;
+  bool read_only = 5;
+  Limits default_limits = 6;
+  Limits max_limits = 7;
+  // Example parameter objects, as JSON text, to help an agent call the op.
+  repeated string examples = 8;
+}
+
+// ---- results -------------------------------------------------------------------------
+
+// google.rpc.Code numbering.
+message Error {
+  int32 code = 1;
+  string message = 2;
+}
+
+message Chunk {
+  string request_id = 1;
+  uint64 seq = 2;
+  bytes data = 3;
+  string content_type = 4;
+  bool final = 5;
+  Error error = 6;
+  bool truncated = 7;
+}
+
+// ---- the private face ----------------------------------------------------------------
+
+message ListSourcesRequest {}
+
+message SourceStatus {
+  SourceDescriptor descriptor = 1;
+  bool available = 2;
+  int64 last_seen_unix_ms = 3;
+}
+
+message ListSourcesResponse {
+  repeated SourceStatus sources = 1;
+}
+
+message CallRequest {
+  string source = 1;
+  string op = 2;
+  bytes params_json = 3;
+  uint32 deadline_ms = 4;
+  Limits limits = 5;
+}
+
+message CallChunk {
+  string request_id = 1;
+  uint64 seq = 2;
+  bytes data = 3;
+  string content_type = 4;
+  bool final = 5;
+  Error error = 6;
+  bool truncated = 7;
+}

@@ -908,7 +908,7 @@ async fn e1<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
     let expiry_ms = i64::try_from(token.expires_at_unix).unwrap_or(i64::MAX / 1000) * 1000;
     let (mut conn, _ok) = open_hello(&dial, &target, token.value()?, vec![], Some(3600), wait).await?;
     let sid = SpawnId::new_v7();
-    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300), credential: None, claude: Vec::new() }).await?;
+    conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(300), credential: None, claude: Vec::new(), relay: None }).await?;
     let pid1 = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await?;
     let (cut, silent) = e1_hold(&mut conn, expiry_ms, Duration::from_secs(240), Duration::from_secs(20), crate::wire::frame::DEAD_AFTER).await;
     conn.close(CLOSE_NORMAL).await;
@@ -1062,7 +1062,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sleep".into(), "3600".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new(), relay: None }).await?;
         let _ = await_spawned(&mut conn, &sid, Duration::from_secs(30)).await;
         tokio::time::sleep(phase).await;
         drop(conn);
@@ -1102,7 +1102,7 @@ async fn e5<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A, ep: &E, starte
         let tok = token::mint(api, &ctx.paths, &vm.id, APP_PORT, 60).await?;
         let (mut conn, _) = open_hello(&dial, &target, tok.value()?, vec![], Some(3600), wait).await?;
         let sid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
+        conn.send(&Frame::Spawn { spawn_id: sid.clone(), argv: vec!["sh".into(), "-c".into(), "while true; do echo tick; sleep 10; done".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new(), relay: None }).await?;
         let until = Instant::now() + phase;
         while Instant::now() < until {
             // Drain VM→Mac frames without acking; a closed socket (suspend) ends the drain.
@@ -1287,7 +1287,7 @@ async fn reattach_gap<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDial, targe
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let gsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
+        conn.send(&Frame::Spawn { spawn_id: gsid.clone(), argv: vec!["sh".into(), "-c".into(), "i=0; while [ $i -lt 200000 ]; do echo g-$i; i=$((i+1)); done; sleep 120".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new(), relay: None }).await?;
         await_spawned(&mut conn, &gsid, Duration::from_secs(30)).await?;
         // Ack up to a high seq so the shim trims past seq 1, until the output quiets.
         let mut hi = 0u64;
@@ -1325,7 +1325,7 @@ async fn reattach_window_kill<A: MicrovmApi>(ctx: &Ctx, api: &A, dial: &AgentDia
         let tok = token::mint(api, &ctx.paths, id, APP_PORT, 5).await?;
         let (mut conn, _) = open_hello(dial, target, tok.value()?, vec![], Some(3600), wait).await?;
         let wsid = SpawnId::new_v7();
-        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() }).await?;
+        conn.send(&Frame::Spawn { spawn_id: wsid.clone(), argv: vec!["sh".into(), "-c".into(), "head -c 20000000 /dev/zero | tr '\\0' X".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new(), relay: None }).await?;
         await_spawned(&mut conn, &wsid, Duration::from_secs(30)).await?;
         // Read up to the window WITHOUT acking so it fills and the shim stops reading the child.
         let mut got = 0u64;
@@ -1429,7 +1429,7 @@ async fn clock_after_resume<A: MicrovmApi, E: EndpointClient>(ctx: &Ctx, api: &A
 /// bracket t0..t1): the stdout text and both instants.
 async fn conn_exec(conn: &mut AgentConn, argv: &[&str], budget: Duration) -> Result<(String, SystemTime, SystemTime), BridgeError> {
     let sid = SpawnId::new_v7();
-    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30), credential: None, claude: Vec::new() };
+    let spec = Frame::Spawn { spawn_id: sid.clone(), argv: argv.iter().map(|s| (*s).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: Some(30), credential: None, claude: Vec::new(), relay: None };
     let t0 = SystemTime::now();
     conn.send(&spec).await?;
     let (mut out, mut t1, mut got) = (String::new(), t0, false);

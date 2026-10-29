@@ -19,11 +19,17 @@
 // S9: the S3 gateway endpoint (NET.s3Endpoint) and the transcripts bucket with its six settings join the inventory,
 // and the `allow` parameter is allow.txt plus the bucket's virtual-hosted name (allowValue), the one AWS host squid
 // serves; allow.txt itself may name no amazonaws.com host (assertEgressSpec with the file's text).
+//
+// S13 (plans/s13-contracts.md §I-infra.4.1): the relay, a third security group (SG_KEYS: TCP 443 in from anywhere for the
+// workers, TCP relayPort in from the VM group, HTTPS and DNS out), the VM group's second egress rule (TCP relayPort to
+// relayIp/32) and the VM subnet's second NACL entry in each direction (RELAY_NACL_RULE_NO), compared as a set; the
+// inventory gains the relay's nineteen resources (relay.ts); and the template renderer moves here from egress.ts
+// (renderTemplate, embedded: LD-I14), so relay-spec.ts, which renders the relay's boot, stays Pulumi-free.
 import * as fs from "fs";
 import * as path from "path";
 import {
-    BUCKET_PREFIX, BUDGET_NAME, BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, EgressNames, PROXY_PARAMETERS, REGION, RUNTIME_POLICY_NAME, STACK_POLICIES, STACK_USERS,
-    TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, dnsQueryLogGroupName, transcriptsBucketHost,
+    BUCKET_PREFIX, BUDGET_NAME, BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, EgressNames, PROXY_PARAMETERS, REGION, RELAY_INSTANCE_PROFILE_NAME, RELAY_ROLE_NAME, RUNTIME_POLICY_NAME,
+    STACK_POLICIES, STACK_USERS, TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, dnsQueryLogGroupName, transcriptsBucketHost,
 } from "./policies";
 
 export const DNS_MODES = ["none", "firewall"] as const;
@@ -56,12 +62,23 @@ export interface EgressConfig {
     reloadDocumentName: string;
     statusDocumentName: string;
     patchDocumentName: string;
+    /** S13: the relay's fixed private address, in the proxy subnet (it shares the proxy's route and the S3 endpoint). */
+    relayIp: string;
+    /** S13: the relay's private port, the VMs' second and last way out. */
+    relayPort: number;
+    relayInstanceType: string;
+    relaySecurityGroupName: string;
+    /** S13: the relay's SSM parameters `<prefix>/{artifact,workers,grants,token-signers,tls}`. */
+    relayParameterPrefix: string;
+    relayLogGroup: string;
+    relayLogRetentionDays: number;
 }
 
 const STRING_KEYS = ["vpcCidr", "proxySubnetCidr", "vmSubnetCidr", "azId", "proxyIp", "instanceType", "dnsMode", "logGroup", "parameterPrefix",
     "connectorName", "proxyRoleName", "operatorRoleName", "proxyInstanceProfileName", "vmSecurityGroupName", "proxySecurityGroupName",
-    "reloadDocumentName", "statusDocumentName", "patchDocumentName"] as const;
-const NUMBER_KEYS = ["proxyPort", "logRetentionDays"] as const;
+    "reloadDocumentName", "statusDocumentName", "patchDocumentName", "relayIp", "relayInstanceType", "relaySecurityGroupName", "relayParameterPrefix",
+    "relayLogGroup"] as const;
+const NUMBER_KEYS = ["proxyPort", "logRetentionDays", "relayPort", "relayLogRetentionDays"] as const;
 const KEYS: readonly string[] = [...STRING_KEYS, ...NUMBER_KEYS, "resolvers", "enableDnsQueryLog"];
 
 /** infra/egress-config.json, typed field by field (values are judged by assertEgressSpec). An unknown key is a typo. */
@@ -87,6 +104,7 @@ export function egressNames(cfg: EgressConfig): EgressNames {
         parameterPrefix: cfg.parameterPrefix, logGroup: cfg.logGroup, proxyRoleName: cfg.proxyRoleName, operatorRoleName: cfg.operatorRoleName,
         proxyInstanceProfileName: cfg.proxyInstanceProfileName, connectorName: cfg.connectorName,
         reloadDocumentName: cfg.reloadDocumentName, statusDocumentName: cfg.statusDocumentName, patchDocumentName: cfg.patchDocumentName,
+        relayParameterPrefix: cfg.relayParameterPrefix, relayLogGroup: cfg.relayLogGroup,
     };
 }
 
@@ -151,7 +169,9 @@ function isPrivate(ip: number): boolean {
 
 // ---- the spec ----
 
-export type SgKey = "vm" | "proxy";
+export type SgKey = "vm" | "proxy" | "relay";
+/** The security groups in the order every loop takes them. */
+export const SG_KEYS = ["vm", "proxy", "relay"] as const;
 export type Peer = { sg: SgKey } | { cidr: string };
 
 export interface RuleSpec {
@@ -199,7 +219,7 @@ export interface EgressSpec {
     /** The VM subnet's own network ACL: a second layer under the VM security group (defence in depth). */
     nacl: { name: string; ingress: NaclRuleSpec[]; egress: NaclRuleSpec[] };
     defaultSecurityGroup: { name: string };
-    securityGroups: { vm: SgSpec; proxy: SgSpec };
+    securityGroups: { vm: SgSpec; proxy: SgSpec; relay: SgSpec };
 }
 
 /** Pulumi names of the network resources (the transform identifies resources by them). */
@@ -218,6 +238,12 @@ export const NET = {
     /** Pulumi names outside the network (the inventory pins them too). */
     logGroup: "egress-log-group",
     dnsLogGroup: "egress-dns-log-group",
+    /** S13: the relay (relay.ts): its instance, its Elastic IP and the association (one name), log group, artifact object and parameter. */
+    relayInstance: "ai-env-relay",
+    relayEip: "ai-env-relay",
+    relayLogGroup: "relay-log-group",
+    relayArtifact: "relay-artifact",
+    relayArtifactParameter: "ai-env-relay-artifact",
 } as const;
 
 /**
@@ -242,13 +268,17 @@ function allowHosts(text: string): string[] {
 /** Fixed: a changed description replaces the security group, which the connector's ENIs hold. */
 export const VM_SG_DESCRIPTION = "ai-env MicroVM egress connector ENIs: TCP 3128 to the proxy only";
 export const PROXY_SG_DESCRIPTION = "ai-env egress proxy: TCP 3128 from the MicroVM ENIs; HTTPS and DNS out";
+/** Fixed: a changed description replaces the group. */
+export const RELAY_SG_DESCRIPTION = "ai-env relay: TCP 443 from workers anywhere, TCP 7443 from the MicroVM ENIs; HTTPS and DNS out";
 export const ANYWHERE = "0.0.0.0/0";
 export const HTTPS = 443;
 export const DNS = 53;
-/** Never open, anywhere: the proxy is reached through SSM only. */
+/** Never open, anywhere: the proxy and the relay are reached through SSM only. */
 export const SSH = 22;
 /** The VM subnet's NACL: the one rule number of each direction, and the client ports the proxy answers to. */
 export const NACL_RULE_NO = 100;
+/** The VM subnet's NACL: the relay's rule number in each direction (the proxy's stays NACL_RULE_NO, 100). */
+export const RELAY_NACL_RULE_NO = 110;
 export const EPHEMERAL_FROM = 1024;
 export const EPHEMERAL_TO = 65535;
 /** DNS Firewall (dnsMode "firewall"): the block-all rule and its association. */
@@ -266,9 +296,15 @@ export function proxyCidr(cfg: EgressConfig): string {
     return `${cfg.proxyIp}/32`;
 }
 
+/** S13: the relay's address as the one CIDR of it the VM subnet may reach (its private port only). */
+export function relayCidr(cfg: EgressConfig): string {
+    return `${cfg.relayIp}/32`;
+}
+
 /**
  * The spec of the egress network, from the config alone. The scratch:* markers are edited by
- * `make preview-scratch NEGATIVE=vm-sg-open|private-route|dns-support-on-in-none-mode|nacl-open` in a scratch copy.
+ * `make preview-scratch NEGATIVE=vm-sg-open|private-route|dns-support-on-in-none-mode|nacl-open|relay-sg-open|vm-relay-wide|relay-nacl-wide`
+ * in a scratch copy.
  */
 export function egressSpec(cfg: EgressConfig): EgressSpec {
     const dnsRules: RuleSpec[] = cfg.resolvers.flatMap((r) => (["udp", "tcp"] as const).map((protocol) => (
@@ -285,9 +321,14 @@ export function egressSpec(cfg: EgressConfig): EgressSpec {
         },
         nacl: {
             name: NET.vms,
-            ingress: [{ ruleNo: NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: proxyCidr(cfg), fromPort: EPHEMERAL_FROM, toPort: EPHEMERAL_TO }],
+            ingress: [
+                { ruleNo: NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: proxyCidr(cfg), fromPort: EPHEMERAL_FROM, toPort: EPHEMERAL_TO },
+                // S13: the relay's answers.
+                { ruleNo: RELAY_NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: relayCidr(cfg), fromPort: EPHEMERAL_FROM, toPort: EPHEMERAL_TO },
+            ],
             egress: [
                 { ruleNo: NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: proxyCidr(cfg), fromPort: cfg.proxyPort, toPort: cfg.proxyPort },
+                { ruleNo: RELAY_NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: relayCidr(cfg), fromPort: cfg.relayPort, toPort: cfg.relayPort },
             ], // scratch:nacl-egress
         },
         defaultSecurityGroup: { name: NET.defaultSecurityGroup },
@@ -296,6 +337,8 @@ export function egressSpec(cfg: EgressConfig): EgressSpec {
                 name: cfg.vmSecurityGroupName, description: VM_SG_DESCRIPTION, rules: [
                     // The proxy's address, not its security group: any interface holding the proxy SG would otherwise be a second proxy.
                     { direction: "egress", protocol: "tcp", port: cfg.proxyPort, peer: { cidr: proxyCidr(cfg) }, description: "to the egress proxy only" },
+                    // S13: the relay's address and private port, never its internet face.
+                    { direction: "egress", protocol: "tcp", port: cfg.relayPort, peer: { cidr: relayCidr(cfg) }, description: "to the relay's private port" }, // scratch:vm-relay-rule
                 ], // scratch:vm-rules
             },
             proxy: {
@@ -304,6 +347,15 @@ export function egressSpec(cfg: EgressConfig): EgressSpec {
                     { direction: "egress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "CONNECT targets, SSM, CloudWatch, dnf" },
                     ...dnsRules,
                 ],
+            },
+            // S13: the relay. Its internet face is 443 (the workers dial in); its private face the relay port, from the VMs.
+            relay: {
+                name: cfg.relaySecurityGroupName, description: RELAY_SG_DESCRIPTION, rules: [
+                    { direction: "ingress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "worker tunnels (the relay's internet face)" },
+                    { direction: "ingress", protocol: "tcp", port: cfg.relayPort, peer: { sg: "vm" }, description: "from the MicroVM egress ENIs (the relay's private face)" },
+                    { direction: "egress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "SSM, CloudWatch Logs, S3 through the gateway endpoint" },
+                    ...dnsRules,
+                ], // scratch:relay-rules
             },
         },
     };
@@ -318,7 +370,7 @@ export function ruleName(spec: EgressSpec, sg: SgKey, rule: RuleSpec): string {
 /** Which security group a rule's Pulumi name belongs to (undefined: not named like a rule of the spec). */
 export function ruleOwner(spec: EgressSpec, name: string): SgKey | undefined {
     // assertEgressSpec refuses two names where one prefixes the other, so at most one matches.
-    return (["vm", "proxy"] as const).find((k) => name.startsWith(`${spec.securityGroups[k].name}-`));
+    return SG_KEYS.find((k) => name.startsWith(`${spec.securityGroups[k].name}-`));
 }
 
 function sameRule(a: RuleSpec, b: RuleSpec): boolean {
@@ -326,29 +378,36 @@ function sameRule(a: RuleSpec, b: RuleSpec): boolean {
     return a.direction === b.direction && a.protocol === b.protocol && a.port === b.port && peer(a.peer) === peer(b.peer);
 }
 
+/** A security group's name in the config, by its key. */
+function sgName(cfg: EgressConfig, sg: SgKey): string {
+    return sg === "vm" ? cfg.vmSecurityGroupName : sg === "proxy" ? cfg.proxySecurityGroupName : cfg.relaySecurityGroupName;
+}
+
 /**
  * One rule against the design, wherever it comes from (the spec, a rule resource seen by the transform, a planned rule):
- *   vm SG:    egress TCP <proxyPort> → <proxyIp>/32, nothing else;
- *   proxy SG: ingress TCP <proxyPort> ← the vm SG; egress TCP 443 → 0.0.0.0/0; egress UDP/TCP 53 → <resolver>/32.
+ *   vm SG:    egress TCP <proxyPort> → <proxyIp>/32 and (S13) TCP <relayPort> → <relayIp>/32, nothing else;
+ *   proxy SG: ingress TCP <proxyPort> ← the vm SG; egress TCP 443 → 0.0.0.0/0; egress UDP/TCP 53 → <resolver>/32;
+ *   relay SG (S13): ingress TCP 443 ← 0.0.0.0/0 (the workers) and TCP <relayPort> ← the vm SG; egress TCP 443 →
+ *             0.0.0.0/0; egress UDP/TCP 53 → <resolver>/32.
  * Never port 22, never protocol -1. Undefined when the rule is allowed, else why not.
  */
 export function checkRule(cfg: EgressConfig, sg: SgKey, rule: RuleSpec): string | undefined {
-    const what = `${sg === "vm" ? cfg.vmSecurityGroupName : cfg.proxySecurityGroupName} ${rule.direction} ${rule.protocol} ${rule.port} ${"sg" in rule.peer ? `sg:${rule.peer.sg}` : rule.peer.cidr}`;
+    const what = `${sgName(cfg, sg)} ${rule.direction} ${rule.protocol} ${rule.port} ${"sg" in rule.peer ? `sg:${rule.peer.sg}` : rule.peer.cidr}`;
     if (rule.protocol !== "tcp" && rule.protocol !== "udp") return `${what}: only tcp or udp (never all protocols)`;
     if (!Number.isInteger(rule.port) || rule.port < 1 || rule.port > 65535) return `${what}: not a port`;
-    if (rule.port === SSH) return `${what}: no port 22 (the proxy is reached through SSM only)`;
+    if (rule.port === SSH) return `${what}: no port 22 (the proxy and the relay are reached through SSM only)`;
     if ("cidr" in rule.peer && cidr(rule.peer.cidr) === undefined) return `${what}: not an IPv4 CIDR`;
+    const one = (direction: RuleSpec["direction"], protocol: RuleSpec["protocol"], port: number, peer: Peer): RuleSpec => ({ direction, protocol, port, peer, description: "" });
+    const dns = cfg.resolvers.flatMap((r) => (["udp", "tcp"] as const).map((protocol) => one("egress", protocol, DNS, { cidr: `${r}/32` })));
     const allowed: RuleSpec[] = sg === "vm"
-        ? [{ direction: "egress", protocol: "tcp", port: cfg.proxyPort, peer: { cidr: proxyCidr(cfg) }, description: "" }]
-        : [
-            { direction: "ingress", protocol: "tcp", port: cfg.proxyPort, peer: { sg: "vm" }, description: "" },
-            { direction: "egress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "" },
-            ...cfg.resolvers.flatMap((r) => (["udp", "tcp"] as const).map((protocol) => ({ direction: "egress" as const, protocol, port: DNS, peer: { cidr: `${r}/32` }, description: "" }))),
-        ];
+        ? [one("egress", "tcp", cfg.proxyPort, { cidr: proxyCidr(cfg) }), one("egress", "tcp", cfg.relayPort, { cidr: relayCidr(cfg) })]
+        : sg === "proxy"
+            ? [one("ingress", "tcp", cfg.proxyPort, { sg: "vm" }), one("egress", "tcp", HTTPS, { cidr: ANYWHERE }), ...dns]
+            : [one("ingress", "tcp", HTTPS, { cidr: ANYWHERE }), one("ingress", "tcp", cfg.relayPort, { sg: "vm" }), one("egress", "tcp", HTTPS, { cidr: ANYWHERE }), ...dns];
     if (allowed.some((a) => sameRule(a, rule))) return undefined;
-    return sg === "vm"
-        ? `${what}: the VM security group allows exactly one rule, egress TCP ${cfg.proxyPort} to ${proxyCidr(cfg)}`
-        : `${what}: the proxy security group allows only TCP ${cfg.proxyPort} from the VM security group, TCP 443 to ${ANYWHERE} and UDP/TCP 53 to the resolvers /32`;
+    if (sg === "vm") return `${what}: the VM security group allows exactly two rules, egress TCP ${cfg.proxyPort} to ${proxyCidr(cfg)} and TCP ${cfg.relayPort} to ${relayCidr(cfg)}`;
+    if (sg === "proxy") return `${what}: the proxy security group allows only TCP ${cfg.proxyPort} from the VM security group, TCP 443 to ${ANYWHERE} and UDP/TCP 53 to the resolvers /32`;
+    return `${what}: the relay security group allows only TCP 443 from ${ANYWHERE}, TCP ${cfg.relayPort} from the VM security group, TCP 443 to ${ANYWHERE} and UDP/TCP 53 to the resolvers /32`;
 }
 
 /** A route table's routes: the VM table has none; the proxy table has exactly 0.0.0.0/0 → the IGW. */
@@ -359,15 +418,29 @@ export function checkRoutes(table: "proxy" | "vms", routes: RouteSpec[]): string
 }
 
 /**
- * The VM subnet's NACL against the design: egress exactly TCP <proxyPort> to <proxyIp>/32, ingress exactly TCP
- * 1024–65535 from <proxyIp>/32 (the proxy's answers), both allow, rule 100; everything else hits the implicit deny.
+ * The VM subnet's NACL against the design: egress exactly TCP <proxyPort> to <proxyIp>/32 (rule 100) and (S13) TCP
+ * <relayPort> to <relayIp>/32 (rule 110), ingress exactly TCP 1024–65535 from each of them (their answers), all allow;
+ * everything else hits the implicit deny. Each direction is compared sorted by rule number, then by every other field
+ * (S13: the provider holds the entries as a set, so the planned order is not the program's).
  */
 export function checkNacl(cfg: EgressConfig, ingress: NaclRuleSpec[], egress: NaclRuleSpec[]): string | undefined {
-    const canon = (rs: NaclRuleSpec[]) => JSON.stringify(rs.map((r) => [r.ruleNo, r.protocol, r.action, r.cidr, r.fromPort, r.toPort]));
-    const wantIn: NaclRuleSpec[] = [{ ruleNo: NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: proxyCidr(cfg), fromPort: EPHEMERAL_FROM, toPort: EPHEMERAL_TO }];
-    const wantOut: NaclRuleSpec[] = [{ ruleNo: NACL_RULE_NO, protocol: "tcp", action: "allow", cidr: proxyCidr(cfg), fromPort: cfg.proxyPort, toPort: cfg.proxyPort }];
-    if (canon(egress) !== canon(wantOut)) return `the VM subnet's network ACL must allow exactly one egress rule, TCP ${cfg.proxyPort} to ${proxyCidr(cfg)}, got ${canon(egress)}`;
-    if (canon(ingress) !== canon(wantIn)) return `the VM subnet's network ACL must allow exactly one ingress rule, TCP ${EPHEMERAL_FROM}-${EPHEMERAL_TO} from ${proxyCidr(cfg)}, got ${canon(ingress)}`;
+    const tuple = (r: NaclRuleSpec) => [r.ruleNo, r.protocol, r.action, r.cidr, r.fromPort, r.toPort];
+    const order = (a: unknown[], b: unknown[]) => {
+        const [na, nb] = [Number(a[0]), Number(b[0])];
+        if (na !== nb) return na < nb ? -1 : 1;
+        const [ra, rb] = [JSON.stringify(a.slice(1)), JSON.stringify(b.slice(1))];
+        return ra < rb ? -1 : ra > rb ? 1 : 0;
+    };
+    const canon = (rs: NaclRuleSpec[]) => JSON.stringify(rs.map(tuple).sort(order));
+    const entry = (ruleNo: number, c: string, fromPort: number, toPort: number): NaclRuleSpec => ({ ruleNo, protocol: "tcp", action: "allow", cidr: c, fromPort, toPort });
+    const wantIn = [entry(NACL_RULE_NO, proxyCidr(cfg), EPHEMERAL_FROM, EPHEMERAL_TO), entry(RELAY_NACL_RULE_NO, relayCidr(cfg), EPHEMERAL_FROM, EPHEMERAL_TO)];
+    const wantOut = [entry(NACL_RULE_NO, proxyCidr(cfg), cfg.proxyPort, cfg.proxyPort), entry(RELAY_NACL_RULE_NO, relayCidr(cfg), cfg.relayPort, cfg.relayPort)];
+    if (canon(egress) !== canon(wantOut)) {
+        return `the VM subnet's network ACL must allow exactly two egress rules, TCP ${cfg.proxyPort} to ${proxyCidr(cfg)} (${NACL_RULE_NO}) and TCP ${cfg.relayPort} to ${relayCidr(cfg)} (${RELAY_NACL_RULE_NO}), got ${canon(egress)}`;
+    }
+    if (canon(ingress) !== canon(wantIn)) {
+        return `the VM subnet's network ACL must allow exactly two ingress rules, TCP ${EPHEMERAL_FROM}-${EPHEMERAL_TO} from ${proxyCidr(cfg)} (${NACL_RULE_NO}) and from ${relayCidr(cfg)} (${RELAY_NACL_RULE_NO}), got ${canon(ingress)}`;
+    }
     return undefined;
 }
 
@@ -389,8 +462,11 @@ const LOG_RETENTION_DAYS = [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400,
 /**
  * Throws, naming every violation, before any resource is registered: CIDRs not disjoint or outside the VPC; the
  * proxy IP outside its subnet, reserved (.0–.3) or the broadcast address; a resolver that is not a public IPv4
- * address; the VM SG with anything but exactly one egress rule TCP <proxyPort> → the proxy SG; a proxy SG rule
- * outside the design; any route on the VM table; DNS attributes that do not match the mode; a mode outside its enum.
+ * address; the VM SG with anything but exactly its two egress rules (TCP <proxyPort> → the proxy's address, S13: TCP
+ * <relayPort> → the relay's); a proxy or relay SG rule outside the design; any route on the VM table; DNS attributes
+ * that do not match the mode; a mode outside its enum. S13: the relay's address outside the proxy subnet, reserved,
+ * the broadcast address or the proxy's; its port privileged or the proxy's; its prefix inside the proxy's or holding
+ * it (the proxy's role reads <parameterPrefix>/*); its log group the squid one; two group names that prefix another.
  * S9: with `allowText` (allow.txt), any host in or under amazonaws.com (or .aws, amazonaws.com.cn): every AWS service
  * endpoint is shared by all customers, and a VM's own IMDS role credentials work at any of them (S7 D2); the stack adds
  * the transcripts bucket's host itself (allowValue), and nothing else of AWS's may be served.
@@ -431,6 +507,21 @@ export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
         else if (ip === proxyNet.base + size(proxyNet) - 1) err(`proxyIp ${cfg.proxyIp} is the subnet's broadcast address (reserved by AWS)`);
     }
     if (!Number.isInteger(cfg.proxyPort) || cfg.proxyPort < 1024 || cfg.proxyPort > 65535) err(`proxyPort ${cfg.proxyPort} must be an unprivileged port (1024–65535)`);
+    // S13: the relay shares the proxy's subnet (its route out and the S3 gateway endpoint); its private port is never
+    // 22 or 443, which the VMs could otherwise reach on its internet face.
+    const relayIp = ipv4(cfg.relayIp);
+    if (relayIp === undefined) err(`relayIp ${cfg.relayIp} is not an IPv4 address`);
+    else {
+        if (proxyNet) {
+            if (!cidrContains(proxyNet, { base: relayIp, bits: 32 })) err(`relayIp ${cfg.relayIp} is not inside proxySubnetCidr ${cfg.proxySubnetCidr} (the relay shares the proxy's subnet and route)`);
+            else if (relayIp - proxyNet.base < 4) err(`relayIp ${cfg.relayIp} is reserved by AWS (the first four addresses of the subnet)`);
+            else if (relayIp === proxyNet.base + size(proxyNet) - 1) err(`relayIp ${cfg.relayIp} is the subnet's broadcast address (reserved by AWS)`);
+        }
+        if (relayIp === ip) err(`relayIp and proxyIp must differ (${cfg.relayIp})`);
+    }
+    if (!Number.isInteger(cfg.relayPort) || cfg.relayPort < 1024 || cfg.relayPort > 65535 || cfg.relayPort === cfg.proxyPort) {
+        err(`relayPort ${cfg.relayPort} must be an unprivileged port (1024–65535) other than proxyPort ${cfg.proxyPort}`);
+    }
 
     if (cfg.resolvers.length === 0) err("resolvers must name at least one DNS server");
     if (new Set(cfg.resolvers).size !== cfg.resolvers.length) err("resolvers lists a server twice");
@@ -442,18 +533,27 @@ export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
 
     if (!/^[a-z]{2,4}[0-9]-az[0-9]+$/.test(cfg.azId)) err(`azId ${cfg.azId} is not an AZ id (euc1-az1)`);
     if (!/^t4g\.[a-z0-9]+$/.test(cfg.instanceType)) err(`instanceType ${cfg.instanceType} must be a t4g type (the AMI is arm64)`);
+    if (!/^t4g\.[a-z0-9]+$/.test(cfg.relayInstanceType)) err(`relayInstanceType ${cfg.relayInstanceType} must be a t4g type (the AMI is arm64)`);
     if (!LOG_RETENTION_DAYS.includes(cfg.logRetentionDays)) err(`logRetentionDays ${cfg.logRetentionDays} is not a CloudWatch Logs retention`);
-    if (!/^(\/[A-Za-z0-9_.-]+)+$/.test(cfg.logGroup)) err(`logGroup ${cfg.logGroup} must be an absolute /a/b path`);
-    if (!/^(\/[A-Za-z0-9_.-]+)+$/.test(cfg.parameterPrefix) || cfg.parameterPrefix.startsWith("/aws") || cfg.parameterPrefix.startsWith("/ssm")) {
+    if (!LOG_RETENTION_DAYS.includes(cfg.relayLogRetentionDays)) err(`relayLogRetentionDays ${cfg.relayLogRetentionDays} is not a CloudWatch Logs retention`);
+    const absolute = /^(\/[A-Za-z0-9_.-]+)+$/;
+    if (!absolute.test(cfg.logGroup)) err(`logGroup ${cfg.logGroup} must be an absolute /a/b path`);
+    if (!absolute.test(cfg.relayLogGroup) || cfg.relayLogGroup === cfg.logGroup) err(`relayLogGroup ${cfg.relayLogGroup} must be an absolute /a/b path other than logGroup`);
+    if (!absolute.test(cfg.parameterPrefix) || cfg.parameterPrefix.startsWith("/aws") || cfg.parameterPrefix.startsWith("/ssm")) {
         err(`parameterPrefix ${cfg.parameterPrefix} must be an absolute /a/b path outside /aws and /ssm, without a trailing /`);
     }
-    for (const k of ["connectorName", "proxyRoleName", "operatorRoleName", "proxyInstanceProfileName", "vmSecurityGroupName", "proxySecurityGroupName"] as const) {
+    // "Inside": equal to the other, or under it. The proxy's role reads <parameterPrefix>/* (proxyRolePolicy).
+    const inside = (a: string, b: string) => a === b || a.startsWith(`${b}/`);
+    const relayPrefix = cfg.relayParameterPrefix;
+    if (!absolute.test(relayPrefix) || relayPrefix.startsWith("/aws") || relayPrefix.startsWith("/ssm") || inside(relayPrefix, cfg.parameterPrefix) || inside(cfg.parameterPrefix, relayPrefix)) {
+        err(`relayParameterPrefix ${relayPrefix} must be an absolute /a/b path outside /aws and /ssm, without a trailing /, neither inside parameterPrefix ${cfg.parameterPrefix} nor containing it (the proxy's role reads ${cfg.parameterPrefix}/*)`);
+    }
+    for (const k of ["connectorName", "proxyRoleName", "operatorRoleName", "proxyInstanceProfileName", "vmSecurityGroupName", "proxySecurityGroupName", "relaySecurityGroupName"] as const) {
         if (!NAME.test(cfg[k])) err(`${k} ${cfg[k]} is not a plain name`);
     }
-    if (cfg.vmSecurityGroupName === cfg.proxySecurityGroupName) err("vmSecurityGroupName and proxySecurityGroupName must differ");
-    if (cfg.vmSecurityGroupName.startsWith(`${cfg.proxySecurityGroupName}-`) || cfg.proxySecurityGroupName.startsWith(`${cfg.vmSecurityGroupName}-`)) {
-        err("one security group name must not prefix the other (rule names are <sg name>-…)");
-    }
+    const sgNames = SG_KEYS.map((k) => sgName(cfg, k));
+    if (new Set(sgNames).size !== sgNames.length) err("vmSecurityGroupName, proxySecurityGroupName and relaySecurityGroupName must differ");
+    if (sgNames.some((a) => sgNames.some((b) => a !== b && a.startsWith(`${b}-`)))) err("no security group name may prefix another (rule names are <sg name>-…)");
     // S8 operators: the proxy's documents, account-owned (the account is in their ARN, which the ops policy names).
     const docNames = documentNames(cfg);
     for (const role of DOCUMENT_ROLES) {
@@ -475,9 +575,10 @@ export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
     }
     const nacl = checkNacl(cfg, spec.nacl.ingress, spec.nacl.egress);
     if (nacl) err(nacl);
-    for (const sg of ["vm", "proxy"] as const) {
+    const descriptions: Record<SgKey, string> = { vm: VM_SG_DESCRIPTION, proxy: PROXY_SG_DESCRIPTION, relay: RELAY_SG_DESCRIPTION };
+    for (const sg of SG_KEYS) {
         const s = spec.securityGroups[sg];
-        const want = sg === "vm" ? [cfg.vmSecurityGroupName, VM_SG_DESCRIPTION] : [cfg.proxySecurityGroupName, PROXY_SG_DESCRIPTION];
+        const want = [sgName(cfg, sg), descriptions[sg]];
         if (s.name !== want[0] || s.description !== want[1]) err(`security group ${s.name}: the name and description are fixed (${want[0]}: ${want[1]})`);
         for (const rule of s.rules) {
             const r = checkRule(cfg, sg, rule);
@@ -487,12 +588,17 @@ export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
         if (new Set(names).size !== names.length) err(`security group ${s.name} lists a rule twice`);
     }
     const vmRules = spec.securityGroups.vm.rules;
-    if (vmRules.length !== 1) err(`the VM security group must have exactly one rule (egress TCP ${cfg.proxyPort} to ${proxyCidr(cfg)}), got ${vmRules.length}`);
+    if (vmRules.length !== 2) err(`the VM security group must have exactly two rules (egress TCP ${cfg.proxyPort} to ${proxyCidr(cfg)}, TCP ${cfg.relayPort} to ${relayCidr(cfg)}), got ${vmRules.length}`);
+    const distinct = (rules: RuleSpec[]) => rules.filter((r, i) => rules.findIndex((o) => sameRule(o, r)) === i).length;
     const proxyRules = spec.securityGroups.proxy.rules;
     const expectedProxy = 2 + 2 * cfg.resolvers.length;
-    const distinct = proxyRules.filter((r, i) => proxyRules.findIndex((o) => sameRule(o, r)) === i);
-    if (distinct.length !== expectedProxy || proxyRules.length !== expectedProxy) {
+    if (distinct(proxyRules) !== expectedProxy || proxyRules.length !== expectedProxy) {
         err(`the proxy security group must have exactly ${expectedProxy} distinct rules (3128 in, 443 out, UDP/TCP 53 to each resolver), got ${proxyRules.length}`);
+    }
+    const relayRules = spec.securityGroups.relay.rules;
+    const expectedRelay = 3 + 2 * cfg.resolvers.length;
+    if (distinct(relayRules) !== expectedRelay || relayRules.length !== expectedRelay) {
+        err(`the relay security group must have exactly ${expectedRelay} distinct rules (443 in from anywhere, ${cfg.relayPort} in from the VM security group, 443 out, UDP/TCP 53 to each resolver), got ${relayRules.length}`);
     }
 
     if (errors.length > 0) throw new Error(`egress spec (infra/egress-spec.ts, infra/egress-config.json) refused:\n  - ${errors.join("\n  - ")}`);
@@ -663,16 +769,19 @@ export const PROVIDER_INPUTS = ["region", "version", "skipCredentialsValidation"
  * guard refuses any resource outside it (CloudFormation stacks, Cloud Control and other generic resources, SSM
  * associations, extra providers, components, and every IAM kind the operator identities must never have: an access
  * key, a login profile, a group or group membership, a PolicyAttachment or UserPolicyAttachmentsExclusive, an
- * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 75 in
- * dnsMode none, 80 in firewall, the stack included (S9 added eight: transcripts.ts's bucket ai-env-transcripts with its
- * versioning, encryption, ownership controls, public access block, lifecycle and policy, and egress.ts's S3 gateway
- * endpoint ai-env-s3; before S9, 67 and 72). A resource added to the program must be added here, or the preview fails.
+ * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 94 in
+ * dnsMode none, 99 in firewall, 102 with the query log, the stack included (S13 added nineteen: the relay instance, its
+ * Elastic IP and association, role, inline policy, SSM attachment, instance profile, security group with seven rules,
+ * the VM group's rule to it, its log group, artifact object and artifact parameter; before S13, 75, 80 and 83; S9 added
+ * eight: transcripts.ts's bucket ai-env-transcripts with its versioning, encryption, ownership controls, public access
+ * block, lifecycle and policy, and egress.ts's S3 gateway endpoint ai-env-s3; before S9, 67 and 72). A resource added
+ * to the program must be added here, or the preview fails.
  */
 export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory {
     const firewall = cfg.dnsMode === "firewall";
     const queryLog = firewall && cfg.enableDnsQueryLog;
     const spec = egressSpec(cfg);
-    const rules = (dir: "ingress" | "egress") => (["vm", "proxy"] as const).flatMap((sg) => spec.securityGroups[sg].rules.filter((r) => r.direction === dir).map((r) => ruleName(spec, sg, r)));
+    const rules = (dir: "ingress" | "egress") => SG_KEYS.flatMap((sg) => spec.securityGroups[sg].rules.filter((r) => r.direction === dir).map((r) => ruleName(spec, sg, r)));
     const entries: [string, string[]][] = [
         ["pulumi:providers:aws", [PROVIDERS.aws]],
         ["pulumi:providers:aws-native", [PROVIDERS.awsNative]],
@@ -685,12 +794,13 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:s3/bucketOwnershipControls:BucketOwnershipControls", [TRANSCRIPTS_RESOURCE]],
         ["aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration", [TRANSCRIPTS_RESOURCE]],
         ["aws:s3/bucketPolicy:BucketPolicy", [TRANSCRIPTS_RESOURCE]],
-        ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip"]],
-        ["aws:cloudwatch/logGroup:LogGroup", ["image-log-group", NET.logGroup, ...(queryLog ? [NET.dnsLogGroup] : [])]],
-        ["aws:iam/role:Role", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
+        // S13: the relay's binary beside the image zip, its log group, its role and inline policy (relay.ts).
+        ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip", NET.relayArtifact]],
+        ["aws:cloudwatch/logGroup:LogGroup", ["image-log-group", NET.logGroup, ...(queryLog ? [NET.dnsLogGroup] : []), NET.relayLogGroup]],
+        ["aws:iam/role:Role", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName, RELAY_ROLE_NAME]],
         // The operator role's is its Deny (policies.ts operatorRolePolicy): an inline policy on the role itself is
         // refused by the guard and the plan check.
-        ["aws:iam/rolePolicy:RolePolicy", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName]],
+        ["aws:iam/rolePolicy:RolePolicy", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName, RELAY_ROLE_NAME]],
         // S8 operators: ai-env-runtime (S3), ai-env-ops and ai-env-deployer; MacRuntimePolicy stays the only inline
         // user policy (on ai-env-runtime); the five managed policies are attached as USER_POLICY_ATTACHMENTS says.
         ["aws:iam/user:User", [...STACK_USERS]],
@@ -712,13 +822,17 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:ec2/networkAcl:NetworkAcl", [NET.vms]],
         ["aws:ec2/networkAclAssociation:NetworkAclAssociation", [NET.vms]],
         ["aws:ec2/defaultSecurityGroup:DefaultSecurityGroup", [NET.defaultSecurityGroup]],
-        ["aws:ec2/securityGroup:SecurityGroup", [cfg.vmSecurityGroupName, cfg.proxySecurityGroupName]],
+        ["aws:ec2/securityGroup:SecurityGroup", [cfg.vmSecurityGroupName, cfg.proxySecurityGroupName, cfg.relaySecurityGroupName]],
         ["aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule", rules("ingress")],
         ["aws:vpc/securityGroupEgressRule:SecurityGroupEgressRule", rules("egress")],
-        ["aws:iam/rolePolicyAttachment:RolePolicyAttachment", [`${cfg.proxyRoleName}-ssm`, cfg.operatorRoleName]],
-        ["aws:iam/instanceProfile:InstanceProfile", [cfg.proxyInstanceProfileName]],
-        ["aws:ec2/instance:Instance", [NET.instance]],
-        ["aws:ssm/parameter:Parameter", PROXY_PARAMETERS.map((p) => `ai-env-proxy-${p}`)],
+        ["aws:iam/rolePolicyAttachment:RolePolicyAttachment", [`${cfg.proxyRoleName}-ssm`, cfg.operatorRoleName, `${RELAY_ROLE_NAME}-ssm`]],
+        ["aws:iam/instanceProfile:InstanceProfile", [cfg.proxyInstanceProfileName, RELAY_INSTANCE_PROFILE_NAME]],
+        ["aws:ec2/instance:Instance", [NET.instance, NET.relayInstance]],
+        // S13: the relay's Elastic IP and its association (one name: the address is the relay's).
+        ["aws:ec2/eip:Eip", [NET.relayEip]],
+        ["aws:ec2/eipAssociation:EipAssociation", [NET.relayEip]],
+        // S13: the relay's artifact parameter (its other four are ai-env relay's, never Pulumi's: LD-I5).
+        ["aws:ssm/parameter:Parameter", [...PROXY_PARAMETERS.map((p) => `ai-env-proxy-${p}`), NET.relayArtifactParameter]],
         // S8 operators: the proxy's documents, the only ones ai-env-ops may send.
         ["aws:ssm/document:Document", DOCUMENT_ROLES.map((r) => documentNames(cfg)[r])],
         ["aws-native:lambda:NetworkConnector", [cfg.connectorName]],
@@ -736,4 +850,32 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
 /** Is `name` one of `type`'s resources in the inventory (never a prototype key: the inventory is a Map of arrays)? */
 export function inInventory(inventory: Inventory, type: string, name: string): boolean {
     return (inventory.get(type) ?? []).includes(name);
+}
+
+// ---- templates (S13: moved here from egress.ts, LD-I14) ----
+
+/**
+ * `<dir>/<file>` with its `@TOKEN@` placeholders replaced in one pass: a value is never scanned again (the proxy's
+ * embedded reload script carries @DIR@). `values` must name exactly `tokens`, the file must carry every one of them (a
+ * missing one means a config value never reaches the instance), and no `@[A-Z_]+@` may be left after rendering but a
+ * `keep` one (written `@NAME@`), filled at run time.
+ */
+export function renderTemplate(dir: string, file: string, tokens: readonly string[], values: Record<string, string>, keep: readonly string[] = []): string {
+    const text = fs.readFileSync(path.join(dir, file), "utf-8");
+    if (Object.keys(values).sort().join() !== tokens.slice().sort().join()) throw new Error(`egress: render ${file}: values for ${Object.keys(values).join(", ")}, expected ${tokens.join(", ")}`);
+    const missing = tokens.filter((t) => !text.includes(`@${t}@`));
+    if (missing.length > 0) throw new Error(`${path.join(dir, file)}: the placeholder(s) ${missing.map((t) => `@${t}@`).join(" ")} are missing (contract 3)`);
+    const out = text.replace(/@([A-Z_]+)@/g, (m, k: string) => (Object.prototype.hasOwnProperty.call(values, k) ? values[k] : m));
+    const left = [...new Set(out.match(/@[A-Z_]+@/g) ?? [])].filter((t) => !keep.includes(t));
+    if (left.length > 0) {
+        // The S5 text for the proxy's @DIR@ (its reload script fills it); nothing else is ever filled later.
+        const filled = keep.length > 0 ? `only ${keep.join(" ")} is filled on the proxy` : "none is filled later";
+        throw new Error(`${path.join(dir, file)}: unknown placeholder(s) ${left.join(" ")} left after rendering (${filled})`);
+    }
+    return out;
+}
+
+/** A file embedded in a heredoc: its own final newline is the heredoc's, so the installed copy is byte for byte the file. */
+export function embedded(text: string): string {
+    return text.endsWith("\n") ? text.slice(0, -1) : text;
 }

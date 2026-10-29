@@ -14,13 +14,20 @@
 //!
 //! - `egress status`: one row per check (ok | DRIFT | unknown) of the
 //!   connector, its ENIs, the VM subnet's effective route table and network
-//!   ACL, the three security groups, the VPC (IPv6, DNS attributes, the DNS
+//!   ACL, the security groups (the VM's, the proxy's, S13's relay's and the
+//!   default), the VPC (IPv6, DNS attributes, the DNS
 //!   Firewall in `firewall` mode, DHCP servers, endpoints, peering, NAT), the
 //!   proxy instance, its SSM agent, squid, the parameter hashes
 //!   `ai-env-proxy-reload --status` prints, and `squid.conf`/`allow` against
 //!   what the stack rendered. Drift is exit 1; anything that could not be
 //!   verified (and no drift) is exit 7; only a stopped proxy's skipped
-//!   checks are neither.
+//!   checks are neither. S13 (plans/s13-contracts.md §I-infra.4.8): the
+//!   relay's rows, `relay-sg` and `relay-endpoint` (who answers on its
+//!   address), and the VM group's and NACL's relay rules, all by
+//!   [`RelayState`]: a state without the relay keeps S12's expectations and
+//!   skips the relay rows (shown unknown, so `egress check` cannot pass on
+//!   it); a partial record expects the relay's VM rules and leaves its rows
+//!   unknown.
 //! - `egress allow|suspend` edit the `extras`/`suspended` parameters under
 //!   `state/egress.lock`: the three lists are read in one call (a value that
 //!   does not parse is never overwritten), the effective set ((allow ∪
@@ -48,7 +55,7 @@
 use super::ops::{self, arr, text, Invocation, Param, ProxyDoc, Wait};
 use super::{
     effective_hosts, fits_parameter, is_aws_service_host, is_valid_slug, normalize_connector, normalize_host, param_name, parse_extras, parse_hosts, parse_reload_status, proxy_env, render_extras, render_suspended, value_sha256, Extra,
-    PARAMETER_PREFIX, PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RESOLVERS,
+    PARAMETER_PREFIX, PARAMS, PARAM_MAX_BYTES, PROXY_PORT, RELAY_IP, RELAY_PORT, RESOLVERS,
 };
 use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::awscli::require_operator_account;
@@ -1296,6 +1303,100 @@ fn rule_diff(direction: &str, got: &[String], want: &[String]) -> Option<String>
     Some(format!("{direction}: {}", parts.join("; ")))
 }
 
+// ---- S13: the relay (plans/s13-contracts.md §I-infra.4.8) ----
+
+/// S13: the relay as `state/infra.toml` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelayRecorded<'a> {
+    pub instance: &'a str,
+    pub sg: &'a str,
+    pub public_ip: Option<&'a str>,
+}
+
+/// S13: what the relay rows expect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayState<'a> {
+    /// No relay key at all: a stack before S13 (S12's VM rules; the relay rows skipped).
+    Absent,
+    Recorded(RelayRecorded<'a>),
+    /// A partial or malformed record, and why: the VM rules expect the relay (fail closed); the relay rows are unknown.
+    Malformed(String),
+}
+
+/// The relay rows' text on a state without the relay (skipped: shown unknown, so `egress check` cannot pass on it).
+const RELAY_ABSENT: &str = "no relay recorded in state/infra.toml (a stack before S13): not checked";
+
+impl<'a> RelayState<'a> {
+    /// I-R56: `Absent` when none of `relay_instance_id`, `relay_security_group_id` and `relay_private_ip` is set
+    /// (trimmed, non-empty); `Recorded` when all three are, the instance an `i-` id and the group an `sg-` id
+    /// ([`is_aws_id`]), the private address exactly [`RELAY_IP`], and `relay_public_ip` absent or a dotted-quad IPv4
+    /// address; anything else `Malformed`.
+    pub(crate) fn of(state: &'a InfraState) -> RelayState<'a> {
+        let set = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        let public_ip = set(&state.relay_public_ip);
+        match (set(&state.relay_instance_id), set(&state.relay_security_group_id), set(&state.relay_private_ip)) {
+            (None, None, None) => RelayState::Absent,
+            (Some(instance), Some(sg), Some(private))
+                if is_aws_id(instance, "i-") && is_aws_id(sg, "sg-") && private == RELAY_IP && public_ip.is_none_or(|p| p.parse::<std::net::Ipv4Addr>().is_ok()) =>
+            {
+                RelayState::Recorded(RelayRecorded { instance, sg, public_ip })
+            }
+            _ => RelayState::Malformed(format!(
+                "state/infra.toml records the relay partially or malformed (relay_instance_id, relay_security_group_id and relay_private_ip: all three or none, the last exactly {RELAY_IP}): {HINT}"
+            )),
+        }
+    }
+}
+
+/// S13: who answers on the relay's address (I-R59): no interface is `ok` (the
+/// relay instance is gone or being replaced: doctor's row is about
+/// availability, LD-I9); else exactly one, the relay instance's, holding
+/// exactly the relay's group, no IPv6 address, the source/destination check
+/// on, and the recorded public address (when both are known). A malformed
+/// answer is unknown.
+fn judge_relay_endpoint(doc: &Value, relay: &RelayRecorded<'_>) -> Judged {
+    let Some(enis) = doc.get("NetworkInterfaces").and_then(Value::as_array) else {
+        return unknown("the describe-network-interfaces answer has no NetworkInterfaces list");
+    };
+    let Some(first) = enis.first() else {
+        return ok(format!("nothing holds {RELAY_IP}: the VMs' relay port reaches no one (the relay instance is gone or being replaced: ai-env doctor)"));
+    };
+    fn instance_of(e: &Value) -> Option<&str> {
+        e.get("Attachment").map(|a| text(a, "InstanceId")).filter(|i| !i.is_empty())
+    }
+    fn public_of(e: &Value) -> Option<&str> {
+        e.get("Association").map(|a| text(a, "PublicIp")).filter(|p| !p.is_empty())
+    }
+    let mut p = Vec::new();
+    if enis.len() > 1 {
+        p.push(format!("{} interfaces hold {RELAY_IP}", enis.len()));
+    }
+    for e in enis {
+        let id = text(e, "NetworkInterfaceId");
+        if instance_of(e) != Some(relay.instance) {
+            p.push(format!("{id} holds {RELAY_IP} for {}, not the relay instance {}", instance_of(e).unwrap_or("no instance"), relay.instance));
+        }
+        let mut groups: Vec<String> = arr(e, "Groups").iter().map(|g| text(g, "GroupId").to_string()).collect();
+        groups.sort();
+        if groups != [relay.sg] {
+            p.push(format!("{id} has groups {}, not exactly [{}]", list(&groups), relay.sg));
+        }
+        if !arr(e, "Ipv6Addresses").is_empty() {
+            p.push(format!("{id} has IPv6 addresses"));
+        }
+        if e.get("SourceDestCheck").and_then(Value::as_bool) == Some(false) {
+            p.push(format!("{id} forwards traffic (source/destination check off)"));
+        }
+        if let (Some(got), Some(want)) = (public_of(e), relay.public_ip) {
+            if got != want {
+                p.push(format!("{id}'s public address is {got}, not the recorded {want} (workers dial {want}): {HINT}"));
+            }
+        }
+    }
+    let detail = format!("{} of {}: {RELAY_IP}, [{}], public {}", text(first, "NetworkInterfaceId"), instance_of(first).unwrap_or("no instance"), relay.sg, public_of(first).unwrap_or("none"));
+    verdict(&p, detail)
+}
+
 /// A network ACL's entries, one string per entry but the default deny
 /// (rule 32767): `egress allow tcp 3128 cidr:10.42.0.10/32`.
 fn flat_acl_entries(entries: &[Value]) -> Vec<String> {
@@ -1328,8 +1429,10 @@ fn flat_acl_entries(entries: &[Value]) -> Vec<String> {
 
 /// The VM subnet's own network ACL (never the VPC's default one, which
 /// allows everything): TCP 3128 out to the proxy, the return traffic in
-/// from it, the default deny, nothing else.
-fn judge_nacl(doc: &Value, subnet: &str, proxy_ip: &str) -> Judged {
+/// from it, the default deny, nothing else; with the relay (S13, `relay`: a
+/// state that records it, even partially) also TCP [`RELAY_PORT`] out to
+/// [`RELAY_IP`] and its return traffic.
+fn judge_nacl(doc: &Value, subnet: &str, proxy_ip: &str, relay: bool) -> Judged {
     let acls = arr(doc, "NetworkAcls");
     let Some(acl) = acls.iter().find(|a| arr(a, "Associations").iter().any(|s| text(s, "SubnetId") == subnet)) else {
         return (Verdict::Drift, format!("no network ACL is associated with {subnet}"));
@@ -1338,9 +1441,16 @@ fn judge_nacl(doc: &Value, subnet: &str, proxy_ip: &str) -> Judged {
     if acl.get("IsDefault").and_then(Value::as_bool) != Some(false) {
         return (Verdict::Drift, format!("{subnet} uses the VPC's default network ACL {id} (it allows everything), not its own"));
     }
-    let want = [format!("egress allow tcp 3128 cidr:{proxy_ip}/32"), format!("ingress allow tcp 1024-65535 cidr:{proxy_ip}/32")];
+    let mut want = vec![format!("egress allow tcp 3128 cidr:{proxy_ip}/32"), format!("ingress allow tcp 1024-65535 cidr:{proxy_ip}/32")];
+    if relay {
+        want.extend([format!("egress allow tcp {RELAY_PORT} cidr:{RELAY_IP}/32"), format!("ingress allow tcp 1024-65535 cidr:{RELAY_IP}/32")]);
+    }
     let p: Vec<String> = rule_diff(id, &flat_acl_entries(arr(acl, "Entries")), &want).into_iter().collect();
-    verdict(&p, format!("{id}: egress tcp 3128 to {proxy_ip}/32, ingress tcp 1024-65535 from {proxy_ip}/32, default deny"))
+    if relay {
+        verdict(&p, format!("{id}: egress tcp 3128 to {proxy_ip}/32 and tcp {RELAY_PORT} to {RELAY_IP}/32, ingress tcp 1024-65535 from both, default deny"))
+    } else {
+        verdict(&p, format!("{id}: egress tcp 3128 to {proxy_ip}/32, ingress tcp 1024-65535 from {proxy_ip}/32, default deny"))
+    }
 }
 
 /// The proxy's egress: TCP 443 anywhere, UDP and TCP 53 to each resolver.
@@ -1356,9 +1466,11 @@ fn proxy_egress_rules() -> Vec<String> {
 
 /// The VM security group (no ingress; egress exactly TCP 3128 to the
 /// proxy's address — an address, not the proxy SG: any interface holding
-/// that group would be a second, unfiltered proxy), the proxy's and the
-/// VPC's default one, exactly as designed.
-fn judge_security_groups(doc: &Value, vm_sg: &str, proxy_sg: &str, proxy_ip: &str) -> Vec<(&'static str, Judged)> {
+/// that group would be a second, unfiltered proxy — and, S13, TCP
+/// [`RELAY_PORT`] to [`RELAY_IP`] unless the state records no relay), the
+/// proxy's, the relay's (skipped without the relay, unknown on a partial
+/// record) and the VPC's default one, exactly as designed.
+fn judge_security_groups(doc: &Value, vm_sg: &str, proxy_sg: &str, proxy_ip: &str, relay: &RelayState<'_>) -> Vec<(&'static str, Judged)> {
     let groups = arr(doc, "SecurityGroups");
     let judge = |found: Option<&Value>, what: String, ingress: Vec<String>, egress: Vec<String>, detail: String| -> Judged {
         let Some(g) = found else { return (Verdict::Drift, format!("{what} is not a security group of the VPC")) };
@@ -1366,8 +1478,29 @@ fn judge_security_groups(doc: &Value, vm_sg: &str, proxy_sg: &str, proxy_ip: &st
         verdict(&p, detail)
     };
     let by_id = |id: &str| groups.iter().find(|g| text(g, "GroupId") == id);
+    let vm = match relay {
+        RelayState::Absent => judge(by_id(vm_sg), vm_sg.to_string(), vec![], vec![format!("tcp 3128 cidr:{proxy_ip}/32")], format!("{vm_sg}: no ingress; egress tcp 3128 → {proxy_ip}/32 only")),
+        RelayState::Recorded(_) | RelayState::Malformed(_) => judge(
+            by_id(vm_sg),
+            vm_sg.to_string(),
+            vec![],
+            vec![format!("tcp 3128 cidr:{proxy_ip}/32"), format!("tcp {RELAY_PORT} cidr:{RELAY_IP}/32")],
+            format!("{vm_sg}: no ingress; egress tcp 3128 → {proxy_ip}/32 and tcp {RELAY_PORT} → {RELAY_IP}/32 only"),
+        ),
+    };
+    let relay_sg = match relay {
+        RelayState::Absent => (Verdict::Skipped, RELAY_ABSENT.to_string()),
+        RelayState::Malformed(why) => unknown(why.clone()),
+        RelayState::Recorded(r) => judge(
+            by_id(r.sg),
+            r.sg.to_string(),
+            vec!["tcp 443 cidr:0.0.0.0/0".to_string(), format!("tcp {RELAY_PORT} sg:{vm_sg}")],
+            proxy_egress_rules(),
+            format!("{}: ingress tcp 443 from 0.0.0.0/0, tcp {RELAY_PORT} from {vm_sg}; egress tcp 443 0.0.0.0/0, udp+tcp 53 to {}", r.sg, RESOLVERS.join(", ")),
+        ),
+    };
     vec![
-        ("vm-sg", judge(by_id(vm_sg), vm_sg.to_string(), vec![], vec![format!("tcp 3128 cidr:{proxy_ip}/32")], format!("{vm_sg}: no ingress; egress tcp 3128 → {proxy_ip}/32 only"))),
+        ("vm-sg", vm),
         (
             "proxy-sg",
             judge(
@@ -1378,6 +1511,7 @@ fn judge_security_groups(doc: &Value, vm_sg: &str, proxy_sg: &str, proxy_ip: &st
                 format!("{proxy_sg}: ingress tcp 3128 from {vm_sg}; egress tcp 443 0.0.0.0/0, udp+tcp 53 to {}", RESOLVERS.join(", ")),
             ),
         ),
+        ("relay-sg", relay_sg),
         ("default-sg", judge(groups.iter().find(|g| text(g, "GroupName") == "default"), "the default group".into(), vec![], vec![], "no rules".into())),
     ]
 }
@@ -1885,6 +2019,8 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
     if !is_rfc1918(proxy_addr) {
         return Err(CliError::Msg(format!("{} proxy_private_ip = {proxy_addr:?} is not an RFC 1918 address: {HINT}", ctx.paths.infra_state().display())));
     }
+    // S13: what the relay rows and the VM rules expect, from the state alone.
+    let relay = RelayState::of(&ctx.state);
     ctx.operator(what)?;
 
     let mut r = Report::default();
@@ -1908,15 +2044,15 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
         Some(c) => judge_route_table(&doc, subnet, c),
         None => unknown("the VPC's CIDRs could not be read"),
     });
-    r.call("vm-nacl", ops::subnet_network_acls(subnet), |doc| judge_nacl(&doc, subnet, proxy_addr));
+    r.call("vm-nacl", ops::subnet_network_acls(subnet), |doc| judge_nacl(&doc, subnet, proxy_addr, relay != RelayState::Absent));
     match ops::security_groups(vpc) {
         Ok(doc) => {
-            for (check, judged) in judge_security_groups(&doc, vm_sg, proxy_sg, proxy_addr) {
+            for (check, judged) in judge_security_groups(&doc, vm_sg, proxy_sg, proxy_addr, &relay) {
                 r.push(check, judged);
             }
         }
         Err(e) => {
-            for check in ["vm-sg", "proxy-sg", "default-sg"] {
+            for check in ["vm-sg", "proxy-sg", "relay-sg", "default-sg"] {
                 r.push(check, unknown(e.clone()));
             }
         }
@@ -1957,6 +2093,12 @@ fn verify(ctx: &Ctx, what: &str) -> Result<(String, Report)> {
     let bucket = store.as_ref().and_then(|s| s.bucket);
     r.call("vpc-peering", ops::peering_connections(), |doc| judge_peering(&doc, vpc));
     r.call("nat-gateways", ops::nat_gateways(vpc), |doc| judge_nat(&doc));
+    // S13: who answers on the relay's address (one call, for a recorded relay only).
+    match &relay {
+        RelayState::Absent => r.push("relay-endpoint", (Verdict::Skipped, RELAY_ABSENT.to_string())),
+        RelayState::Malformed(why) => r.push("relay-endpoint", unknown(why.clone())),
+        RelayState::Recorded(rec) => r.call("relay-endpoint", ops::enis_holding(vpc, RELAY_IP), |doc| judge_relay_endpoint(&doc, rec)),
+    }
     let state = match ops::instance(instance) {
         Ok(doc) => {
             let (judged, state) = judge_instance(&doc, proxy_sg, proxy_addr, ctx.cfg.aws.proxy_private_ip.as_deref());
@@ -2057,6 +2199,11 @@ mod tests {
     const VM_SG: &str = "sg-0ddd3333eeee4444f";
     const PROXY_SG: &str = "sg-0fff5555aaaa6666b";
     const CONN: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+    /// S13: the relay's instance, security group, interface and Elastic IP (documentation range) as the fixtures hold them.
+    const RELAY_INSTANCE: &str = "i-0123456789abcdef1";
+    const RELAY_SG: &str = "sg-0ccc9999dddd0000e";
+    const RELAY_ENI: &str = "eni-0bbb00000000000b1";
+    const RELAY_EIP: &str = "203.0.113.20";
 
     fn golden() -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/egress/lambda-core.get-network-connector.json");
@@ -2142,16 +2289,43 @@ mod tests {
         ]})
     }
 
+    /// S13: the answer once the relay is deployed: the VM group's second rule (TCP 7443 to the relay's address) and
+    /// the relay's group, before the default one.
+    fn green_s13_sgs() -> Value {
+        let mut d = green_sgs();
+        d["SecurityGroups"][0]["IpPermissionsEgress"].as_array_mut().unwrap().push(json!({"IpProtocol": "tcp", "FromPort": 7443, "ToPort": 7443, "IpRanges": [{"CidrIp": "10.42.0.20/32"}]}));
+        let relay = sg(
+            RELAY_SG,
+            "ai-env-relay",
+            json!([
+                {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "tcp", "FromPort": 7443, "ToPort": 7443, "UserIdGroupPairs": [{"GroupId": VM_SG, "UserId": "123456789012"}], "IpRanges": []}
+            ]),
+            json!([
+                {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                {"IpProtocol": "udp", "FromPort": 53, "ToPort": 53, "IpRanges": [{"CidrIp": "1.1.1.1/32"}, {"CidrIp": "9.9.9.9/32"}]},
+                {"IpProtocol": "tcp", "FromPort": 53, "ToPort": 53, "IpRanges": [{"CidrIp": "1.1.1.1/32"}, {"CidrIp": "9.9.9.9/32"}]}
+            ]),
+        );
+        d["SecurityGroups"].as_array_mut().unwrap().insert(2, relay);
+        d
+    }
+
+    fn recorded() -> RelayState<'static> {
+        RelayState::Recorded(RelayRecorded { instance: RELAY_INSTANCE, sg: RELAY_SG, public_ip: Some(RELAY_EIP) })
+    }
+
     #[test]
     fn security_groups_are_exactly_as_designed() {
+        // S12's rows on a state without the relay (the relay row skipped): the S5 cases below.
         let doc = green_sgs();
-        for (check, (v, d)) in judge_security_groups(&doc, VM_SG, PROXY_SG, PROXY_IP) {
-            assert_eq!(v, Verdict::Ok, "{check}: {d}");
+        for (check, (v, d)) in judge_security_groups(&doc, VM_SG, PROXY_SG, PROXY_IP, &RelayState::Absent) {
+            assert!(v == Verdict::Ok || (check == "relay-sg" && v == Verdict::Skipped), "{check}: {d}");
         }
         let flip = |f: &dyn Fn(&mut Value)| {
             let mut d = green_sgs();
             f(&mut d);
-            judge_security_groups(&d, VM_SG, PROXY_SG, PROXY_IP).into_iter().filter(|(_, (v, _))| *v == Verdict::Drift).map(|(c, (_, d))| format!("{c}: {d}")).collect::<Vec<_>>()
+            judge_security_groups(&d, VM_SG, PROXY_SG, PROXY_IP, &RelayState::Absent).into_iter().filter(|(_, (v, _))| *v == Verdict::Drift).map(|(c, (_, d))| format!("{c}: {d}")).collect::<Vec<_>>()
         };
         let cidr = flip(&|d| d["SecurityGroups"][0]["IpPermissionsEgress"][0]["IpRanges"] = json!([{"CidrIp": "10.42.0.10/32"}, {"CidrIp": "0.0.0.0/0"}]));
         assert_eq!(cidr.len(), 1);
@@ -2176,6 +2350,112 @@ mod tests {
         assert!(default[0].starts_with("default-sg: ingress: unexpected all all sg:sg-0bbb7777cccc8888d"), "{default:?}");
         let gone = flip(&|d| d["SecurityGroups"].as_array_mut().unwrap().remove(1).as_object().map(|_| ()).unwrap());
         assert!(gone[0].contains("is not a security group of the VPC"), "{gone:?}");
+
+        // S13 (I-T28): with a recorded relay the deployed answer is green on all four rows, in order.
+        let rows = judge_security_groups(&green_s13_sgs(), VM_SG, PROXY_SG, PROXY_IP, &recorded());
+        assert_eq!(rows.iter().map(|(c, _)| *c).collect::<Vec<_>>(), ["vm-sg", "proxy-sg", "relay-sg", "default-sg"]);
+        for (check, (v, d)) in &rows {
+            assert_eq!(*v, Verdict::Ok, "{check}: {d}");
+        }
+        assert_eq!(rows[0].1 .1, format!("{VM_SG}: no ingress; egress tcp 3128 → 10.42.0.10/32 and tcp 7443 → 10.42.0.20/32 only"));
+        assert_eq!(rows[2].1 .1, format!("{RELAY_SG}: ingress tcp 443 from 0.0.0.0/0, tcp 7443 from {VM_SG}; egress tcp 443 0.0.0.0/0, udp+tcp 53 to 1.1.1.1, 9.9.9.9"));
+        let flip13 = |f: &dyn Fn(&mut Value)| {
+            let mut d = green_s13_sgs();
+            f(&mut d);
+            judge_security_groups(&d, VM_SG, PROXY_SG, PROXY_IP, &recorded()).into_iter().filter(|(_, (v, _))| *v == Verdict::Drift).map(|(c, (_, d))| format!("{c}: {d}")).collect::<Vec<_>>()
+        };
+        let wide = flip13(&|d| d["SecurityGroups"][0]["IpPermissionsEgress"][1]["IpRanges"] = json!([{"CidrIp": "10.42.0.0/24"}]));
+        assert!(wide.len() == 1 && wide[0].starts_with("vm-sg: egress: unexpected tcp 7443 cidr:10.42.0.0/24; missing tcp 7443 cidr:10.42.0.20/32"), "{wide:?}");
+        let face = flip13(&|d| d["SecurityGroups"][0]["IpPermissionsEgress"].as_array_mut().unwrap().push(json!({"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "IpRanges": [{"CidrIp": "10.42.0.20/32"}]})));
+        assert!(face.len() == 1 && face[0].starts_with("vm-sg: egress: unexpected tcp 443 cidr:10.42.0.20/32"), "the relay's internet face from a VM: {face:?}");
+        let open = flip13(&|d| d["SecurityGroups"][2]["IpPermissions"][1] = json!({"IpProtocol": "tcp", "FromPort": 7443, "ToPort": 7443, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}));
+        assert!(open.len() == 1 && open[0] == format!("relay-sg: ingress: unexpected tcp 7443 cidr:0.0.0.0/0; missing tcp 7443 sg:{VM_SG}"), "{open:?}");
+        let all = flip13(&|d| d["SecurityGroups"][2]["IpPermissionsEgress"].as_array_mut().unwrap().push(json!({"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]})));
+        assert!(all.len() == 1 && all[0] == "relay-sg: egress: unexpected all all cidr:0.0.0.0/0", "{all:?}");
+        let missing = flip13(&|d| {
+            d["SecurityGroups"].as_array_mut().unwrap().remove(2);
+        });
+        assert_eq!(missing, [format!("relay-sg: {RELAY_SG} is not a security group of the VPC")]);
+        // Absent (a stack before S13): S12's answer is green with S12's text and the relay row skipped; S13's answer
+        // is drift in vm-sg (its relay rule unexpected).
+        let absent = judge_security_groups(&green_sgs(), VM_SG, PROXY_SG, PROXY_IP, &RelayState::Absent);
+        assert_eq!(absent[0].1, (Verdict::Ok, format!("{VM_SG}: no ingress; egress tcp 3128 → 10.42.0.10/32 only")));
+        assert_eq!(absent[2], ("relay-sg", (Verdict::Skipped, RELAY_ABSENT.to_string())));
+        let early = judge_security_groups(&green_s13_sgs(), VM_SG, PROXY_SG, PROXY_IP, &RelayState::Absent);
+        assert!(early[0].1 .0 == Verdict::Drift && early[0].1 .1.contains("unexpected tcp 7443 cidr:10.42.0.20/32"), "{early:?}");
+        // Malformed: the relay row unknown, the VM group judged with the relay's rule (fail closed).
+        let partial = RelayState::Malformed("partial record".into());
+        let m = judge_security_groups(&green_s13_sgs(), VM_SG, PROXY_SG, PROXY_IP, &partial);
+        assert_eq!((m[0].1 .0, m[2].1.clone()), (Verdict::Ok, (Verdict::Unknown, "partial record".to_string())));
+        assert_eq!(judge_security_groups(&green_sgs(), VM_SG, PROXY_SG, PROXY_IP, &partial)[0].1 .0, Verdict::Drift, "a partial record still expects the VM group's relay rule");
+    }
+
+    /// S13 (I-T30): the relay's three keys are all recorded, or none.
+    #[test]
+    fn the_relay_record_is_all_three_keys_or_none() {
+        let state = |instance: Option<&str>, sg: Option<&str>, private: Option<&str>, public: Option<&str>| InfraState {
+            relay_instance_id: instance.map(str::to_string),
+            relay_security_group_id: sg.map(str::to_string),
+            relay_private_ip: private.map(str::to_string),
+            relay_public_ip: public.map(str::to_string),
+            ..InfraState::default()
+        };
+        assert_eq!(RelayState::of(&InfraState::default()), RelayState::Absent);
+        assert_eq!(RelayState::of(&state(Some(" "), Some(""), None, Some(RELAY_EIP))), RelayState::Absent, "blank keys are none; a public address alone records nothing");
+        let full = state(Some(RELAY_INSTANCE), Some(RELAY_SG), Some("10.42.0.20"), Some(RELAY_EIP));
+        assert_eq!(RelayState::of(&full), recorded());
+        let no_public = state(Some(RELAY_INSTANCE), Some(RELAY_SG), Some("10.42.0.20"), None);
+        assert_eq!(RelayState::of(&no_public), RelayState::Recorded(RelayRecorded { instance: RELAY_INSTANCE, sg: RELAY_SG, public_ip: None }));
+        let why = format!("state/infra.toml records the relay partially or malformed (relay_instance_id, relay_security_group_id and relay_private_ip: all three or none, the last exactly 10.42.0.20): {HINT}");
+        for bad in [
+            state(Some(RELAY_INSTANCE), None, None, None),
+            state(None, Some(RELAY_SG), Some("10.42.0.20"), None),
+            state(Some(RELAY_INSTANCE), Some(RELAY_SG), None, Some(RELAY_EIP)),
+            state(Some("vol-0123456789abcdef1"), Some(RELAY_SG), Some("10.42.0.20"), None),
+            state(Some(RELAY_INSTANCE), Some("vpc-0ccc9999dddd0000e"), Some("10.42.0.20"), None),
+            state(Some(RELAY_INSTANCE), Some(RELAY_SG), Some("10.42.0.21"), None),
+            state(Some(RELAY_INSTANCE), Some(RELAY_SG), Some("10.42.0.20"), Some("203.0.113")),
+            state(Some(RELAY_INSTANCE), Some(RELAY_SG), Some("10.42.0.20"), Some("--endpoint-url")),
+        ] {
+            assert_eq!(RelayState::of(&bad), RelayState::Malformed(why.clone()), "{bad:?}");
+        }
+    }
+
+    /// The relay's interface as `describe-network-interfaces` answers it (the fixture's shape).
+    fn relay_eni() -> Value {
+        json!({"NetworkInterfaceId": RELAY_ENI, "Attachment": {"InstanceId": RELAY_INSTANCE, "Status": "attached"}, "Groups": [{"GroupId": RELAY_SG, "GroupName": "ai-env-relay"}],
+            "PrivateIpAddress": "10.42.0.20", "Ipv6Addresses": [], "SourceDestCheck": true, "Association": {"PublicIp": RELAY_EIP}})
+    }
+
+    /// S13 (I-T31): who answers on the relay's address is the relay instance's interface alone, or nothing.
+    #[test]
+    fn the_relay_endpoint_is_the_relay_instance_alone() {
+        let rec = RelayRecorded { instance: RELAY_INSTANCE, sg: RELAY_SG, public_ip: Some(RELAY_EIP) };
+        let judge = |enis: Vec<Value>| judge_relay_endpoint(&json!({"NetworkInterfaces": enis}), &rec);
+        assert_eq!(judge(vec![relay_eni()]), (Verdict::Ok, format!("{RELAY_ENI} of {RELAY_INSTANCE}: 10.42.0.20, [{RELAY_SG}], public {RELAY_EIP}")));
+        let (v, d) = judge(vec![]);
+        assert!(v == Verdict::Ok && d.starts_with("nothing holds 10.42.0.20: "), "a relay being replaced is availability, not drift: {d}");
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut e = relay_eni();
+            f(&mut e);
+            judge(vec![e])
+        };
+        let drift = |j: Judged, what: &str| assert!(j.0 == Verdict::Drift && j.1.contains(what), "{what}: {j:?}");
+        drift(with(&|e| e["Attachment"]["InstanceId"] = json!("i-0123456789abcdef0")), &format!("{RELAY_ENI} holds 10.42.0.20 for i-0123456789abcdef0, not the relay instance {RELAY_INSTANCE}"));
+        drift(with(&|e| e.as_object_mut().unwrap().remove("Attachment").map(|_| ()).unwrap()), &format!("{RELAY_ENI} holds 10.42.0.20 for no instance, not the relay instance {RELAY_INSTANCE}"));
+        drift(with(&|e| e["Groups"] = json!([{"GroupId": VM_SG}, {"GroupId": RELAY_SG}])), &format!("{RELAY_ENI} has groups [{RELAY_SG}, {VM_SG}], not exactly [{RELAY_SG}]"));
+        drift(with(&|e| e["Ipv6Addresses"] = json!([{"Ipv6Address": "2001:db8::20"}])), &format!("{RELAY_ENI} has IPv6 addresses"));
+        drift(with(&|e| e["SourceDestCheck"] = json!(false)), &format!("{RELAY_ENI} forwards traffic (source/destination check off)"));
+        drift(with(&|e| e["Association"]["PublicIp"] = json!("198.51.100.7")), &format!("{RELAY_ENI}'s public address is 198.51.100.7, not the recorded {RELAY_EIP} (workers dial {RELAY_EIP}): {HINT}"));
+        let mut other = relay_eni();
+        other["NetworkInterfaceId"] = json!("eni-0bbb00000000000b2");
+        drift(judge(vec![relay_eni(), other]), "2 interfaces hold 10.42.0.20");
+        // Without a recorded public address, the interface's is not compared; a malformed answer never passes.
+        let unrecorded = RelayRecorded { public_ip: None, ..rec };
+        let mut moved = relay_eni();
+        moved["Association"]["PublicIp"] = json!("198.51.100.7");
+        assert_eq!(judge_relay_endpoint(&json!({"NetworkInterfaces": [moved]}), &unrecorded).0, Verdict::Ok);
+        assert_eq!(judge_relay_endpoint(&json!({}), &rec).0, Verdict::Unknown);
     }
 
     #[test]
@@ -2257,14 +2537,23 @@ mod tests {
             ]}]})
     }
 
+    /// S13: the NACL once the relay is deployed: its two entries (rule 110), put first to show the order never matters.
+    fn green_s13_nacl() -> Value {
+        let mut d = green_nacl();
+        let entries = d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap();
+        entries.insert(0, json!({"RuleNumber": 110, "Egress": false, "Protocol": "6", "RuleAction": "allow", "CidrBlock": "10.42.0.20/32", "PortRange": {"From": 1024, "To": 65535}}));
+        entries.insert(0, json!({"RuleNumber": 110, "Egress": true, "Protocol": "6", "RuleAction": "allow", "CidrBlock": "10.42.0.20/32", "PortRange": {"From": 7443, "To": 7443}}));
+        d
+    }
+
     #[test]
     fn the_vm_subnet_has_its_own_nacl_with_exactly_the_proxy_path() {
-        let (v, d) = judge_nacl(&green_nacl(), SUBNET, PROXY_IP);
+        let (v, d) = judge_nacl(&green_nacl(), SUBNET, PROXY_IP, false);
         assert_eq!(v, Verdict::Ok, "{d}");
         let flip = |f: &dyn Fn(&mut Value)| {
             let mut d = green_nacl();
             f(&mut d);
-            judge_nacl(&d, SUBNET, PROXY_IP)
+            judge_nacl(&d, SUBNET, PROXY_IP, false)
         };
         let (v, d) = flip(&|d| d["NetworkAcls"][0]["IsDefault"] = json!(true));
         assert!(v == Verdict::Drift && d.contains("default network ACL"), "{d}");
@@ -2276,7 +2565,29 @@ mod tests {
         assert!(d.contains("unexpected egress allow tcp 443 cidr6:::/0"), "{d}");
         let (_, d) = flip(&|d| d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().remove(0).as_object().map(|_| ()).unwrap());
         assert!(d.contains("missing egress allow tcp 3128 cidr:10.42.0.10/32"), "{d}");
-        assert_eq!(judge_nacl(&json!({"NetworkAcls": []}), SUBNET, PROXY_IP).0, Verdict::Drift);
+        assert_eq!(judge_nacl(&json!({"NetworkAcls": []}), SUBNET, PROXY_IP, false).0, Verdict::Drift);
+
+        // S13 (I-T29): with the relay, the four entries in any order are ok; one missing, a wider relay CIDR or an extra
+        // entry is drift; without the relay S12's answer is ok and S13's is drift.
+        let (v, d) = judge_nacl(&green_s13_nacl(), SUBNET, PROXY_IP, true);
+        assert_eq!((v, d.as_str()), (Verdict::Ok, "acl-0123456789abcdef0: egress tcp 3128 to 10.42.0.10/32 and tcp 7443 to 10.42.0.20/32, ingress tcp 1024-65535 from both, default deny"));
+        let mut reversed = green_s13_nacl();
+        reversed["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().reverse();
+        assert_eq!(judge_nacl(&reversed, SUBNET, PROXY_IP, true).0, Verdict::Ok, "the order never matters");
+        let flip13 = |f: &dyn Fn(&mut Value)| {
+            let mut d = green_s13_nacl();
+            f(&mut d);
+            judge_nacl(&d, SUBNET, PROXY_IP, true)
+        };
+        let (v, d) = flip13(&|d| d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().remove(1).as_object().map(|_| ()).unwrap());
+        assert!(v == Verdict::Drift && d.contains("missing ingress allow tcp 1024-65535 cidr:10.42.0.20/32"), "{d}");
+        let (v, d) = flip13(&|d| d["NetworkAcls"][0]["Entries"][0]["CidrBlock"] = json!("10.42.0.0/16"));
+        assert!(v == Verdict::Drift && d.contains("unexpected egress allow tcp 7443 cidr:10.42.0.0/16") && d.contains("missing egress allow tcp 7443 cidr:10.42.0.20/32"), "{d}");
+        let (v, d) = flip13(&|d| d["NetworkAcls"][0]["Entries"].as_array_mut().unwrap().push(json!({"RuleNumber": 120, "Egress": true, "Protocol": "6", "RuleAction": "allow", "CidrBlock": "10.42.0.20/32", "PortRange": {"From": 443, "To": 443}})));
+        assert!(v == Verdict::Drift && d.contains("unexpected egress allow tcp 443 cidr:10.42.0.20/32"), "{d}");
+        assert_eq!(judge_nacl(&green_nacl(), SUBNET, PROXY_IP, true).0, Verdict::Drift, "a relay recorded but its entries missing");
+        let (v, d) = judge_nacl(&green_s13_nacl(), SUBNET, PROXY_IP, false);
+        assert!(v == Verdict::Drift && d.contains("unexpected egress allow tcp 7443 cidr:10.42.0.20/32"), "S13's entries on a state without the relay: {d}");
     }
 
     fn firewall(assocs: Value, config: Value, rules: Value, domains: Value) -> Judged {

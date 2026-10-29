@@ -285,6 +285,24 @@
 #                             requires_action before FAKE_ASK's can_use_tool and running once it is
 #                             answered, idle after every result (answered, interrupted, usage-limited);
 #                             none for a miss, an EOF while a prompt is held, or FAKE_ONBOARDING
+# S13 (A6: extension 2.1.312's names; plans/s13-contracts.md §B-away-a6.4). Real CLI variables, as the CLI obeys them:
+#   CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS  1 (the extension sets it, the wrapper forwards it), with
+#                             FAKE_PROMPT_HOOK: right after a turn's `running` state frame (where it would be without
+#                             CLAUDE_CODE_SDK_READS_SESSION_STATE), the turn's UserPromptSubmit hook:
+#                             {"type":"system","subtype":"hook_started","hook_id":<h>,"hook_name":<name>,
+#                             "hook_event":"UserPromptSubmit","uuid":<u>,"session_id":<sid>}, then
+#                             {"type":"system","subtype":"hook_response","hook_id":<h>,"hook_name":<name>,
+#                             "hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,
+#                             "outcome":"success","uuid":<u>,"session_id":<sid>}; <h> is kind 2200, the two uuids
+#                             kinds 2000 and 2100, each <turn, %08x>-0000-4000-<kind>-<gen, %012x>; none for a
+#                             duplicate (FAKE_DEDUP_RESUMED)
+#   FAKE_PROMPT_HOOK          <json>: the hook's name (a JSON string's body), the fake's stand-in for a configured
+#                             UserPromptSubmit hook: the frames above need both it and the variable
+#   CLAUDE_CODE_SDK_READS_STARTUP_MARKS  1 (the wrapper never forwards it by default):
+#                             {"type":"keep_alive","startup_mark":"action_handler_start"} once the options are parsed
+#                             (after FAKE_REJECT_OPTION's refusal, before FAKE_DIE_BEFORE_INIT's death: a claude that
+#                             dies before its init prints it first), and {"type":"keep_alive","startup_mark":
+#                             "stdin_listen_started"} right before stdin is read; both before the initialize answer
 
 # The remote link's knobs (see above), before anything reads one. S11: a
 # staged copy's embedded FAKE_KNOBS_FILE names the file in place of
@@ -393,6 +411,15 @@ if [ -n "${FAKE_REJECT_OPTION:-}" ]; then
     done
   done
 fi
+# S13 (A6): the CLI's start-up mark $1 (claude 2.1.312's preAction writer), with
+# CLAUDE_CODE_SDK_READS_STARTUP_MARKS=1 only. Nothing without the variable.
+startup_mark() {
+  if [ "${CLAUDE_CODE_SDK_READS_STARTUP_MARKS:-}" != "1" ]; then
+    return
+  fi
+  printf '{"type":"keep_alive","startup_mark":"%s"}\n' "$1"
+}
+startup_mark action_handler_start
 if [ "${FAKE_DIE_BEFORE_INIT:-0}" = "1" ]; then
   if [ -n "${FAKE_ENV_LOG:-}" ]; then
     printf 'gen %s died_before_init\n' "$gen" >> "$FAKE_ENV_LOG"
@@ -939,6 +966,19 @@ state_frame() {
   printf '{"type":"system","subtype":"session_state_changed","state":"%s","sdk_host_only":true,"uuid":"%s","session_id":"%s"}\n' "$1" "$(printf '%08x-0000-4000-3000-%012x' "$states" "$gen")" "$sid"
 }
 
+# S13 (A6): this turn's UserPromptSubmit hook, as claude 2.1.312 reports it with
+# CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS=1 when a hook is configured
+# (FAKE_PROMPT_HOOK, its name): hook_started, then hook_response (success, no
+# output). Nothing without both.
+prompt_hook_frames() {
+  if [ "${CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS:-}" != "1" ] || [ -z "${FAKE_PROMPT_HOOK:-}" ]; then
+    return
+  fi
+  hook_id=$(printf '%08x-0000-4000-2200-%012x' "$turns" "$gen")
+  printf '{"type":"system","subtype":"hook_started","hook_id":"%s","hook_name":"%s","hook_event":"UserPromptSubmit","uuid":"%s","session_id":"%s"}\n' "$hook_id" "$FAKE_PROMPT_HOOK" "$(printf '%08x-0000-4000-2000-%012x' "$turns" "$gen")" "$sid"
+  printf '{"type":"system","subtype":"hook_response","hook_id":"%s","hook_name":"%s","hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,"outcome":"success","uuid":"%s","session_id":"%s"}\n' "$hook_id" "$FAKE_PROMPT_HOOK" "$(printf '%08x-0000-4000-2100-%012x' "$turns" "$gen")" "$sid"
+}
+
 # A1: FAKE_USAGE_LIMIT, whether this turn is refused for the account's usage limit.
 usage_limited_turn() {
   case "${FAKE_USAGE_LIMIT:-}" in
@@ -1158,6 +1198,7 @@ on_user() {
     return
   fi
   state_frame running
+  prompt_hook_frames
   # A1: a turn refused for the account's usage limit ends here: no reply, no effects.
   if usage_limited_turn; then
     outcome=allow
@@ -1251,6 +1292,7 @@ if [ "${FAKE_ONBOARDING:-0}" = "1" ]; then
   exit 1
 fi
 
+startup_mark stdin_listen_started
 while IFS= read -r line || [ -n "$line" ]; do
   log_stdin "$line"
   case "$line" in

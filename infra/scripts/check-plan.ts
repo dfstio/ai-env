@@ -38,22 +38,32 @@
 // that endpoint by URN), and the exact `allow` value: allow.txt next to --egress-config, then the bucket's host
 // (egress-spec.ts allowValue); allow.txt itself names no AWS host (assertEgressSpec).
 //
+// S13 (plans/s13-contracts.md §I-infra.4.4): the relay's nineteen resources: its instance exactly as the proxy's (in the
+// proxy subnet, its own group, address and profile, IMDSv2 hop limit 1, no key pair), its Elastic IP and the
+// association (that address, the relay instance, by URN and by value), its role, inline policy (relayRolePolicy) and SSM
+// attachment, its log group, its artifact object (the artifacts bucket, a hash-keyed key) and the artifact parameter
+// that pins it (that object's key, the bucket, and the uploaded file's hash when the plan carries it); its security
+// group's rules by checkRule; the VM group's second rule and NACL entries by checkRule and checkNacl; ai-env-ops' policy
+// built from the relay instance too.
+//
 // Exit: 0 the plan matches; 1 it does not (each violation on stderr); 2 bad arguments or not a JSON plan.
 import * as fs from "fs";
 import * as path from "path";
 import {
     DNS_MODES, DOCUMENT_ROLES, egressNames, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY, NET, NaclRuleSpec,
-    PARAMETER_MAX_BYTES, PROVIDERS, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, RouteSpec, RuleSpec, VM_SG_DESCRIPTION, allowValue, assertEgressSpec,
-    checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, egressSpec, loadEgressConfig, readAllowText,
-    readProxyDocuments, ruleOwner, stackInventory,
+    PARAMETER_MAX_BYTES, PROVIDERS, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, RELAY_SG_DESCRIPTION, RouteSpec, RuleSpec, SG_KEYS, SgKey,
+    VM_SG_DESCRIPTION, allowValue, assertEgressSpec, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, egressSpec,
+    loadEgressConfig, readAllowText, readProxyDocuments, ruleOwner, stackInventory,
 } from "../egress-spec";
 import {
     BUCKET_PREFIX, BUILD_ROLE_NAME, CONNECTOR_OPERATOR_POLICY_ARN, DEPLOYER_POLICY_NAME, DEPLOYER_USER_NAME, DEPLOY_DNS_POLICY_NAME, DEPLOY_EGRESS_POLICY_NAME,
     DEPLOY_POLICY_NAME, EGRESS_CHECK_PREFIX, EXECUTION_ROLE_NAME, Names, OPS_POLICY_NAME, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_POLICY_NAME, RUNTIME_USER_NAME,
     S3_ENDPOINT_SERVICE, SSM_INSTANCE_POLICY_ARN, STACK_POLICIES, STACK_USERS, TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, buildRolePolicy, deployDnsPolicy,
     deployEgressPolicy, deployPolicy, deployerPolicy, executionRolePolicy, lambdaTrustPolicy, operatorRolePolicy, operatorTrustPolicy, opsPolicy, policyArn, proxyRolePolicy,
-    proxyTrustPolicy, roleArn, runtimePolicy, s3EndpointPolicy, transcriptsBucketName, transcriptsBucketPolicy,
+    proxyTrustPolicy, RELAY_INSTANCE_PROFILE_NAME, RELAY_ROLE_NAME, relayRolePolicy, relayTrustPolicy, roleArn, runtimePolicy, s3EndpointPolicy, transcriptsBucketName,
+    transcriptsBucketPolicy,
 } from "../policies";
+import { RELAY_KEY_RE, parseRelayArtifactValue } from "../relay-spec";
 
 /**
  * S9: the transcripts bucket's lifecycle (contracts §7.2), written out again (not imported from transcripts.ts, a Pulumi
@@ -249,10 +259,10 @@ for (const t of types) {
 }
 console.log(`  ${String(all.length).padStart(3)}  resources in total, the stack included (expected ${expectedTotal})`);
 if (all.length !== expectedTotal) bad(`${all.length} resources, expected ${expectedTotal}`);
-// The inventory's own size is pinned (contracts §7.1: S9 took it from 67 and 72 to 75 and 80): a resource added to the
-// stack changes this pin too, where review sees it.
-const pinnedTotal = cfg.dnsMode === "firewall" ? (cfg.enableDnsQueryLog ? 83 : 80) : 75;
-if (expectedTotal !== pinnedTotal) bad(`the stack inventory holds ${expectedTotal} resources (the stack included) in dnsMode ${cfg.dnsMode}, the pin says ${pinnedTotal} (75 in none, 80 in firewall, 83 with the query log)`);
+// The inventory's own size is pinned (contracts §7.1: S9 took it from 67 and 72 to 75 and 80; S13 took it from 75, 80
+// and 83 to 94, 99 and 102, the relay's nineteen): a resource added to the stack changes this pin too, where review sees it.
+const pinnedTotal = cfg.dnsMode === "firewall" ? (cfg.enableDnsQueryLog ? 102 : 99) : 94;
+if (expectedTotal !== pinnedTotal) bad(`the stack inventory holds ${expectedTotal} resources (the stack included) in dnsMode ${cfg.dnsMode}, the pin says ${pinnedTotal} (94 in none, 99 in firewall, 102 with the query log)`);
 
 // ---- every resource: a child of the stack, the pinned provider of its package, unprotected, in the region ----
 const providerUrn = (name: string) => all.find((r) => r.type.startsWith("pulumi:providers:") && r.name === name)?.urn;
@@ -313,6 +323,8 @@ const T = {
     encryption: "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", ownership: "aws:s3/bucketOwnershipControls:BucketOwnershipControls",
     publicAccess: "aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock", lifecycle: "aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration",
     bucketPolicy: "aws:s3/bucketPolicy:BucketPolicy",
+    // S13.
+    eip: "aws:ec2/eip:Eip", eipAssoc: "aws:ec2/eipAssociation:EipAssociation", object: "aws:s3/bucketObjectv2:BucketObjectv2",
 };
 
 // ---- IAM: role-level policy inputs refused, every document exactly the policies.ts function's output ----
@@ -350,6 +362,8 @@ const names: Names = {
         // The proxy instance's id, which the ops policy names (S8 operators): likewise its oldState id, unknown only
         // while the instance is created or replaced (then so is the ops policy's document, which iamDoc accepts).
         proxyInstanceId: idOf(one(T.instance, NET.instance)) ?? UNKNOWN,
+        // S13: the relay instance's id, which the ops policy names too (RelayInstance), the same way.
+        relayInstanceId: idOf(one(T.instance, NET.relayInstance)) ?? UNKNOWN,
     },
     // S9: the transcripts bucket (the account's), and the S3 gateway endpoint's id, which the bucket policy names: its
     // oldState id on an existing stack, unknown only while the endpoint is created (then so is the bucket policy).
@@ -386,6 +400,7 @@ const iamDoc = (r: Res, prop: string, fn: string, want: () => PolicyDocument) =>
 };
 const roles = new Map<string, () => PolicyDocument>([
     [BUILD_ROLE_NAME, lambdaTrustPolicy], [EXECUTION_ROLE_NAME, lambdaTrustPolicy], [cfg.proxyRoleName, proxyTrustPolicy], [cfg.operatorRoleName, operatorTrustPolicy],
+    [RELAY_ROLE_NAME, relayTrustPolicy],
 ]);
 for (const r of found.get("aws:iam/role:Role") ?? []) {
     for (const k of ["managedPolicyArns", "inlinePolicies", "permissionsBoundary"]) {
@@ -401,7 +416,7 @@ const roleRes = (n: string) => (found.get("aws:iam/role:Role") ?? []).find((r) =
 // case iamDoc accepts.
 const inline = new Map<string, [string, (n: Names) => PolicyDocument]>([
     [BUILD_ROLE_NAME, [BUILD_ROLE_NAME, buildRolePolicy]], [EXECUTION_ROLE_NAME, [EXECUTION_ROLE_NAME, executionRolePolicy]], [cfg.proxyRoleName, [cfg.proxyRoleName, proxyRolePolicy]],
-    [cfg.operatorRoleName, [cfg.operatorRoleName, operatorRolePolicy]],
+    [cfg.operatorRoleName, [cfg.operatorRoleName, operatorRolePolicy]], [RELAY_ROLE_NAME, [RELAY_ROLE_NAME, relayRolePolicy]],
 ]);
 for (const r of found.get("aws:iam/rolePolicy:RolePolicy") ?? []) {
     const entry = inline.get(r.name);
@@ -517,18 +532,20 @@ const defaultSg = one(T.defaultSg, NET.defaultSecurityGroup);
 ref(defaultSg, "vpcId", [vpc]);
 eq("default SG ingress", defaultSg.i.ingress, []);
 eq("default SG egress", defaultSg.i.egress, []);
-const sgs = { vm: one(T.sg, cfg.vmSecurityGroupName), proxy: one(T.sg, cfg.proxySecurityGroupName) };
-for (const k of ["vm", "proxy"] as const) {
+const sgNames: Record<SgKey, string> = { vm: cfg.vmSecurityGroupName, proxy: cfg.proxySecurityGroupName, relay: cfg.relaySecurityGroupName };
+const sgDescriptions: Record<SgKey, string> = { vm: VM_SG_DESCRIPTION, proxy: PROXY_SG_DESCRIPTION, relay: RELAY_SG_DESCRIPTION };
+const sgs = { vm: one(T.sg, sgNames.vm), proxy: one(T.sg, sgNames.proxy), relay: one(T.sg, sgNames.relay) };
+for (const k of SG_KEYS) {
     const g = sgs[k];
-    eq(`SG ${g.name} name`, g.i.name, k === "vm" ? cfg.vmSecurityGroupName : cfg.proxySecurityGroupName);
-    eq(`SG ${g.name} description`, g.i.description, k === "vm" ? VM_SG_DESCRIPTION : PROXY_SG_DESCRIPTION);
+    eq(`SG ${g.name} name`, g.i.name, sgNames[k]);
+    eq(`SG ${g.name} description`, g.i.description, sgDescriptions[k]);
     absent(g, ["ingress", "egress", "namePrefix"]);
     ref(g, "vpcId", [vpc]);
 }
 const spec = egressSpec(cfg);
 for (const r of [...(found.get(T.ingress) ?? []), ...(found.get(T.egress) ?? [])]) {
     const owner = ruleOwner(spec, r.name);
-    if (owner === undefined) { bad(`${r.type} ${r.name}: belongs to neither egress security group`); continue; }
+    if (owner === undefined) { bad(`${r.type} ${r.name}: belongs to no security group of the spec`); continue; }
     ref(r, "securityGroupId", [sgs[owner]]);
     absent(r, ["cidrIpv6", "prefixListId"]);
     const peers = [set(r.i.cidrIpv4), set(r.i.referencedSecurityGroupId)].filter(Boolean).length;
@@ -584,6 +601,75 @@ const squid = String(one(T.parameter, "ai-env-proxy-squid.conf").i.insecureValue
 if (!squid.includes(`${cfg.proxyIp}:${cfg.proxyPort}`) || !squid.includes(cfg.vmSubnetCidr)) bad("parameter squid.conf: the proxy address or the VM subnet is not rendered in");
 const squidGroup = one(T.logGroup, NET.logGroup);
 eq("squid log group", [squidGroup.i.name, squidGroup.i.retentionInDays], [cfg.logGroup, cfg.logRetentionDays]);
+
+// ---- S13: the relay, as the proxy is checked ----
+const relayRole = one(T.role, RELAY_ROLE_NAME);
+const relayProfile = one(T.profile, RELAY_INSTANCE_PROFILE_NAME);
+ref(relayProfile, "role", [relayRole]);
+const relayInst = one(T.instance, NET.relayInstance);
+eq("relay instance privateIp", relayInst.i.privateIp, cfg.relayIp);
+eq("relay instance associatePublicIpAddress", relayInst.i.associatePublicIpAddress, true);
+eq("relay instance instanceType", relayInst.i.instanceType, cfg.relayInstanceType);
+const relayMd = (relayInst.i.metadataOptions ?? {}) as Record<string, unknown>;
+eq("relay instance IMDS", [relayMd.httpTokens, relayMd.httpPutResponseHopLimit], ["required", 1]);
+const relayRoot = (relayInst.i.rootBlockDevice ?? {}) as Record<string, unknown>;
+eq("relay instance root volume", [relayRoot.volumeType, relayRoot.volumeSize, relayRoot.encrypted], ["gp3", 8, true]);
+eq("relay instance credits", ((relayInst.i.creditSpecification ?? {}) as Record<string, unknown>).cpuCredits, "standard");
+eq("relay instance userDataReplaceOnChange", relayInst.i.userDataReplaceOnChange, true);
+if (relayInst.i.sourceDestCheck === false) bad("relay instance: sourceDestCheck must stay on");
+for (const k of ["ami", "userData"]) present(relayInst, k);
+absent(relayInst, ["keyName", "networkInterfaces", "ipv6AddressCount", "ipv6Addresses", "secondaryPrivateIps", "securityGroups", "launchTemplate"]);
+ref(relayInst, "subnetId", [subnets.proxy]);
+ref(relayInst, "vpcSecurityGroupIds", [sgs.relay]);
+eq("relay instance security groups", (Array.isArray(relayInst.i.vpcSecurityGroupIds) ? relayInst.i.vpcSecurityGroupIds : []).length, 1);
+ref(relayInst, "iamInstanceProfile", [relayProfile]);
+const relaySsm = one(T.attachment, `${RELAY_ROLE_NAME}-ssm`);
+eq("relay managed policy", relaySsm.i.policyArn, SSM_INSTANCE_POLICY_ARN);
+ref(relaySsm, "role", [relayRole]);
+// Its Elastic IP: a VPC address and nothing else; the association binds exactly it to the relay instance (by URN, and
+// by value where known: a VPC address's id is its allocation id).
+const relayEip = one(T.eip, NET.relayEip);
+eq("relay EIP domain", relayEip.i.domain, "vpc");
+absent(relayEip, ["instance", "networkInterface", "associateWithPrivateIp", "address", "publicIpv4Pool", "customerOwnedIpv4Pool", "ipamPoolId", "networkBorderGroup"]);
+const relayEipAssoc = one(T.eipAssoc, NET.relayEip);
+ref(relayEipAssoc, "allocationId", [relayEip]);
+ref(relayEipAssoc, "instanceId", [relayInst]);
+absent(relayEipAssoc, ["networkInterfaceId", "privateIpAddress", "publicIp", "allowReassociation"]);
+const relayGroup = one(T.logGroup, NET.relayLogGroup);
+eq("relay log group", [relayGroup.i.name, relayGroup.i.retentionInDays], [cfg.relayLogGroup, cfg.relayLogRetentionDays]);
+// Its binary: a hash-keyed object of the artifacts bucket, and the parameter that pins it (the reload unit installs
+// exactly that object, by its SHA-256).
+const relayObject = one(T.object, NET.relayArtifact);
+if (relayObject !== EMPTY) {
+    ref(relayObject, "bucket", [bucketRes]);
+    if (!(typeof relayObject.i.key === "string" && RELAY_KEY_RE.test(relayObject.i.key))) bad(`relay artifact key: ${json(relayObject.i.key)} is not relay/ai-env-relay-<sha256[:16]>`);
+    eq("relay artifact contentType", relayObject.i.contentType, "application/octet-stream");
+    present(relayObject, "source");
+}
+const relayParam = one(T.parameter, NET.relayArtifactParameter);
+if (relayParam !== EMPTY) {
+    eq("relay artifact parameter name", relayParam.i.name, `${cfg.relayParameterPrefix}/artifact`);
+    eq("relay artifact parameter type/tier", [relayParam.i.type, relayParam.i.tier], ["String", "Standard"]);
+    absent(relayParam, ["value", "valueWo", "keyId"]);
+    const v = relayParam.i.insecureValue;
+    if (!known(v)) {
+        // As iamDoc: unknown only while what it is built from (the artifacts bucket, the object) is created or replaced.
+        if (!(relayParam.deps.insecureValue ?? []).some((u) => CREATING.has(byUrn.get(u)?.op ?? ""))) {
+            bad(`${relayParam.type} ${relayParam.name}: insecureValue is unknown on a ${relayParam.op} step whose inputs all exist: cannot prove it pins the uploaded binary`);
+        }
+    } else if (Buffer.byteLength(v) > PARAMETER_MAX_BYTES) {
+        bad(`relay artifact parameter: over ${PARAMETER_MAX_BYTES} bytes`);
+    } else {
+        const a = parseRelayArtifactValue(v);
+        if (typeof a === "string") bad(`relay artifact parameter: ${a}`);
+        else {
+            if (a.key !== relayObject.i.key) bad(`relay artifact parameter: key ${a.key} is not the artifact object's key ${json(relayObject.i.key)}`);
+            if (typeof bucketName === "string" && a.bucket !== bucketName) bad(`relay artifact parameter: bucket ${a.bucket} is not the artifacts bucket ${bucketName}`);
+            const source = relayObject.i.source as { hash?: unknown } | undefined;
+            if (source !== null && typeof source === "object" && typeof source.hash === "string" && source.hash !== a.sha256) bad("relay artifact parameter: sha256 is not the uploaded file's");
+        }
+    }
+}
 
 // ---- the connector ----
 const conn = one(T.connector, cfg.connectorName);
@@ -726,8 +812,10 @@ for (const p of MANAGED_POLICIES) {
     absent(r, ["namePrefix"]);
 }
 const opsPolicyRes = one(T.policy, OPS_POLICY_NAME);
-if (opsPolicyRes !== EMPTY && inst !== EMPTY && !(opsPolicyRes.deps.policy ?? []).includes(inst.urn)) {
-    bad(`${opsPolicyRes.type} ${OPS_POLICY_NAME}: policy does not depend on ${inst.urn.split("::").slice(-2).join("::")} (opsPolicy's ProxyInstance and ProxyCommands name the proxy instance)`);
+for (const [target, why] of [[inst, "ProxyInstance and ProxyCommands name the proxy instance"], [relayInst, "RelayInstance names the relay instance"]] as const) {
+    if (opsPolicyRes !== EMPTY && target !== EMPTY && !(opsPolicyRes.deps.policy ?? []).includes(target.urn)) {
+        bad(`${opsPolicyRes.type} ${OPS_POLICY_NAME}: policy does not depend on ${target.urn.split("::").slice(-2).join("::")} (opsPolicy's ${why})`);
+    }
 }
 // Who holds which: exactly HOLDINGS (the inventory counts them, and policies.ts must agree, above), each binding the
 // user and the stack's policy its name says, by URN and, where known, by value. So ai-env-deployer holds exactly its

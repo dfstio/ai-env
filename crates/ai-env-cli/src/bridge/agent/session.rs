@@ -188,6 +188,7 @@ pub async fn run<A: MicrovmApi, E: EndpointClient>(env: &AgentEnv<'_, A, E>, sta
         cred_suspended: false,
         claude: None,
         claude_cap: false,
+        relay_cap: false,
         park: park.map(Parking::new),
     };
     session.run().await
@@ -703,6 +704,9 @@ struct Session<'e, 'a, A: MicrovmApi, E: EndpointClient> {
     claude: Option<String>,
     /// S11 (A.4): the last `hello_ok` named `claude_stage_v1`: only then does the spawn carry `spec.claude`.
     claude_cap: bool,
+    /// S13 (M, WM-R52): the last `hello_ok` named `relay_v1`: only then does the spawn carry the delivery's relay
+    /// session (an older shim would drop the field and the token would cross for nothing).
+    relay_cap: bool,
     /// S10 §D: a wrapper session's park (none: S9's session, which never parks).
     park: Option<Parking>,
 }
@@ -1128,6 +1132,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
         }
         // S11 (A.4): the spawn names staged claudes only to a shim that runs them (an S10 shim would ignore the field).
         self.claude_cap = ok.caps.iter().any(|c| c == crate::wire::frame::CAP_CLAUDE_STAGE_V1);
+        // S13 (WM-R52): the relay session goes only to a shim that hands it to its relay client.
+        self.relay_cap = ok.caps.iter().any(|c| c == crate::wire::frame::CAP_RELAY_V1);
         // S10: whether this shim parks; a parking session on one that does not says so once.
         if let Some(p) = &mut self.park {
             p.served = ok.caps.iter().any(|c| c == CAP_PARK_V1);
@@ -1257,6 +1263,8 @@ impl<'a, A: MicrovmApi, E: EndpointClient> Session<'_, 'a, A, E> {
             detach_grace_s: spec.detach_grace_s,
             credential,
             claude: if self.claude_cap { spec.claude.clone() } else { Vec::new() },
+            // S13 (WM-R52): after the gate check every spawn frame passes (`offer_credential`), to this VM only.
+            relay: if self.relay_cap { self.delivery.as_ref().and_then(super::Delivery::relay_frame_value) } else { None },
         };
         link.send(&frame).await;
         self.st.phase = Phase::SpawnSent;
@@ -2578,7 +2586,7 @@ mod tests {
     /// A session as `run` builds it (a fresh token), before its first socket.
     async fn session<'e, 'a>(env: &'e AgentEnv<'a, FakeMicrovmApi, FakeMicrovmApi>, io: SpawnIo, start: Start) -> Session<'e, 'a, FakeMicrovmApi, FakeMicrovmApi> {
         let token = mint_token(env).await.unwrap();
-        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None, claude_cap: false, park: None }
+        Session { env, io, trace: Trace::default(), token, st: State::new(start), attached: false, paused: false, control_open: true, delivery: None, cred_retried: false, cred_suspended: false, claude: None, claude_cap: false, relay_cap: false, park: None }
     }
 
     /// A socket to the rig's endpoint with the session's token, and the endpoint's end of it.
@@ -4725,6 +4733,155 @@ mod tests {
             let e = super::super::run_spawn_with(&env, attach, sio, Some(delivery(&rig, Some(cred_value()), false))).await.unwrap_err();
             assert!(matches!(&e, BridgeError::Policy(m) if m.contains("new spawn")), "{e}");
             assert!(rig.endpoint.attempts().is_empty(), "nothing dialed");
+        })
+        .await;
+    }
+
+    // ---- S13 (M): the relay session ------------------------------------------------------
+
+    /// A minted relay session, as `relay::mint` makes one (the token's shape, built at run time).
+    fn relay_session() -> crate::wire::relay::RelaySpawn {
+        let ca = {
+            use base64::Engine as _;
+            let mut der = vec![0x30, 0x82, 0x01, 0x00];
+            der.extend(std::iter::repeat_n(0x5a, 256));
+            base64::engine::general_purpose::STANDARD.encode(der)
+        };
+        crate::wire::relay::RelaySpawn { token: Secret::new(format!("v1.{}.{}", "eyJh".repeat(12), "c2ln".repeat(6))), addr: "10.42.0.20:7443".into(), server_name: "10.42.0.20".into(), ca_der_b64: ca }
+    }
+
+    /// An S7 shim's `hello_ok` holding the credential (a hit), naming `relay_v1` when `relay`.
+    fn hello_ok_relay(spawns: Vec<SpawnStatus>, resumed: Vec<Resumed>, relay: bool) -> Frame {
+        let Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, mut caps, credential } = hello_ok_s7_with(spawns, resumed, Some((CRED_NAME, CRED_TAG))) else { unreachable!() };
+        if relay {
+            caps.push(crate::wire::frame::CAP_RELAY_V1.to_string());
+        }
+        Frame::HelloOk { wire, shim_version, claude_version, microvm_id, image_version, boot_nonce, owner, has_credentials, uptime_s, run_hook_seen, spawns, resumed, caps, credential }
+    }
+
+    /// S13 (WM-T41, WM-R52): the delivery's relay session rides the spawn only to a shim whose `hello_ok` names
+    /// `relay_v1`: there the spawn's `relay` is the minted session (`10.42.0.20:7443`, `10.42.0.20`, the CA's
+    /// DER); without the cap none. A socket lost before `spawned` sends the spawn again with it, to the same VM.
+    /// After `spawned` the delivery holds no token. A gate pass that aged before the VM answered sends no spawn
+    /// at all (exit 9), so no token.
+    #[tokio::test]
+    async fn a_relay_token_rides_the_spawn_only_to_a_relay_v1_shim() {
+        let minted = relay_session();
+        for relay in [true, false] {
+            bounded(async {
+                let rig = rig(true).await;
+                seed_row(&rig);
+                let env = rig.env(policy());
+                let (sio, cio) = spawn_channels(8);
+                let shim = async {
+                    let mut ws = rig.endpoint.next().await;
+                    assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                    put(&mut ws, &hello_ok_relay(vec![], vec![], relay)).await;
+                    let Frame::Spawn { spawn_id, relay: sent, credential, .. } = frame(&mut ws).await else { panic!("the spawn") };
+                    assert_eq!(credential.as_deref(), Some(CRED_NAME));
+                    if relay {
+                        let sent = sent.expect("the relay session rides the spawn");
+                        assert_eq!(sent, minted, "the minted session");
+                        assert_eq!((sent.addr.as_str(), sent.server_name.as_str()), ("10.42.0.20:7443", "10.42.0.20"));
+                    } else {
+                        assert!(sent.is_none(), "no relay_v1, no session");
+                    }
+                    run_and_exit(&mut ws, &spawn_id).await;
+                    ws
+                };
+                let d = delivery(&rig, None, false).with_relay(Some(minted.clone()));
+                let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(d)), consume(cio, None, Duration::ZERO), shim);
+                assert_eq!(result.unwrap().exit.code, Some(0), "relay_v1={relay}");
+            })
+            .await;
+        }
+        // A socket lost before `spawned`: the spawn goes again with the session, to the same VM.
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws1 = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws1).await, Frame::Hello { .. }));
+                put(&mut ws1, &hello_ok_relay(vec![], vec![], true)).await;
+                let Frame::Spawn { spawn_id: id, relay: first, .. } = frame(&mut ws1).await else { panic!("the spawn") };
+                assert_eq!(first.as_ref(), Some(&minted));
+                drop(ws1);
+                let mut ws2 = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws2).await, Frame::Hello { .. }));
+                put(&mut ws2, &hello_ok_relay(vec![], vec![Resumed { spawn_id: id.clone(), status: ResumeStatus::Unknown }], true)).await;
+                let Frame::Spawn { spawn_id, relay: again, .. } = frame(&mut ws2).await else { panic!("the spawn again") };
+                assert!(spawn_id == id && again.as_ref() == Some(&minted), "sent again with the session");
+                run_and_exit(&mut ws2, &id).await;
+                ws2
+            };
+            let d = delivery(&rig, None, false).with_relay(Some(minted.clone()));
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(d)), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(result.unwrap().exit.code, Some(0));
+        })
+        .await;
+        // After `spawned` the delivery holds no token.
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let (sio, _cio) = spawn_channels(8);
+            let mut s = session(&env, sio, Start::New(cat_spec())).await;
+            s.delivery = Some(delivery(&rig, None, false).with_relay(Some(minted.clone())));
+            s.st.phase = Phase::SpawnSent;
+            let (mut link, _ws) = link_to(&rig, &s).await;
+            assert!(s.delivery.as_ref().unwrap().relay_frame_value().is_some());
+            let spawned = Frame::Spawned { spawn_id: s.st.id.clone(), pid: 4242, pgid: 4242, claude_version: None, claude_sha256: None };
+            s.on_frame(spawned, &mut link, &mut false).await.unwrap();
+            assert!(s.delivery.as_ref().unwrap().relay_frame_value().is_none(), "the Mac's copy goes once the spawn runs");
+        })
+        .await;
+        // A pass that aged before the VM answered: no spawn, so no token (exit 9).
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let (sio, cio) = spawn_channels(8);
+            let shim = async {
+                let mut ws = rig.endpoint.next().await;
+                assert!(matches!(frame(&mut ws).await, Frame::Hello { .. }));
+                put(&mut ws, &hello_ok_relay(vec![], vec![], true)).await;
+                let next = tokio::time::timeout(LIMIT, ws.next()).await.expect("the socket ends");
+                assert!(!matches!(next, Some(Ok(Message::Text(_)))), "no frame after hello_ok");
+                ws
+            };
+            let d = aged(&rig, 100, None, false).with_relay(Some(minted.clone()));
+            let (result, _, _ws) = tokio::join!(super::super::run_spawn_with(&env, Start::New(cat_spec()), sio, Some(d)), consume(cio, None, Duration::ZERO), shim);
+            assert_eq!(CliError::from(result.unwrap_err()).exit_code(), 9);
+        })
+        .await;
+    }
+
+    /// S13 (WM-R55): with `AI_ENV_BRIDGE_TRACE=2` the frames file shows a relay spawn's session by its shape, its
+    /// address, name and CA, and never its token, which rides the frame itself.
+    #[tokio::test]
+    async fn the_frames_file_never_holds_the_relay_token() {
+        let minted = relay_session();
+        bounded(async {
+            let rig = rig(true).await;
+            seed_row(&rig);
+            let env = rig.env(policy());
+            let (sio, _cio) = spawn_channels(8);
+            let mut s = session(&env, sio, Start::New(cat_spec())).await;
+            s.trace = Trace::new(2, env.paths);
+            s.relay_cap = true;
+            s.delivery = Some(delivery(&rig, None, false).with_relay(Some(minted.clone())));
+            let (conn, mut ws) = tokio::join!(AgentConn::open(&s.env.dial, &s.env.target.endpoint, s.token.value().unwrap()), rig.endpoint.next());
+            let mut link = Link::start(conn.unwrap().with_trace(s.trace.clone()));
+            s.send_spawn(&mut link).await;
+            let Frame::Spawn { relay: sent, .. } = frame(&mut ws).await else { panic!("the spawn") };
+            assert_eq!(sent.as_ref(), Some(&minted), "the session rides the frame itself");
+            let text = std::fs::read_to_string(Trace::frames_path(env.paths)).unwrap();
+            let line: serde_json::Value = serde_json::from_str(text.lines().find(|l| l.contains("\"spawn\"")).expect("the spawn's line")).unwrap();
+            let token = minted.token.expose();
+            assert_eq!(line["frame"]["relay"], serde_json::json!({"token": format!("[masked:{}]", token.len()), "addr": "10.42.0.20:7443", "server_name": "10.42.0.20", "ca_der_b64": minted.ca_der_b64}));
+            assert!(!text.contains(token.as_str()) && !text.contains("eyJheyJh") && !text.contains("c2lnc2ln"), "no part of the token: {text}");
         })
         .await;
     }

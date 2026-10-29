@@ -1,0 +1,52 @@
+[package]
+name = "ai-env-worker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/dfstio/ai-env"
+description = "The ai-env relay worker: dial the relay over pinned TLS 1.3, prove a whitelisted Ed25519 key, serve DataSources."
+publish = false
+
+# Caret requirements on purpose, and no `workspace = true` (as crates/ai-env-relay-proto/Cargo.toml):
+# private repos depend on this crate by git tag, and ai-env's `=` pins would become their constraints.
+[features]
+default = ["runtime"]
+# The worker runtime. Without it: globs, keys, session tokens, the relay lists, the agent protocol, the
+# signers, the relay's certificates and the wire mapping, which ai-env-cli and the relay take with
+# `default-features = false`.
+runtime = ["dep:tonic", "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:hyper-util", "dep:tower", "dep:tokio-stream"]
+
+[dependencies]
+ai-env-relay-proto = { path = "../ai-env-relay-proto", version = "0.1" }
+ai-env-source = { path = "../ai-env-source", version = "0.1" }
+# Guarded (G-1): aws-lc-rs is the only crypto provider; no default features (no ring-io, ring-sig-verify).
+aws-lc-rs = { version = "1.14", default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22"
+# Key files (WM-R4): the effective uid, safely (the crate forbids unsafe code).
+nix = { version = "0.30", default-features = false, features = ["user"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.40", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+tracing = "0.1"
+zeroize = "1"
+# Guarded (G-1): tonic's client only, never a `tls-*`, `transport` or default feature; rustls on aws-lc-rs;
+# no public root store (the pinned relay CA is the only trust anchor).
+tonic = { version = "0.14", default-features = false, features = ["channel"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"], optional = true }
+rustls-pki-types = { version = "1.9", features = ["std"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+tokio-stream = { version = "0.1", default-features = false, optional = true }
+
+[dev-dependencies]
+ai-env-source = { path = "../ai-env-source", version = "0.1", features = ["testkit"] }
+# One `#[async_trait]` signer in the tests (Q-WM19): the trait takes the form async-trait expands to.
+async-trait = "0.1"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full"] }
+# `tls-aws-lc` turns tonic's `_tls-any` on in the test build, as a private repo's graph may:
+# an `https` origin through the custom connector then fails every runtime test (M-WM6).
+tonic = { version = "0.14", default-features = false, features = ["server", "channel", "tls-aws-lc"] }

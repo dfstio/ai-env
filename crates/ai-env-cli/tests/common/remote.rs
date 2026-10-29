@@ -120,6 +120,14 @@ pub const FIXTURE_BRANCH: &str = "main";
 pub const FIXTURE_AUTHOR: (&str, &str) = ("ai-env fixture", "fixture@ai-env.invalid");
 pub const FIXTURE_DATE: &str = "2026-10-12T08:00:00+00:00";
 pub const FIXTURE_MESSAGE: &str = "fixture";
+/// S13 (WM-J1): where a test plants, under the rig's tempdir and before the
+/// rig, the relay client its shims start (a copy of
+/// `tests/fakes/relay-client.sh`) and the MCP config they give a relay
+/// spawn's claude: host paths, as `vm-curl`. Each shim names `relay_v1`
+/// (and the fake API's `/health` with it) only when both are files at its
+/// start (`shim::relay::opts_for`); without them nothing changes.
+pub const RELAY_CLIENT: &str = "vm-relay-client";
+pub const RELAY_MCP_CONFIG: &str = "vm-relay-mcp.json";
 
 /// Whether a test's variable belongs to the VM side on the remote link: the
 /// fake claude's knobs and logs (`FAKE_*`, `ARGV_LOG`), but not the fake
@@ -326,6 +334,7 @@ impl RemoteRig {
         // `/health/detail` is the shim's own (the VM's live spawns, its
         // credential cache), through the endpoint.
         let at = rig.endpoint.addr;
+        let relay = rig.shim.serves_relay();
         rig.update_fake(|s| {
             s.health_caps.extend([CAP_WORKSPACE_V1, CAP_GIT_HTTP_V1, CAP_TRANSCRIPT_S3_V1].map(str::to_string));
             // S10: `park_v1` too once the shim parks (`shim::agent::PARK_SERVED`), as its `hello_ok` names it.
@@ -345,6 +354,10 @@ impl RemoteRig {
             }
             if ai_env_cli::shim::claudebin::SERVED {
                 s.health_caps.push(ai_env_cli::wire::frame::CAP_CLAUDE_STAGE_V1.to_string());
+            }
+            // S13 (WM-J1): `relay_v1` when the shims name it (a test planted RELAY_CLIENT and RELAY_MCP_CONFIG).
+            if relay {
+                s.health_caps.push(ai_env_cli::wire::frame::CAP_RELAY_V1.to_string());
             }
             s.health_detail_at = Some(at);
         });
@@ -730,6 +743,8 @@ fn vm_shim(rt: &tokio::runtime::Handle, root: &Path, dir: &str) -> std::io::Resu
         helper: Some(PathBuf::from(env!("CARGO_BIN_EXE_ai-env"))),
         git: root.join("vm-git"),
         curl: root.join("vm-curl"),
+        relay_client: root.join(RELAY_CLIENT),
+        relay_mcp_config: root.join(RELAY_MCP_CONFIG),
         ..ShimOpts::default()
     };
     let shim = Arc::new(ShimState::with(root.join("vm-claude"), opts, ProbeSpec::default(), Arc::new(RealSys)));
@@ -940,8 +955,17 @@ impl Drop for Alone {
 
 /// A rig's share of the lane: the read half, taken by its thread's first
 /// rig and let go with the last one; none under [`alone`].
-struct LaneShare {
+pub struct LaneShare {
     counted: bool,
+}
+
+/// A rig's share of the lane ([`LaneShare`]) for a test that runs a rig's
+/// session out of this process (S13 WM-J1: in a child of the test binary),
+/// held until the guard is dropped: no test measures a close budget alone
+/// meanwhile.
+#[must_use]
+pub fn lane_share() -> LaneShare {
+    LaneShare::take()
 }
 
 impl LaneShare {

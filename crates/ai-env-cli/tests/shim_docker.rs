@@ -70,13 +70,25 @@
 //! runs it as the agent (1000:1000), who can neither change nor remove it.
 //! The only real claude ever executed is the pinned Linux binary inside L2
 //! (or the claude under test there); S12's staged one is a shell script.
+//! S13 L2 (V's wave 1, plans/s13-contracts.md §V-vm.8.4): a spawn's relay
+//! session on the real image ([`l2_with`], `--claude` a stand-in script):
+//! the relay client as `ai-env-net` (999) in its own session, its environment
+//! `LC_ALL` and `PATH` alone, its socket `/run/ai-env/relay/<pid>.sock` (666 in
+//! a 750 `999:1000` directory) refusing every process outside the spawn's
+//! session, the token on no disk, command line or environment, and the image's
+//! MCP server answering `relay_catalog` and `relay_call` (the relay
+//! unreachable: `unavailable`); the pinned claude (or the claude under test)
+//! starting that server from the baked `--mcp-config` (a recorded check in
+//! `make claude-admit-docker`, LD-V11); the relay files root's and no
+//! `/run/ai-env` baked.
 #[path = "common/curl.rs"]
 mod curl;
 
 use ai_env_cli::wire::chunk::{decode, Chunker};
 use ai_env_cli::wire::frame::{ClientInfo, CredentialErrCode, Deliver, EventKind, ExitInfo, Frame, Health, HealthDetail, HealthStatus, RunHookPayload, Scope, Sig, SpawnErrCode, SpawnId};
-use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_CLAUDE_STAGE_V1, CAP_PARK_V1};
+use ai_env_cli::wire::frame::{ParkOwner, ParkRefusal, SpawnDetail, CAP_CLAUDE_STAGE_V1, CAP_PARK_V1, CAP_RELAY_V1};
 use ai_env_cli::wire::redact::Secret;
+use ai_env_cli::wire::relay::RelaySpawn;
 use ai_env_cli::wire::workspace::ClaudeRef;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
@@ -844,6 +856,9 @@ struct Spec {
     /// preference order. Empty in every test before S12's: the field is then
     /// left out of the frame, which stays S10's.
     claude: Vec<ClaudeRef>,
+    /// S13: the spawn's relay session (`spawn.relay`); `None` in every test before S13's: the field is then left
+    /// out of the frame, which stays S12's.
+    relay: Option<RelaySpawn>,
 }
 
 impl Spec {
@@ -928,7 +943,7 @@ impl Agent {
     fn launch(&mut self, spec: &Spec) -> Result<Launched, (SpawnErrCode, String)> {
         let id = SpawnId::new_v7();
         let secrets = spec.secret.iter().map(|(k, v)| (k.clone(), Secret::new(v.clone()))).collect();
-        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone(), claude: spec.claude.clone() });
+        self.send(&Frame::Spawn { spawn_id: id.clone(), argv: spec.argv.clone(), cwd: spec.cwd.clone(), env: spec.env.clone(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: spec.grace, credential: spec.credential.clone(), claude: spec.claude.clone(), relay: spec.relay.clone() });
         let deadline = Instant::now() + SPAWN_WAIT;
         loop {
             assert!(Instant::now() < deadline, "no answer to spawn {id} within {SPAWN_WAIT:?}");
@@ -1009,6 +1024,38 @@ impl Agent {
         let (id, _) = self.spawn(spec).unwrap_or_else(|(code, m)| panic!("{:?}: spawn_err {code:?}: {m}", spec.argv.first()));
         self.feed(&id, stdin);
         self.collect(&id)
+    }
+
+    /// S13: `bytes` as the stdin chunk `seq` (one frame; no EOF): an interactive client's line.
+    fn stdin_chunk(&mut self, id: &SpawnId, seq: u64, bytes: &[u8]) {
+        let mut chunker = Chunker::new();
+        let mut chunks = chunker.push(bytes);
+        chunks.extend(chunker.finish());
+        assert_eq!(chunks.len(), 1, "one chunk: {} bytes", bytes.len());
+        self.send(&Frame::Stdin { spawn_id: id.clone(), seq, data: chunks.remove(0) });
+    }
+
+    /// S13: `id`'s stdout, acked as it is read, until `pred` holds of all of it so far (or `limit` passes: a panic);
+    /// that stdout. Other frames (stdin acks, stderr, other spawns') are skipped; an exit first is a panic.
+    fn out_until(&mut self, id: &SpawnId, limit: Duration, pred: impl Fn(&str) -> bool) -> String {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + limit;
+        loop {
+            let text = String::from_utf8_lossy(&out).into_owned();
+            if pred(&text) {
+                return text;
+            }
+            assert!(Instant::now() < deadline, "{id}'s stdout did not hold what was awaited within {limit:?}: {text}");
+            match self.next() {
+                Ok(Frame::Stdout { spawn_id, seq, data }) if spawn_id == *id => {
+                    out.extend(decode(&data).unwrap());
+                    self.ack(id, seq, 0);
+                }
+                Ok(Frame::Exit { spawn_id, code, signal, .. }) if spawn_id == *id => panic!("{id} exited (code {code:?}, signal {signal:?}) before its stdout held what was awaited: {text}"),
+                Ok(_) => {}
+                Err(close) => panic!("the socket ended ({close:?}) while {id} ran"),
+            }
+        }
     }
 
     /// `spec` without stdin: its stdout, after a clean exit 0.
@@ -2657,8 +2704,8 @@ fn l2_validate_200() {
     }
     assert!(logs.contains("ai-env: validate V3 ok 2 settings files parse and are readable by 1000:1000;"), "the agent is 1000:1000 (the --gid default):\n{logs}");
     assert!(
-        logs.lines().any(|l| l == "ai-env: validate V4 ok no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache"),
-        "V4 holds the image's empty claude cache:\n{logs}"
+        logs.lines().any(|l| l == "ai-env: validate V4 ok no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache, the relay programs 0755 and no /run/ai-env"),
+        "V4 holds the image's empty claude cache and (S13) its relay programs:\n{logs}"
     );
     let ip = c.ip();
     assert_v6_named(&logs, &ip, "the platform's /validate request came from outside this VM (admitted without a lookup); ");
@@ -3137,4 +3184,259 @@ fn l2_claude_stage_runs_the_fetched_claude_as_the_agent() {
     assert!(c.exec(&["cat", &bin]).stdout == staged.as_bytes(), "the binary's bytes as staged");
     assert_eq!(c.sh(&listing), before, "its directory as it was");
     eprintln!("L2 claude stage: {STAGED_VERSION} ({len} bytes, sha {}) fetched by curl as {} in {fetch_ms} ms; the spawn as the agent printed {ran}", &sha[..12], call.uid);
+}
+
+// ---- S13: the relay's VM side (V's wave 1, plans/s13-contracts.md §V-vm.8.4) -----------------------------------
+
+/// S13: a relay CA made at run time by the OpenSSL 3 CLI (Homebrew's first, as `tests/tls_policy.rs` picks it): a
+/// P-256 self-signed CA in a tempdir, its DER in standard base64. Its key goes with the tempdir.
+fn test_ca_der_b64() -> String {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let brew = Path::new("/opt/homebrew/bin/openssl");
+    let openssl = if brew.is_file() { brew.to_path_buf() } else { PathBuf::from("openssl") };
+    let (key, der) = (dir.path().join("ca.key"), dir.path().join("ca.der"));
+    let run = |cmd: &mut Command| {
+        let out = cmd.stdin(Stdio::null()).output().unwrap_or_else(|e| panic!("{}: {e}", openssl.display()));
+        assert!(out.status.success(), "openssl: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(Command::new(&openssl).args(["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out"]).arg(&key));
+    run(Command::new(&openssl)
+        .args(["req", "-x509", "-new", "-key"])
+        .arg(&key)
+        .args(["-subj", "/CN=relay L2 test CA", "-days", "1", "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-outform", "DER", "-out"])
+        .arg(&der));
+    base64::engine::general_purpose::STANDARD.encode(std::fs::read(&der).unwrap())
+}
+
+/// S13: a relay session for `token`: the unreachable relay `127.0.0.1:1` (each call fails at its connect,
+/// `unavailable`), its name an IP, a run-time CA.
+fn relay_spawn(token: &str) -> RelaySpawn {
+    RelaySpawn { token: Secret::new(token.to_string()), addr: "127.0.0.1:1".into(), server_name: "127.0.0.1".into(), ca_der_b64: test_ca_der_b64() }
+}
+
+/// S13: the stand-in claude of [`l2_relay_client_serves_the_session_to_its_claude_alone`]: `--version` prints the
+/// lock's line; otherwise its argv and ids, then (after one stdin line) the image's MCP server on [`MCP_IN`].
+fn relay_claude(version: &str) -> String {
+    format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version} (Claude Code)'; exit 0; fi\necho \"argv=$*\"\necho \"ids=$(id -u):$(id -g) pid=$$\"\nread -r go\n/usr/local/bin/ai-env-relay-mcp < /opt/fake/mcp-in.jsonl\necho \"mcp_exit=$?\"\n"
+    )
+}
+
+/// S13: what the stand-in claude feeds the MCP server: `initialize`, the `initialized` notification, `tools/list`, a
+/// catalog and a call.
+const MCP_IN: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"l2","version":"0"}}}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"relay_catalog","arguments":{}}}"#,
+    "\n",
+    r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"relay_call","arguments":{"source":"echo","op":"echo","params":{"x":1}}}}"#,
+    "\n",
+);
+
+/// S13: the relay client's pid on `id`'s spawn line (` relay=<cpid>`, its last word).
+fn relay_cpid(c: &Container, id: &SpawnId, pid: u32) -> u32 {
+    let head = format!("ai-env: spawn {id} pid={pid} ");
+    let logs = c.wait_log(10, &head);
+    let line = logs.lines().find(|l| l.starts_with(&head)).unwrap_or_default();
+    line.rsplit_once(" relay=").and_then(|(_, cpid)| cpid.parse().ok()).unwrap_or_else(|| panic!("no relay=<cpid> at the end of {line}"))
+}
+
+/// S13 (V-R8, V-R17 to V-R21, VC-1 to VC-3): the image's shim names `relay_v1`; a relay spawn of `claude` (the
+/// stand-in) runs as 1000:1000 with `--mcp-config=/etc/ai-env/relay-mcp.json` as its argv[1]; the client runs as
+/// 999:999 in its own session with exactly its argv and `LC_ALL=C`, `PATH=/usr/bin:/bin`; `/run/ai-env` 755 `0:0`,
+/// the socket dir 750 `999:1000`, the socket 666 `999:999`; the agent can read neither the client's environ nor its
+/// fds; a process outside the session (as 1000, 999 or 0, with `--socket`) is `forbidden_peer`, and without
+/// `--socket` the MCP server finds `no_session`; the token is on no disk, command line or environment; the stand-in's
+/// MCP server answers the five lines (the relay unreachable: `unavailable`, `connect 127.0.0.1:1: …`); the client
+/// ends with its leader, its socket gone, its calls logged and the token in no line. Kills M-V14 (the environment
+/// form), M-V15, M-V22, M-V49.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_relay_client_serves_the_session_to_its_claude_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = tempfile::tempdir().expect("a tempdir for the stand-in claude");
+    std::fs::write(fake.path().join("claude"), relay_claude(&lock_version())).unwrap();
+    std::fs::set_permissions(fake.path().join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(fake.path().join("mcp-in.jsonl"), MCP_IN).unwrap();
+    std::fs::set_permissions(fake.path().join("mcp-in.jsonl"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(fake.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mount = format!("{}:/opt/fake:ro", fake.path().display());
+    let vm = Vm::started(l2_with(&["-v", &mount], &[("--claude", "/opt/fake/claude")]), Some(fake), 120);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    // 1. The cap.
+    assert!(a.caps.iter().any(|cap| cap == CAP_RELAY_V1), "the image's shim names {CAP_RELAY_V1}: {:?}", a.caps);
+    // 2. The spawn: the config right after argv[0], as the agent.
+    let token = format!("relay-l2-{}", SpawnId::new_v7());
+    let l = a.launch(&Spec { relay: Some(relay_spawn(&token)), ..Spec::argv(&["claude", "--output-format", "stream-json"]) }).unwrap_or_else(|(code, m)| panic!("spawn_err {code:?}: {m}"));
+    let out = a.out_until(&l.id, Duration::from_secs(30), |o| o.contains("\nids="));
+    assert!(out.starts_with("argv=--mcp-config=/etc/ai-env/relay-mcp.json --output-format stream-json\n"), "{out}");
+    assert!(out.contains(&format!("ids=1000:1000 pid={}\n", l.pid)), "{out}");
+    let pid = l.pid;
+    // 3. The client: ai-env-net, its own session, its argv, its environment.
+    let cpid = relay_cpid(c, &l.id, pid);
+    let ps = c.sh(&format!("ps -o uid=,gid=,sid=,args= -p {cpid}")).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(ps, format!("999 999 {cpid} /usr/local/bin/ai-env-relay-client serve --leader {pid} --socket /run/ai-env/relay/{pid}.sock --agent-uid 1000"));
+    let environ = docker(&["exec", "--privileged", "-u", "0", &c.id, "sh", "-c", &format!("tr '\\0' '\\n' < /proc/{cpid}/environ")]);
+    let mut vars: Vec<String> = String::from_utf8_lossy(&environ.stdout).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    vars.sort();
+    assert_eq!(vars, ["LC_ALL=C", "PATH=/usr/bin:/bin"], "the client's environment, exactly");
+    // 4. The directories and the socket.
+    let socket = format!("/run/ai-env/relay/{pid}.sock");
+    assert_eq!(c.sh(&format!("stat -c '%a %u:%g %F' /run/ai-env /run/ai-env/relay {socket}")), "755 0:0 directory\n750 999:1000 directory\n666 999:999 socket");
+    // 5. The agent cannot look into the client.
+    for cmd in [format!("cat /proc/{cpid}/environ"), format!("ls /proc/{cpid}/fd")] {
+        let out = c.exec_as("1000", &["sh", "-c", &cmd]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "{cmd} as 1000: {}", String::from_utf8_lossy(&out.stdout));
+    }
+    // 6. A process outside the session: refused whatever its uid; without --socket, no session is found.
+    let ask = format!("{}\n{}\n", MCP_IN.lines().next().unwrap(), MCP_IN.lines().nth(3).unwrap());
+    for user in ["1000", "999", "0"] {
+        let out = c.exec_input(user, &["/usr/local/bin/ai-env-relay-mcp", "--socket", &socket], ask.as_bytes());
+        let answer = String::from_utf8_lossy(&out.stdout).lines().find(|l| l.contains("\"id\":3")).map(str::to_string).unwrap_or_default();
+        assert!(answer.contains("\"isError\":true") && answer.contains("forbidden_peer"), "as {user}: {answer}");
+    }
+    let out = c.exec_input("1000", &["/usr/local/bin/ai-env-relay-mcp"], ask.as_bytes());
+    let answer = String::from_utf8_lossy(&out.stdout).lines().find(|l| l.contains("\"id\":3")).map(str::to_string).unwrap_or_default();
+    assert!(answer.contains("\"isError\":true") && answer.contains("no_session"), "without --socket: {answer}");
+    let logs = c.wait_log(10, "ai-env-relay-client: refused peer pid=");
+    assert_eq!(logs.matches("ai-env-relay-client: refused peer pid=").count(), 3, "{logs}");
+    // 7. The token on no disk, command line or environment.
+    assert_eq!(c.disk_hits(&[&token]), Vec::<String>::new(), "the token on disk");
+    assert_eq!(c.proc_hits(&[&token], &["LC_ALL=C"]), 0, "the token in a command line or an environment");
+    // 8. The stand-in's MCP server, through the session.
+    a.feed(&l.id, b"go\n");
+    let ran = a.collect(&l.id);
+    let text = ran.ok("the stand-in claude");
+    let replies: BTreeMap<u64, serde_json::Value> = text.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).filter_map(|v| v["id"].as_u64().map(|id| (id, v))).collect();
+    assert_eq!(replies.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4], "one answer per request, none for the notification: {text}");
+    assert_eq!((replies[&1]["result"]["protocolVersion"].as_str(), replies[&1]["result"]["serverInfo"].clone()), (Some("2025-06-18"), serde_json::json!({"name": "ai-env-relay", "version": env!("CARGO_PKG_VERSION")})));
+    let names: Vec<&str> = replies[&2]["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert_eq!(names, ["relay_catalog", "relay_call"]);
+    for id in [3, 4] {
+        let r = &replies[&id]["result"];
+        let tool: serde_json::Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(r["isError"] == true && tool["error"]["code"] == "unavailable" && tool["error"]["message"].as_str().is_some_and(|m| m.starts_with("connect 127.0.0.1:1:")), "{id}: {tool}");
+    }
+    assert!(replies[&4]["result"]["content"][0]["text"].as_str().unwrap().starts_with(r#"{"source":"echo","op":"echo","error":"#), "{}", replies[&4]);
+    assert_eq!(text.lines().last(), Some("mcp_exit=0"), "{text}");
+    // 9. The client ends with its leader.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while (c.alive(cpid) || c.exec(&["test", "-e", &socket]).status.success()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!c.alive(cpid), "the client outlived its leader");
+    assert!(!c.exec(&["test", "-e", &socket]).status.success(), "the socket outlived the client");
+    let logs = c.wait_log(5, &format!("ai-env: relay {} client ended code=0 signal=-", l.id));
+    assert!(logs.contains(&format!("ai-env: relay {} ai-env-relay-client: catalog outcome=unavailable", l.id)), "{logs}");
+    assert!(logs.contains(&format!("ai-env: relay {} ai-env-relay-client: call - outcome=unavailable", l.id)), "{logs}");
+    assert!(!logs.contains(&token), "the token in the log");
+}
+
+/// S13 (P0-A2's offline half, LD-V5, LD-V11): the pinned claude (or the claude under test) started as a remote
+/// session's is (stream-json in and out, the proxy unreachable, a dummy setup-token on fd 3, a relay session) starts
+/// the image's MCP server from the `--mcp-config` the shim gave it: `ai-env-relay-mc` as 1000:1000 among its children
+/// (within 20 s, or 30 s after one user message); `mcp_status`, when this claude answers it, names `ai-env-relay`
+/// connected. A control: it pins claude's behaviour, not ai-env's; `make claude-admit-docker` records it for each new
+/// claude and never refuses one over it.
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_pinned_claude_starts_the_relay_mcp_server() {
+    let vm = Vm::started(l2(), None, 120);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    let token = format!("relay-l2-{}", SpawnId::new_v7());
+    let credential = dummy_credential("relay-mcp");
+    let env: BTreeMap<String, String> = [("HTTPS_PROXY", "http://127.0.0.1:9"), ("HTTP_PROXY", "http://127.0.0.1:9"), ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"), ("DISABLE_TELEMETRY", "1")]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let spec = Spec { env, secret: Some((CRED.to_string(), credential.clone())), relay: Some(relay_spawn(&token)), ..Spec::argv(&["claude", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json"]) };
+    let l = a.launch(&spec).unwrap_or_else(|(code, m)| panic!("spawn_err {code:?}: {m}"));
+    let cpid = relay_cpid(c, &l.id, l.pid);
+    // The initialize of tests/docker_exec.rs, answered.
+    a.stdin_chunk(&l.id, 1, b"{\"request_id\":\"init0001\",\"type\":\"control_request\",\"request\":{\"subtype\":\"initialize\",\"hooks\":{},\"jsonSchema\":null}}\n");
+    let response = |out: &str, id: &str| out.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).find(|v| v["type"] == "control_response" && v["response"]["request_id"] == id);
+    let out = a.out_until(&l.id, Duration::from_secs(90), |o| response(o, "init0001").is_some());
+    let init = response(&out, "init0001").unwrap();
+    assert_eq!(init["response"]["subtype"].as_str(), Some("success"), "{init}");
+    // The MCP server among claude's children, as the agent.
+    let children = |c: &Container| c.sh(&format!("ps -o pid=,uid=,gid=,comm= --ppid {} || true", l.pid));
+    let started = |c: &Container, secs: u64| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let kids = children(c);
+            if kids.lines().any(|k| k.split_whitespace().skip(1).collect::<Vec<_>>() == ["1000", "1000", "ai-env-relay-mc"]) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let mut seq = 1;
+    let mut found = started(c, 20);
+    if !found {
+        seq += 1;
+        a.stdin_chunk(&l.id, seq, b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"ping\"},\"parent_tool_use_id\":null,\"session_id\":\"default\"}\n");
+        found = started(c, 30);
+    }
+    assert!(found, "claude started no ai-env-relay-mcp as 1000:1000: {}\n{}", children(c), c.logs());
+    // mcp_status, when this claude answers it.
+    seq += 1;
+    a.stdin_chunk(&l.id, seq, b"{\"request_id\":\"mcps0001\",\"type\":\"control_request\",\"request\":{\"subtype\":\"mcp_status\"}}\n");
+    let out = a.out_until(&l.id, Duration::from_secs(30), |o| response(o, "mcps0001").is_some());
+    let status = response(&out, "mcps0001").unwrap();
+    let summary = if status["response"]["subtype"] == "success" {
+        let servers = status["response"]["response"]["mcpServers"].as_array().cloned().unwrap_or_default();
+        assert!(servers.iter().any(|s| s["name"] == "ai-env-relay" && s["status"] == "connected"), "{status}");
+        "mcp_status names ai-env-relay connected"
+    } else {
+        "mcp_status unsupported (the process tree stands as the evidence)"
+    };
+    // The end: the client and its socket go with the spawn; no line holds the token or the credential.
+    a.detach(&l.id, true);
+    let socket = format!("/run/ai-env/relay/{}.sock", l.pid);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (c.alive(cpid) || c.exec(&["test", "-e", &socket]).status.success()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!c.alive(cpid) && !c.exec(&["test", "-e", &socket]).status.success(), "the client or its socket outlived the spawn");
+    let logs = c.logs();
+    assert!(!logs.contains(&token) && !logs.contains(&credential), "the relay token or the credential in the log");
+    eprintln!("L2 relay MCP: claude {} started ai-env-relay-mcp; {summary}", expected_claude());
+}
+
+/// S13 (V-R36, V-R37, V-R39): the relay binaries are root's 0755 and the config root's 0644, the config is
+/// image/relay-mcp.json, both binaries print the workspace's version; `/run/ai-env` is absent before and after
+/// `/validate` (200) and `/run`; an agent's caps name `relay_v1`. Kills M-V26 (the Docker form).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_the_relay_files_are_baked_roots_and_no_session_is() {
+    let c = l2();
+    wait_ready(&c, 120);
+    assert_eq!(
+        c.sh("stat -c '%a %u:%g %n' /usr/local/bin/ai-env-relay-client /usr/local/bin/ai-env-relay-mcp /etc/ai-env/relay-mcp.json"),
+        "755 0:0 /usr/local/bin/ai-env-relay-client\n755 0:0 /usr/local/bin/ai-env-relay-mcp\n644 0:0 /etc/ai-env/relay-mcp.json"
+    );
+    let image = std::fs::read_to_string(Path::new(REPO).join("image/relay-mcp.json")).unwrap();
+    assert_eq!(format!("{}\n", c.sh("cat /etc/ai-env/relay-mcp.json")), image);
+    for b in ["ai-env-relay-client", "ai-env-relay-mcp"] {
+        let v = c.sh(&format!("/usr/local/bin/{b} --version"));
+        assert_eq!(v, format!("{b} {}", env!("CARGO_PKG_VERSION")));
+    }
+    let absent = |c: &Container| !c.exec(&["test", "-e", "/run/ai-env"]).status.success();
+    assert!(absent(&c), "/run/ai-env is baked into the image");
+    assert_eq!(http(c.port(9000), "POST", &format!("{PREFIX}/validate"), "").0, 200, "{}", c.logs());
+    assert!(absent(&c), "/validate made /run/ai-env");
+    let vm = Vm::started(c, None, 120);
+    assert!(absent(&vm.c), "/run made /run/ai-env");
+    let a = vm.agent();
+    assert!(a.caps.iter().any(|cap| cap == CAP_RELAY_V1), "{:?}", a.caps);
 }

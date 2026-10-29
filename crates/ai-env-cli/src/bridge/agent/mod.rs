@@ -234,6 +234,10 @@ pub struct Delivery {
     /// A1: the Claude account the sealed token is ([`Delivery::with_account`]),
     /// for its records and messages; none in a tree with no account.
     account: Option<String>,
+    /// S13 (M, WM-R52): the spawn's relay session ([`Delivery::with_relay`]),
+    /// its token masked by the scrubber while it is held; it goes with the
+    /// value ([`Delivery::drop_value`]).
+    relay: Option<crate::wire::relay::RelaySpawn>,
 }
 
 /// What became of a [`Delivery`] in its session (S8: the remote session's
@@ -274,7 +278,26 @@ impl Delivery {
         if parts.one_shot && parts.secret.is_none() {
             return Err(BridgeError::CredentialMissing("a one-spawn credential needs its value".into()));
         }
-        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false, report: DeliveryReport::default(), account: None })
+        Ok(Delivery { vm_id: vm_id.to_string(), pass: pass.clone(), parts, masked: false, report: DeliveryReport::default(), account: None, relay: None })
+    }
+
+    /// S13 (M): the spawn's relay session (token, address, server name, CA), sent with this spawn only (WM-R52):
+    /// in its frame while the session holds it, to a shim naming `relay_v1`, behind the gate check every spawn
+    /// frame passes, to this delivery's VM alone. Its token is registered with the scrubber until it is dropped.
+    #[must_use]
+    pub fn with_relay(mut self, relay: Option<crate::wire::relay::RelaySpawn>) -> Delivery {
+        if let Some(r) = &relay {
+            crate::wire::redact::register_secret(r.token.expose());
+        }
+        if let Some(old) = std::mem::replace(&mut self.relay, relay) {
+            crate::wire::redact::forget_secret(old.token.expose());
+        }
+        self
+    }
+
+    /// A copy for one spawn frame while the session is held.
+    pub(crate) fn relay_frame_value(&self) -> Option<crate::wire::relay::RelaySpawn> {
+        self.relay.clone()
     }
 
     /// A1: the delivery names `account`, the Claude account its seal is
@@ -413,6 +436,10 @@ impl Delivery {
                 crate::wire::redact::forget_secret(s.expose());
             }
         }
+        // S13 (WM-R52): the relay session goes with it (its token zeroized, its masking forgotten).
+        if let Some(r) = self.relay.take() {
+            crate::wire::redact::forget_secret(r.token.expose());
+        }
     }
 }
 
@@ -426,7 +453,18 @@ impl Drop for Delivery {
 
 impl std::fmt::Debug for Delivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Delivery({}, {} tag={}, {:?}, value={}, one_shot={}, account={:?})", self.vm_id, self.parts.name, self.parts.tag, self.parts.deliver, if self.holds_value() { "held" } else { "none" }, self.parts.one_shot, self.account)
+        write!(
+            f,
+            "Delivery({}, {} tag={}, {:?}, value={}, one_shot={}, relay={}, account={:?})",
+            self.vm_id,
+            self.parts.name,
+            self.parts.tag,
+            self.parts.deliver,
+            if self.holds_value() { "held" } else { "none" },
+            self.parts.one_shot,
+            if self.relay.is_some() { "held" } else { "none" },
+            self.account
+        )
     }
 }
 
@@ -821,6 +859,38 @@ mod tests {
         let said = named.missing("microvm-1", "nothing was sent").to_string();
         assert!(said.contains("microvm-1 no longer holds CLAUDE_CODE_OAUTH_TOKEN (seal seal, Claude account work): its copy went"), "{said}");
         assert!(format!("{named:?}").ends_with("account=Some(\"work\"))"), "{named:?}");
+    }
+
+    /// S13 (WM-T40, WM-R52): a delivery carries the spawn's relay session. `relay_frame_value` is a copy of it;
+    /// the scrubber masks its token while the delivery holds it; `Debug` says `relay=held` and shows no part of
+    /// the token; `drop_value` (at `spawned`) drops it: `relay=none`, no frame value, the scrubber forgets the
+    /// token (once). A delivery given `with_relay(None)` holds none.
+    #[test]
+    fn the_delivery_carries_the_relay_token_and_drops_it() {
+        use crate::wire::redact::{forget_secret, scrub};
+        use crate::wire::relay::RelaySpawn;
+        let now = 1_790_000_000;
+        let parts = || DeliveryParts { name: "CLAUDE_CODE_OAUTH_TOKEN".into(), tag: "seal".into(), deliver: Deliver::Fd, secret: None, one_shot: false };
+        let token = format!("v1.{}.{}", "Rq7".repeat(30), "Wx3".repeat(29));
+        let spawn = RelaySpawn { token: Secret::new(token.clone()), addr: "10.42.0.20:7443".into(), server_name: "10.42.0.20".into(), ca_der_b64: "MIIBkTCB+w==".into() };
+        let masked = |v: &str| !scrub(&format!("x {v} y")).contains(v);
+        assert!(!masked(&token), "no generic rule masks it: the delivery's registration does");
+        let mut d = Delivery::new(&GatePass::for_tests("microvm-1", now), "microvm-1", now, parts()).unwrap().with_relay(Some(spawn.clone()));
+        assert_eq!(d.relay_frame_value(), Some(spawn.clone()), "a copy for the spawn frame");
+        assert!(masked(&token), "masked while the delivery holds it");
+        let shown = format!("{d:?}");
+        assert!(shown.contains(", relay=held, ") && !shown.contains("Rq7Rq7") && !shown.contains("Wx3Wx3"), "{shown}");
+        d.drop_value();
+        assert!(d.relay_frame_value().is_none() && format!("{d:?}").contains(", relay=none, "), "{d:?}");
+        assert!(!masked(&token) && !forget_secret(&token), "forgotten with the delivery's value, once");
+        let none = Delivery::new(&GatePass::for_tests("microvm-1", now), "microvm-1", now, parts()).unwrap().with_relay(None);
+        assert!(none.relay_frame_value().is_none() && format!("{none:?}").contains(", relay=none, "), "{none:?}");
+        // A delivery that goes while still holding its session forgets the token too.
+        let token2 = format!("v1.{}.{}", "Tz5".repeat(30), "Yv4".repeat(29));
+        let held = Delivery::new(&GatePass::for_tests("microvm-1", now), "microvm-1", now, parts()).unwrap().with_relay(Some(RelaySpawn { token: Secret::new(token2.clone()), ..spawn }));
+        assert!(masked(&token2));
+        drop(held);
+        assert!(!masked(&token2), "forgotten with the delivery");
     }
 
     #[test]

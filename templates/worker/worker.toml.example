@@ -1,0 +1,18 @@
+# Copy to /etc/ai-env-worker/worker.toml (0640, root:ai-env-worker). Placeholders only.
+worker_id = "example-worker"               # as the deployer allowed it: ai-env relay allow <worker_id> ...
+relay = "203.0.113.10:443"                 # the relay's public address and port (documentation range)
+server_name = "ai-env-relay"               # the name in the relay's certificate
+relay_ca = "/etc/ai-env-worker/relay-ca.pem"   # the relay CA's certificate: the only trust anchor
+signer = "file"                            # "file" on a server; "agent" on the Mac (ai-env relay agent)
+key_file = "/etc/ai-env-worker/worker.key" # 0600, owned by the worker's user; made by `my-worker keygen`
+max_in_flight = 8
+
+[[source]]
+kind = "echo"
+name = "example-echo"
+
+# [[source]]
+# kind = "http_json"
+# name = "example-http"
+# base_url = "https://api.example.com"
+# paths = ["/v1/status"]

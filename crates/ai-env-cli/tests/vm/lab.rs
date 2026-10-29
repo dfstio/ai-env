@@ -1300,6 +1300,12 @@ fn green_network_with(vm_toml: &str, extras: &str, suspended: &str) -> World {
         connector_state: Some("ACTIVE".into()),
         squid_conf_sha256: Some(value_sha256(NET_SQUID_CONF)),
         allow_sha256: Some(value_sha256(NET_ALLOW)),
+        // S13: the relay the fixtures carry (its group, the VM group's rule and NACL entries to it, its interface): a
+        // state without it leaves the relay's rows unknown, and no check passes on that (I-R66).
+        relay_instance_id: Some("i-0123456789abcdef1".into()),
+        relay_security_group_id: Some("sg-0ccc9999dddd0000e".into()),
+        relay_private_ip: Some("10.42.0.20".into()),
+        relay_public_ip: Some("203.0.113.20".into()),
         ..InfraState::default()
     };
     fs::create_dir_all(w.bridge().join("state")).unwrap();
@@ -1323,6 +1329,9 @@ fn transcript_with(w: &World, replace: &[(&str, &str)]) -> PathBuf {
             "direct-ipv4" | "direct-http" | "proxy-other-port" => "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
+            // S13 (I-T34's): the relay's internet face timed out without a connection; its private port answered (TLS
+            // under the relay's own CA: rc 60), recorded only.
+            "relay-other-port" | "relay-port" => if c.name == "relay-port" { "rc=60 code=000 size=0 conn=1 hc=000 t403=no sq=no" } else { "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no" }.to_string(),
             // The S9 S3 cases (§7.7): s3-own stored and read back through the endpoint; the S3Denied cases 403
             // AccessDenied through the tunnel; s3-direct made no connection; proxy-s3-other-host is a CONNECT 403 (the
             // proxy- arm below catches it).
@@ -1401,14 +1410,15 @@ fn egress_check_records_a_pass_resting_on_the_network_and_squids_log() {
     assert_eq!(code(&o), 0, "{}\n{}", stdout(&o), stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("note: the case results are reported by the VM itself; a record rests on the network verification and squid's log"), "{out}");
-    assert!(out.contains("network: 19 checks ok: connector, connector-enis") && out.contains("squid log: from 10.42.1.17: 2 tunnels"), "{out}");
+    // S13: the network verification's 21 rows (I-R60: the relay's two added).
+    assert!(out.contains("network: 21 checks ok: connector, connector-enis") && out.contains("squid log: from 10.42.1.17: 2 tunnels"), "{out}");
     assert!(out.contains("egress check passed: recorded for image version 1.0"), "{out}");
     let v = verified(&w);
     assert_eq!(v.records.len(), 1, "{v:?}");
     let rec = &v.records[0];
     assert_eq!((rec.image_arn.as_str(), rec.image_version.as_str(), rec.connector.as_str(), rec.dns.as_str(), rec.dns_rule), (ai_env_cli::bridge::api::FAKE_IMAGE_ARN, "1.0", CONNECTOR, "no-dns", DNS_RULE));
     assert!(out.contains("dns: no-dns (asked d5eed5eed5eed5eed.example.com A; the credential gate accepts it: [egress].accept_platform_dns accepts no platform resolver (only no-dns passes))"), "{out}");
-    assert!(rec.network.starts_with("19 checks ok: connector") && rec.squid_log.contains("TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443") && rec.cases.contains("allowed-last=pass"), "{rec:?}");
+    assert!(rec.network.starts_with("21 checks ok: connector") && rec.squid_log.contains("TCP_DENIED/403 for CONNECT n5eed5eed5eed5eed.example.com:443") && rec.cases.contains("allowed-last=pass"), "{rec:?}");
     // Bound to the connector's live facts (the golden get-network-connector) and the image version's created_at (the fake's 1.0).
     assert_eq!(
         (rec.connector_facts.id.as_str(), rec.connector_facts.version.as_str(), rec.connector_facts.subnet_ids.clone(), rec.connector_facts.security_group_ids.clone(), rec.image_created_at),
@@ -1799,7 +1809,7 @@ fn egress_check_judges_a_suspended_github_and_revokes() {
     assert_eq!(code(&o), 9, "{}\n{}", stdout(&o), stderr(&o));
     let err = stderr(&o);
     assert!(err.contains("proxy-github: OPEN: the proxy opened a tunnel: HTTP 200 (rc 0, 284512 bytes; 1 connect), CONNECT 200 (github.com was not on the proxy's effective allowlist as this check read it"), "{err}");
-    assert!(stdout(&o).contains("network: 19 checks ok: ") && !stdout(&o).lines().any(|l| l.starts_with("allowlisted:")) && !err.contains("allowlisted:"), "{}\n{err}", stdout(&o));
+    assert!(stdout(&o).contains("network: 21 checks ok: ") && !stdout(&o).lines().any(|l| l.starts_with("allowlisted:")) && !err.contains("allowlisted:"), "{}\n{err}", stdout(&o));
     let v = verified(&w);
     assert!(v.records.iter().all(|r| r.connector != CONNECTOR) && v.records.len() == 1, "revoked, nothing recorded: {v:?}");
     let last = check_audit(&w).pop().unwrap();

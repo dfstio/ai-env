@@ -33,8 +33,14 @@
 # bucket's beside each principal's own; and ai-env-ops' bucket reads (never an object). S11 (part A) adds the claude
 # objects, v1/_claude/mac/<v>/<sha256>, to section 9 with no policy change: a VM's fetch through the endpoint, the
 # stager's single PUT from outside it, the Mac's list and delete allowed; a PUT through the endpoint and a GET outside
-# it denied (the bucket's DenyMacWritesThroughTheEndpoint covers their /mac/ segment). The caller's account id only
-# lives in shell variables: nothing here writes it to a file. Read-only against AWS; region always $REGION.
+# it denied (the bucket's DenyMacWritesThroughTheEndpoint covers their /mac/ segment). S13 (plans/s13-contracts.md
+# §I-infra.4.6): section 6 adds the relay instance's start and stop and its four non-secret parameters for ai-env-ops
+# (never the TLS pair, a command or a session), section 7 the deployer's relay rights (its parameters, Elastic IP, the VM
+# subnet's NACL entries, its profile, PassRole to EC2 alone, the SSM agent policy alone on its role), section 9 the
+# relay role's binary through the endpoint, and a section 10 the relay's role itself with the AWS managed SSM agent
+# policy (its five parameters, the decryption of its TLS pair alone, its binary, its log group; no MicroVM, connector,
+# role, command or write right). The caller's account id only lives in shell variables: nothing here writes it to a
+# file. Read-only against AWS; region always $REGION.
 #
 # Env (set by infra/infra.mk): AI_ENV_REPO_ROOT, REGION, POLICIES_OUT.
 set -euo pipefail
@@ -372,6 +378,9 @@ test "$failed" -eq 0 || { echo "check-policies: the operator role does not match
 econf() { sed -n "s/.*\"$1\": *\"\\([^\"]*\\)\".*/\\1/p" "$infra/egress-config.json" | head -1; }
 proxy_id=i-0123456789abcdef0
 proxy_i="$ec2_arn:instance/$proxy_id"
+# S13: the relay instance, an id of the real shape (print-policies' placeholder); its ARN is built here, as the proxy's.
+relay_id=i-0123456789abcdef1
+relay_i="$ec2_arn:instance/$relay_id"
 doc_arn="arn:aws:ssm:$region:$acct:document"
 proxy_docs=()
 for k in reloadDocumentName statusDocumentName patchDocumentName; do
@@ -394,9 +403,18 @@ cloudtrail_group="arn:aws:logs:$region:$acct:log-group:aws-cloudtrail-logs-probe
 proxy_profile_name=$(econf proxyInstanceProfileName)
 test -n "$proxy_profile_name" || { echo "check-policies: no proxyInstanceProfileName in $infra/egress-config.json" >&2; exit 1; }
 proxy_profile="arn:aws:iam::$acct:instance-profile/$proxy_profile_name"
-docs=("$(pp --proxy-instance-id "$proxy_id" --name ops)")
+docs=("$(pp --proxy-instance-id "$proxy_id" --relay-instance-id "$relay_id" --name ops)")
 # Allowed: what the operator commands call (plans/s8-operators-design.md B5).
 sim allowed "ops: start and stop the proxy" "$proxy_i" - ec2:StartInstances ec2:StopInstances
+# S13: `ai-env relay start|stop|status` and `make relay-logs`: the relay instance, its four non-secret parameters, its log group.
+relay_param=$(pp --arn relay-parameter)
+relay_prefix=${relay_param%/workers}
+relay_tls=$(pp --arn relay-tls)
+relay_group=$(pp --arn relay-log-group)
+sim allowed "ops: start and stop the relay" "$relay_i" - ec2:StartInstances ec2:StopInstances
+for p in artifact workers grants token-signers; do sim allowed "ops: the relay's $p" "$relay_prefix/$p" - ssm:GetParameters; done
+sim allowed "ops: read the relay's log group" "$relay_group" - logs:FilterLogEvents logs:StartLiveTail
+sim allowed "ops: read the relay's log group's streams" "$relay_group:*" - logs:FilterLogEvents logs:StartLiveTail
 for d in "${proxy_docs[@]}"; do sim allowed "ops: send ${d##*/}" "$d" - ssm:SendCommand; done
 sim allowed "ops: send to the proxy instance" "$proxy_i" - ssm:SendCommand
 for p in squid.conf allow extras suspended; do sim allowed "ops: read the $p parameter" "$prefix_param/$p" - ssm:GetParameters ssm:GetParameterHistory; done
@@ -409,7 +427,7 @@ sim allowed "ops: the unscoped reads" "*" - \
     ec2:DescribeVpcBlockPublicAccessOptions ec2:DescribeVpcBlockPublicAccessExclusions route53resolver:ListFirewallRuleGroupAssociations \
     lambda:ListNetworkConnectors lambda:ListMicrovmImages lambda:ListManagedMicrovmImages lambda:ListManagedMicrovmImageVersions lambda:ListMicrovms \
     logs:DescribeLogGroups cloudtrail:DescribeTrails cloudtrail:GetEventSelectors cloudtrail:ListChannels cloudtrail:GetChannel \
-    iam:GetAccountSummary access-analyzer:ValidatePolicy iam:SimulateCustomPolicy
+    iam:GetAccountSummary access-analyzer:ValidatePolicy iam:SimulateCustomPolicy ec2:DescribeAddresses
 sim allowed "ops: the DNS Firewall rules" "arn:aws:route53resolver:$region:$acct:firewall-rule-group/rslvr-frg-0000000000000000" - route53resolver:ListFirewallRules
 sim allowed "ops: the DNS Firewall domains" "arn:aws:route53resolver:$region:$acct:firewall-domain-list/rslvr-fdl-0000000000000000" - route53resolver:ListFirewallDomains
 sim allowed "ops: the DNS Firewall config" "arn:aws:route53resolver:$region:$acct:firewall-config/rslvr-fc-0000000000000000" - route53resolver:GetFirewallConfig
@@ -530,17 +548,24 @@ sim implicitDeny "ops: S3 and Logs writes, no resource type" "*" - \
 # no read of a CloudTrail group (the command cloudtrail-payload prints for one is the deployer's: section 7).
 log_writes=(logs:CreateLogGroup logs:DeleteLogGroup logs:PutRetentionPolicy logs:DeleteRetentionPolicy logs:PutSubscriptionFilter logs:PutDataProtectionPolicy
     logs:DeleteDataProtectionPolicy logs:TagResource logs:UntagResource logs:AssociateKmsKey logs:CreateLogStream logs:PutLogEvents logs:DeleteLogStream)
-for g in "$image_group" "$squid_group" "$dns_group" "$cloudtrail_group"; do
+for g in "$image_group" "$squid_group" "$dns_group" "$cloudtrail_group" "$relay_group"; do
     sim implicitDeny "ops: write ${g##*:log-group:}" "$g" - "${log_writes[@]}"
     sim implicitDeny "ops: write ${g##*:log-group:}'s streams" "$g:*" - "${log_writes[@]}"
 done
 sim implicitDeny "ops: read a CloudTrail log group" "$cloudtrail_group" - logs:FilterLogEvents logs:Unmask logs:StartLiveTail
 sim implicitDeny "ops: read a CloudTrail group's streams" "$cloudtrail_group:*" - logs:FilterLogEvents logs:Unmask logs:StartLiveTail
-test "$failed" -eq 0 || { echo "check-policies: the ops policy does not match plans/s8-operators-plan.md §1 (above)" >&2; exit 1; }
+# S13: never the relay's TLS pair, never a write of its parameters, never a command, a session or its role, disks, network.
+sim implicitDeny "ops: the relay's TLS" "$relay_tls" - ssm:GetParameters ssm:GetParameter ssm:GetParameterHistory
+for p in artifact workers grants token-signers tls; do sim implicitDeny "ops: write the relay's $p" "$relay_prefix/$p" - ssm:PutParameter ssm:DeleteParameter; done
+sim implicitDeny "ops: a command or a session on the relay" "$relay_i" - ssm:SendCommand ssm:StartSession
+sim implicitDeny "ops: the relay's role, disks, network" "$relay_i" - \
+    ec2:RebootInstances ec2:AssociateIamInstanceProfile ec2:ReplaceIamInstanceProfileAssociation ec2:DisassociateIamInstanceProfile \
+    ec2:AttachNetworkInterface ec2:AssociateAddress ec2:AttachVolume ec2:DetachVolume ec2:CreateImage ec2:ModifyInstanceCreditSpecification
+test "$failed" -eq 0 || { echo "check-policies: the ops policy does not match plans/s8-operators-plan.md §1 and plans/s13-contracts.md §I (above)" >&2; exit 1; }
 
 # ---- 7. ai-env-deployer: its five policies together (the three deploy policies, its supplement, ai-env-ops) ----
 # The context entry carries iam:PolicyARN for the attach and detach rows (the supplement's ArnEquals conditions).
-ppd() { pp --vm-subnet-id "$vm_subnet_id" --vm-security-group-id "$vm_sg_id" --proxy-instance-id "$proxy_id" "$@"; }
+ppd() { pp --vm-subnet-id "$vm_subnet_id" --vm-security-group-id "$vm_sg_id" --proxy-instance-id "$proxy_id" --relay-instance-id "$relay_id" "$@"; }
 docs=("$(ppd --name deploy)" "$(ppd --name deploy-egress)" "$(ppd --name deploy-dns)" "$(ppd --name deployer)" "$(ppd --name ops)")
 with_policy() { printf 'ContextKeyName=iam:PolicyARN,ContextKeyValues=%s,ContextKeyType=string' "$1"; }
 admin=arn:aws:iam::aws:policy/AdministratorAccess
@@ -595,7 +620,21 @@ sim implicitDeny "deployer: another policy" "arn:aws:iam::$acct:policy/not-ai-en
 sim implicitDeny "deployer: another user" "arn:aws:iam::$acct:user/not-ai-env" - iam:CreateUser iam:CreateAccessKey iam:AttachUserPolicy
 sim implicitDeny "deployer: share a document" "$reload_doc" - ssm:ModifyDocumentPermission
 sim implicitDeny "deployer: a group" "arn:aws:iam::$acct:group/not-ai-env" - iam:CreateGroup
-test "$failed" -eq 0 || { echo "check-policies: ai-env-deployer's five policies do not match plans/s8-operators-plan.md §1 (above)" >&2; exit 1; }
+# S13: what building the relay and `ai-env relay` need as the deployer, and its limits.
+relay_role=$(pp --arn relay-role)
+to_ec2="ContextKeyName=iam:PassedToService,ContextKeyValues=ec2.amazonaws.com,ContextKeyType=string"
+for p in workers grants token-signers tls; do sim allowed "deployer: ai-env relay writes $p" "$relay_prefix/$p" - ssm:PutParameter ssm:GetParameters ssm:DeleteParameter; done
+sim allowed "deployer: the relay's address" "$ec2_arn:elastic-ip/eipalloc-0123456789abcdef0" - ec2:AllocateAddress ec2:AssociateAddress ec2:DisassociateAddress ec2:ReleaseAddress
+sim allowed "deployer: the VM subnet's NACL entries" "$ec2_arn:network-acl/acl-0123456789abcdef0" - ec2:CreateNetworkAclEntry ec2:DeleteNetworkAclEntry ec2:ReplaceNetworkAclEntry
+sim allowed "deployer: the relay's instance profile" "$(pp --arn relay-instance-profile)" - \
+    iam:CreateInstanceProfile iam:AddRoleToInstanceProfile iam:GetInstanceProfile iam:RemoveRoleFromInstanceProfile iam:DeleteInstanceProfile
+sim allowed "deployer: pass the relay role to EC2" "$relay_role" "$to_ec2" iam:PassRole
+sim implicitDeny "deployer: pass the relay role to Lambda" "$relay_role" "$to_lambda" iam:PassRole
+# Q-I12: the relay role holds the SSM agent's managed policy, never the connector's operator policy.
+sim allowed "deployer: the SSM agent policy on the relay role" "$relay_role" "$(with_policy "$(pp --arn ssm-instance-policy)")" iam:AttachRolePolicy iam:DetachRolePolicy
+sim implicitDeny "deployer: the operator policy on the relay role" "$relay_role" "$(with_policy "$(pp --arn operator-policy)")" iam:AttachRolePolicy
+sim implicitDeny "deployer: a session on the relay" "$relay_i" - ssm:StartSession
+test "$failed" -eq 0 || { echo "check-policies: ai-env-deployer's five policies do not match plans/s8-operators-plan.md §1 and plans/s13-contracts.md §I (above)" >&2; exit 1; }
 
 # ---- 9. S9: the transcript store (contracts §7.3 to §7.5): the principal × endpoint matrix ----
 # simulate-custom-policy evaluates no VPC endpoint policy, and with a resource policy it takes an IAM user as the caller
@@ -660,7 +699,7 @@ docs=("$bucket_doc")
 sim explicitDeny "bucket: an anonymous caller via the endpoint" "$t_vm" "$(s3ctx - endpoint)" s3:GetObject s3:PutObject
 sim explicitDeny "bucket: an anonymous caller outside it" "$t_mac" "$(s3ctx - outside)" s3:GetObject s3:PutObject
 # ai-env-ops: the bucket's settings and policy for egress status, never an object.
-docs=("$(pp --proxy-instance-id "$proxy_id" --name ops)")
+docs=("$(pp --proxy-instance-id "$proxy_id" --relay-instance-id "$relay_id" --name ops)")
 sim allowed "ops: the transcripts bucket's settings" "$t_bucket" - s3:GetBucketPolicy s3:GetBucketVersioning s3:GetBucketPublicAccessBlock s3:GetBucketOwnershipControls \
     s3:GetEncryptionConfiguration s3:GetLifecycleConfiguration
 sim allowed "ops: the VPC endpoints" "*" - ec2:DescribeVpcEndpoints
@@ -680,7 +719,39 @@ sim allowed "bucket: the stager's claude PUT outside it" "$t_claude" "$(s3ctx "$
 sim explicitDeny "bucket: a claude GET outside the endpoint" "$t_claude" "$(s3ctx "$runtime_user" outside)" s3:GetObject
 sim allowed "bucket: a claude delete" "$t_claude" "$(s3ctx "$runtime_user" outside)" s3:DeleteObject
 sim allowed "bucket: runtime lists v1/_claude/mac/" "$t_bucket" "$(s3ctx "$runtime_user" outside true "v1/_claude/mac/")" s3:ListBucket
-test "$failed" -eq 0 || { echo "check-policies: the transcript store's policies do not match plans/s9-contracts.md §7.3 to §7.5 and plans/s11-contracts-A.md §7.3 (above)" >&2; exit 1; }
+# S13: through the endpoint, the relay role reads its binary, and nothing else of the bucket or ours; nobody else reads it.
+relay_object=$(pp --arn relay-artifact-object)
+docs=("$endpoint_doc")
+sim allowed "endpoint: the relay role's binary" "$relay_object" "$(s3ctx "$relay_role" endpoint)" s3:GetObject
+sim implicitDeny "endpoint: the relay role's writes" "$relay_object" "$(s3ctx "$relay_role" endpoint)" s3:PutObject
+sim implicitDeny "endpoint: the relay role, the image zip" "$bucket_arn/ai-env/image-0000000000000000.zip" "$(s3ctx "$relay_role" endpoint)" s3:GetObject
+sim implicitDeny "endpoint: the relay role, our transcripts" "$t_vm" "$(s3ctx "$relay_role" endpoint)" s3:GetObject s3:PutObject
+sim implicitDeny "endpoint: the relay's binary to the VM's role" "$relay_object" "$(s3ctx "$exec_role" endpoint)" s3:GetObject
+test "$failed" -eq 0 || { echo "check-policies: the transcript store's policies do not match plans/s9-contracts.md §7.3 to §7.5 and plans/s11-contracts-A.md §7.3, or the relay's binary through the endpoint plans/s13-contracts.md §I (above)" >&2; exit 1; }
+
+# ---- 10. S13: the relay's role, its inline policy beside the AWS managed SSM agent policy ----
+# What its root units do (the reload unit's get-parameters and decryption, its binary, the CloudWatch agent), and every
+# right the relay must not have in Track A (plans/s13-plan.md §A4). The KMS key is a placeholder id of the real shape:
+# the Allow names any key of the account through SSM, and the Deny any decryption of another parameter.
+docs=("$(pp --name relay)" "$ssm_managed")
+kms_key="arn:aws:kms:$region:$acct:key/0199a1b2-0000-7000-8000-000000000001"
+kms_ctx() { printf '[{"ContextKeyName":"kms:EncryptionContext:PARAMETER_ARN","ContextKeyValues":["%s"],"ContextKeyType":"string"},{"ContextKeyName":"kms:ViaService","ContextKeyValues":["ssm.%s.amazonaws.com"],"ContextKeyType":"string"}]' "$1" "$region"; }
+for p in artifact workers grants token-signers tls; do sim allowed "relay: its $p" "$relay_prefix/$p" - ssm:GetParameters; done
+sim allowed "relay: decrypt its TLS pair through SSM" "$kms_key" "$(kms_ctx "$relay_tls")" kms:Decrypt
+sim explicitDeny "relay: decrypt another parameter" "$kms_key" "$(kms_ctx "$relay_param")" kms:Decrypt
+sim explicitDeny "relay: decrypt without a parameter" "$kms_key" - kms:Decrypt
+sim allowed "relay: its binary" "$relay_object" "ContextKeyName=s3:ResourceAccount,ContextKeyValues=$acct,ContextKeyType=string" s3:GetObject
+sim implicitDeny "relay: write its binary" "$relay_object" - s3:PutObject s3:DeleteObject
+sim implicitDeny "relay: the image zip" "$zip_arn" - s3:GetObject
+sim allowed "relay: its log group's streams" "$relay_group:*" - logs:CreateLogStream logs:PutLogEvents
+sim implicitDeny "relay: the squid log group" "$squid_group:*" - logs:PutLogEvents
+sim implicitDeny "relay: the proxy's parameters" "$proxy_param" - ssm:GetParameters ssm:PutParameter
+sim implicitDeny "relay: write its parameters" "$relay_param" - ssm:PutParameter ssm:DeleteParameter
+sim implicitDeny "relay: no MicroVM right (Track A)" "$image" - lambda:RunMicrovm lambda:CreateMicrovmAuthToken lambda:CreateMicrovmShellAuthToken lambda:TerminateMicrovm
+sim implicitDeny "relay: no connector" "*" - lambda:PassNetworkConnector
+sim implicitDeny "relay: no role of its own" "$relay_role" - iam:PassRole iam:PutRolePolicy
+sim implicitDeny "relay: no command or session" "$relay_i" - ssm:SendCommand ssm:StartSession
+test "$failed" -eq 0 || { echo "check-policies: the relay role does not match plans/s13-contracts.md §I (above)" >&2; exit 1; }
 
 # ---- 8. every action a deny row names exists ----
 # simulate-custom-policy accepts invented names, so a deny row naming a misspelled action passes without proving
@@ -708,4 +779,4 @@ while IFS= read -r d; do
 done <<<"$chunks"
 test "$bad" -eq 0 || { echo "check-policies: a deny row names an action that does not exist (above): it passes without proving anything" >&2; exit 1; }
 printf 'validate-policy %-16s %-16s %d actions, no ERROR\n' "deny rows" IDENTITY_POLICY "$(wc -l <<<"$deny_names" | tr -d ' ')"
-echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only; the operator role creates ENIs only in the VM subnet with the VM security group, under the pinned managed policy; ai-env-ops runs the proxy's three documents and reads, nothing that deploys or widens egress; ai-env-deployer's five policies manage themselves, the ops user and the keys within their documented limits; the transcript store admits the runtime user's v1/ through the endpoint only and refuses the VM's role and anonymous callers; every action a deny row names exists)"
+echo "check-policies: ok (Access Analyzer clean of ERROR and SECURITY_WARNING; runtime policy matches §9 and S5; the proxy role holds its own parameters and log group only; the operator role creates ENIs only in the VM subnet with the VM security group, under the pinned managed policy; ai-env-ops runs the proxy's three documents and reads, nothing that deploys or widens egress; ai-env-deployer's five policies manage themselves, the ops user and the keys within their documented limits; the transcript store admits the runtime user's v1/ through the endpoint only and refuses the VM's role and anonymous callers; the relay's role reads its five parameters, decrypts its TLS pair alone, reads its binary through the endpoint and writes its log group, and ops never reads that pair; every action a deny row names exists)"

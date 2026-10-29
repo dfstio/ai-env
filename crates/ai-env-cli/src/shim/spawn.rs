@@ -154,6 +154,8 @@ pub struct SpawnOpts {
     /// is a VM path, entered under this prefix as every other VM path is
     /// (`ShimState::at`); the default (`home`) is the shim's own path already.
     pub fs_root: Option<PathBuf>,
+    /// S13: set when the shim runs relay sessions (`shim::relay::opts_for`): it names `relay_v1` exactly then.
+    pub relay: Option<crate::shim::relay::RelayOpts>,
 }
 
 /// A `spawn` frame's fields. `Debug` is written by hand: the id, argv[0] and
@@ -174,6 +176,9 @@ pub struct SpawnRequest {
     /// `spawn.claude` (S11, A.4): the staged claudes this spawn may run, in
     /// preference order (at most `CLAUDE_REFS_MAX`).
     pub claude: Vec<ClaudeRef>,
+    /// `spawn.relay` (S13, §V-vm): the spawn's relay session, handed to its relay client on fd 3 alone and never
+    /// kept; `None` for every spawn without one (and for each spawn of a shim that serves no relay).
+    pub relay: Option<crate::wire::relay::RelaySpawn>,
     /// What a `claude` argv[0] runs (S11): `None` until the `/agent`
     /// connection resolved it (`resolve_claude`, from the shim's cache),
     /// and for any other argv[0].
@@ -185,7 +190,7 @@ impl SpawnRequest {
     #[must_use]
     pub fn from_frame(f: Frame) -> Option<SpawnRequest> {
         match f {
-            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential, claude } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s, credential, claude, picked: None }),
+            Frame::Spawn { spawn_id, argv, cwd, env, secrets, deliver_secret, detach_grace_s, credential, claude, relay } => Some(SpawnRequest { spawn_id, argv, cwd, env, secrets, deliver: deliver_secret, detach_grace_s, credential, claude, relay, picked: None }),
             _ => None,
         }
     }
@@ -196,7 +201,7 @@ impl std::fmt::Debug for SpawnRequest {
         let argv0 = short(self.argv.first().map_or("", |a| basename(a)));
         write!(
             f,
-            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?}, credential={:?}, claude={})",
+            "SpawnRequest({}, argv0={argv0}, argc={}, cwd={}, env={}, secrets={}, deliver={:?}, detach_grace_s={:?}, credential={:?}, relay={}, claude={})",
             short(&self.spawn_id.0),
             self.argv.len(),
             if self.cwd.is_some() { "set" } else { "home" },
@@ -205,6 +210,7 @@ impl std::fmt::Debug for SpawnRequest {
             self.deliver,
             self.detach_grace_s,
             self.credential,
+            if self.relay.is_some() { "on" } else { "off" },
             self.claude.len()
         )
     }
@@ -442,6 +448,8 @@ struct Spawn {
     last_io: Instant,
     /// S10: the busy check's samples of its session (Linux).
     activity: Activity,
+    /// S13: the spawn's relay client, while its leader lives (its watcher reaps it).
+    relay: Option<crate::shim::relay::RelayClient>,
 }
 
 impl Spawn {
@@ -993,6 +1001,10 @@ impl SpawnManager {
             return Err((SpawnErrCode::Draining, "the shim is stopping".into()));
         }
         check_request(&req).map_err(|m| (SpawnErrCode::BadRequest, m))?;
+        // S13 (V-R2): a relay session only where the shim names relay_v1, never this spawn without its client.
+        if req.relay.is_some() && opts.relay.is_none() {
+            return Err((SpawnErrCode::BadRequest, "relay: this shim serves no relay (it names no relay_v1)".into()));
+        }
         {
             let st = inner.lock();
             // Single-use: a record released since (its exit collected, or its grace over) still counts.
@@ -1026,8 +1038,13 @@ impl SpawnManager {
             _ => None,
         };
         let mut cmd = tokio::process::Command::new(&program);
-        cmd.arg0(&req.argv[0])
-            .args(&req.argv[1..])
+        cmd.arg0(&req.argv[0]);
+        // S13 (V-R7): a relay spawn's `claude` gets the image's relay MCP config as its argv[1], one token; the
+        // Mac's argv[1..] follows unchanged, and any other argv[0] gets exactly the Mac's argv.
+        if let (Some(_), Some(o), "claude") = (&req.relay, &opts.relay, req.argv[0].as_str()) {
+            cmd.arg(crate::wire::relay::mcp_config_arg(&o.mcp_config));
+        }
+        cmd.args(&req.argv[1..])
             .env_clear()
             .env("HOME", &opts.home)
             .env("PATH", child_path(cached.as_deref()))
@@ -1105,6 +1122,7 @@ impl SpawnManager {
             park: None,
             last_io: Instant::now(),
             activity: Activity::default(),
+            relay: None,
         };
         let (credit, ready) = (record.credit.clone(), record.ready.clone());
         {
@@ -1112,6 +1130,25 @@ impl SpawnManager {
             st.used.insert(id.clone());
             st.spawns.insert(id.clone(), record);
         }
+        // S13 (V-R8, V-R9): the spawn's relay client, once its leader is registered and before the leader's watcher
+        // runs (its death then finds the client to end), still under the spawn lock and before `spawned`. One that
+        // does not start never fails the spawn; the request's session is dropped (zeroized) here either way.
+        let relay_note = match (req.relay.take(), &opts.relay) {
+            (Some(relay), Some(o)) => match crate::shim::relay::start(o, &id, pid, &relay) {
+                Ok(client) => {
+                    let note = format!(" relay={}", client.pid);
+                    if let Some(s) = inner.lock().spawns.get_mut(&id) {
+                        s.relay = Some(client);
+                    }
+                    note
+                }
+                Err(why) => {
+                    log(&format!("ai-env: relay {id} client did not start: {why}"));
+                    " relay=failed".to_string()
+                }
+            },
+            _ => String::new(),
+        };
         let readers = vec![tokio::spawn(read_stdout(inner.clone(), id.clone(), stdout, credit)).abort_handle(), tokio::spawn(read_stderr(inner.clone(), id.clone(), stderr)).abort_handle()];
         let writer = tokio::spawn(write_stdin(inner.clone(), id.clone(), stdin, ready)).abort_handle();
         tokio::spawn(watch_leader(inner.clone(), id.clone(), child, pid));
@@ -1124,7 +1161,7 @@ impl SpawnManager {
         // S11: which claude ran, when the connection picked one (argv[0] `claude`).
         let ran = req.picked.as_ref().map_or(String::new(), |p| format!(" claude={} src={}", p.version.as_deref().unwrap_or("-"), if p.path.is_some() { "cache" } else { "image" }));
         log(&format!(
-            "ai-env: spawn {id} pid={pid} pgid={pid} argv0={argv0} argc={} cwd=\"{cwd_text}\" uid={} secret={secret_kind}{ran}",
+            "ai-env: spawn {id} pid={pid} pgid={pid} argv0={argv0} argc={} cwd=\"{cwd_text}\" uid={} secret={secret_kind}{ran}{relay_note}",
             req.argv.len(),
             opts.uid.map_or("-".to_string(), |u| u.to_string())
         ));
@@ -1537,6 +1574,10 @@ impl SpawnManager {
             for s in &live {
                 s.signal_group(libc::SIGTERM);
             }
+            // S13 (V-R11): every relay client with the TERM pass.
+            for c in st.spawns.values().filter_map(|s| s.relay.as_ref()) {
+                c.signal(libc::SIGTERM);
+            }
             // The workspace helpers too (S8): each one's owner reaps it.
             let helpers = st.helper_groups();
             for g in &helpers {
@@ -1552,6 +1593,10 @@ impl SpawnManager {
             for s in &due {
                 s.signal_group(libc::SIGKILL);
             }
+            // S13: every relay client still running with the KILL pass.
+            for c in st.spawns.values().filter_map(|s| s.relay.as_ref()) {
+                c.signal(libc::SIGKILL);
+            }
             for g in st.helper_groups() {
                 killpg(g, libc::SIGKILL);
             }
@@ -1564,13 +1609,14 @@ impl SpawnManager {
         self.inner.bump();
     }
 
-    /// Until no leader runs and no workspace helper's group is left to
-    /// signal (each one's owner reaps it), or `limit`.
+    /// Until no leader runs, no workspace helper's group is left to
+    /// signal (each one's owner reaps it) and no relay client runs (S13), or
+    /// `limit`.
     async fn wait_idle(&self, limit: Duration) {
         let until = Instant::now() + limit;
         let busy = || {
             let st = self.inner.lock();
-            st.live() > 0 || st.helpers.values().any(Option::is_some)
+            st.live() > 0 || st.helpers.values().any(Option::is_some) || st.spawns.values().any(|s| s.relay.as_ref().is_some_and(|c| !c.ended()))
         };
         while busy() && Instant::now() < until {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1770,23 +1816,29 @@ async fn watch_leader(inner: Arc<Inner>, id: SpawnId, mut child: Child, pid: u32
         None => child.wait().await.map_or(ExitInfo { code: None, signal: None }, |s| ExitInfo { code: s.code(), signal: s.signal() }),
     };
     let died = Instant::now();
-    let (idle, released) = {
+    let (idle, released, relay) = {
         let mut st = inner.lock();
         if pinned {
             killpg(pid, libc::SIGTERM);
         }
+        let mut relay = None;
         let mine = match st.spawns.get_mut(&id).filter(|s| s.pid == pid) {
             Some(s) => {
                 s.leader = Some(info);
                 s.reaped = !pinned;
                 s.due.clear();
                 s.credit.notify_one();
+                // S13 (V-R11): the spawn's relay client lives as long as its leader.
+                if let Some(c) = &s.relay {
+                    c.signal(libc::SIGTERM);
+                    relay = Some(c.clone());
+                }
                 true
             }
             None => false,
         };
         let released = if mine { st.settle(&id) } else { None };
-        (st.live() == 0, released)
+        (st.live() == 0, released, relay)
     };
     if let Some(r) = released {
         r.abort_tasks();
@@ -1797,12 +1849,21 @@ async fn watch_leader(inner: Arc<Inner>, id: SpawnId, mut child: Child, pid: u32
         {
             let mut st = inner.lock();
             killpg(pid, libc::SIGKILL);
+            if let Some(c) = &relay {
+                c.signal(libc::SIGKILL);
+            }
             if let Some(s) = st.spawns.get_mut(&id).filter(|s| s.pid == pid) {
                 s.reaped = true;
             }
         }
         // From here the pid, and so the group id, may name someone else.
         let _ = child.wait().await;
+    } else if let Some(c) = relay {
+        // No zombie to wait on: the client's KILL keeps the group's time on a task of its own.
+        tokio::spawn(async move {
+            tokio::time::sleep_until(died + GROUP_KILL_AFTER).await;
+            c.signal(libc::SIGKILL);
+        });
     }
     if idle && inner.opts.sweep {
         inner.sweep_if_idle().await;
@@ -1994,7 +2055,7 @@ fn refusal_word(r: ParkRefusal) -> &'static str {
 
 // ---- process plumbing --------------------------------------------------------------------
 
-fn log(line: &str) {
+pub(crate) fn log(line: &str) {
     #[cfg(test)]
     tests::LOG.lock().unwrap_or_else(PoisonError::into_inner).push(line.to_string());
     errln!("{line}");
@@ -2180,6 +2241,10 @@ fn check_request(req: &SpawnRequest) -> Result<(), String> {
             return Err(format!("claude ref {i} names a sha256 an earlier ref names"));
         }
     }
+    // S13 (V-R3): the relay session's shapes, each refusal naming its field, never a value.
+    if let Some(relay) = &req.relay {
+        relay.check().map_err(|m| format!("relay {m}"))?;
+    }
     for (k, v) in &req.secrets {
         check_name(k)?;
         let var = match req.deliver {
@@ -2297,7 +2362,7 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(10);
 
     fn opts(home: &Path, window_bytes: u64) -> SpawnOpts {
-        SpawnOpts { claude: PathBuf::from("/nonexistent/claude"), home: home.to_path_buf(), uid: None, gid: None, agent_uid: 1000, window_bytes, sweep: false, fs_root: None }
+        SpawnOpts { claude: PathBuf::from("/nonexistent/claude"), home: home.to_path_buf(), uid: None, gid: None, agent_uid: 1000, window_bytes, sweep: false, fs_root: None, relay: None }
     }
 
     fn manager(home: &Path) -> SpawnManager {
@@ -2305,7 +2370,7 @@ mod tests {
     }
 
     fn req(argv: &[&str]) -> SpawnRequest {
-        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), picked: None }
+        SpawnRequest { spawn_id: SpawnId::new_v7(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), relay: None, picked: None }
     }
 
     async fn start(m: &SpawnManager, conn: ConnGen, r: SpawnRequest) -> (SpawnId, u32) {
@@ -2508,6 +2573,7 @@ mod tests {
             park: None,
             last_io: Instant::now(),
             activity: Activity::default(),
+            relay: None,
         };
         let one = || Chunk { text: Some("x".into()), b64: None };
         for _ in 0..STDOUT_WINDOW_CHUNKS {
@@ -3505,11 +3571,15 @@ mod tests {
         r.env.insert("FOO".into(), "env-value-text".into());
         r.secrets.insert("TOKEN_NAME".into(), Secret::new("secret-value-text".into()));
         r.cwd = Some("/Users/mike/private-dir".into());
+        assert!(format!("{r:?}").contains(", relay=off, claude=0)"), "{r:?}");
+        // S13 (V-R14): a relay session shows as `relay=on` right before `claude=`, never its token.
+        let token = relay_token();
+        r.relay = Some(relay_session(&token));
         let d = format!("{r:?}");
-        for hidden in ["the prompt text", "-p", "env-value-text", "secret-value-text", "private-dir", "FOO", "TOKEN_NAME"] {
+        for hidden in ["the prompt text", "-p", "env-value-text", "secret-value-text", "private-dir", "FOO", "TOKEN_NAME", token.as_str(), "10.42.0.20"] {
             assert!(!d.contains(hidden), "{hidden}: {d}");
         }
-        assert!(d.contains("argv0=claude") && d.contains("argc=3") && d.contains("env=1") && d.contains("secrets=1"), "{d}");
+        assert!(d.contains("argv0=claude") && d.contains("argc=3") && d.contains("env=1") && d.contains("secrets=1") && d.ends_with(", relay=on, claude=0)"), "{d}");
     }
 
     #[test]
@@ -3659,6 +3729,7 @@ mod tests {
             park: None,
             last_io: Instant::now(),
             activity: Activity::default(),
+            relay: None,
         }
     }
 
@@ -3899,6 +3970,313 @@ mod tests {
         assert!(d.detach_left_s.is_some_and(|left| left > 50 && left <= 60), "the detach grace, not the park grace: {d:?}");
         let log = LOG.lock().unwrap().join("\n");
         assert!(log.contains(&format!("ai-env: spawn {id} unparked by a refused park")), "{log}");
+        m.shutdown("test").await;
+    }
+
+    // ---- S13: a spawn's relay session (§V-vm.8.1) ----------------------------------------------------------------
+
+    /// A run-time token (low-entropy parts, never a committed value).
+    fn relay_token() -> String {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!("relay-test-{:08x}-{:04x}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// A relay session as the Mac sends it: `token`, the relay's private face, its name, a CA's shape.
+    fn relay_session(token: &str) -> crate::wire::relay::RelaySpawn {
+        crate::wire::relay::RelaySpawn { token: Secret::new(token.to_string()), addr: "10.42.0.20:7443".into(), server_name: "10.42.0.20".into(), ca_der_b64: "MA==".into() }
+    }
+
+    /// An executable script at `path`.
+    fn script(path: &Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A relay client of §V-vm.9's behaviour (inline, as the module builds its own programs): it records next to its
+    /// `--socket` its argv (one a line), `<uid>:<gid>`, its descriptors from 3 (comma-separated, `-` for none), its
+    /// environment's names (sorted), whether it leads its session, its pid and fd 3's bytes; then by `mode`: `serve`
+    /// (a ready line, TERM writes `.term` and exits 0), `exit` (a refusal line, exit 2), `hang` (TERM ignored,
+    /// `.term-ignored` written, until KILL).
+    fn fake_client(dir: &Path, mode: &str) -> PathBuf {
+        let path = dir.join(format!("fake-relay-client-{mode}"));
+        // Its TERM trap first (a TERM while it records runs it once the command at hand ends), its pid next.
+        let trap = match mode {
+            "serve" => "trap 'touch \"$sock.term\"; exit 0' TERM\n",
+            "hang" => "trap 'touch \"$sock.term-ignored\"' TERM\n",
+            "exit" => "",
+            other => panic!("no fake mode {other}"),
+        };
+        let facts = "fds=''; for n in $(seq 3 254); do [ -e /dev/fd/$n ] && fds=\"$fds$n,\"; done; fds=${fds%,}; [ -n \"$fds\" ] || fds=-\n\
+                     echo $$ > \"$sock.pid\"\n\
+                     printf '%s\\n' \"$@\" > \"$sock.argv\"\n\
+                     echo \"$(id -u):$(id -g)\" > \"$sock.ids\"\n\
+                     echo \"$fds\" > \"$sock.fds\"\n\
+                     env | cut -d= -f1 | grep -v -e '^PWD$' -e '^SHLVL$' -e '^_$' -e '^OLDPWD$' | sort > \"$sock.env\"\n\
+                     sid=$(ps -o sess= -p $$ 2>/dev/null | tr -d ' '); if [ \"$sid\" = $$ ]; then echo leader; else echo member; fi > \"$sock.sid\"\n\
+                     (umask 077; cat <&3 > \"$sock.session.tmp\"; mv \"$sock.session.tmp\" \"$sock.session\")\n";
+        let tail = match mode {
+            "serve" => "echo 'ai-env-relay-client: ready (fake)' >&2\nwhile :; do sleep 0.1; done\n",
+            "exit" => "echo 'ai-env-relay-client: refused: session token' >&2\nexit 2\n",
+            _ => "while :; do sleep 0.1; done\n",
+        };
+        let head = "[ \"$1\" = warm ] && exit 0\nsock=''; prev=''\nfor a in \"$@\"; do [ \"$prev\" = --socket ] && sock=$a; prev=$a; done\n";
+        script(&path, &format!("{head}{trap}{facts}{tail}"));
+        // macOS assesses a new file's first exec (about 200 ms): done here, not while a leader waits.
+        let warmed = {
+            let _fork = crate::test_locks::forking();
+            std::process::Command::new(&path).arg("warm").status().unwrap()
+        };
+        assert!(warmed.success());
+        path
+    }
+
+    /// Spawn options that run relay sessions with `client` (the dirs under `root`), `claude` a script printing its
+    /// argv; and the relay options alone.
+    fn relay_opts(root: &Path, client: &Path) -> SpawnOpts {
+        let claude = root.join("claude");
+        script(&claude, "echo \"$*\"\n");
+        let relay = crate::shim::relay::RelayOpts {
+            client: client.to_path_buf(),
+            mcp_config: root.join("relay-mcp.json"),
+            run_dir: root.join("run/ai-env"),
+            socket_dir: root.join("run/ai-env/relay"),
+            net: None,
+            agent: (1000, 1000),
+        };
+        SpawnOpts { claude, relay: Some(relay), ..opts(root, STDOUT_WINDOW_BYTES) }
+    }
+
+    /// A fact the fake wrote next to the socket of leader `pid`, once it is there (within `limit`).
+    async fn fact(root: &Path, pid: u32, name: &str, limit: Duration) -> Option<String> {
+        let path = root.join(format!("run/ai-env/relay/{pid}.sock.{name}"));
+        wait_until(limit, || path.exists()).await.then(|| std::fs::read_to_string(&path).unwrap_or_default())
+    }
+
+    /// A relay spawn of `argv`.
+    fn relay_req(argv: &[&str], token: &str) -> SpawnRequest {
+        SpawnRequest { relay: Some(relay_session(token)), ..req(argv) }
+    }
+
+    /// V-R7: a relay spawn's `claude` gets `--mcp-config=<cfg>` as its argv[1], the Mac's argv after it (argv[0]
+    /// stays `claude`: a script's `$0` is its path); without a relay, exactly the Mac's argv; another argv[0] (`sh`,
+    /// which an inserted flag would make refuse an option) exactly the Mac's too.
+    /// `r`'s stdout to its exit, and the exit.
+    async fn stdout_of(m: &SpawnManager, conn: ConnGen, r: SpawnRequest) -> (String, ExitInfo) {
+        let mut c = Client::new(m, conn);
+        start(m, conn, r).await;
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        (String::from_utf8_lossy(&c.out).into_owned(), c.exited().1)
+    }
+
+    #[tokio::test]
+    async fn the_mcp_config_goes_right_after_argv0_for_claude_only() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let client = fake_client(&root, "serve");
+        let o = relay_opts(&root, &client);
+        let cfg = o.relay.as_ref().unwrap().mcp_config.display().to_string();
+        let m = SpawnManager::new(o);
+        let token = relay_token();
+        let out = stdout_of;
+        let (with, exit) = out(&m, 1, relay_req(&["claude", "--output-format", "stream-json"], &token)).await;
+        assert_eq!((with.as_str(), exit.code), (format!("--mcp-config={cfg} --output-format stream-json\n").as_str(), Some(0)));
+        let (without, _) = out(&m, 2, req(&["claude", "--output-format", "stream-json"])).await;
+        assert_eq!(without, "--output-format stream-json\n");
+        let (sh, exit) = out(&m, 3, relay_req(&["sh", "-c", "echo \"$*\"", "x", "a"], &token)).await;
+        assert_eq!((sh.as_str(), exit.code), ("a\n", Some(0)), "another argv[0] gets the Mac's argv");
+        m.shutdown("test").await;
+    }
+
+    /// V-R8, VC-1: the client gets `serve --leader <pid> --socket <dir>/<pid>.sock --agent-uid <uid>`, descriptors
+    /// past 2 exactly `3`, the environment `LC_ALL` and `PATH` alone, its own session, fd 3 the session JSON byte for
+    /// byte; the spawn holds descriptors 0 to 2 alone, and its environment holds neither the token nor any
+    /// `*_FILE_DESCRIPTOR`.
+    #[tokio::test]
+    async fn the_relay_session_reaches_the_client_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let client = fake_client(&root, "serve");
+        let m = SpawnManager::new(relay_opts(&root, &client));
+        let token = relay_token();
+        // The leader reports, then waits for the client's last fact (its end would TERM the client).
+        let probe = "for fd in $(seq 0 63); do [ -e /dev/fd/$fd ] && echo fd=$fd; done; env; while [ ! -e \"$0/$$.sock.session\" ]; do sleep 0.05; done";
+        let socket_dir = root.join("run/ai-env/relay");
+        let mut c = Client::new(&m, 1);
+        let (_, pid) = start(&m, 1, relay_req(&["sh", "-c", probe, socket_dir.to_str().unwrap()], &token)).await;
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        let out = String::from_utf8_lossy(&c.out).into_owned();
+        let fds: Vec<&str> = out.lines().filter(|l| l.starts_with("fd=")).collect();
+        assert_eq!(fds, ["fd=0", "fd=1", "fd=2"], "the spawn holds 0 to 2 alone: {out}");
+        assert!(!out.contains(&token) && !out.contains("_FILE_DESCRIPTOR"), "the spawn's environment: {out}");
+        let sock = root.join(format!("run/ai-env/relay/{pid}.sock"));
+        let argv = fact(&root, pid, "argv", WAIT).await.unwrap();
+        assert_eq!(argv.lines().collect::<Vec<_>>(), ["serve", "--leader", &pid.to_string(), "--socket", sock.to_str().unwrap(), "--agent-uid", "1000"]);
+        assert_eq!(fact(&root, pid, "fds", WAIT).await.unwrap().trim(), "3");
+        assert_eq!(fact(&root, pid, "env", WAIT).await.unwrap().lines().collect::<Vec<_>>(), ["LC_ALL", "PATH"]);
+        let sid = fact(&root, pid, "sid", WAIT).await.unwrap();
+        if cfg!(target_os = "linux") || sid.trim() == "leader" {
+            assert_eq!(sid.trim(), "leader", "its own session");
+        }
+        let session = fact(&root, pid, "session", WAIT).await.unwrap();
+        assert_eq!(session.as_bytes(), relay_session(&token).session().as_slice(), "fd 3: the session, byte for byte");
+        m.shutdown("test").await;
+    }
+
+    /// V-R11, V-R12: a relay spawn whose leader exits at once: the fake (`serve`) writes its `.term` within 1.5 s and
+    /// the watcher logs `client ended code=0 signal=-`; a fake that ignores TERM (`hang`) is gone within 2.5 s,
+    /// `client ended code=- signal=9`.
+    #[tokio::test]
+    async fn a_relay_client_ends_with_its_leader() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        for (mode, done, ended) in [("serve", "term", "code=0 signal=-"), ("hang", "term-ignored", "code=- signal=9")] {
+            let client = fake_client(&root, mode);
+            let m = SpawnManager::new(relay_opts(&root, &client));
+            let mut c = Client::new(&m, 1);
+            let t = Instant::now();
+            let (id, pid) = start(&m, 1, relay_req(&["sh", "-c", "sleep 0.3"], &relay_token())).await;
+            let cpid = m.inner.lock().spawns.get(&id).and_then(|s| s.relay.as_ref()).map(|c| c.pid).expect("a client");
+            assert!(fact(&root, pid, done, Duration::from_millis(1500)).await.is_some(), "{mode}: .{done} within 1.5 s of the leader's end");
+            let line = format!("ai-env: relay {id} client ended {ended}");
+            assert!(wait_until(Duration::from_millis(2500), || LOG.lock().unwrap().contains(&line)).await, "{mode}: {line}");
+            assert!(gone(cpid), "{mode}: the client is gone");
+            assert!(t.elapsed() < Duration::from_millis(3000), "{mode}: {:?}", t.elapsed());
+            assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        }
+    }
+
+    /// V-R11: two relay spawns of `sleep 60` whose leaders ignore TERM, so no leader dies (and no watcher signals its
+    /// client) before the stop's KILL pass, 3 s into `shutdown` and 5 s into `terminate`. `shutdown`'s TERM pass TERMs
+    /// both clients while it still runs (their `.term` files within 1.5 s); again with `terminate`, whose clients
+    /// ignore TERM (`.term-ignored` within 1.5 s) and end at its KILL pass: gone when it returns, well before a
+    /// watcher's KILL ([`GROUP_KILL_AFTER`] after its leader's death) could have ended them.
+    #[tokio::test]
+    async fn shutdown_and_terminate_stop_the_relay_clients() {
+        let leader = ["sh", "-c", "trap '' TERM; exec sleep 60"];
+        for (terminate, mode, mark, term_wait) in [(false, "serve", "term", SHUTDOWN_TERM_WAIT), (true, "hang", "term-ignored", TERMINATE_TERM_WAIT)] {
+            let root = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(root.path()).unwrap();
+            let client = fake_client(&root, mode);
+            let m = SpawnManager::new(relay_opts(&root, &client));
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let (id, pid) = start(&m, 1, relay_req(&leader, &relay_token())).await;
+                assert!(fact(&root, pid, "session", WAIT).await.is_some(), "the client runs");
+                let cpid = m.inner.lock().spawns.get(&id).and_then(|s| s.relay.as_ref()).map(|c| c.pid).expect("a client");
+                clients.push((pid, cpid));
+            }
+            let t = Instant::now();
+            let stop = async {
+                if terminate {
+                    m.terminate().await;
+                } else {
+                    m.shutdown("test").await;
+                }
+                t.elapsed()
+            };
+            let termed = async {
+                for (pid, _) in &clients {
+                    assert!(fact(&root, *pid, mark, Duration::from_millis(1500)).await.is_some(), "terminate={terminate}: the TERM pass reached the client of {pid} (.{mark})");
+                }
+            };
+            let (took, ()) = tokio::join!(stop, termed);
+            for (pid, cpid) in &clients {
+                assert!(gone(*cpid), "terminate={terminate}: the client of {pid} is gone when the stop returns");
+            }
+            assert!(took < term_wait + Duration::from_millis(800), "terminate={terminate}: the KILL pass ended the clients: {took:?}");
+        }
+    }
+
+    /// V-R9, V-R13: the spawn line ends ` relay=<cpid>` (the fake's own pid); a fake that refuses (`exit`) is
+    /// logged line by line (`ai-env: relay <id> <its stderr>`), then `client ended code=2 signal=-`; a client that
+    /// does not exist gives `client did not start` and ` relay=failed`, and the spawn still runs to its exit 0; no
+    /// line holds the token or `ca_der_b64`.
+    #[tokio::test]
+    async fn the_spawn_line_names_the_client_and_never_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let token = relay_token();
+        let line_of = |id: &SpawnId| LOG.lock().unwrap().iter().find(|l| l.starts_with(&format!("ai-env: spawn {id} pid="))).cloned().unwrap();
+        let serve = SpawnManager::new(relay_opts(&root, &fake_client(&root, "serve")));
+        let (id, pid) = start(&serve, 1, relay_req(&["sleep", "60"], &token)).await;
+        let cpid = fact(&root, pid, "pid", WAIT).await.unwrap();
+        assert!(line_of(&id).ends_with(&format!(" relay={}", cpid.trim())), "{}", line_of(&id));
+        serve.shutdown("test").await;
+        let refusing = SpawnManager::new(relay_opts(&root, &fake_client(&root, "exit")));
+        let (id, _) = start(&refusing, 1, relay_req(&["sleep", "60"], &token)).await;
+        let said = format!("ai-env: relay {id} ai-env-relay-client: refused: session token");
+        let ended = format!("ai-env: relay {id} client ended code=2 signal=-");
+        assert!(wait_until(WAIT, || LOG.lock().unwrap().contains(&ended)).await, "{ended}");
+        let log = LOG.lock().unwrap().clone();
+        let (at_said, at_ended) = (log.iter().position(|l| *l == said), log.iter().position(|l| *l == ended));
+        assert!(at_said.is_some() && at_said < at_ended, "its stderr, then its end: {log:?}");
+        refusing.shutdown("test").await;
+        let missing = SpawnManager::new(relay_opts(&root, &root.join("no-such-client")));
+        let mut c = Client::new(&missing, 1);
+        let (id, _) = start(&missing, 1, relay_req(&["sh", "-c", "exit 0"], &token)).await;
+        assert!(line_of(&id).ends_with(" relay=failed"), "{}", line_of(&id));
+        assert!(LOG.lock().unwrap().iter().any(|l| l.starts_with(&format!("ai-env: relay {id} client did not start: ")) && l.contains("no-such-client")));
+        assert!(c.until(WAIT, |c| c.exit.is_some()).await);
+        assert_eq!(c.exited().1.code, Some(0), "the spawn ran without its client");
+        let log = LOG.lock().unwrap().join("\n");
+        assert!(!log.contains(&token) && !log.contains("\"MA==\"") && !log.contains("{\"v\":1"), "no line holds the session");
+    }
+
+    /// V-R2, V-R3: `SpawnOpts.relay` `None` and a relay field: `bad_request` naming the missing cap; with relay
+    /// options and a token holding a space: `bad_request` naming the token's bytes; neither starts the client
+    /// (no fact written) nor the spawn.
+    #[tokio::test]
+    async fn a_relay_field_is_refused_unchecked_or_unserved() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let client = fake_client(&root, "serve");
+        let marker = root.join("spawn-ran");
+        let argv = ["sh", "-c", "touch \"$0\"", marker.to_str().unwrap()];
+        let unserved = SpawnManager::new(SpawnOpts { relay: None, ..relay_opts(&root, &client) });
+        let (code, message) = refused(&unserved, relay_req(&argv, &relay_token())).await;
+        assert_eq!((code, message.as_str()), (SpawnErrCode::BadRequest, "relay: this shim serves no relay (it names no relay_v1)"));
+        let served = SpawnManager::new(relay_opts(&root, &client));
+        let token = format!("{} x", relay_token());
+        let (code, message) = refused(&served, relay_req(&argv, &token)).await;
+        assert_eq!((code, message.as_str()), (SpawnErrCode::BadRequest, "relay token holds a byte outside A-Za-z0-9._~+/=-"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "no spawn ran");
+        assert!(!root.join("run").exists(), "no client started (not even its directory)");
+        assert_eq!((unserved.live(), served.live()), (0, 0));
+    }
+
+    /// V-R10: the first relay spawn makes `run/ai-env` 0755 and `run/ai-env/relay` 0750; a socket dir of 0777 is
+    /// reset to 0750 with one line; a symlink planted at the socket dir gives ` relay=failed` and a line naming the
+    /// path, and the link's target is untouched.
+    #[tokio::test]
+    async fn the_socket_dir_is_made_with_its_modes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let client = fake_client(&root, "serve");
+        let m = SpawnManager::new(relay_opts(&root, &client));
+        let (run, relay) = (root.join("run/ai-env"), root.join("run/ai-env/relay"));
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+        start(&m, 1, relay_req(&["sleep", "60"], &relay_token())).await;
+        assert_eq!((mode(&run), mode(&relay)), (0o755, 0o750));
+        std::fs::set_permissions(&relay, std::fs::Permissions::from_mode(0o777)).unwrap();
+        start(&m, 1, relay_req(&["sleep", "60"], &relay_token())).await;
+        assert_eq!(mode(&relay), 0o750, "reset");
+        let resets = LOG.lock().unwrap().iter().filter(|l| l.starts_with(&format!("ai-env: relay dir {} reset to 0750", relay.display())) && l.contains("(it was 0777")).count();
+        assert_eq!(resets, 1, "one line");
+        m.shutdown("test").await;
+        let target = root.join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::remove_dir_all(&relay).unwrap();
+        std::os::unix::fs::symlink(&target, &relay).unwrap();
+        let m = SpawnManager::new(relay_opts(&root, &client));
+        let (id, _) = start(&m, 1, relay_req(&["sleep", "60"], &relay_token())).await;
+        let log = LOG.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l.starts_with(&format!("ai-env: spawn {id} pid=")) && l.ends_with(" relay=failed")), "{log:?}");
+        assert!(log.iter().any(|l| *l == format!("ai-env: relay {id} client did not start: {} is a symlink", relay.display())), "{log:?}");
+        assert_eq!(mode(&target), 0o777, "the link's target is untouched");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
         m.shutdown("test").await;
     }
 }

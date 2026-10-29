@@ -338,6 +338,7 @@ fn check_frame(plan: &ExecPlan) -> Result<()> {
         detach_grace_s: plan.detach_grace_s,
         credential: None,
         claude: Vec::new(),
+        relay: None,
     };
     let size = frame.to_json().len();
     if size > CONTROL_FRAME_MAX {
@@ -1767,7 +1768,7 @@ mod tests {
         let env = spawn_env(&c, &row("vpc"), &[("LANG".into(), "C".into())]);
         assert_eq!(env.len(), 7);
         assert_eq!(env["https_proxy"], format!("http://{}:3128", crate::bridge::egress::PROXY_IP));
-        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1,::1");
+        assert_eq!(env["NO_PROXY"], crate::bridge::egress::NO_PROXY);
         let env = spawn_env(&c, &row("internet"), &[("LANG".into(), "C".into())]);
         assert_eq!(env.into_iter().collect::<Vec<_>>(), vec![("LANG".to_string(), "C".to_string())]);
     }

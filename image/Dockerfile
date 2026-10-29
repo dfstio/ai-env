@@ -141,5 +141,30 @@ RUN set -eu; \
     test -z "$(find /opt/ai-env/claude -mindepth 1 -print -quit)" || { echo "a claude is baked into the cache: $(ls -A /opt/ai-env/claude)"; exit 1; }; \
     echo "claude-cache gate: /opt/ai-env/claude root 0755, empty"
 
+# S13's VM side of the relay: ai-env-relay-client runs as ai-env-net (999),
+# one per claude spawn the Mac gave a relay session, started by the root shim
+# with that session on fd 3 alone; it serves /run/ai-env/relay/<leader>.sock
+# to that spawn's processes and dials the relay's private face over TLS 1.3.
+# ai-env-relay-mcp is the stdio MCP server claude starts from the baked
+# /etc/ai-env/relay-mcp.json (the shim adds --mcp-config=<it>). The gate:
+# both print `<name> <the shim's version>` and are root's, 0755; the config
+# is root's, 0644, and names that server alone; /run/ai-env is absent (the
+# shim makes it).
+COPY ai-env-relay-client ai-env-relay-mcp /usr/local/bin/
+COPY relay-mcp.json /etc/ai-env/relay-mcp.json
+RUN set -eu; \
+    chmod 0755 /usr/local/bin/ai-env-relay-client /usr/local/bin/ai-env-relay-mcp; \
+    chmod 0644 /etc/ai-env/relay-mcp.json; \
+    shim=$(/usr/local/bin/ai-env --version); shim=${shim##* }; \
+    for b in ai-env-relay-client ai-env-relay-mcp; do \
+      v=$("/usr/local/bin/$b" --version); \
+      test "$v" = "$b $shim" || { echo "$b --version printed $v, not $b $shim"; exit 1; }; \
+      test "$(stat -c '%u:%g %a' "/usr/local/bin/$b")" = "0:0 755" || { echo "/usr/local/bin/$b is $(stat -c '%u:%g %a' "/usr/local/bin/$b")"; exit 1; }; \
+    done; \
+    test "$(stat -c '%u:%g %a' /etc/ai-env/relay-mcp.json)" = "0:0 644" || { echo "/etc/ai-env/relay-mcp.json is $(stat -c '%u:%g %a' /etc/ai-env/relay-mcp.json)"; exit 1; }; \
+    grep -qF '"command":"/usr/local/bin/ai-env-relay-mcp"' /etc/ai-env/relay-mcp.json || { echo "/etc/ai-env/relay-mcp.json names another program"; exit 1; }; \
+    test ! -e /run/ai-env || { echo "/run/ai-env is baked into the image: $(ls -A /run/ai-env)"; exit 1; }; \
+    echo "relay gate: ai-env-relay-client and ai-env-relay-mcp $shim, root 0755; relay-mcp.json root 0644; no /run/ai-env"
+
 EXPOSE 8080 9000 9418
 ENTRYPOINT ["/usr/local/bin/ai-env","shim","--app-port","8080","--hooks-port","9000","--code-port","9418","--claude","/usr/local/bin/claude","--home","/Users/mike","--uid","1000","--hook-source","peer"]

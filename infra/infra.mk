@@ -3,14 +3,14 @@
 # IMAGE_OUT, IMAGE_JSON, IMAGE_CONFIG, IMAGE_NAME), its cmdline function and its MAKE_DRY.
 #
 # Part A (the agent; read-only against AWS, this shell's own credentials, the agent's own account): infra-install,
-# infra-typecheck, check-policies, preview-scratch.
+# infra-typecheck, check-policies, preview-scratch; S13's relay-artifact and relay-reload-gz build locally, keyless.
 # Part B (Mike; creates or changes AWS resources), each target as one of the stack's AWS identities
 # (plans/s8-operators-plan.md §7; TIER below asks once per top-level make):
 #   the deployer (ai-env-deployer, its key pasted from Strongbox): deploy, preview, deploy-policies, runtime-key, ops-key,
 #     deployer-key, image-activate, image-deactivate, image-prune YES=1, image-delete, connector-probe,
 #     connector-delete, test-egress;
 #   ops (ai-env-ops, credentials/ops.env: one Touch ID): image-wait, image-status, image-versions, image-builds,
-#     image-prune's dry run, connector-status, connector-wait, logs, egress-logs, acceptance;
+#     image-prune's dry run, connector-status, connector-wait, logs, egress-logs, relay-logs (S13), acceptance;
 #   the account root (its own credentials, ai-env as root): operator-keys, once after the bootstrap deploy, and destroy
 #     (BREAKGLASS=1 only); the bootstrap deploy itself, and BREAKGLASS=1 on the command line for any deployer target;
 #   no tier: infra-status, allowlist-reload, proxy-stop, proxy-start, proxy-patch (and gates, check-base-image) are one
@@ -25,11 +25,13 @@
 .PHONY: infra-install infra-typecheck check-policies preview-scratch preview deploy deploy-policies image-wait image-status image-versions image-builds image-deactivate image-activate image-prune image-delete logs infra-status runtime-key ops-key deployer-key operator-keys destroy \
         connector-status connector-wait connector-probe connector-delete egress-logs allowlist-reload proxy-stop proxy-start proxy-patch claude-update \
         preview-run deploy-run deploy-policies-run image-wait-run image-status-run image-versions-run image-builds-run image-deactivate-run image-activate-run image-prune-run image-delete-run logs-run \
-        runtime-key-run ops-key-run deployer-key-run operator-keys-run destroy-run connector-status-run connector-wait-run connector-probe-run connector-delete-run egress-logs-run
+        runtime-key-run ops-key-run deployer-key-run operator-keys-run destroy-run connector-status-run connector-wait-run connector-probe-run connector-delete-run egress-logs-run \
+        relay-artifact relay-reload-gz relay-logs relay-logs-run
 
 INFRA              := infra
-# The program reads image.json and resolves the paths inside it from the repo root, also from a scratch copy.
-PULUMI_ENV          = IMAGE_JSON="$(abspath $(IMAGE_JSON))" AI_ENV_REPO_ROOT="$(CURDIR)"
+# The program reads image.json and (S13) relay.json, and resolves the paths inside them from the repo root, also from a
+# scratch copy.
+PULUMI_ENV          = IMAGE_JSON="$(abspath $(IMAGE_JSON))" RELAY_JSON="$(abspath $(RELAY_JSON))" AI_ENV_REPO_ROOT="$(CURDIR)"
 # The stack's passphrase, sealed once per Mac (README "Identities"): PULUMI_SEALED=FILE, on the command line or from the
 # environment, names another file (PULUMI_ENV above is the program's own), a leading ~/ HOME's (zsh hands make the
 # command line's `PULUMI_SEALED=~/f` as it is), so that TIER, its dry form and ops.sh look at one file. PASS_TARGETS
@@ -151,7 +153,7 @@ VERSIONS_WARN      ?= 40
 VERSIONS_QUOTA     := 50
 SINCE              ?= 1h
 # The switches that delete, rotate, write, pick a version or an identity (YES, KEEP, VERSION, ROTATE, WRITE, CONFIRM,
-# RECORD_PROBE, FOLLOW, REFRESH, BREAKGLASS) count only when given on the make command line: $(call cmdline,NAME),
+# RECORD_PROBE, FOLLOW, REFRESH, BREAKGLASS, ONLY) count only when given on the make command line: $(call cmdline,NAME),
 # defined in the top-level Makefile (s3-preflight's EXPECT_BUILD_FAILURE uses it too); a make under the runner
 # inherits them.
 KEEP_N              = $(or $(call cmdline,KEEP),3)
@@ -161,6 +163,11 @@ KEEP_N              = $(or $(call cmdline,KEEP),3)
 EGRESS_CONFIG      := $(INFRA)/egress-config.json
 EGRESS_LOG_GROUP   := $(shell sed -n 's/.*"logGroup": *"\([^"]*\)".*/\1/p' $(EGRESS_CONFIG) 2>/dev/null)
 EGRESS_VPC_CIDR    := $(shell sed -n 's/.*"vpcCidr": *"\([^"]*\)".*/\1/p' $(EGRESS_CONFIG) 2>/dev/null)
+# S13: the relay's cross-built binary and relay.json (make relay-artifact; the program uploads it and pins it in the
+# artifact parameter), and its log group (relay-logs), read like the egress names.
+RELAY_OUT          ?= target/relay
+RELAY_JSON         := $(RELAY_OUT)/relay.json
+RELAY_LOG_GROUP    := $(shell sed -n 's/.*"relayLogGroup": *"\([^"]*\)".*/\1/p' $(EGRESS_CONFIG) 2>/dev/null)
 # The endpoints the S5 operator calls pin (bridge::awscli; ops.sh derives the same from REGION): never taken from the
 # command line or the environment.
 override LAMBDA_CORE_URL := https://lambda.$(REGION).amazonaws.com
@@ -190,8 +197,12 @@ PLAN_GATE           = echo "cd $(INFRA) && pulumi preview --json --stack $(STACK
                         plan=$$(cd $(INFRA) && $(PULUMI_ENV) pulumi preview --json --show-sames --show-reads --non-interactive --stack $(STACK)) \
                           || { st=$$?; printf '%s' "$$plan" | $(OPS) plan-errors; echo "$(1): pulumi preview --json failed (exit $$st): nothing deployed (Pulumi's error above; its incorrect passphrase: the value in effect is wrong or empty, the sealed one set with ai-env edit $(PULUMI_SEALED), which make $(1) unseals unless PULUMI_CONFIG_PASSPHRASE or PULUMI_CONFIG_PASSPHRASE_FILE is set (README \"Identities\"))"; exit 1; }; \
                         printf '%s' "$$plan" | $(OPS) plan-gate$(if $(2), $(2))
-# deploy-policies' targets: the stack's five managed policies (infra/policies.ts), the only resources it updates.
+# deploy-policies' targets: the stack's five managed policies (infra/policies.ts), the only resources it updates; S13:
+# ONLY=<policy>... on the make command line updates those alone (S13's first deploy needs ai-env-deploy-egress before the
+# relay exists, and ai-env-ops' new document cannot be known until it does: LD-I8). A name that is no stack policy is
+# refused by the plan gate's own row (the plan holds no step of it) before pulumi up.
 STACK_POLICIES     := ai-env-deploy ai-env-deploy-egress ai-env-deploy-dns ai-env-deployer ai-env-ops
+DEPLOY_POLICIES     = $(or $(call cmdline,ONLY),$(STACK_POLICIES))
 
 # --ignore-scripts: @pulumi/aws and @pulumi/aws-native would otherwise run `pulumi plugin install` into ~/.pulumi
 # (errors hidden); the plugins are a precondition checked by s3-preflight P7.
@@ -208,16 +219,16 @@ infra-typecheck: ## S3: typecheck the Pulumi program and its scripts (tsc --noEm
 check-policies: ## S3 T3.6, S5: Access Analyzer on every IAM document; simulate-custom-policy of the runtime policy (§9), the proxy role and the operator role (its Deny with the AWS managed policy); the operator policy's (action, resource) pin and the Deny's shape; read-only
 	AI_ENV_REPO_ROOT="$(CURDIR)" REGION=$(REGION) POLICIES_OUT="$(CURDIR)/target/infra-policies" $(SHELL) $(INFRA)/scripts/check-policies.sh
 
-preview-scratch: ## S3 T3.2/T3.5, S5, S8 operators: pulumi preview of a scratch copy (throwaway backend, stack, passphrase) + the plan check, the existing-stack copies (the bootstrap passes, the tampered ones are refused); NEGATIVE=no-logging|no-logging-cast|region|vm-sg-open|private-route|nacl-open|dns-support-on-in-none-mode|stray-rule|stray-type|late-transform|early-transform|dns-firewall-qtype|miswired|iam-widen|owned-param-reset|identity-widen|document-widen|endpoint-on-vm-table|endpoint-policy-widen|bucket-policy-no-vpce; EGRESS_MODE=none|firewall
+preview-scratch: ## S3 T3.2/T3.5, S5, S8 operators: pulumi preview of a scratch copy (throwaway backend, stack, passphrase) + the plan check, the existing-stack copies (the bootstrap passes, the tampered ones are refused); NEGATIVE=no-logging|no-logging-cast|region|vm-sg-open|private-route|nacl-open|dns-support-on-in-none-mode|stray-rule|stray-type|late-transform|early-transform|dns-firewall-qtype|miswired|iam-widen|owned-param-reset|identity-widen|document-widen|endpoint-on-vm-table|endpoint-policy-widen|bucket-policy-no-vpce|relay-sg-open|vm-relay-wide|relay-nacl-wide|relay-imds|relay-eip-elsewhere|relay-role-widen; EGRESS_MODE=none|firewall
 	@$(PULUMI_ENV) REGION=$(REGION) SCRATCH="$(SCRATCH)" NEGATIVE="$(NEGATIVE)" EGRESS_MODE="$(EGRESS_MODE)" $(SHELL) $(INFRA)/scripts/preview-scratch.sh
 
-# The deployer's targets that build the image zip build it first, in the wrapper, without any key or the stack's
-# passphrase in its environment (D18: cargo-lambda's build scripts, the stage's scan); the passphrase is unsealed and
-# then the key pasted after the build (A39, TIER), and X-run does not build it again. Without the sealed passphrase,
+# The deployer's targets that build the image zip (and, S13, the relay's binary) build it first, in the wrapper, without
+# any key or the stack's passphrase in its environment (D18: cargo-lambda's build scripts, the stage's scan); the
+# passphrase is unsealed and then the key pasted after the build (A39, TIER), and X-run does not build it again. Without the sealed passphrase,
 # preview keeps Pulumi's own prompt for it (a terminal); deploy and deploy-policies, whose plan check cannot prompt,
 # refuse first (PASS_CHECK).
-preview: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S3 part B: image-zip, then pulumi preview --diff of the real stack $(STACK); REFRESH=1 (command line only) adds --refresh (every resource read as the deployer)
-	$(NO_KEY) $(MAKE) --no-print-directory image-zip
+preview: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S3 part B: image-zip and relay-artifact, then pulumi preview --diff of the real stack $(STACK); REFRESH=1 (command line only) adds --refresh (every resource read as the deployer)
+	$(NO_KEY) $(MAKE) --no-print-directory image-zip relay-artifact
 	@$(call NOT_UNDER_I_OR_P,preview)
 	@$(call TIER,deployer,preview) $(MAKE) --no-print-directory preview-run
 
@@ -246,9 +257,9 @@ preview-run:
 # the vpc VM warning, the egress-check line on a new image version, egress status as the out-of-band drift check:
 # `pulumi up` does not refresh; drift fails the deploy at the end), after any failure the reload and the warnings
 # (`--after-failure`: Pulumi may already have written a proxy parameter); the exit status is the first failure's.
-deploy: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set; the bootstrap, and BREAKGLASS=1 on the command line: as the account root, README "Break-glass") S3/S5 part B: image-zip, s3-preflight PHASE=b, check-policies, plan check + replacement guard (pulumi preview --json), pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait, connector-wait, egress reload/status; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
+deploy: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set; the bootstrap, and BREAKGLASS=1 on the command line: as the account root, README "Break-glass") S3/S5 part B: image-zip and relay-artifact, s3-preflight PHASE=b, check-policies, plan check + replacement guard (pulumi preview --json), pre-deploy snapshots, pulumi up $(STACK) (interactive confirmation), image-wait, connector-wait, egress reload/status; EXPECT_BUILD_FAILURE=1 skips P12 (T3.4)
 	@$(call PASS_CHECK,deploy)
-	$(NO_KEY) $(MAKE) --no-print-directory image-zip
+	$(NO_KEY) $(MAKE) --no-print-directory image-zip relay-artifact
 	@$(call NOT_UNDER_I_OR_P,deploy)
 	@$(call TIER,deployer,deploy) $(MAKE) --no-print-directory deploy-run
 
@@ -273,9 +284,9 @@ deploy-run:
 # create or delete a policy. IAM takes some seconds to apply a new version. The gate also wants the five documents
 # known in its plan: one the plan check accepts unknown (a resource it names, the proxy instance, created or replaced)
 # would be rendered anew by the targeted up from the old resource and applied uncompared; make deploy takes it whole.
-deploy-policies: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S8 operators: image-zip, s3-preflight PHASE=b, check-policies, the plan check, then pulumi up of the five stack policies only (--target each; interactive confirmation); then wait about 15 s for IAM and make deploy
+deploy-policies: ## (deployer: asks once for its key, from Strongbox, after the zip is built and the stack's passphrase: one Touch ID unless set) S8 operators: image-zip and relay-artifact, s3-preflight PHASE=b, check-policies, the plan check, then pulumi up of the five stack policies only (--target each; interactive confirmation), or (S13) of ONLY=<policy>... (command line only); then wait about 15 s for IAM and make deploy
 	@$(call PASS_CHECK,deploy-policies)
-	$(NO_KEY) $(MAKE) --no-print-directory image-zip
+	$(NO_KEY) $(MAKE) --no-print-directory image-zip relay-artifact
 	@$(call NOT_UNDER_I_OR_P,deploy-policies)
 	@$(call TIER,deployer,deploy-policies) $(MAKE) --no-print-directory deploy-policies-run
 
@@ -284,8 +295,8 @@ deploy-policies-run:
 	@$(call NOT_UNDER_I_OR_P,deploy-policies)
 	$(MAKE) --no-print-directory s3-preflight PHASE=b
 	$(MAKE) --no-print-directory check-policies
-	@$(call PLAN_GATE,deploy-policies,--known-documents $(STACK_POLICIES))
-	cd $(INFRA) && $(PULUMI_ENV) pulumi up --stack $(STACK) $(foreach p,$(STACK_POLICIES),--target urn:pulumi:$(STACK)::ai-env::aws:iam/policy:Policy::$(p))
+	@$(call PLAN_GATE,deploy-policies,--known-documents $(DEPLOY_POLICIES))
+	cd $(INFRA) && $(PULUMI_ENV) pulumi up --stack $(STACK) $(foreach p,$(DEPLOY_POLICIES),--target urn:pulumi:$(STACK)::ai-env::aws:iam/policy:Policy::$(p))
 	@echo "deploy-policies: done: wait about 15 s for IAM, then make deploy"
 
 # S11 (A.7): the daily Claude Code update is retired: VMs follow the Cursor extension's claude with no deploy (an
@@ -517,6 +528,43 @@ egress-logs: ## (ops: one Touch ID) S5 part B: tail the squid access log $(EGRES
 egress-logs-run:
 	@$(call NOT_UNDER_I_OR_P,egress-logs)
 	aws logs tail $(EGRESS_LOG_GROUP) --since $(SINCE) --format short $(if $(filter 1,$(call cmdline,FOLLOW)),--follow) --region $(REGION) --endpoint-url $(LOGS_URL)
+
+# ---- S13: the relay (plans/s13-contracts.md §I-infra.4.7) ----
+
+relay-logs: ## (ops: one Touch ID) S13 part B: tail the relay's log group $(RELAY_LOG_GROUP) (its request log, the reload unit's lines, its diagnostics: ids and hashes only; SINCE=1h, FOLLOW=1)
+	@test -n "$(RELAY_LOG_GROUP)" || { echo "relay-logs: no relayLogGroup in $(EGRESS_CONFIG)"; exit 1; }
+	@$(call NOT_UNDER_I_OR_P,relay-logs)
+	@$(call TIER,ops,relay-logs) $(MAKE) --no-print-directory relay-logs-run
+
+relay-logs-run:
+	@$(call NOT_UNDER_I_OR_P,relay-logs)
+	aws logs tail $(RELAY_LOG_GROUP) --since $(SINCE) --format short $(if $(filter 1,$(call cmdline,FOLLOW)),--follow) --region $(REGION) --endpoint-url $(LOGS_URL)
+
+# The relay's binary, cross-built as vm-build builds the shim (the cargo-lambda vm-build-pick prints, picked inside one
+# shell line through $(SUBMAKE), so a dry make -n stays dry), without any key, marker or passphrase in its environment
+# (D18); then relay.json, which the program reads (relay.ts loadRelayJson: the binary hashed again, uploaded under
+# relay/ai-env-relay-<sha16> and pinned by the artifact parameter, whose SHA-256 the relay's reload unit checks).
+relay-artifact: ## S13: cross-build the relay (cargo-lambda --arm64, -p ai-env-relay) -> $(RELAY_OUT)/ai-env-relay; aarch64 ELF, glibc <= $(GLIBC_MAX); then $(RELAY_JSON) (sha256, S3 key, version)
+	@set -eu; out=$$($(SUBMAKE) -s --no-print-directory vm-build-pick) || { echo "relay-artifact: $$out"; exit 1; }; cl=$${out% *}; \
+	  echo "relay-artifact: using $$out"; \
+	  rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' || { echo "missing target: rustup target add $(TARGET) --toolchain $(TOOLCHAIN)"; exit 1; }; \
+	  test -x $(LLVM_BIN)/llvm-objdump || { echo "relay-artifact: $(LLVM_BIN)/llvm-objdump missing (brew install llvm, or set LLVM_BIN)"; exit 1; }; \
+	  rm -f target/lambda/ai-env-relay/bootstrap; \
+	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay
+	mkdir -p $(RELAY_OUT)
+	cp target/lambda/ai-env-relay/bootstrap $(RELAY_OUT)/ai-env-relay
+	@file $(RELAY_OUT)/ai-env-relay | grep -q 'ELF 64-bit.*aarch64' || { file $(RELAY_OUT)/ai-env-relay; echo "relay-artifact: not an aarch64 ELF"; exit 1; }
+	@max=$$($(LLVM_BIN)/llvm-objdump -T $(RELAY_OUT)/ai-env-relay | grep -o 'GLIBC_2\.[0-9]*' | sort -u -t. -k2,2n | tail -1); \
+	  echo "relay-artifact: max glibc symbol version $$max"; \
+	  test "$${max#GLIBC_2.}" -le $(subst 2.,,$(GLIBC_MAX)) || { echo "relay-artifact: glibc ceiling exceeded ($$max > GLIBC_$(GLIBC_MAX))"; exit 1; }
+	@set -eu; sha=$$(shasum -a 256 $(RELAY_OUT)/ai-env-relay | cut -d' ' -f1); \
+	  version=$$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1); \
+	  test -n "$$version" || { echo "relay-artifact: no [workspace.package] version in Cargo.toml"; exit 1; }; \
+	  printf '{"binary":"%s","sha256":"%s","key":"relay/ai-env-relay-%s","version":"%s"}\n' "$(RELAY_OUT)/ai-env-relay" "$$sha" "$${sha:0:16}" "$$version" > "$(RELAY_JSON)"; \
+	  ls -l $(RELAY_OUT)/ai-env-relay; cat "$(RELAY_JSON)"
+
+relay-reload-gz: ## S13: regenerate infra/relay/reload.py.gz from infra/relay/reload.py (gzip -9 -n), the bytes the relay's user data embeds; commit both
+	gzip -9 -n -c infra/relay/reload.py > infra/relay/reload.py.gz
 
 # One ai-env command each: the binary resolves its identity itself (an ai-env as marker, else credentials/ops.env with
 # one Touch ID), so no runner; egress allow, which widens egress, is the deployer's (ai-env as deployer -- ...). Each

@@ -16,6 +16,20 @@
                     ],
                     "Ipv6Ranges": [],
                     "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 7443,
+                    "ToPort": 7443,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "to the relay's private port",
+                            "CidrIp": "10.42.0.20/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
                 }
             ],
             "VpcId": "vpc-0123456789abcdef0",
@@ -111,6 +125,97 @@
             "GroupName": "default",
             "Description": "default VPC security group",
             "IpPermissions": []
+        },
+        {
+            "GroupId": "sg-0ccc9999dddd0000e",
+            "IpPermissionsEgress": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "SSM, CloudWatch Logs, S3 through the gateway endpoint",
+                            "CidrIp": "0.0.0.0/0"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "udp",
+                    "FromPort": 53,
+                    "ToPort": 53,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "DNS to resolver 1.1.1.1",
+                            "CidrIp": "1.1.1.1/32"
+                        },
+                        {
+                            "Description": "DNS to resolver 9.9.9.9",
+                            "CidrIp": "9.9.9.9/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 53,
+                    "ToPort": 53,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "DNS to resolver 1.1.1.1",
+                            "CidrIp": "1.1.1.1/32"
+                        },
+                        {
+                            "Description": "DNS to resolver 9.9.9.9",
+                            "CidrIp": "9.9.9.9/32"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                }
+            ],
+            "VpcId": "vpc-0123456789abcdef0",
+            "SecurityGroupArn": "arn:aws:ec2:eu-central-1:123456789012:security-group/sg-0ccc9999dddd0000e",
+            "OwnerId": "123456789012",
+            "GroupName": "ai-env-relay",
+            "Description": "ai-env relay: TCP 443 from workers anywhere, TCP 7443 from the MicroVM ENIs; HTTPS and DNS out",
+            "IpPermissions": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "UserIdGroupPairs": [],
+                    "IpRanges": [
+                        {
+                            "Description": "worker tunnels (the relay's internet face)",
+                            "CidrIp": "0.0.0.0/0"
+                        }
+                    ],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                },
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 7443,
+                    "ToPort": 7443,
+                    "UserIdGroupPairs": [
+                        {
+                            "Description": "from the MicroVM egress ENIs (the relay's private face)",
+                            "UserId": "123456789012",
+                            "GroupId": "sg-0ddd3333eeee4444f"
+                        }
+                    ],
+                    "IpRanges": [],
+                    "Ipv6Ranges": [],
+                    "PrefixListIds": []
+                }
+            ]
         }
     ]
 }

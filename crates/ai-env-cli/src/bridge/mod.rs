@@ -21,6 +21,9 @@
 //! timeline (`cost`, `timeline`), the loopback control panel (`panel`) and
 //! doctor's drift rows (`drift`).
 //! S12: chat names (`title`) and the live tests' cost rows (`testruns`).
+//! S13: the relay's Mac side (`relay`): this Mac's relay keys and signing
+//! agent, the relay's lists and TLS, the relay instance, and the VM session
+//! token minted at each remote spawn.
 //! Nothing here is compiled into the VM image.
 pub mod accounts;
 pub mod agent;
@@ -57,6 +60,7 @@ pub mod pasteboard;
 pub mod probes;
 pub mod pump;
 pub mod registry;
+pub mod relay;
 pub mod remote;
 pub mod review;
 pub mod route;

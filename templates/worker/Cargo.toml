@@ -1,0 +1,35 @@
+# A worker behind the ai-env relay, from ai-env's templates/worker: copy this directory into a repository of
+# its own, rename the package, and add your sources in src/sources.rs. Placeholders only.
+[package]
+name = "my-worker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# A workspace of its own: this directory builds alone, wherever it is copied.
+[workspace]
+
+[dependencies]
+# Pinned by the tag of an ai-env release, never a branch. For local development against a checkout of
+# ai-env, add (and never commit):
+# [patch."https://github.com/dfstio/ai-env"]
+# ai-env-worker = { path = "../ai-env/crates/ai-env-worker" }
+# ai-env-source = { path = "../ai-env/crates/ai-env-source" }
+ai-env-worker = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0" }
+ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# HttpJsonSource's client: rustls with no provider of its own; main installs aws-lc-rs, so no ring is built.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0", features = ["testkit"] }
+tokio = { version = "1", features = ["rt", "macros"] }

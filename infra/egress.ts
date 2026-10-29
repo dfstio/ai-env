@@ -23,6 +23,12 @@
 // endpoint and the transcripts bucket's resources (transcripts.ts) input by input, their policies against policies.ts
 // for the stack's account. The scratch:endpoint-table and scratch:endpoint-policy markers are edited by `make
 // preview-scratch NEGATIVE=endpoint-on-vm-table|endpoint-policy-widen` in a scratch copy.
+//
+// S13 (plans/s13-contracts.md §I-infra.4.2): the relay's security group `ai-env-relay` and its seven rules join the SG
+// loop (SG_KEYS), the VM group gets its second rule (to the relay's private port), and the guard checks the relay's
+// resources (relay.ts): its instance by name, its Elastic IP and association, its artifact object, parameter, log group
+// and SSM attachment. The template renderer is egress-spec.ts's renderTemplate (LD-I14): the proxy's files render byte
+// for byte as before.
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -31,15 +37,16 @@ import * as aws from "@pulumi/aws";
 import * as awsnative from "@pulumi/aws-native";
 import {
     AMI_PARAMETER, DOCUMENT_ROLES, DocumentRole, EgressConfig, EgressSpec, FIREWALL_ASSOCIATION_PRIORITY, FIREWALL_BLOCK_RESPONSE, FIREWALL_REDIRECTION, FIREWALL_RULE_PRIORITY,
-    ImageNames, NET, NaclRuleSpec, PARAMETER_MAX_BYTES, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, ProxyParameter, RouteSpec, RuleSpec, SgKey,
-    VM_SG_DESCRIPTION, allowValue, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames, inInventory, ruleName,
-    ruleOwner, stackInventory,
+    ImageNames, NET, NaclRuleSpec, PARAMETER_MAX_BYTES, PROVIDER_INPUTS, PROXY_PARAMETERS, PROXY_SG_DESCRIPTION, ProxyDocuments, ProxyParameter, RELAY_SG_DESCRIPTION, RouteSpec,
+    RuleSpec, SG_KEYS, SgKey, VM_SG_DESCRIPTION, allowValue, checkNacl, checkProxyDocument, checkRoutes, checkRule, checkVpcDns, dnsQueryLogGroup, documentFile, documentNames,
+    embedded, inInventory, renderTemplate, ruleName, ruleOwner, stackInventory,
 } from "./egress-spec";
 import {
-    CONNECTOR_OPERATOR_POLICY_ARN, Names, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RUNTIME_USER_NAME, S3_ENDPOINT_SERVICE, SSM_INSTANCE_POLICY_ARN, TRANSCRIPTS_RESOURCE,
-    USER_POLICY_ATTACHMENTS, attachmentName, canonicalPolicyText, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy, proxyTrustPolicy, s3EndpointPolicy,
-    transcriptsBucketName, transcriptsBucketPolicy,
+    CONNECTOR_OPERATOR_POLICY_ARN, Names, POLICY_DESCRIPTIONS, PolicyDocument, REGION, RELAY_INSTANCE_PROFILE_NAME, RELAY_ROLE_NAME, RUNTIME_USER_NAME, S3_ENDPOINT_SERVICE,
+    SSM_INSTANCE_POLICY_ARN, TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, canonicalPolicyText, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy,
+    proxyTrustPolicy, s3EndpointPolicy, transcriptsBucketName, transcriptsBucketPolicy,
 } from "./policies";
+import { RELAY_KEY_RE } from "./relay-spec";
 import { TRANSCRIPTS_LIFECYCLE } from "./transcripts";
 
 /** The operator role must be assumable before CreateNetworkConnector (IAM is eventually consistent; image.ts waits 15 s). */
@@ -66,22 +73,9 @@ const TOKENS: Record<string, string[]> = {
     "user-data.sh": ["PARAM_PREFIX", "REGION", "LOG_GROUP", "RELOAD_SH", "CW_AGENT_JSON"],
 };
 
-/** One pass of token replacement: a value is never scanned again (the embedded reload script carries @DIR@). */
+/** One pass of token replacement (egress-spec.ts renderTemplate): a value is never scanned again (the embedded reload script carries @DIR@). */
 function render(dir: string, file: string, values: Record<string, string>): string {
-    const text = fs.readFileSync(path.join(dir, file), "utf-8");
-    const tokens = TOKENS[file];
-    if (Object.keys(values).sort().join() !== tokens.slice().sort().join()) throw new Error(`egress: render ${file}: values for ${Object.keys(values).join(", ")}, expected ${tokens.join(", ")}`);
-    const missing = tokens.filter((t) => !text.includes(`@${t}@`));
-    if (missing.length > 0) throw new Error(`${path.join(dir, file)}: the placeholder(s) ${missing.map((t) => `@${t}@`).join(" ")} are missing (contract 3)`);
-    const out = text.replace(/@([A-Z_]+)@/g, (m, k: string) => (Object.prototype.hasOwnProperty.call(values, k) ? values[k] : m));
-    const left = [...new Set(out.match(/@[A-Z_]+@/g) ?? [])].filter((t) => t !== RUNTIME_TOKEN);
-    if (left.length > 0) throw new Error(`${path.join(dir, file)}: unknown placeholder(s) ${left.join(" ")} left after rendering (only ${RUNTIME_TOKEN} is filled on the proxy)`);
-    return out;
-}
-
-/** A file embedded in a heredoc: its own final newline is the heredoc's, so the installed copy is byte for byte the file. */
-function embedded(text: string): string {
-    return text.endsWith("\n") ? text.slice(0, -1) : text;
+    return renderTemplate(dir, file, TOKENS[file], values, [RUNTIME_TOKEN]);
 }
 
 /**
@@ -156,6 +150,10 @@ const T = {
     fwConfig: "aws:route53/resolverFirewallConfig:ResolverFirewallConfig",
     queryLog: "aws:route53/resolverQueryLogConfig:ResolverQueryLogConfig",
     queryLogAssociation: "aws:route53/resolverQueryLogConfigAssociation:ResolverQueryLogConfigAssociation",
+    // S13: the relay's Elastic IP, its association and its artifact (relay.ts).
+    eip: "aws:ec2/eip:Eip",
+    eipAssociation: "aws:ec2/eipAssociation:EipAssociation",
+    bucketObject: "aws:s3/bucketObjectv2:BucketObjectv2",
     // S9: the S3 gateway endpoint and the transcripts bucket's resources (transcripts.ts).
     endpoint: "aws:ec2/vpcEndpoint:VpcEndpoint",
     bucket: "aws:s3/bucket:Bucket",
@@ -169,10 +167,11 @@ const T = {
 
 /**
  * Ids the guard compares references against (tracked right after each resource is created). S9 adds the stack's
- * account (the policies the guard compares are built for it), the S3 gateway endpoint and the transcripts bucket.
+ * account (the policies the guard compares are built for it), the S3 gateway endpoint and the transcripts bucket; S13
+ * the relay instance and its Elastic IP (a VPC address's id is its allocation id), and `sg:relay` through SgKey.
  */
 type IdKey = "vpc" | "dhcp" | "igw" | "nacl" | "fw-list" | "fw-group" | "query-log" | `subnet:${"proxy" | "vms"}` | `rt:${"proxy" | "vms"}` | `sg:${SgKey}`
-    | "account" | "s3-endpoint" | "transcripts";
+    | "account" | "s3-endpoint" | "transcripts" | "relay-instance" | "relay-eip";
 
 export interface EgressGuard {
     /** Records a resource's id for the guard's reference checks (call right after creating the resource). */
@@ -261,10 +260,18 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
     const counts = new Map<string, number>();
     // Maps, never object literals: a name like `constructor` must not find Object.prototype's.
     const tables = new Map<string, "proxy" | "vms">([[NET.proxy, "proxy"], [NET.vms, "vms"]]);
-    const sgKeys = new Map<string, SgKey>([[cfg.vmSecurityGroupName, "vm"], [cfg.proxySecurityGroupName, "proxy"]]);
-    const parameterNames = new Map<string, string>(PROXY_PARAMETERS.map((p) => [`ai-env-proxy-${p}`, `${cfg.parameterPrefix}/${p}`]));
-    const logGroups = new Map<string, string>([["image-log-group", image.logGroup], [NET.logGroup, cfg.logGroup], [NET.dnsLogGroup, dnsQueryLogGroup(cfg)]]);
-    const attachments = new Map<string, string>([[`${cfg.proxyRoleName}-ssm`, SSM_INSTANCE_POLICY_ARN], [cfg.operatorRoleName, CONNECTOR_OPERATOR_POLICY_ARN]]);
+    const sgKeys = new Map<string, SgKey>([[cfg.vmSecurityGroupName, "vm"], [cfg.proxySecurityGroupName, "proxy"], [cfg.relaySecurityGroupName, "relay"]]);
+    const sgDescriptions = new Map<SgKey, string>([["vm", VM_SG_DESCRIPTION], ["proxy", PROXY_SG_DESCRIPTION], ["relay", RELAY_SG_DESCRIPTION]]);
+    const parameterNames = new Map<string, string>([
+        ...PROXY_PARAMETERS.map((p) => [`ai-env-proxy-${p}`, `${cfg.parameterPrefix}/${p}`] as [string, string]),
+        [NET.relayArtifactParameter, `${cfg.relayParameterPrefix}/artifact`],
+    ]);
+    const logGroups = new Map<string, string>([
+        ["image-log-group", image.logGroup], [NET.logGroup, cfg.logGroup], [NET.dnsLogGroup, dnsQueryLogGroup(cfg)], [NET.relayLogGroup, cfg.relayLogGroup],
+    ]);
+    const attachments = new Map<string, string>([
+        [`${cfg.proxyRoleName}-ssm`, SSM_INSTANCE_POLICY_ARN], [cfg.operatorRoleName, CONNECTOR_OPERATOR_POLICY_ARN], [`${RELAY_ROLE_NAME}-ssm`, SSM_INSTANCE_POLICY_ARN],
+    ]);
     // S8 operators: which user and policy each user policy attachment binds, and which document each name is.
     const userAttachments = new Map<string, readonly [string, string]>(USER_POLICY_ATTACHMENTS.map(([u, p]) => [attachmentName(u, p), [u, p] as const]));
     const documentRoles = new Map<string, DocumentRole>(DOCUMENT_ROLES.map((r) => [documentNames(cfg)[r], r]));
@@ -416,7 +423,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             // No inline ingress/egress: rules are separate resources this guard checks one by one.
             only("name", "description", "vpcId", "tags", "region");
             eq("name", name);
-            eq("description", sg === "vm" ? VM_SG_DESCRIPTION : PROXY_SG_DESCRIPTION);
+            eq("description", sgDescriptions.get(sg));
             ref("vpcId", "vpc", props.vpcId);
             break;
         }
@@ -433,7 +440,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             const computed = ["ipProtocol", "fromPort", "toPort", "cidrIpv4"].filter((k) => props[k] === UNKNOWN);
             if (computed.length > 0) { bad(`${computed.join(", ")} must be literal values`); break; }
             if (props.fromPort !== props.toPort) { bad(`one port only, got ${String(props.fromPort)}-${String(props.toPort)}`); break; }
-            // The only referenced group in the spec: the proxy's ingress names the VM group.
+            // The only referenced group in the spec: the proxy's and the relay's ingress name the VM group.
             if (isSet(props.referencedSecurityGroupId)) ref("referencedSecurityGroupId", "sg:vm", props.referencedSecurityGroupId);
             const rule: RuleSpec = {
                 direction, protocol: props.ipProtocol as RuleSpec["protocol"], port: props.fromPort as number,
@@ -441,25 +448,45 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             };
             const r = checkRule(cfg, sg, rule);
             if (r) bad(r);
-            if (sg === "vm") once(`rules of ${cfg.vmSecurityGroupName}`, 1);
+            if (sg === "vm") once(`rules of ${cfg.vmSecurityGroupName}`, 2);
             if (sg === "proxy" && direction === "ingress") once(`ingress rules of ${cfg.proxySecurityGroupName}`, 1);
+            if (sg === "relay" && direction === "ingress") once(`ingress rules of ${cfg.relaySecurityGroupName}`, 2);
             break;
         }
+        // The proxy, and (S13) the relay by its name: both in the proxy subnet, each with its own group, address and profile.
         case T.instance: {
+            const relay = name === NET.relayInstance;
             only("ami", "instanceType", "subnetId", "privateIp", "associatePublicIpAddress", "vpcSecurityGroupIds", "iamInstanceProfile", "metadataOptions",
                 "rootBlockDevice", "creditSpecification", "userData", "userDataReplaceOnChange", "tags", "volumeTags", "region");
             ref("subnetId", "subnet:proxy", props.subnetId);
             const sgs = props.vpcSecurityGroupIds;
-            if (!Array.isArray(sgs) || sgs.length !== 1) bad("vpcSecurityGroupIds must be exactly the proxy security group");
-            else ref("vpcSecurityGroupIds[0]", "sg:proxy", sgs[0]);
-            eq("privateIp", cfg.proxyIp);
+            if (!Array.isArray(sgs) || sgs.length !== 1) bad(`vpcSecurityGroupIds must be exactly the ${relay ? "relay" : "proxy"} security group`);
+            else ref("vpcSecurityGroupIds[0]", relay ? "sg:relay" : "sg:proxy", sgs[0]);
+            eq("privateIp", relay ? cfg.relayIp : cfg.proxyIp);
             eq("associatePublicIpAddress", true);
-            eq("instanceType", cfg.instanceType);
-            eq("iamInstanceProfile", cfg.proxyInstanceProfileName);
+            eq("instanceType", relay ? cfg.relayInstanceType : cfg.instanceType);
+            eq("iamInstanceProfile", relay ? RELAY_INSTANCE_PROFILE_NAME : cfg.proxyInstanceProfileName);
             const md = (props.metadataOptions ?? {}) as Props;
             if (md.httpTokens !== "required" || md.httpPutResponseHopLimit !== 1) bad("metadataOptions must require IMDSv2 with hop limit 1");
             break;
         }
+        // S13: the relay's Elastic IP (a VPC address, nothing else set) and its association (that address, the relay instance).
+        case T.eip:
+            only("domain", "tags", "region");
+            eq("domain", "vpc");
+            break;
+        case T.eipAssociation:
+            only("allocationId", "instanceId", "region");
+            ref("allocationId", "relay-eip", props.allocationId);
+            ref("instanceId", "relay-instance", props.instanceId);
+            break;
+        // S13: the relay's artifact object (the image zip falls through, as before): its hash-keyed key, a binary.
+        case T.bucketObject:
+            if (name !== NET.relayArtifact) break;
+            only("bucket", "key", "source", "contentType", "tags", "region");
+            if (props.key !== UNKNOWN && !(typeof props.key === "string" && RELAY_KEY_RE.test(props.key))) bad(`key must be relay/ai-env-relay-<sha256[:16]>, got ${show(props.key)}`);
+            eq("contentType", "application/octet-stream");
+            break;
         case T.connector: {
             only("name", "configuration", "operatorRole", "tags");
             eq("name", cfg.connectorName);
@@ -652,7 +679,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             policyIs(props.policy, (acct, endpoint) => transcriptsBucketPolicy({ accountId: acct, transcriptsBucket: transcriptsBucketName(acct), s3EndpointId: endpoint }), true);
             break;
         default:
-            // In the inventory, but without checks here: S3's artifacts bucket, its public access block and the zip object.
+            // In the inventory, but without checks here: S3's artifacts bucket and its public access block.
             break;
         }
         await Promise.all(waits);
@@ -710,6 +737,15 @@ export interface Egress {
     s3Endpoint: aws.ec2.VpcEndpoint;
     s3EndpointPolicy: pulumi.Output<string>;
     proxyRouteTable: aws.ec2.RouteTable;
+    /**
+     * S13: the relay's security group and its rules, and what the relay instance (relay.ts) sits on and boots through:
+     * the proxy subnet, its route table association and the VPC's DHCP options.
+     */
+    relaySecurityGroup: aws.ec2.SecurityGroup;
+    relayRules: pulumi.Resource[];
+    proxySubnet: aws.ec2.Subnet;
+    proxyRouteAssociation: aws.ec2.RouteTableAssociation;
+    dhcpAssociation: aws.ec2.VpcDhcpOptionsAssociation;
 }
 
 /** The initial value of a parameter `ai-env egress` owns (an SSM parameter cannot be empty; `#` lines are comments). */
@@ -804,9 +840,10 @@ export function createEgress(
         guard.track(`sg:${k}`, r.id);
         return r;
     };
-    const sgs: Record<SgKey, aws.ec2.SecurityGroup> = { vm: securityGroup("vm"), proxy: securityGroup("proxy") };
-    const rules: Record<SgKey, pulumi.Resource[]> = { vm: [], proxy: [] };
-    for (const k of ["vm", "proxy"] as const) {
+    const sgs = {} as Record<SgKey, aws.ec2.SecurityGroup>;
+    for (const k of SG_KEYS) sgs[k] = securityGroup(k);
+    const rules: Record<SgKey, pulumi.Resource[]> = { vm: [], proxy: [], relay: [] };
+    for (const k of SG_KEYS) {
         for (const rule of spec.securityGroups[k].rules) {
             const name = ruleName(spec, k, rule);
             const args = {
@@ -948,5 +985,6 @@ export function createEgress(
     return {
         vpc, vmSubnet, vmSecurityGroup: sgs.vm, proxySecurityGroup: sgs.proxy, instance, logGroup, parameters, proxyRole, operatorRole, connector, documents,
         squidConfSha256: sha256(files.squidConf), allowSha256: allow.apply(sha256), s3Endpoint, s3EndpointPolicy: s3EndpointPolicyJson, proxyRouteTable: proxyRoutes.table,
+        relaySecurityGroup: sgs.relay, relayRules: rules.relay, proxySubnet, proxyRouteAssociation: proxyRoutes.association, dhcpAssociation,
     };
 }

@@ -16,6 +16,9 @@ mod transcript_s3;
 mod claude_stage;
 #[path = "shim_local/s11.rs"]
 mod s11;
+// S13 (V's wave 1): a spawn's relay session, /validate's relay checks, the image's relay files.
+#[path = "shim_local/relay.rs"]
+mod relay;
 
 use ai_env_cli::shim::health::{router, ProbeSpec, ShimOpts, ShimState};
 use ai_env_cli::shim::hooks::{self, HookPeer, HookSource, PREFIX};
@@ -1345,7 +1348,7 @@ async fn agent_spawn_is_answered_by_the_spawn_manager() {
     s.run(true).await;
     let mut w = ws_hello_ok(s.app).await;
     let id = SpawnId::new_v7();
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), relay: None };
     send_frame(&mut w, &spawn).await;
     match next_frame(&mut w).await {
         Ok(Frame::Spawned { spawn_id, pid, .. }) => assert!(spawn_id == id && pid != 0, "{spawn_id} {pid}"),
@@ -1369,7 +1372,7 @@ async fn spawning_stack() -> (Stack, tempfile::TempDir) {
 /// tests run (the agent is this process's own uid, the home a canonical
 /// tempdir), so anything else before its `spawned` fails the test.
 async fn start(w: &mut Ws, id: &SpawnId, argv: &[&str], detach_grace_s: Option<u32>) -> (u32, Vec<Frame>) {
-    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s, credential: None, claude: Vec::new() };
+    let spawn = Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: Deliver::Fd, detach_grace_s, credential: None, claude: Vec::new(), relay: None };
     start_frame(w, &spawn).await
 }
 
@@ -1540,7 +1543,7 @@ async fn hello_view(app: SocketAddr) -> (Ws, bool, Vec<String>, CredentialView) 
 
 /// A `spawn` of `argv` naming `credential` and carrying `secrets` (fd delivery).
 fn spawn_with(id: &SpawnId, argv: &[&str], credential: Option<&str>, secrets: BTreeMap<String, Secret<String>>) -> Frame {
-    Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: None, credential: credential.map(str::to_string), claude: Vec::new() }
+    Frame::Spawn { spawn_id: id.clone(), argv: argv.iter().map(|a| (*a).to_string()).collect(), cwd: None, env: BTreeMap::new(), secrets, deliver_secret: Deliver::Fd, detach_grace_s: None, credential: credential.map(str::to_string), claude: Vec::new(), relay: None }
 }
 
 /// The spawn's answer when it is refused: its code and message.
@@ -1804,7 +1807,7 @@ fn shim_help_lists_the_entrypoint_surface() {
         let block = flag_block(&text, head);
         assert!(block.contains(&format!("[default: {default}]")), "{head}: [default: {default}] missing from {block:?}");
     }
-    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes", "--helper", "--git", "--curl"] {
+    for hidden in ["--fs-root", "--init-pid", "--supervise", "--kill-after-s", "--agent-window-bytes", "--helper", "--git", "--curl", "--relay-client", "--relay-mcp-config"] {
         assert!(!text.contains(hidden), "{hidden} is a hidden test/role flag:\n{text}");
     }
 }
@@ -1853,6 +1856,10 @@ fn the_image_entrypoint_runs_the_agent_as_1000_1000() {
     assert!(a.helper.is_none() && !argv.iter().any(|w| w == "--helper" || w == "--git" || w == "--curl"), "{argv:?}");
     assert_eq!(a.git, PathBuf::from("/usr/bin/git"));
     assert_eq!(a.curl, PathBuf::from("/usr/bin/curl"));
+    // S13: the image's relay client and MCP config, by default; the ENTRYPOINT names neither flag.
+    assert_eq!(a.relay_client, PathBuf::from("/usr/local/bin/ai-env-relay-client"));
+    assert_eq!(a.relay_mcp_config, PathBuf::from("/etc/ai-env/relay-mcp.json"));
+    assert!(!argv.iter().any(|w| w == "--relay-client" || w == "--relay-mcp-config"), "{argv:?}");
 }
 
 #[test]

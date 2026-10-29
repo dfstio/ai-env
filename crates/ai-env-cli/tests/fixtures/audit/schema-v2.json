@@ -24,7 +24,8 @@
       ],
       "name": "session_remote_start",
       "optional": [
-        "account"
+        "account",
+        "relay"
       ],
       "required": [
         "id",
@@ -1634,6 +1635,105 @@
       "optional": [],
       "required": [
         "port",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_keygen",
+      "optional": [
+        "replaced"
+      ],
+      "required": [
+        "worker_id",
+        "worker_fp",
+        "session_fp"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_allow",
+      "optional": [
+        "version",
+        "sources",
+        "not_after"
+      ],
+      "required": [
+        "kind",
+        "id",
+        "fp",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_revoke",
+      "optional": [
+        "version"
+      ],
+      "required": [
+        "kind",
+        "id",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_grant",
+      "optional": [
+        "rules",
+        "version"
+      ],
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_start",
+      "optional": [
+        "ms"
+      ],
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_stop",
+      "optional": [
+        "ms"
+      ],
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_agent",
+      "optional": [
+        "hours",
+        "signed",
+        "minted"
+      ],
+      "required": [
         "outcome"
       ],
       "session": "none",

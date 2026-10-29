@@ -102,7 +102,7 @@ To let another party decrypt — a deploy target's age key (e.g. the per-stack s
 in AWS SSM), or a colleague — add their **public** recipient to your key:
 
 ```sh
-ai-env keys add-recipient silvana-mainnet age1xyz… --label "server-mainnet (SSM)" --rekey .
+ai-env keys add-recipient example-mainnet age1xyz… --label "server-mainnet (SSM)" --rekey .
 ```
 
 The recipient must be the public `age1…` half (from `age-keygen -y`); pasting an
@@ -206,8 +206,19 @@ ai-env lab    list | show PROBE | run PROBE [ID] [--log FILE] [--manual VERDICT]
 ai-env egress status [--json] | env [--shell] | reload [--if-changed]   # S5 operator commands, as ai-env-ops (see Identities; bridge feature)
 ai-env egress allow SLUG HOST [--remove] | suspend HOST [--restore]    # per-workspace extras (global on the proxy; allow: the deployer only) / the kill switch
 ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a vpc VM: direct egress and DNS closed, the allowlist working, S3 for
-                                                          #   the transcripts bucket alone (S9) → state/egress-verified.toml
+                                                          #   the transcripts bucket alone (S9), the relay's internet face closed (S13)
+                                                          #   → state/egress-verified.toml
 ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
+ai-env relay  keygen [--force] | pubkey [--worker|--session] [--verify] | ca [--der]   # this Mac's two relay keys, sealed with no Touch ID /
+                                                          #   printed (--verify: one Touch ID) / the relay CA's certificate, for a worker (S13; no AWS)
+ai-env relay  allow ID --key KEY --sources GLOBS|--token-signer [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
+                                                          #   whitelist and token signers, as ai-env-deployer only (S13)
+ai-env relay  grant GRANT RULE… | grant GRANT --remove | tls init [--force] | tls rotate   # the grants (default-deny), the relay CA and
+                                                          #   its certificate, as ai-env-deployer only (tls rotate: one Touch ID; S13)
+ai-env relay  status [--json] [--local] | start | stop    # the relay instance, as ai-env-ops (--local: this Mac's keys and agent only,
+                                                          #   no AWS, no Touch ID; S13)
+ai-env relay  agent [--hours N]                           # one Touch ID, then it signs worker handshakes and mints VM session tokens
+                                                          #   until Ctrl-C or N hours (default 12, at most 24; S13)
 ai-env as     deployer|ops|root|ambient [--account ACCOUNT] -- CMD ARGS...   # run CMD as one AWS identity, the marker AI_ENV_BRIDGE_AS set (Identities)
 ai-env as     --check deployer|ops|root|ambient                # make's guard: exit 0 when this process already runs as it, else 9
 ai-env shim   --claude PATH [--app-port 8080] …           # VM mode: MicroVM image entrypoint (shim feature)
@@ -465,13 +476,17 @@ knob) instead of `"sdk"`. The live Makefile targets drop all three; `make s4-smo
 
 `--egress vpc` VMs get the stack's network connector `ai-env-egress` (the default once
 `make infra-status WRITE=1` wrote `[aws] egress_connector_arn`). Its subnet, 10.42.1.0/24 of a dedicated
-VPC, has no route but `local`; its security group allows only TCP 3128 to the proxy's address and its
-network ACL only that and the replies. The one way out is a squid proxy (t4g.nano, 10.42.0.10) that
+VPC, has no route but `local`; its security group allows only TCP 3128 to the proxy's address and,
+since S13, TCP 7443 to the relay's (10.42.0.20), and its network ACL only those and the replies. So a VM
+has two ways out. The first is a squid proxy (t4g.nano, 10.42.0.10) that
 tunnels CONNECT to port 443 of exactly the allowlisted hosts — the stack's `allow` list plus
 per-workspace extras, minus suspended hosts — and refuses everything else: plain HTTP, other ports, IP
 literals, names that resolve to private, loopback or link-local addresses, clients outside the VM
-subnet. The VPC has no Amazon DNS (`enableDnsSupport` off; DHCP hands out public resolvers that only
-the proxy may reach), so a VM resolves nothing itself; its tools go through the proxy
+subnet. The second (S13) is the relay's private port, 10.42.0.20:7443, which answers only the relay's
+catalog and calls, behind TLS 1.3 and a session token the Mac minted (stage S13, below); a vpc spawn's
+`no_proxy` holds that address, so it never goes through squid. The VPC has no Amazon DNS
+(`enableDnsSupport` off; DHCP hands out public resolvers that only the proxy may reach), so a VM
+resolves nothing itself; its tools go through the proxy
 (`ai-env egress env` prints `https_proxy` and friends). The only DNS a VM reaches is the platform's
 `fd00:ec2::253`, which answers locally with an empty reply and sends nothing out (measured with a
 canarytokens and an interactsh test). Every VM reaches squid from the connector's one network interface
@@ -517,8 +532,9 @@ still get created).
   `(only ai-env-ops and ai-env-deployer may send the proxy documents: run it under ai-env as ops --)`.
 - **`egress check`** starts its own `--egress vpc --shell` VM and runs, through the platform shell,
   curl and dig cases: direct egress and DNS must be closed, the allowlist must answer (401 from the API)
-  and refuse the rest; since S9, S3 must take our transcripts bucket alone (seven more cases, 34 in
-  all: "S3 through the proxy"). The case markers are VM-reported, so a pass also needs the VM-independent
+  and refuse the rest; since S9, S3 must take our transcripts bucket alone (seven more cases: "S3
+  through the proxy"); since S13, a VM must not reach the relay's internet face (two more, 36 in all:
+  stage S13). The case markers are VM-reported, so a pass also needs the VM-independent
   network verification of `egress status` and squid's own log lines (from CloudWatch) for the run's
   tunnels and denials. A pass is recorded in `state/egress-verified.toml` for that image version and
   connector and bound to the connector as the network verification judged it (its Id, network
@@ -535,7 +551,8 @@ still get created).
   result fails.
 - **Credentials (S7)** may enter a VM only through `egress::credential_gate`: a `vpc` VM whose live
   echo is exactly the connector, whose image version has a recorded passing check under the current DNS
-  and egress rules (since S9 a pass recorded before its S3 cases does not count), and whose DNS
+  and egress rules (since S9 a pass recorded before its S3 cases does not count, since S13 one recorded
+  before its relay cases), and whose DNS
   verdicts (the check's and the newest `dns-path`) are `no-dns` or `platform-dns:<ip>`
   of resolvers `[egress] accept_platform_dns = "<ip>"` names (a list for several). A platform reply counts
   only as an empty NOERROR (no answer, no authority section) to a fresh name `d<nonce>.example.com`, from a
@@ -1156,7 +1173,8 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
 - more than one workspace folder: `--add-dir` is stripped (`[wrapper] strip_add_dir`), and only the
   folder the chat starts in is seeded;
 - user-scope MCP servers: `claude mcp add` runs on the Mac and edits the Mac's `~/.claude.json` (the
-  wrapper says so); the VM has the servers of a committed `.mcp.json` only;
+  wrapper says so); the VM has the servers of a committed `.mcp.json` only, plus the image's
+  `ai-env-relay` server when the Mac gave the chat a relay session (stage S13, below);
 - Chrome MCP (its command is the Mac's wrapper path), claude.ai MCP servers, artifacts, Remote Control
   (a setup-token cannot) and installing system packages;
 - a workspace that is not a git repository (exit 9, above).
@@ -1189,7 +1207,11 @@ make test-docker deploy   # the image with the rule (test-docker builds the zip 
   session state to Cursor, and the chat still parks), while a bridge.toml that sets `env_forward` keeps
   its own list; `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH` and `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH` in either
   list refuse the session too (exit 9), because the wrapper answers a remote claude's refreshes with no
-  token;
+  token. Since S13 the default also has `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS` (with it, Cursor
+  shows a prompt hook's start and end); extension 2.1.312's `CLAUDE_CODE_SDK_READS_STARTUP_MARKS` and
+  `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` are not forwarded: either makes a claude that fails at its start
+  look started (it prints before its `initialize` answer), which costs the restart with the next claude
+  (stage S11). A list that names them forwards them anyway;
 - the scans are tripwires, not proofs: a secret in a shape no rule knows, in a tracked or untracked
   file, goes to AWS; `box seed --dry-run` shows what a first seed would carry. A chat's transcript holds
   what its tools printed: since S9 a remote chat's stays in the VM and in S3 (the Mac never receives it
@@ -1535,13 +1557,14 @@ bucket's policy denies reads and the VM's writes from outside that endpoint, the
 it, and every other principal. `ai-env egress allow` still refuses every AWS service host (exit 9).
 `egress status` checks the endpoint (exactly one, on the proxy's route table, its policy as deployed)
 and the bucket (versioning, encryption, ownership, the public access block, its policy), and takes the
-bucket's host in `allow` and no other AWS host. `egress check` adds seven cases (34 in all): our
+bucket's host in `allow` and no other AWS host. `egress check` adds seven cases (34 in all; S13's two
+make 36): our
 bucket's PUT and GET through the proxy must pass (the GET's 200 proves the endpoint, since the bucket
 refuses reads outside it), and these must be refused: a public object of another bucket asked through
 our host, by name and path-style; a key outside `v1/`; the VM's own IMDS credentials
 (`recorded:no_role` without an execution role); another S3 host; S3 without the proxy. Run it again
-after S9's deploy: its record notes the rule it was judged by (`egress_rule = 1`). A pass recorded
-before these cases (rule 0) counts neither for the credential gate nor for
+after S9's deploy: its record notes the rule it was judged by (`egress_rule = 1`; S13's is 2). A pass
+recorded before these cases (rule 0) counts neither for the credential gate nor for
 `ai-env egress check --if-needed`, which runs the check again and says why.
 
 **Also in S9.** `make test-cursor` needs `SINCE` (the step's start, taken with
@@ -2055,8 +2078,9 @@ The panel's start and stop are audited (`panel_serve`).
 
 **The audit.** `audit.jsonl` is at schema v2: every row's `detail.actor` says who wrote it (`cli`,
 `wrapper` or `panel`; the wrapper's detached `vm warm` says `wrapper`, `claude admit --auto` `cli`), and
-a registry of every event (87, with their keys, the key that names a VM, where the session comes from
-and what each means for the cost) is frozen in `tests/fixtures/audit/schema-v2.json`: names and keys
+a registry of every event (94, S13's seven `relay_*` included, with their keys, the key that names a
+VM, where the session comes from and what each means for the cost) is frozen in
+`tests/fixtures/audit/schema-v2.json`: names and keys
 are never renamed. S11's events: `claude_admit`, `claude_stage`, `claude_fetch`, `claude_object_bad`,
 `claude_start_failed`, `argv_dropped`, `vm_observed` (a VM seen in a new state) and `panel_serve`;
 `vm_run` gains `max_duration_s`, `max_idle_s`, `suspended_s` and `memory_mib`, `transcript_stage`
@@ -2134,9 +2158,12 @@ pinned to another version than the active one. The claude rows (above) replace S
 offline, names and flags only, never a value: `[!! ]` for env names it starts chats with that
 `[wrapper] env_forward` and `env_extra` do not forward and no review has classified (`ENV_REVIEWED`,
 `src/bridge/drift.rs`; since S12 `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` and
-`CLAUDE_CODE_SDK_READS_SESSION_STATE` are forwarded by default instead, so this row names them only
-for a bridge.toml whose own `env_forward` and `env_extra` leave them out), `[-  ]` for a forwarded
-name it no longer sets (a window on an extension that does not set those two lists them there) and
+`CLAUDE_CODE_SDK_READS_SESSION_STATE`, and since S13 `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS`,
+are forwarded by default instead, so this row names them only for a bridge.toml whose own
+`env_forward` and `env_extra` leave them out; since S13 extension 2.1.312's two start-up names,
+`CLAUDE_CODE_SDK_READS_STARTUP_MARKS` and `CLAUDE_CODE_STARTUP_FAILURE_RESULTS`, are reviewed), `[-  ]`
+for a forwarded name it no longer sets (a window on an extension that does not set them lists them
+there: a window on 2.1.310, or on 2.1.312 with its experiment gate off, lists the hook name) and
 for a name a remote session never carries (one `vm exec` refuses, such as a TOKEN name; S12's two
 refresh names, which `[wrapper]` refuses, get no row), `[!! ]` for flags the router does not classify
 (add them to `VALUE_FLAGS` or `BOOL_FLAGS` in `src/wire/argv.rs`, then
@@ -2303,6 +2330,183 @@ make test-aws S12=1   # S12's live tests (live_s12_*): DeleteObjects' checksum, 
 - a migration's early `claude_fetch` row (`why` `phase_a`) names the chat it fetched for, never the
   session a fork resumed, and a fork's `claude_start_failed` row names `-`, not the chat it forked.
 
+### The relay: data sources for remote chats (stage S13)
+
+**What changes.** A remote chat can now read data the developer grants it (service logs, metrics, a
+SQL database, an HTTP API) through the relay, a small EC2 instance in the stack. VMs reach it
+privately, on 10.42.0.20:7443; workers, small programs beside each data source (on a server inside
+its private network, or on this Mac), dial it from the internet on its Elastic IP's port 443 and
+answer its calls. Each source's credential stays on its worker: the relay and the VM hold none. ai-env
+holds only the protocol, a public SDK and generic code; the workers that reach real sources live in
+private repositories, and ai-env never names a private source, host or grant. S13's second track, work
+from the phone with the Mac off ("away mode"), is planned and gated on live probes: none of it is built.
+
+**What a remote chat gets.** Two tools, `relay_catalog` (the sources and ops the chat's grant reaches,
+each op with its params JSON Schema) and `relay_call(source, op, params)` (the op's output, with
+truncation flags), which claude names `mcp__ai-env-relay__relay_catalog` and
+`mcp__ai-env-relay__relay_call`, and only when the Mac gave the chat a relay session. Each new spawn
+(a new chat, a retry, a move; never a reattach) asks this Mac's `ai-env relay agent` for a session
+token within 2 s. The token names the VM, the spawn, the chat and the grant (the workspace's
+`relay_grant`, else `[relay].grant`), and lives at most 8 h, never past the VM's wall. With no grant,
+a VM whose shim does not name `relay_v1`, no `state/relay-ca.der` (`ai-env relay tls init` never ran
+here) or no agent, the chat starts as before, without the tools (the ask never delays a spawn past
+its 2 s); `session_remote_start` records the outcome (`relay=WORD`: `minted`, `no_cap`, `no_ca`,
+`no_agent`, …), and with a grant set a missing agent gives the chat one note
+(`relay: no relay agent answers on this Mac …`). The wrapper asks no Touch ID for it: the agent holds
+the keys.
+
+**What the VM holds.** The session (the token, the relay's address and name, and the relay CA) rides
+the spawn's credential delivery to its own VM only, behind the credential gate. The shim hands it on
+fd 3 to `ai-env-relay-client`, started as ai-env-net (uid 999), one per spawn: it serves
+`/run/ai-env/relay/<pid>.sock` to that spawn's processes alone (the agent's uid, under that claude),
+dials 10.42.0.20:7443 over TLS 1.3 with the relay CA as its one trust anchor, and ends with its
+claude. The shim adds `--mcp-config=/etc/ai-env/relay-mcp.json` to such a spawn's claude, which starts
+`ai-env-relay-mcp`, a stdio MCP server that finds its chat's socket and holds no token: no process of
+the agent, and no file, argv, environment, log or audit row, holds the token. The image gains these
+three files (the two programs in `/usr/local/bin`; MANIFEST, the Dockerfile's gate and `/validate`
+check them), and a shim that finds the client and the config names the cap `relay_v1`; the Mac sends
+a relay session to no other. The version is 0.12.0 and an image deploy is due; until it has run, doctor says
+`[NO ] image shim 0.11.0 ≠ ai-env 0.12.0  <- make deploy, then make infra-status WRITE=1`. The shim's
+hidden `--relay-client` and `--relay-mcp-config` are test flags (no help text).
+
+**The instance.** `ai-env-relay`, a t4g.nano in the proxy subnet at 10.42.0.20 with an Elastic IP for
+the workers, costs about $8 a month and runs all the time (`make proxy-stop` leaves it up). Its
+security group admits 443 from anywhere and 7443 from the VM security group only. It is administered
+through SSM only: its configuration reaches it as SSM parameters; it has no key pair and no port 22,
+no SSM command or session reaches it, IMDSv2 has a hop limit of 1 and its user data holds no secret.
+Its binary is hash-pinned: `make relay-artifact` cross-builds it (aarch64, the shim's glibc ceiling)
+into `target/relay/` with `relay.json` (`make deploy`, `make preview` and `make deploy-policies` run it
+first), and the deploy uploads it and pins its SHA-256 in the parameter `artifact`. The reload unit
+(`ai-env-relay-reload`, every minute) fetches `/ai-env/relay/{artifact,workers,grants,token-signers,tls}`
+in one call, checks each value, swaps them into the relay's live directory and installs the pinned
+binary when it changed, going back to the previous one if it does not start. The weekly patch
+(`ai-env-relay-patch`, Sundays from 03:30 UTC) runs `dnf upgrade --security`, then restarts the relay,
+or reboots when dnf says so. The relay fails closed while a list or its certificate is missing or
+stale, never calls AWS, and logs ids and hashes only (one request line per call, never a parameter or
+a result): `make relay-logs` tails its log group `/ai-env/relay` (ops: one Touch ID; `SINCE=1h`,
+`FOLLOW=1`). Doctor's relay row, under `ai-env as ops -- ai-env doctor`, says
+`[ok ] relay i-… running (10.42.0.20, 203.0.113.20)`, `[!! ]` when it is stopped (workers cannot
+connect and VM relay calls fail), `[-  ]` before S13's deploy, never `[NO ]`.
+
+**Egress.** The VM security group and the VM subnet's network ACL gain TCP 7443 to 10.42.0.20/32 (and
+its replies), and nothing else of the relay. `egress status` checks them and adds the rows `relay-sg`
+and `relay-endpoint` (who answers on 10.42.0.20). `egress check` adds two cases, 36 in all:
+`relay-other-port` (the relay's internet face, asked from the VM without the proxy) must time out
+without a connection, and `relay-port` (its private port) is recorded, never judged. The check's rule
+is now 2 and the credential gate counts no pass of rule 1 (doctor's credential gate row says
+`passed by an earlier rule (1, now 2)`), so **after S13's deploy and `make infra-status WRITE=1`, run
+`ai-env egress check` before any remote chat**. Not before both: until `state/infra.toml` records the
+relay, its rows stay unknown and the new 7443 rules of the VM group and network ACL read as drift, so
+the check fails, and a failed check revokes the connector's records. `make deploy` itself says to run
+`ai-env egress check` (`new image version: …`) before its `make infra-status WRITE=1` hint: keep the
+order below.
+
+**Who may use it.** Three SSM String parameters under `/ai-env/relay`, each a JSON list that only the
+deployer writes (`ai-env relay allow`, `revoke` and `grant`: as ai-env-ops, or with no runner, they are
+refused before any Touch ID or AWS call, exit 9), created at the first write and never by Pulumi
+(grants name private sources, which stay out of the repository and of Pulumi's state):
+
+- `workers`, the whitelist: each worker's id, its Ed25519 public key, the source names it may register
+  (globs) and its last valid day (`--not-after`: a year by default, at most two);
+- `token-signers`: the keys whose VM session tokens the relay takes, each Mac's session key
+  (`--token-signer`); a key has one id and one role, so a worker's key never mints tokens;
+- `grants`, default-deny: each grant is a list of `SOURCE-GLOB/OP-GLOB` rules, and a chat lists and
+  calls only what its token's grant reaches (`*/*` reaches everything, which the command notes).
+
+The relay applies a change within 60 s (`revoke` closes the worker's tunnel by then). A list holds at
+most 64 entries and 4096 bytes. A list that does not parse is never overwritten (exit 1). Writers on
+this Mac take turns (`state/relay.lock`). A write that raced another writer (the list created or
+changed meanwhile) exits 7, and by then a changed list has been overwritten: run the command again to
+see what it holds.
+
+**This Mac's keys and the agent.** `ai-env relay keygen` seals this Mac's two Ed25519 keys into
+`credentials/relay-worker.env` with no Touch ID: its worker key (for a worker on this Mac) and its
+session key (which signs the VM session tokens); it prints the public keys and the commands that allow
+them. `ai-env relay agent` unseals them once (one Touch ID) and, like ssh-agent, answers this user only,
+on the 0600 socket `state/relay-agent.sock`: it signs the handshakes of a worker on this Mac, and mints
+tokens only for this Mac's live vpc VMs whose egress gate passed and for grants bridge.toml names,
+until Ctrl-C or `--hours` (12 by default, at most 24), then drops the keys. `ai-env relay status`
+shows this Mac's side first (no AWS, no Touch ID; `--local` stops there), then, as ai-env-ops, the
+instance, the three lists and the relay's newest status line: `[NO ]` and exit 1 when this Mac's
+session key is no token signer in force, a list does not parse or the instance is not running.
+`ai-env relay stop` stops the instance: VM relay calls then answer `unavailable`, and workers keep
+dialing until `ai-env relay start`.
+
+**The relay's TLS.** `ai-env as deployer -- ai-env relay tls init` makes the relay CA (ECDSA P-256),
+seals its key into `credentials/relay-ca.env` (no Touch ID), writes its certificate to
+`state/relay-ca.pem` and `state/relay-ca.der`, and issues the relay's certificate (397 days, for
+`ai-env-relay` and 10.42.0.20) into the SecureString `/ai-env/relay/tls`, which the relay serves
+within a minute and ops never reads. `--force` makes a new CA, which strands every worker's pinned
+`relay_ca` file; `ai-env relay tls rotate` issues a new certificate under the sealed CA (one paste, one
+Touch ID). Both run only as ai-env-deployer, and hand the value to aws on its stdin, never in a file: under
+`ai-env as root` or `ambient` they are refused (exit 9), since that aws CLI reads your own aws config, whose
+`cli_history` would record the relay's private key. `ai-env relay ca` prints the CA's certificate for a worker
+(no AWS, no Touch ID).
+
+```toml
+[relay]                 # bridge.toml
+worker_id = "mac"       # this Mac's id: its worker's, its token signer's and its tokens' caller
+grant = "default"       # the grant a remote chat's token names; "" (the default): no token, no tools
+agent_hours = 12        # ai-env relay agent's life, 1 to 24
+
+[[workspace]]
+path = "/path/to/a/repo"
+relay_grant = ""        # this workspace's own grant, over [relay].grant; "" gives its chats none
+```
+
+**S13's deploy, then the relay's setup**, in this order (only the first S13 deploy needs `ONLY=`: ops'
+new policy names the relay instance, which does not exist before it):
+
+```sh
+make install                                    # 0.12.0; doctor's version row fails until the deploy (image shim 0.11.0)
+make test-docker                                # the 0.12.0 image's Docker tests (no key); they stamp its zip, which
+                                                #   deploy-policies and deploy require (preflight P12)
+make deploy-policies ONLY=ai-env-deploy-egress  # (deployer: one paste; the stack's passphrase: one Touch ID unless set)
+                                                #   the deploy policy the relay needs, alone; then wait about 15 s
+make deploy                                     # (the same) the relay's resources, the VM rules, the 0.12.0 image
+make infra-status WRITE=1                       # (ops: one Touch ID) the relay's ids and addresses into state/infra.toml;
+                                                #   relay_public_ip is the address every worker's relay setting names
+ai-env egress status                            # (ops: one Touch ID) relay-sg and relay-endpoint among the rows
+ai-env egress check                             # (two Touch IDs) before any remote chat: 36 cases, a pass of rule 2
+ai-env as deployer -- ai-env relay tls init     # (one paste) the relay CA, sealed here, and the relay's certificate
+make relay-logs SINCE=10m                       # (ops: one Touch ID) within two minutes, the reload's ok line
+ai-env relay keygen                             # no Touch ID; prints the allow commands with this Mac's keys
+ai-env as deployer -- ai-env relay allow mac --token-signer --key 'ed25519:…'   # (one paste) the relay takes this Mac's tokens
+ai-env as deployer -- ai-env relay grant default 'example-*/*'                  # (one paste) every op of the sources example-*
+ai-env relay agent                              # one Touch ID; leave it running, and name the grant in bridge.toml (above)
+ai-env as deployer -- ai-env relay allow example-worker --key 'ed25519:…' --sources 'example-*'   # (one paste) a server's worker
+ai-env relay ca                                 # the relay CA's certificate, for that worker's relay_ca file
+```
+
+**Writing a worker.** Start from `templates/worker/`: its README is the guide (a private repository,
+the release tag to pin, the key, the config, the systemd unit). A source implements `DataSource` from
+`crates/ai-env-source`: a descriptor naming its ops, each with a params JSON Schema, and `call`, which
+answers JSON, text or a stream; the crate's `testkit` brings `EchoSource` and the conformance checks.
+`crates/ai-env-worker` is the runtime (`Worker::builder()…run_until(…)`); it signs with a `FileSigner`
+(a 0600 key file of the worker's own user, on a server) or an `AgentSigner` (`signer = "agent"`, on
+this Mac, through `ai-env relay agent`). Workers for your own databases, APIs and logs live in private
+repositories that pin an ai-env release tag (`relay-v…`); ai-env names none of them.
+
+**The security model.** A worker proves a whitelisted Ed25519 key by challenge-response: it signs a
+domain-separated transcript of the relay's fresh nonce, the relay's id, its own id and its key; every
+failure gets one generic `unauthenticated`, and the relay rate-limits by IP. Both faces speak TLS 1.3
+only, under the relay CA, which workers and VM clients pin as their one trust anchor (beside the
+MicroVM endpoint's Amazon roots, ai-env's second sanctioned TLS setup). No source credential is on the
+relay or in a VM, and a VM holds only its chat's session token (one VM, one grant, at most 8 h), out
+of the agent's reach. A worker sends up only descriptors and redacted output, and the logs hold ids
+and hashes only.
+
+**Also in S13.**
+
+- extension 2.1.312's env names (A6): `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS` is forwarded
+  by default, the two start-up names are reviewed (stage S8's security; stage S11's drift rows);
+- seven audit events (`relay_keygen`, `relay_allow`, `relay_revoke`, `relay_grant`, `relay_start`,
+  `relay_stop`, `relay_agent`: ids, words, numbers and fingerprints only), and `session_remote_start`
+  gains `relay` (stage S11's audit);
+- the replacement guard refuses a plan that replaces the Elastic IP (every worker names it), and
+  `make destroy`'s checklist names the relay's instance, Elastic IP and parameters;
+- the library crates build on Rust 1.88, for the private repositories (`make check-msrv`).
+
 ### Identities: the deployer, ops and the runtime key
 
 The AWS side has three IAM users, all made by Pulumi and none with a key in Pulumi (see the S3 notes
@@ -2319,12 +2523,13 @@ bootstrap and break-glass (below):
   account before anything runs.
 - **Ops**, `ai-env-ops`, runs the daily operator commands: the egress and proxy commands but
   `egress allow`, `make infra-status`, `make gates`, the read-only image, connector and log targets,
-  `ai-env lab run cloudtrail-payload` and doctor's AWS rows. It may start and stop the proxy
-  instance, send it the three proxy documents, write the `suspended` list and read what those
-  commands read. It may not send any other document or reach any other instance, write `extras`,
-  `allow` or `squid.conf`, make any IAM write (its own key included), pass a role or deploy. Its key
-  is sealed in `credentials/ops.env` under the bridge keystore key, like the runtime key: one Touch ID
-  per command outside a runner, none under `ai-env as`.
+  `ai-env lab run cloudtrail-payload`, doctor's AWS rows and (S13) `ai-env relay status`, `start` and
+  `stop`. It may start and stop the proxy instance and (S13) the relay instance, send the proxy the
+  three proxy documents, write the `suspended` list and read what those commands read (of the relay's
+  parameters, never `tls`). It may not send any other document or reach any other instance, write
+  `extras`, `allow`, `squid.conf` or the relay's lists, make any IAM write (its own key included),
+  pass a role or deploy. Its key is sealed in `credentials/ops.env` under the bridge keystore key,
+  like the runtime key: one Touch ID per command outside a runner, none under `ai-env as`.
 - **The runtime principal**, `ai-env-runtime`, is unchanged: VMs and Cursor sessions, its key in
   `credentials/aws.env` (and `combined.env`), one Touch ID per credentialed `vm`, `box` or wrapper
   command. Since S9 it also signs the transcripts' S3 requests: objects under `v1/` of the transcripts
@@ -2404,11 +2609,11 @@ user.
   whatever key their shell holds, so put none of them after `ai-env as deployer --` or into the
   break-glass terminal (`make test-docker deploy` asks once anyway, after the build);
 - the ops tier asks for one Touch ID: `image-wait`, `image-status`, `image-versions`, `image-builds`,
-  `image-prune` without `YES=1`, `connector-status`, `connector-wait`, `logs`, `egress-logs` and
-  `acceptance`, and the one-command targets `infra-status`, `gates`, `check-base-image`,
-  `proxy-start`, `proxy-stop`, `proxy-patch` and `allowlist-reload`, whose one `ai-env` command
-  resolves its identity itself, as `ai-env egress …` and `ai-env proxy …` typed by hand do; none
-  asks again under `ai-env as ops --` or `ai-env as deployer --`;
+  `image-prune` without `YES=1`, `connector-status`, `connector-wait`, `logs`, `egress-logs`,
+  `relay-logs` (S13) and `acceptance`, and the one-command targets `infra-status`, `gates`,
+  `check-base-image`, `proxy-start`, `proxy-stop`, `proxy-patch` and `allowlist-reload`, whose one
+  `ai-env` command resolves its identity itself, as `ai-env egress …` and `ai-env proxy …` typed by
+  hand do; none asks again under `ai-env as ops --` or `ai-env as deployer --`;
 - `ai-env egress allow` needs the deployer (`ai-env as deployer -- ai-env egress allow SLUG HOST`),
   and `ai-env egress check` costs the ops key's Touch ID and then the runtime key's for its VM;
   `ai-env claude update` and `ai-env claude stage` cost the runtime key's Touch ID, and
@@ -2417,9 +2622,9 @@ user.
   shell's own credentials are the account root's; `ai-env as ops -- ai-env doctor` (one Touch ID)
   adds the rows that call AWS: the operator identity (checked with sts), the deployer's key count
   (one is the norm), whether the account root still has an access key (a deactivated one counts),
-  the proxy, the base image and the quota. The ops key row (from its file's notes: the user, the
-  last four characters and the day it was sealed) and the deployer row show either way, and
-  `ai-env creds status` shows the ops key and the deployer without a Touch ID;
+  the proxy, the relay (S13), the base image and the quota. The ops key row (from its file's notes:
+  the user, the last four characters and the day it was sealed) and the deployer row show either
+  way, and `ai-env creds status` shows the ops key and the deployer without a Touch ID;
 - `make -n TARGET` (and `-q`, `-t`) asks for nothing: it shows the unseal (when it would happen) and
   the runner it would call, then the recipe. Every tiered target refuses `make -i` (a refused
   identity would be ignored) and `make -p` (`-n` beside it or not: make prints every variable when it
@@ -2722,6 +2927,9 @@ the diffs annoy you.
 - The panel listens on 127.0.0.1 only, behind a fresh bearer per run that is never written anywhere;
   it checks `Host`, `Origin` and `Sec-Fetch-Site`, sets no cookie, and every action asks its own
   Touch ID (S11).
+- A relay session token reaches only its own VM, behind the credential gate, and there only the relay
+  client (uid 999), on fd 3; a relay private key stays in its sealed container on this Mac, the `tls`
+  SecureString or a worker's own 0600 key file. Workers and VM relay clients trust the relay CA alone (S13).
 
 ## Workspace
 
@@ -2729,11 +2937,18 @@ the diffs annoy you.
 |---|---|
 | `crates/ai-env-age` | pure-Rust age *header* parser + tag matcher (`#![forbid(unsafe_code)]`, no crypto beyond SHA-256/HKDF-Extract, fuzz-tested, KAT-frozen against real age output; MSRV 1.88) |
 | `crates/ai-env-cli` | one library (`ai_env_cli`) and two binaries: `ai-env` (the classic commands, the MicroVM-bridge operator commands behind the `bridge` feature, and the `shim` VM mode behind the `shim` feature) and `ai-env-claude` (the Cursor wrapper; `required-features = ["bridge"]`). Rust 1.94.1+ (the AWS SDK's MSRV); toolchain pinned to 1.98.1 |
+| `crates/ai-env-relay-proto` | S13: the relay's gRPC protocol (`relay.proto`) and its generated bindings, committed, so no protoc is needed to build (`make relay-proto` regenerates them); MSRV 1.88 |
+| `crates/ai-env-source` | S13: the `DataSource` trait and its types, generic, with no gRPC, HTTP or TLS crate; `testkit`: `EchoSource`, `ScriptedSource` and the conformance checks; MSRV 1.88 |
+| `crates/ai-env-worker` | S13: the worker runtime (feature `runtime`), and the shared formats ai-env-cli and the relay take without it (keys, session tokens, the relay's lists, the agent protocol, the signers, the certificates); MSRV 1.88 |
+| `crates/ai-env-relay` | S13: the relay's binary for its EC2 instance (`make relay-artifact`) |
+| `crates/ai-env-relay-client` | S13: the VM side, `ai-env-relay-client` and `ai-env-relay-mcp`, cross-built beside the shim by `make vm-build` |
 
 Features: `default = ["bridge", "shim"]`. The VM image is built with `--no-default-features
 --features shim`, which contains no AWS SDK, no TLS client and no crypto provider (`make
-check-features` asserts it). The bridge design and its stages live in `plans/v6-microvm-bridge.md`
-(gitignored working documents).
+check-features` asserts it); the image's two relay programs (S13) are a package of their own, on
+rustls and aws-lc-rs. `templates/worker/` (a worker's starting point) and `tools/relay-protogen` (the
+bindings' generator) are workspaces of their own. The bridge design and its stages live in
+`plans/v6-microvm-bridge.md` (gitignored working documents).
 
 ```sh
 make help                                         # every target, one line each
@@ -2741,7 +2956,8 @@ make build test                                   # all four feature sets
 make doc-test                                     # the README's and SKILL.md's sh doc-test blocks, dry, in a planted HOME (also in make test)
 make clippy lint                                  # -D warnings in every cfg world + TLS/WS grep guards
 make check-bins check-features check-msrv         # packaging invariants
-make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env
+make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env, and (S13) the
+                                                  #   relay client and MCP server → image/ai-env-relay-client, image/ai-env-relay-mcp
 make image-zip test-docker                        # the S3 image: stage + scan + zip, then the opt-in Docker tests
 make vm-run ARGS='shim --help'                    # run image/ai-env inside the AL2023 arm64 base image
 make gates                                        # G1–G8 pre-code gates → plans/gates.md (ops: one Touch ID, none under
@@ -2752,5 +2968,8 @@ AI_ENV_SE_TESTS=1 cargo test -- --ignored         # real enclave round-trips (th
 
 Cross-building needs cargo-lambda ≥ 1.9.2 (older releases embed a cargo-zigbuild that cannot link
 aarch64 on rustc 1.9x) and the `aarch64-unknown-linux-gnu` target on the pinned toolchain
-(`rustup target add aarch64-unknown-linux-gnu --toolchain 1.98.1`). `rustfmt` is advisory: the
-house style is wider than rustfmt's defaults, so `make fmt` reports but never gates.
+(`rustup target add aarch64-unknown-linux-gnu --toolchain 1.98.1`). `make clippy`, and so
+`make lint`, also needs a cross C compiler for the relay's and the relay client's aws-lc-sys (S13):
+`brew install aarch64-unknown-linux-gnu` (a formula of the `messense/macos-cross-toolchains` tap),
+which provides `aarch64-linux-gnu-gcc`. `rustfmt` is advisory: the house style is wider than
+rustfmt's defaults, so `make fmt` reports but never gates.

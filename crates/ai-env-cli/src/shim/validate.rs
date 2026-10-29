@@ -15,7 +15,10 @@
 //!   `<home>/.claude/settings.json` parse as JSON objects and are readable by
 //!   the agent's uid:gid (claude refuses to start on an unreadable or
 //!   unparseable managed-settings file), and the managed file carries every
-//!   value of `wire::managed::MANAGED_HARDENING` (D6).
+//!   value of `wire::managed::MANAGED_HARDENING` (D6). S13 (V-R38): when the
+//!   image holds the relay client and its MCP config, the config parses, is
+//!   exactly `wire::relay::MCP_CONFIG_JSON`'s document, is readable by the
+//!   agent, and (as root) is `0:0`, mode 0644.
 //! - V4 hygiene: nothing from the build leaked into the snapshot every clone
 //!   shares: no `/root/.claude*`, no legacy `<home>/.claude/.config.json`
 //!   (it would take priority), `/etc/machine-id` absent or empty, no
@@ -26,7 +29,11 @@
 //!   the claude cache `/opt/ai-env/claude` is a directory, empty, mode 0755
 //!   (and `0:0` when the shim is root), and its index
 //!   `/var/lib/ai-env/claude-index.json` is absent (`shim::claudebin`: the
-//!   image bakes no claude into the cache).
+//!   image bakes no claude into the cache). S13 (V-R39): `/run/ai-env` is
+//!   absent (the shim makes it at a relay spawn); with the relay client in
+//!   the image, it and the MCP server are regular files of mode 0755 (`0:0`
+//!   as root) and the MCP config is there; without it, neither of the other
+//!   two is. L1 and the native trees hold no relay program, and pass (LD-V7).
 //! - V5 facts: logged only (boot report).
 //! - V6 guard (S6, critic M2): the peer guard tested on this very VM, so a
 //!   guard that would refuse the platform or admit the agent never becomes
@@ -178,7 +185,10 @@ fn v3(state: &ShimState) -> Check {
             problems.push(e);
         }
     }
-    check("V3", problems, format!("{} settings files parse and are readable by {}:{}; the managed hardening is in place", files.len(), state.opts.uid, state.opts.gid))
+    let (relay, checked) = relay_config_problems(state);
+    problems.extend(relay);
+    let relay_ok = if checked { "; the relay MCP config is the shim's" } else { "" };
+    check("V3", problems, format!("{} settings files parse and are readable by {}:{}; the managed hardening is in place{relay_ok}", files.len(), state.opts.uid, state.opts.gid))
 }
 
 /// Every entry below `dir` (relative to `base`, `/`-joined), depth first,
@@ -279,7 +289,14 @@ fn v4(state: &ShimState) -> Check {
     }
     problems.extend(baked_subset_problems(&claude_dir));
     problems.extend(claude_cache_problems(state));
-    check("V4", problems, "no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache".into())
+    let (relay, present) = relay_program_problems(state);
+    problems.extend(relay);
+    let relay_ok = match (crate::shim::relay::SERVED, present) {
+        (false, _) => "",
+        (true, true) => ", the relay programs 0755 and no /run/ai-env",
+        (true, false) => ", no relay programs and no /run/ai-env",
+    };
+    check("V4", problems, format!("no build-time state, no identity keys, no project entries, only the baked subset, an empty claude cache{relay_ok}"))
 }
 
 /// S11 (V4): the claude cache as the image leaves it: `CACHE_DIR` a real
@@ -318,6 +335,82 @@ fn claude_cache_problems(state: &ShimState) -> Vec<String> {
         problems.push(format!("{INDEX_PATH} exists (a claude cache index baked into the image)"));
     }
     problems
+}
+
+/// S13 (V3, V-R38): the relay MCP config's problems, and whether it was checked (the client binary is in the image
+/// and the config beside it: a missing config is V4's). It parses, is exactly `wire::relay::mcp_config()`, is
+/// readable by the agent, and as root is `0:0`, mode 0644. Each problem names the path, never a value.
+fn relay_config_problems(state: &ShimState) -> (Vec<String>, bool) {
+    use crate::wire::relay::{mcp_config, CLIENT_BIN, MCP_CONFIG};
+    let config = state.at(Path::new(MCP_CONFIG));
+    if !crate::shim::relay::SERVED || std::fs::symlink_metadata(state.at(Path::new(CLIENT_BIN))).is_err() || std::fs::symlink_metadata(&config).is_err() {
+        return (Vec::new(), false);
+    }
+    let mut problems = Vec::new();
+    match std::fs::read_to_string(&config).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string())) {
+        Ok(doc) if doc == mcp_config() => {}
+        Ok(_) => problems.push(format!("{MCP_CONFIG} is not the shim's relay MCP config")),
+        Err(e) => problems.push(format!("{MCP_CONFIG}: {e}")),
+    }
+    let root = state.opts.fs_root.clone().unwrap_or_else(|| PathBuf::from("/"));
+    if let Err(e) = readable_by(&root, &config, state.opts.uid, state.opts.gid) {
+        problems.push(e);
+    }
+    if nix::unistd::geteuid().is_root() {
+        if let Ok(md) = std::fs::symlink_metadata(&config) {
+            let mode = md.mode() & 0o7777;
+            if mode != 0o644 {
+                problems.push(format!("{MCP_CONFIG} is mode {mode:04o}, not 0644"));
+            }
+            if (md.uid(), md.gid()) != (0, 0) {
+                problems.push(format!("{MCP_CONFIG} is owned by {}:{}, not 0:0", md.uid(), md.gid()));
+            }
+        }
+    }
+    (problems, true)
+}
+
+/// S13 (V4, V-R39): `/run/ai-env` absent; the relay programs' kinds and modes; whether they are in the image (the
+/// client is). With the client, it and the MCP server are regular files of mode 0755 (`0:0` as root) and the MCP
+/// config is there; without it, neither of the other two is. A problem names a path and a mode, never a value.
+fn relay_program_problems(state: &ShimState) -> (Vec<String>, bool) {
+    use crate::wire::relay::{CLIENT_BIN, MCP_BIN, MCP_CONFIG, RUN_DIR};
+    if !crate::shim::relay::SERVED {
+        return (Vec::new(), false);
+    }
+    let mut problems = Vec::new();
+    if std::fs::symlink_metadata(state.at(Path::new(RUN_DIR))).is_ok() {
+        problems.push(format!("{RUN_DIR} exists (a relay session baked into the image)"));
+    }
+    let present = |p: &str| std::fs::symlink_metadata(state.at(Path::new(p))).ok();
+    let with_client = present(CLIENT_BIN).is_some();
+    if with_client {
+        for program in [CLIENT_BIN, MCP_BIN] {
+            match present(program) {
+                None => problems.push(format!("{program} is missing")),
+                Some(md) if !md.is_file() => problems.push(format!("{program} is not a regular file")),
+                Some(md) => {
+                    let mode = md.mode() & 0o7777;
+                    if mode != 0o755 {
+                        problems.push(format!("{program} is mode {mode:04o}, not 0755"));
+                    }
+                    if nix::unistd::geteuid().is_root() && (md.uid(), md.gid()) != (0, 0) {
+                        problems.push(format!("{program} is owned by {}:{}, not 0:0", md.uid(), md.gid()));
+                    }
+                }
+            }
+        }
+        if present(MCP_CONFIG).is_none() {
+            problems.push(format!("{MCP_CONFIG} is missing"));
+        }
+    } else {
+        for stray in [MCP_BIN, MCP_CONFIG] {
+            if present(stray).is_some() {
+                problems.push(format!("{stray} is in the image without its relay client"));
+            }
+        }
+    }
+    (problems, with_client)
 }
 
 /// The agent's self-test client (the image installs curl; V6 fails without it).

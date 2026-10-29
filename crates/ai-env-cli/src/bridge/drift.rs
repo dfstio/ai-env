@@ -23,9 +23,15 @@ pub const ENV_PREFIXES: [&str; 8] = ["CLAUDE_", "ANTHROPIC_", "MCP_", "DISABLE_"
 /// and `CLAUDE_CODE_SDK_READS_SESSION_STATE`, are forwarded by default now
 /// (`WrapperCfg::default().env_forward`) and left the list: an explicit
 /// `[wrapper] env_forward` that lacks them gets the `[!! ]` row for them.
+/// S13 (A6): extension 2.1.312 starts chats with three new names.
+/// `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS` is forwarded by default; the two start-up names are reviewed
+/// here, because the pump counts any stdout line as the CLI's start (`gen_output`).
 pub const ENV_REVIEWED: &[(&str, &str)] = &[
     ("CLAUDE_CODE_CONFIG_PROBE", "marks the extension's config probe; remote probes have run without it since S8"),
     ("CLAUDE_CODE_EMIT_STARTUP_TIMING", "start-up timing for the extension's own log; nothing remote reads it"),
+    // S13 (A6): extension 2.1.312's two start-up names.
+    ("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "start-up marks, keep_alive lines before the initialize answer that feed only the SDK's init-timeout note; on a VM they make a claude that dies at its start look started, which costs S11's start-up respawn"),
+    ("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "a result line on a known start-up failure, beside its stderr; on a VM it makes a failed start look started, which costs S11's start-up respawn; remote failures end on stderr, as since S8"),
 ];
 /// The most names or flags one row lists before ` (+<k> more)`.
 pub const DRIFT_LIST_MAX: usize = 12;
@@ -319,7 +325,7 @@ mod tests {
     }
 
     /// The default `[wrapper]`'s forwarded names, so a row carrying them has no gone row (S12: the extension's two
-    /// as well, R2-1).
+    /// as well, R2-1; S13: 2.1.312's hook name, A6).
     fn forwarded() -> Vec<&'static str> {
         vec![
             "CLAUDE_CODE_ENTRYPOINT",
@@ -329,6 +335,7 @@ mod tests {
             "CLAUDE_CODE_ENABLE_TASKS",
             "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
             "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+            "CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS",
         ]
     }
 
@@ -615,19 +622,25 @@ mod tests {
         assert_eq!(texts(&env_and_flag_rows(&rows, &[window(EXT)], &w)), Vec::<String>::new());
     }
 
-    /// S12 (R2): `ENV_REVIEWED` keeps the two names no session forwards, and none of the default `env_forward`'s:
-    /// a reviewed name that is also forwarded by default would hide a list that left it out (R2-2).
+    /// S12 (R2), S13 (A6): `ENV_REVIEWED` keeps the four names no session forwards, in order (S8's two, then
+    /// extension 2.1.312's two start-up names), none of the default `env_forward`'s, each with its why: a reviewed
+    /// name that is also forwarded by default would hide a list that left it out (R2-2).
     #[test]
     fn no_reviewed_name_is_a_default_forwarded_one() {
-        assert_eq!(ENV_REVIEWED.iter().map(|(n, _)| *n).collect::<Vec<_>>(), ["CLAUDE_CODE_CONFIG_PROBE", "CLAUDE_CODE_EMIT_STARTUP_TIMING"]);
+        assert_eq!(
+            ENV_REVIEWED.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            ["CLAUDE_CODE_CONFIG_PROBE", "CLAUDE_CODE_EMIT_STARTUP_TIMING", "CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "CLAUDE_CODE_STARTUP_FAILURE_RESULTS"]
+        );
         let forward = WrapperCfg::default().env_forward;
-        for (name, _) in ENV_REVIEWED {
+        for (name, why) in ENV_REVIEWED {
             assert!(!forward.iter().any(|n| n == name), "{name} is reviewed and forwarded by default");
+            assert!(!why.is_empty(), "{name} has its why");
         }
     }
 
-    /// S12 (R2-6): a window on an extension older than the two names (2.1.300: its chats carry the five relevant
-    /// names forwarded before S12) gets the existing gone row for the two, exactly, and nothing else.
+    /// S12 (R2-6), S13 (A6): a window on an extension older than the S12 names (2.1.300: its chats carry the five
+    /// relevant names forwarded before S12) gets the existing gone row for the three it lacks, 2.1.312's hook name
+    /// among them, exactly, and nothing else.
     #[test]
     fn an_older_window_lacking_the_s12_names_gets_the_gone_note() {
         let w = WrapperCfg::default();
@@ -635,7 +648,56 @@ mod tests {
         let rows = vec![row("session", "2.1.300", &["--verbose"], &pre_s12)];
         assert_eq!(
             texts(&env_and_flag_rows(&rows, &[window("2.1.300")], &w)),
-            vec!["[-  ] extension 2.1.300 starts chats without CLAUDE_CODE_QUESTION_PREVIEW_FORMAT, CLAUDE_CODE_SDK_READS_SESSION_STATE, which [wrapper].env_forward forwards".to_string()]
+            vec!["[-  ] extension 2.1.300 starts chats without CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS, CLAUDE_CODE_QUESTION_PREVIEW_FORMAT, CLAUDE_CODE_SDK_READS_SESSION_STATE, which [wrapper].env_forward forwards".to_string()]
+        );
+    }
+
+    /// S13 (A6-1, A6-8): a 2.1.312 window whose chats carry the default forwarded names, the hook name among them,
+    /// the two start-up names and S8's two reviewed names has no env row: none unreviewed, none refused. Without
+    /// `ENV_REVIEWED` exactly its four names are unreviewed, sorted. (`EXT` stays 2.1.310.)
+    #[test]
+    fn extension_2_1_312s_names_are_forwarded_or_reviewed() {
+        let w = WrapperCfg::default();
+        let env: Vec<&str> = forwarded().into_iter().chain(["CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "CLAUDE_CODE_EMIT_STARTUP_TIMING", "CLAUDE_CODE_CONFIG_PROBE"]).collect();
+        let rows = vec![row("session", "2.1.312", &["--verbose"], &env)];
+        assert!(unreviewed_env_names(&rows, "2.1.312", &w).is_empty(), "{:?}", unreviewed_env_names(&rows, "2.1.312", &w));
+        assert!(refused_env_names(&rows, "2.1.312").is_empty());
+        assert!(env_and_flag_rows(&rows, &[window("2.1.312")], &w).is_empty(), "{:?}", texts(&env_and_flag_rows(&rows, &[window("2.1.312")], &w)));
+        assert_eq!(
+            unreviewed_of(&rows, "2.1.312", &w, &[]),
+            s(&["CLAUDE_CODE_CONFIG_PROBE", "CLAUDE_CODE_EMIT_STARTUP_TIMING", "CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "CLAUDE_CODE_STARTUP_FAILURE_RESULTS"])
+        );
+        assert_eq!(EXT, "2.1.310");
+    }
+
+    /// S13 (A6-6, A6-8): a 2.1.310 window, whose bundle never sets the hook name, gets exactly the gone note for
+    /// it. An explicit `env_forward` of the S12 nine (no hook name) with a 2.1.312 row carrying it gets exactly one
+    /// row: the hook name neither forwarded nor reviewed.
+    #[test]
+    fn a_2_1_310_window_gets_the_hook_names_gone_note() {
+        let w = WrapperCfg::default();
+        let without: Vec<&str> = forwarded().into_iter().filter(|n| *n != "CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS").collect();
+        let rows = vec![row("session", "2.1.310", &["--verbose"], &without)];
+        assert_eq!(
+            texts(&env_and_flag_rows(&rows, &[window("2.1.310")], &w)),
+            vec!["[-  ] extension 2.1.310 starts chats without CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS, which [wrapper].env_forward forwards".to_string()]
+        );
+        let s12_nine = s(&[
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_AGENT_SDK_VERSION",
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+            "MCP_CONNECTION_NONBLOCKING",
+            "CLAUDE_CODE_ENABLE_TASKS",
+            "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
+            "CLAUDE_CODE_SDK_READS_SESSION_STATE",
+            "LANG",
+            "TERM",
+        ]);
+        let explicit = WrapperCfg { env_forward: s12_nine, ..WrapperCfg::default() };
+        let rows = vec![row("session", "2.1.312", &["--verbose"], &forwarded())];
+        assert_eq!(
+            texts(&env_and_flag_rows(&rows, &[window("2.1.312")], &explicit)),
+            vec!["[!! ] extension 2.1.312 starts chats with env names neither forwarded nor reviewed: CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS  <- [wrapper].env_extra, or ENV_REVIEWED".to_string()]
         );
     }
 }

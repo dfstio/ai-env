@@ -638,6 +638,63 @@ fn status_records_the_operator_identities_and_refuses_foreign_ones() {
     assert_eq!(tree(&bridge(t)), before, "nothing changed");
 }
 
+/// S13 (I-T44): the relay's ten outputs land in `state/infra.toml` as
+/// snake_case keys; a relay address the VMs' rules do not name is refused
+/// like a foreign connector (exit 7, before any aws call, nothing written).
+#[test]
+fn status_records_the_relay_and_refuses_a_foreign_relay_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let mut v = outputs("eu-central-1");
+    let relay = [
+        ("relayInstanceId", serde_json::json!("i-0123456789abcdef1")),
+        ("relayPrivateIp", serde_json::json!("10.42.0.20")),
+        ("relayPublicIp", serde_json::json!("203.0.113.20")),
+        ("relaySecurityGroupId", serde_json::json!("sg-0ccc9999dddd0000e")),
+        ("relayRoleArn", serde_json::json!("arn:aws:iam::123456789012:role/ai-env-relay")),
+        ("relayLogGroup", serde_json::json!("/ai-env/relay")),
+        ("relayParameterPrefix", serde_json::json!("/ai-env/relay")),
+        ("relayPort", serde_json::json!(7443)),
+        ("relayArtifactSha256", serde_json::json!("0".repeat(64))),
+        ("relayVersion", serde_json::json!("0.12.0")),
+    ];
+    for (k, value) in &relay {
+        v[*k] = value.clone();
+    }
+    let json = write_json(t, "outputs.json", &v);
+    let o = run(&mut infra_status(t, &["--json-in", json.to_str().unwrap(), "--write"]));
+    assert!(o.status.success(), "{}{}", stdout(&o), stderr(&o));
+    let text = std::fs::read_to_string(bridge(t).join("state/infra.toml")).unwrap();
+    for (k, want) in [
+        ("relay_instance_id", "i-0123456789abcdef1"),
+        ("relay_private_ip", "10.42.0.20"),
+        ("relay_public_ip", "203.0.113.20"),
+        ("relay_security_group_id", "sg-0ccc9999dddd0000e"),
+        ("relay_role_arn", "arn:aws:iam::123456789012:role/ai-env-relay"),
+        ("relay_log_group", "/ai-env/relay"),
+        ("relay_parameter_prefix", "/ai-env/relay"),
+        ("relay_port", "7443"),
+        ("relay_artifact_sha256", &"0".repeat(64)),
+        ("relay_version", "0.12.0"),
+    ] {
+        assert!(text.contains(&format!("\n{k} = \"{want}\"\n")), "{k}: {text}");
+    }
+    let s = read_infra_state(&Paths::from_root_and_env(bridge(t), None)).unwrap().unwrap();
+    assert_eq!((s.relay_instance_id.as_deref(), s.relay_public_ip.as_deref()), (Some("i-0123456789abcdef1"), Some("203.0.113.20")));
+    // A relay address the VMs' rules do not name: refused before any aws call, the tree as it was.
+    let before = tree(&bridge(t));
+    let log = t.join("aws.log");
+    let mut bad = v.clone();
+    bad["relayPrivateIp"] = serde_json::json!("10.42.0.21");
+    let json = write_json(t, "bad-relay.json", &bad);
+    let o = run(infra_status(t, &["--json-in", json.to_str().unwrap(), "--write"]).env("FAKE_AWS_LOG", &log));
+    assert_eq!(o.status.code(), Some(7), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(stderr(&o), "ai-env: stack output relayPrivateIp \"10.42.0.21\" is not 10.42.0.20, the relay address the VMs' rules name (infra/egress-config.json): update ai-env; nothing written\n");
+    assert_eq!(stdout(&o), "", "nothing shown either");
+    assert!(!log.exists(), "no aws call");
+    assert_eq!(tree(&bridge(t)), before, "nothing changed");
+}
+
 /// S8 operators: without an operator identity (no `ai-env as …`, no sealed
 /// `credentials/ops.env`) the live reads are skipped, never made on the
 /// shell's own credentials: a note says how to give one, the state records

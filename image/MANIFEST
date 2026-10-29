@@ -13,3 +13,6 @@ dir     claude/agents           0755
 dir     claude/skills           0755
 dir     claude/commands         0755
 file    ai-env                  0755
+file    ai-env-relay-client     0755
+file    ai-env-relay-mcp        0755
+file    relay-mcp.json          0644

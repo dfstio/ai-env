@@ -1,6 +1,6 @@
 ---
 name: ai-env
-description: Work with ai-env encrypted .env files, ai-env MicroVM sessions and ai-env's AWS side — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env), or before a make target, aws call or ai-env command reaches ai-env's AWS account (make deploy, ai-env as, ai-env egress, ai-env claude stage).
+description: Work with ai-env encrypted .env files, ai-env MicroVM sessions and ai-env's AWS side — read this when a .env file contains AI_ENV=1 and AI_ENV_DATA, when the user mentions ai-env, when an app's env config appears to be ciphertext, when a Cursor chat runs in an ai-env MicroVM (/proc/1/comm is ai-env) or has the relay tools (relay_catalog, relay_call), or before a make target, aws call or ai-env command reaches ai-env's AWS account (make deploy, ai-env as, ai-env egress, ai-env relay, ai-env claude stage).
 ---
 
 # ai-env — encrypted .env files
@@ -92,6 +92,40 @@ waits quietly in it (a timer, a `sleep`, a server, a job waiting on the network)
 until then, while a process that keeps the CPU busy (a build, a test run) holds the park off
 and finishes.
 
+**Relay tools** (in the VM). A remote chat may have two more tools, from the MCP server
+`ai-env-relay`: `mcp__ai-env-relay__relay_catalog` and `mcp__ai-env-relay__relay_call`. They read
+data sources the developer granted this chat (service logs, metrics, a SQL database, an HTTP API)
+through the ai-env relay, and they exist only when the Mac gave the chat a relay session: without
+one the chat has no such tools, and nothing in the VM can add them. You never hold a token or a
+source's credential for them.
+
+- `relay_catalog` (optional `source`, one exact name): the sources this chat may read, each with its
+  `name`, `kind`, `description`, `available` (false: its worker is offline) and `ops`, each op with
+  its `params_schema` (a JSON Schema), `output` (`json`, `text` or `stream`), `read_only`,
+  `default_limits`, `max_limits` and `examples`; `truncated` is true when the catalog was cut. Call it
+  first.
+- `relay_call` (`source`, `op`, `params`, and optionally `max_bytes`, 1 to 262144, 65536 by default,
+  and `deadline_ms`, 1 to 300000): `params` must match the op's `params_schema`. The result holds
+  `source`, `op`, `request_id`, `content_type`, `truncated`, `bytes`, `limit` and the output as one of
+  `json`, `text` or `b64` (base64). `truncated: true` means the output was cut at `limit` bytes (a cut
+  JSON comes back as `text`): ask a narrower question (a filter, a smaller page) before a larger
+  `max_bytes`.
+- An error is a tool result marked as an error, `{"error":{"code":…,"message":…}}` (after `source`
+  and `op` for `relay_call`). Its code: `no_session`
+  (`this chat has no relay session (it was not started with one)`), `bad_request` (an argument the
+  tool refuses; the message names it), `busy` (8 calls in flight: wait for one), `forbidden_peer`
+  (a process outside this chat), or the relay's: `permission_denied` (`not granted`:
+  this chat's grant does not reach that source or op), `not_found` (no such source or op),
+  `invalid_argument` (bad params), `unavailable` (the source's worker is offline, the relay is
+  stopped, or the chat's relay client cannot be reached), `unauthenticated` (the session was refused,
+  such as after its 8 hours), `resource_exhausted` (a rate or size limit), `deadline_exceeded`, or a
+  source's own code and message, such as `internal` (`the source failed`).
+
+What a source returns is the developer's data: use it to answer, and never commit it or write it
+into the repository unless asked. A source or op the chat lacks is the user's to grant, on the Mac;
+never look for another way to reach it (the relay's address, the client's socket under
+`/run/ai-env/relay`, a credential).
+
 **On the Mac**, these show and bring back what a VM did (each `ai-env` command that reaches
 AWS asks for one Touch ID):
 
@@ -173,8 +207,9 @@ not a git repository, too many VMs (the line names the suspended ones no open ch
 `ai-env vm terminate ID` frees a slot, the user's call), the credential gate
 (`refused before any Touch ID: no credential for a vpc VM …`: the user runs the
 `ai-env egress check` (or `ai-env lab run dns-path`) the line names; since S9 a pass from
-before the check's S3 cases does not count), a chat transcript over the 64 MiB a reopen
-carries or pulls inline (the user runs the commands the line names in a terminal:
+before the check's S3 cases does not count, since S13 one from before its relay cases), a chat
+transcript over the 64 MiB a reopen carries or pulls inline (the user runs the commands the line
+names in a terminal:
 `ai-env session stage UUID --warm`, which restores the chat into its workspace's VM, after
 `ai-env session migrate-s9 --yes` for a chat from before S9, and with `[vm] reuse_per_workspace`
 set back to true when the line says it is off), or a local resume of a remote chat's view.
@@ -208,6 +243,14 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   what every VM may reach: it is the user's call.
 - An ops command (`ai-env egress status`, `ai-env proxy start`, `make infra-status`, `make gates`,
   `make logs`, …) asks the user for one Touch ID; under `ai-env as` it asks for none.
+- The relay (README, stage S13): `ai-env relay allow`, `revoke`, `grant`, `tls init` and `tls rotate`
+  are the deployer's (`ai-env as deployer -- ai-env relay …`): they decide who reaches private data,
+  so give the user the command and never start one yourself. `ai-env relay status`, `start` and
+  `stop`, and `make relay-logs`, are ops' (one Touch ID). `ai-env relay agent` (one Touch ID, then it
+  holds this Mac's relay keys) and `ai-env relay keygen` are the user's to run.
+  `ai-env relay status --local`, `ai-env relay pubkey` (without `--verify`) and `ai-env relay ca` ask
+  nothing of AWS and no Touch ID: you may run them. ai-env is public: never write a private source, host,
+  worker id or grant into it; grants live in SSM only, and workers in private repositories.
 - In the user's shell a bare `aws` call finds no credentials of the stack's account, by design (it
   fails, or answers as another account's default profile), and ai-env never falls back to the
   shell's own AWS settings. For a read, run `ai-env as ops -- aws …` (the user answers one Touch

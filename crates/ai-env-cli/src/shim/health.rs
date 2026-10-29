@@ -28,7 +28,7 @@ use crate::shim::spawn::{SpawnManager, SpawnOpts};
 use crate::shim::state::RunState;
 use crate::shim::sys::{ClockMode, RealSys, SysOps};
 use crate::wire::frame::{Health, HealthDetail, HealthStatus, HookPeerSeen, CAP_CREDENTIAL_CACHE, CAP_GIT_HTTP_V1, CAP_PARK_V1, CAP_TRANSCRIPT_S3_V1, CAP_WORKSPACE_V1, STDOUT_WINDOW_BYTES, WIRE_VERSION};
-use crate::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_VIEW_PARENT_V1};
+use crate::wire::frame::{CAP_CLAUDE_STAGE_V1, CAP_CODEOUT_MANIFEST_V1, CAP_RELAY_V1, CAP_TRANSCRIPT_GZIP_V1, CAP_VIEW_PARENT_V1};
 use crate::wire::workspace::{budget, refusal, vm_path_check, PathQuery, SettingsCapture, TranscriptStat, WsRefusal, SETTINGS_ROUTE, TRANSCRIPT_ROUTE};
 use crate::wire::workspace::{TRANSCRIPT_PULL_ROUTE, TRANSCRIPT_PUSH_ROUTE, TRANSCRIPT_TAIL_ROUTE, TRANSCRIPT_VIEW_ROUTE};
 use crate::wire::workspace::{CLAUDE_RELAY_ROUTE, CLAUDE_STAGE_ROUTE};
@@ -157,6 +157,10 @@ pub struct ShimOpts {
     /// `ai-env-net`; the shim's own uid otherwise, the native tests).
     pub net_uid: u32,
     pub net_gid: u32,
+    /// S13: the relay client (`--relay-client`, default `wire::relay::CLIENT_BIN`) and the MCP config claude gets
+    /// (`--relay-mcp-config`, default `wire::relay::MCP_CONFIG`); host paths, never under `--fs-root`, as `curl`.
+    pub relay_client: PathBuf,
+    pub relay_mcp_config: PathBuf,
     /// The cold-start warm (S10, hidden `--cold-warm`): `read` reads the claude binary once in the background after the first accepted /run
     /// (`ShimState::cold_warm`); `run` is not built and says so. B0 chose no warm: the image passes no flag.
     pub cold_warm: ColdWarm,
@@ -188,6 +192,8 @@ impl Default for ShimOpts {
             curl: PathBuf::from(CURL_DEFAULT),
             net_uid: NET_UID,
             net_gid: NET_GID,
+            relay_client: PathBuf::from(crate::wire::relay::CLIENT_BIN),
+            relay_mcp_config: PathBuf::from(crate::wire::relay::MCP_CONFIG),
             cold_warm: ColdWarm::Off,
         }
     }
@@ -266,6 +272,7 @@ impl ShimState {
             window_bytes: opts.window_bytes,
             sweep: cfg!(target_os = "linux") && probe.uid.is_some(),
             fs_root: opts.fs_root.clone(),
+            relay: crate::shim::relay::opts_for(&opts),
         });
         // S10 (W3 #2): the last seed's record survives a shim restart.
         let workspace = WorkspaceSlot::persisted(asagent::RecordStore::for_shim(&opts));
@@ -350,9 +357,11 @@ impl ShimState {
     /// since A1): with a helper,
     /// `codeout_manifest_v1` (`code::MANIFEST_SERVED`), `view_parent_v1` and
     /// `transcript_gzip_v1` (`s3xfer::SERVED` and `s3xfer::VIEW_PARENT_SERVED`,
-    /// `s3xfer::GZIP_SERVED`); last, with or without a helper,
+    /// `s3xfer::GZIP_SERVED`); then, with or without a helper,
     /// `claude_stage_v1` (`claudebin::SERVED` and a cache with a store). An
-    /// S10 shim's list is a prefix of an S11 one's.
+    /// S10 shim's list is a prefix of an S11 one's. Last, with or without a
+    /// helper, `relay_v1` (`relay::SERVED` and its two files at start, S13).
+    /// An S12 shim's list is a prefix of an S13 one's.
     #[must_use]
     pub fn caps(&self) -> Vec<String> {
         let mut caps = vec![CAP_CREDENTIAL_CACHE.to_string()];
@@ -382,6 +391,9 @@ impl ShimState {
         if self.serves_claude() {
             caps.push(CAP_CLAUDE_STAGE_V1.to_string());
         }
+        if self.serves_relay() {
+            caps.push(CAP_RELAY_V1.to_string());
+        }
         caps
     }
 
@@ -391,6 +403,12 @@ impl ShimState {
     #[must_use]
     fn serves_claude(&self) -> bool {
         crate::shim::claudebin::SERVED && self.claude_cache.enabled()
+    }
+
+    /// S13: whether this shim runs relay sessions (`SpawnOpts.relay` is set): it names `relay_v1` exactly then.
+    #[must_use]
+    pub fn serves_relay(&self) -> bool {
+        self.spawns.opts().relay.is_some()
     }
 
     /// S11 (LD-24): `what` used this VM (`spawn`: a spawn frame, before it
@@ -903,6 +921,43 @@ mod tests {
             if [code::MANIFEST_SERVED, s3xfer::VIEW_PARENT_SERVED, s3xfer::GZIP_SERVED, claudebin::SERVED].iter().all(|served| !served) {
                 assert_eq!(caps, [s9.clone(), park.clone()].concat(), "phase 0: S10's list");
             }
+        }
+    }
+
+    /// S13 (V-R6): with `--fs-root` and both relay files planted as regular files, `caps()` is the S11 list then
+    /// `relay_v1`; with either missing, or a directory in its place, the S11 list alone; without `--fs-root` (and not
+    /// root) the S11 list alone; `serves_relay()` agrees each time.
+    #[test]
+    fn relay_v1_is_named_last_with_its_programs_present() {
+        let root = tempfile::tempdir().unwrap();
+        let (client, config) = (root.path().join("ai-env-relay-client"), root.path().join("relay-mcp.json"));
+        std::fs::write(&client, "#!/bin/sh\n").unwrap();
+        std::fs::write(&config, crate::wire::relay::MCP_CONFIG_JSON).unwrap();
+        let state = |fs_root: Option<&Path>, client: &Path, config: &Path| {
+            let opts = ShimOpts { fs_root: fs_root.map(Path::to_path_buf), relay_client: client.to_path_buf(), relay_mcp_config: config.to_path_buf(), ..ShimOpts::default() };
+            ShimState::with(PathBuf::from("c"), opts, ProbeSpec::default(), Arc::new(RealSys))
+        };
+        let s11 = |s: &ShimState| {
+            let mut caps = s.caps();
+            caps.retain(|c| c != CAP_RELAY_V1);
+            caps
+        };
+        let both = state(Some(root.path()), &client, &config);
+        let caps = both.caps();
+        assert_eq!(caps.last().map(String::as_str), Some(CAP_RELAY_V1), "{caps:?}");
+        assert_eq!(caps[..caps.len() - 1], s11(&both)[..], "the S11 list first");
+        assert!(both.serves_relay());
+        let missing = root.path().join("missing");
+        let dir = root.path().join("a-dir");
+        std::fs::create_dir(&dir).unwrap();
+        for (c, f) in [(&missing, &config), (&client, &missing), (&dir, &config), (&client, &dir)] {
+            let s = state(Some(root.path()), c, f);
+            assert!(!s.caps().iter().any(|c| c == CAP_RELAY_V1) && !s.serves_relay(), "{c:?} {f:?}");
+            assert_eq!(s.caps(), s11(&both), "the S11 list alone");
+        }
+        if !nix::unistd::geteuid().is_root() {
+            let native = state(None, &client, &config);
+            assert!(!native.serves_relay() && !native.caps().iter().any(|c| c == CAP_RELAY_V1), "not root and no fs root");
         }
     }
 

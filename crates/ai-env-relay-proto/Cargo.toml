@@ -1,0 +1,16 @@
+[package]
+name = "ai-env-relay-proto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/dfstio/ai-env"
+description = "The ai-env relay protocol: generated gRPC bindings (committed, so no protoc is needed) and the descriptor set."
+publish = false
+
+# Caret requirements on purpose: private repos depend on this crate by git tag, and an
+# exact pin here would become a hard constraint in their lockfiles.
+[dependencies]
+prost = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+tonic-prost = "0.14"

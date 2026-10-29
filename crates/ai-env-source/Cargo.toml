@@ -1,0 +1,31 @@
+[package]
+name = "ai-env-source"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/dfstio/ai-env"
+description = "The DataSource trait and its types for ai-env relay workers: generic, with no gRPC, HTTP or TLS crate in its API."
+publish = false
+
+# Caret requirements on purpose (plans/s13-plan.md:78): private repos depend on this crate by git tag.
+[features]
+# ScriptedSource, EchoSource and the conformance checks, for ai-env's tests and private repos' tests.
+testkit = ["tokio/rt"]
+
+[dependencies]
+base64 = "0.22"
+futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "time"] }
+tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+# The crate's own tests see the testkit under a plain `cargo test --workspace` (LD-P14).
+ai-env-source = { path = ".", features = ["testkit"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["io-util", "macros", "rt", "test-util", "time"] }
+# P-T5 to P-T7 only (tests/frozen.rs): the lead's proto crate and its descriptor types. Never a normal dependency (G-1).
+ai-env-relay-proto = { path = "../ai-env-relay-proto" }
+prost-types = "0.14"

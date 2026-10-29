@@ -40,7 +40,7 @@ use crate::bridge::audit::{self, AuditRow};
 use crate::bridge::awscli::{arn_account, aws_json, operator_capture};
 use crate::bridge::config::{is_connector_arn, is_rfc1918, AwsCfg, BridgeConfig, Paths, REGION};
 use crate::bridge::doctor::run_capture_cmd;
-use crate::bridge::egress::{PATCH_DOCUMENT, RELOAD_DOCUMENT, STATUS_DOCUMENT};
+use crate::bridge::egress::{PATCH_DOCUMENT, RELAY_IP, RELAY_LOG_GROUP, RELAY_PARAMETER_PREFIX, RELAY_PORT, RELOAD_DOCUMENT, STATUS_DOCUMENT};
 use crate::bridge::identity::{self, DEPLOYER_USER, OPS_USER};
 use crate::bridge::errors::BridgeError;
 use crate::bridge::logging::open_log_file;
@@ -198,6 +198,28 @@ pub struct StackOutputs {
     pub transcripts_bucket_policy_sha256: Option<String>,
     #[serde(default, deserialize_with = "scalar")]
     pub proxy_route_table_id: Option<String>,
+    // S13 (infra/index.ts, plans/s13-contracts.md §I-infra.3.5): the relay, names, ids, addresses and its binary's
+    // hash only; `relayPort` is a number, recorded as text.
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_instance_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_private_ip: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_public_ip: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_security_group_id: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_role_arn: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_log_group: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_parameter_prefix: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_port: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_artifact_sha256: Option<String>,
+    #[serde(default, deserialize_with = "scalar")]
+    pub relay_version: Option<String>,
 }
 
 /// What to do when the outputs lack the two keys every successful deploy
@@ -283,6 +305,54 @@ pub fn check_identities(o: &StackOutputs) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// S13: the relay's outputs, applied with [`check_egress`] before anything is read live or written (I-R70): its
+/// private address, port, parameter prefix and log group must be the ones this ai-env names (the VMs' rules, `ai-env
+/// relay`), its instance and security group ids of their kinds, its public address a public IPv4 address (workers dial
+/// it), its role the stack's account's `ai-env-relay` and its binary's hash a SHA-256. Absent outputs pass (a stack
+/// before S13).
+pub fn check_relay(o: &StackOutputs) -> std::result::Result<(), String> {
+    let refuse = |key: &str, v: &str, why: &str| Err(format!("stack output {key} {v:?} is not {why}; nothing written"));
+    let port = RELAY_PORT.to_string();
+    let fixed = [
+        ("relayPrivateIp", &o.relay_private_ip, RELAY_IP, format!("{RELAY_IP}, the relay address the VMs' rules name (infra/egress-config.json): update ai-env")),
+        ("relayPort", &o.relay_port, port.as_str(), format!("{RELAY_PORT}, the port the VMs' rules name: update ai-env")),
+        ("relayParameterPrefix", &o.relay_parameter_prefix, RELAY_PARAMETER_PREFIX, format!("{RELAY_PARAMETER_PREFIX}, the prefix ai-env relay writes: update ai-env")),
+        ("relayLogGroup", &o.relay_log_group, RELAY_LOG_GROUP, format!("{RELAY_LOG_GROUP}: update ai-env")),
+    ];
+    for (key, v, want, why) in fixed {
+        if let Some(v) = v.as_deref().filter(|v| *v != want) {
+            return refuse(key, v, &why);
+        }
+    }
+    if let Some(v) = o.relay_instance_id.as_deref().filter(|v| !crate::bridge::doctor::is_instance_id(v)) {
+        return refuse("relayInstanceId", v, "an EC2 instance id");
+    }
+    let is_sg = |v: &str| v.strip_prefix("sg-").is_some_and(|h| matches!(h.len(), 8 | 17) && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    if let Some(v) = o.relay_security_group_id.as_deref().filter(|v| !is_sg(v)) {
+        return refuse("relaySecurityGroupId", v, "a security group id");
+    }
+    if let Some(v) = o.relay_public_ip.as_deref().filter(|v| !is_public_ipv4(v)) {
+        return refuse("relayPublicIp", v, "a public IPv4 address");
+    }
+    let account = o.account_id.as_deref().or_else(|| arn_account(&o.image_arn)).unwrap_or_default();
+    let role = format!("arn:aws:iam::{account}:role/ai-env-relay");
+    if let Some(v) = o.relay_role_arn.as_deref().filter(|v| *v != role) {
+        return refuse("relayRoleArn", v, &role);
+    }
+    if let Some(v) = o.relay_artifact_sha256.as_deref().filter(|v| !(v.len() == 64 && v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))) {
+        return refuse("relayArtifactSha256", v, "a SHA-256 (64 lowercase hex digits)");
+    }
+    Ok(())
+}
+
+/// A dotted-quad IPv4 address on the internet: not private, loopback, link-local, unspecified, broadcast, multicast or
+/// shared (100.64.0.0/10).
+fn is_public_ipv4(v: &str) -> bool {
+    let Ok(ip) = v.parse::<std::net::Ipv4Addr>() else { return false };
+    let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
+    !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || shared)
 }
 
 /// The `[aws]` entries the outputs supply, in the order they are written
@@ -580,6 +650,30 @@ pub struct InfraState {
     pub transcripts_bucket_policy_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_route_table_id: Option<String>,
+    /// S13: the relay's ten outputs (`relayInstanceId` … `relayVersion`): its
+    /// instance, addresses and security group (`egress status`'s relay rows,
+    /// doctor's relay row, `ai-env relay`), role, log group, parameter prefix,
+    /// private port, and its binary's hash and version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_private_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_public_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_security_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_role_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_log_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_parameter_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_artifact_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_version: Option<String>,
     /// The connector's Id, from the live read (the echo gate accepts the Id
     /// form only when `connector_arn` equals `[aws].egress_connector_arn`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -652,6 +746,16 @@ impl InfraState {
             s3_endpoint_policy_sha256: o.s3_endpoint_policy_sha256.clone(),
             transcripts_bucket_policy_sha256: o.transcripts_bucket_policy_sha256.clone(),
             proxy_route_table_id: o.proxy_route_table_id.clone(),
+            relay_instance_id: o.relay_instance_id.clone(),
+            relay_private_ip: o.relay_private_ip.clone(),
+            relay_public_ip: o.relay_public_ip.clone(),
+            relay_security_group_id: o.relay_security_group_id.clone(),
+            relay_role_arn: o.relay_role_arn.clone(),
+            relay_log_group: o.relay_log_group.clone(),
+            relay_parameter_prefix: o.relay_parameter_prefix.clone(),
+            relay_port: o.relay_port.clone(),
+            relay_artifact_sha256: o.relay_artifact_sha256.clone(),
+            relay_version: o.relay_version.clone(),
             connector_id: None,
             connector_state: None,
             connector_state_source: None,
@@ -1290,7 +1394,9 @@ fn aws_snippet(entries: &[(&str, String)]) -> String {
 
 /// `ai-env infra status [--write] [--json-in FILE] [--stack S] [--cwd DIR]`
 /// (D24): read the outputs, refuse a foreign region, connector or proxy
-/// address ([`check_region`], [`check_egress`]), read the image's live
+/// address ([`check_region`], [`check_egress`]), an operator identity or
+/// document of another kind ([`check_identities`]) and, S13, a relay this
+/// ai-env does not name ([`check_relay`]), read the image's live
 /// state (`get-microvm-image`, also with `--json-in`; a failed read keeps
 /// the outputs' copy and says so) and, when the outputs name a connector,
 /// its live state (`get-network-connector`, likewise), show current vs
@@ -1311,6 +1417,7 @@ pub fn cmd_status(write: bool, json_in: Option<&Path>, stack: &str, cwd: &Path) 
     check_region(&outputs).map_err(CliError::Aws)?;
     check_egress(&outputs).map_err(CliError::Aws)?;
     check_identities(&outputs).map_err(CliError::Aws)?;
+    check_relay(&outputs).map_err(CliError::Aws)?;
     let entries = aws_entries(&outputs);
 
     let paths = Paths::resolve()?;
@@ -2296,6 +2403,85 @@ mod tests {
         check_identities(&parse_outputs(&j.to_string()).unwrap()).unwrap();
         j["imageArn"] = serde_json::json!("arn:aws:lambda:eu-central-1:999999999999:microvm-image:ai-env-agent");
         assert!(check_identities(&parse_outputs(&j.to_string()).unwrap()).unwrap_err().contains("is not arn:aws:iam::999999999999:user/ai-env-ops"));
+    }
+
+    /// S13 (I-T36): the relay's ten outputs reach `state/infra.toml` and read
+    /// back; [`check_relay`] refuses a relay this ai-env does not name (its
+    /// address, port, prefix or log group), ids of another kind, a public
+    /// address that is not one, another account's role and a malformed hash;
+    /// a stack without the relay passes.
+    #[test]
+    fn the_relay_outputs_reach_the_state_and_foreign_ones_are_refused() {
+        use serde_json::{json, Value};
+        let sha = "0".repeat(64);
+        let relay: Vec<(&str, Value)> = vec![
+            ("relayInstanceId", json!("i-0123456789abcdef1")),
+            ("relayPrivateIp", json!("10.42.0.20")),
+            ("relayPublicIp", json!("203.0.113.20")),
+            ("relaySecurityGroupId", json!("sg-0ccc9999dddd0000e")),
+            ("relayRoleArn", json!("arn:aws:iam::123456789012:role/ai-env-relay")),
+            ("relayLogGroup", json!("/ai-env/relay")),
+            ("relayParameterPrefix", json!("/ai-env/relay")),
+            ("relayPort", json!(7443)),
+            ("relayArtifactSha256", json!(sha)),
+            ("relayVersion", json!("0.12.0")),
+        ];
+        let outputs = |pairs: &[(&str, Value)]| {
+            let mut j = s5_outputs_json();
+            for (k, v) in pairs {
+                j[*k] = v.clone();
+            }
+            parse_outputs(&j.to_string()).unwrap()
+        };
+        let o = outputs(&relay);
+        check_relay(&o).unwrap();
+        let s = InfraState::from_outputs(&o, "dev", "2026-10-29T00:00:00Z".into());
+        assert_eq!(
+            (s.relay_instance_id.as_deref(), s.relay_private_ip.as_deref(), s.relay_public_ip.as_deref(), s.relay_security_group_id.as_deref(), s.relay_role_arn.as_deref()),
+            (Some("i-0123456789abcdef1"), Some("10.42.0.20"), Some("203.0.113.20"), Some("sg-0ccc9999dddd0000e"), Some("arn:aws:iam::123456789012:role/ai-env-relay"))
+        );
+        assert_eq!(
+            (s.relay_log_group.as_deref(), s.relay_parameter_prefix.as_deref(), s.relay_port.as_deref(), s.relay_artifact_sha256.as_deref(), s.relay_version.as_deref()),
+            (Some("/ai-env/relay"), Some("/ai-env/relay"), Some("7443"), Some(sha.as_str()), Some("0.12.0")),
+            "relayPort, a number, is recorded as text"
+        );
+        let text = s.render().unwrap();
+        for k in ["relay_instance_id", "relay_private_ip", "relay_public_ip", "relay_security_group_id", "relay_role_arn", "relay_log_group", "relay_parameter_prefix", "relay_port", "relay_artifact_sha256", "relay_version"] {
+            assert!(text.contains(&format!("\n{k} = ")), "{k}: {text}");
+        }
+        assert!(text.contains("\nrelay_port = \"7443\"\n"), "{text}");
+        assert_eq!(toml::from_str::<InfraState>(&text).unwrap(), s, "the state reads back");
+        // Each refusal names the output, its value and why; nothing is written.
+        for (key, bad, why) in [
+            ("relayPrivateIp", json!("10.42.0.21"), "is not 10.42.0.20, the relay address the VMs' rules name (infra/egress-config.json): update ai-env"),
+            ("relayPort", json!(7444), "is not 7443, the port the VMs' rules name: update ai-env"),
+            ("relayParameterPrefix", json!("/ai-env/proxy"), "is not /ai-env/relay, the prefix ai-env relay writes: update ai-env"),
+            ("relayLogGroup", json!("/ai-env/egress/squid"), "is not /ai-env/relay: update ai-env"),
+            ("relayInstanceId", json!("i-xyz"), "is not an EC2 instance id"),
+            ("relaySecurityGroupId", json!("sg-123"), "is not a security group id"),
+            ("relayPublicIp", json!("10.42.0.20"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("100.64.0.1"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("127.0.0.1"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("169.254.169.254"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("255.255.255.255"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("224.0.0.1"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("0.0.0.0"), "is not a public IPv4 address"),
+            ("relayPublicIp", json!("2001:db8::1"), "is not a public IPv4 address"),
+            ("relayRoleArn", json!("arn:aws:iam::999999999999:role/ai-env-relay"), "is not arn:aws:iam::123456789012:role/ai-env-relay"),
+            ("relayRoleArn", json!("arn:aws:iam::123456789012:role/ai-env-egress-proxy"), "is not arn:aws:iam::123456789012:role/ai-env-relay"),
+            ("relayArtifactSha256", json!("abc"), "is not a SHA-256 (64 lowercase hex digits)"),
+        ] {
+            let pairs: Vec<(&str, Value)> = relay.iter().map(|(k, v)| (*k, if *k == key { bad.clone() } else { v.clone() })).collect();
+            let shown = match &bad {
+                Value::String(v) => format!("{v:?}"),
+                v => format!("{:?}", v.to_string()),
+            };
+            assert_eq!(check_relay(&outputs(&pairs)).unwrap_err(), format!("stack output {key} {shown} {why}; nothing written"));
+        }
+        assert!(is_public_ipv4("203.0.113.20") && is_public_ipv4("8.8.8.8") && !is_public_ipv4("192.168.1.1") && !is_public_ipv4("100.127.255.255") && is_public_ipv4("100.128.0.1"));
+        // A stack before S13: no relay output, nothing to refuse.
+        check_relay(&parse_outputs(&s5_outputs_json().to_string()).unwrap()).unwrap();
+        check_relay(&parse_outputs(&outputs_json().to_string()).unwrap()).unwrap();
     }
 
     fn golden_connector() -> serde_json::Value {

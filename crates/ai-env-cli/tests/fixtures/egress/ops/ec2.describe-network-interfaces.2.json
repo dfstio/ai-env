@@ -1,0 +1,57 @@
+{
+    "NetworkInterfaces": [
+        {
+            "Association": {
+                "AllocationId": "eipalloc-0123456789abcdef0",
+                "AssociationId": "eipassoc-0123456789abcdef0",
+                "IpOwnerId": "123456789012",
+                "PublicDnsName": "",
+                "PublicIp": "203.0.113.20"
+            },
+            "Attachment": {
+                "AttachTime": "2026-10-29T10:00:00+00:00",
+                "AttachmentId": "eni-attach-0bbb00000000000b1",
+                "DeleteOnTermination": true,
+                "DeviceIndex": 0,
+                "NetworkCardIndex": 0,
+                "InstanceId": "i-0123456789abcdef1",
+                "InstanceOwnerId": "123456789012",
+                "Status": "attached"
+            },
+            "AvailabilityZone": "eu-central-1a",
+            "AvailabilityZoneId": "euc1-az1",
+            "Description": "",
+            "Groups": [
+                {
+                    "GroupId": "sg-0ccc9999dddd0000e",
+                    "GroupName": "ai-env-relay"
+                }
+            ],
+            "InterfaceType": "interface",
+            "Ipv6Addresses": [],
+            "MacAddress": "02:00:00:00:00:20",
+            "NetworkInterfaceId": "eni-0bbb00000000000b1",
+            "OwnerId": "123456789012",
+            "PrivateIpAddress": "10.42.0.20",
+            "PrivateIpAddresses": [
+                {
+                    "Association": {
+                        "AllocationId": "eipalloc-0123456789abcdef0",
+                        "AssociationId": "eipassoc-0123456789abcdef0",
+                        "IpOwnerId": "123456789012",
+                        "PublicDnsName": "",
+                        "PublicIp": "203.0.113.20"
+                    },
+                    "Primary": true,
+                    "PrivateIpAddress": "10.42.0.20"
+                }
+            ],
+            "RequesterManaged": false,
+            "SourceDestCheck": true,
+            "Status": "in-use",
+            "SubnetId": "subnet-0ccc2222dddd3333e",
+            "TagSet": [],
+            "VpcId": "vpc-0123456789abcdef0"
+        }
+    ]
+}

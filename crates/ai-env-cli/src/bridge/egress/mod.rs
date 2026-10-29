@@ -1,7 +1,11 @@
 //! The S5 egress allowlist, Mac side: the shared contract every part works
 //! from. MicroVMs with `--egress vpc` get the stack's network connector,
 //! whose subnet has no route out; the only way out is TCP 3128 to a squid
-//! CONNECT allowlist (`infra/egress.ts`, `infra/proxy/*`).
+//! CONNECT allowlist (`infra/egress.ts`, `infra/proxy/*`). S13
+//! (plans/s13-contracts.md §I-infra): and TCP [`RELAY_PORT`] to the relay's
+//! private address [`RELAY_IP`], the VMs' second and last way out, which
+//! [`NO_PROXY`] keeps away from squid; the egress check's rule
+//! ([`EGRESS_RULE`]) is 2 from then on.
 //!
 //! Here: the constants of `infra/egress-config.json` (a test keeps both in
 //! step), the echo gate's matching rules ([`ExpectedEcho`]: a VM must echo
@@ -70,8 +74,9 @@ pub const DOCUMENT_VERSION: &str = "$DEFAULT";
 
 /// Every key of `infra/egress-config.json` with its value as Rust sees it
 /// (numbers and booleans as text, arrays joined with `,`); a unit test reads
-/// the JSON and requires both to agree, key for key.
-pub const EGRESS_CONSTS: [(&str, &str); 22] = [
+/// the JSON and requires both to agree, key for key. S13 appends the relay's
+/// seven.
+pub const EGRESS_CONSTS: [(&str, &str); 29] = [
     ("vpcCidr", VPC_CIDR),
     ("proxySubnetCidr", PROXY_SUBNET_CIDR),
     ("vmSubnetCidr", VM_SUBNET_CIDR),
@@ -94,12 +99,41 @@ pub const EGRESS_CONSTS: [(&str, &str); 22] = [
     ("reloadDocumentName", RELOAD_DOCUMENT),
     ("statusDocumentName", STATUS_DOCUMENT),
     ("patchDocumentName", PATCH_DOCUMENT),
+    ("relayIp", RELAY_IP),
+    ("relayPort", "7443"),
+    ("relayInstanceType", "t4g.nano"),
+    ("relaySecurityGroupName", "ai-env-relay"),
+    ("relayParameterPrefix", RELAY_PARAMETER_PREFIX),
+    ("relayLogGroup", RELAY_LOG_GROUP),
+    ("relayLogRetentionDays", "90"),
 ];
 
 /// `<prefix>/<param>` (`/ai-env/proxy/allow`).
 #[must_use]
 pub fn param_name(param: &str) -> String {
     format!("{PARAMETER_PREFIX}/{param}")
+}
+
+// ---- S13: the relay (infra/egress-config.json's relay keys, plans/s13-contracts.md §I-infra.3.4) ----------
+
+/// S13: the relay's fixed private address in the proxy subnet: the VMs' second and last way out (TCP [`RELAY_PORT`]).
+pub const RELAY_IP: &str = "10.42.0.20";
+/// S13: the relay's private port: the VM security group's second egress rule.
+pub const RELAY_PORT: u16 = 7443;
+/// S13: the relay's SSM parameters `<prefix>/<name>` (`ai-env relay` writes them as the deployer; the relay's reload unit reads them).
+pub const RELAY_PARAMETER_PREFIX: &str = "/ai-env/relay";
+/// S13: the relay's log group (its request log, its reload unit's lines, its diagnostics, its patch log).
+pub const RELAY_LOG_GROUP: &str = "/ai-env/relay";
+/// S13: what the relay's reload unit fetches, in its order (infra/relay/reload.py, policies.ts RELAY_PARAMETERS):
+/// `artifact` is the stack's, the rest `ai-env relay`'s; `tls` alone is a SecureString.
+pub const RELAY_PARAMETERS: [&str; 5] = ["artifact", "workers", "grants", "token-signers", "tls"];
+/// S13: `no_proxy` on vpc spawns: loopback, then the relay, which a VM reaches directly and never through squid.
+pub const NO_PROXY: &str = "localhost,127.0.0.1,::1,10.42.0.20";
+
+/// `<RELAY_PARAMETER_PREFIX>/<param>` (`/ai-env/relay/workers`).
+#[must_use]
+pub fn relay_param_name(param: &str) -> String {
+    format!("{RELAY_PARAMETER_PREFIX}/{param}")
 }
 
 // ---- connectors and the echo gate ---------------------------------------------------------
@@ -244,12 +278,13 @@ pub fn proxy_url(ip: &str, port: u16) -> String {
 
 /// The environment a process in a `vpc` VM needs to reach the allowlist:
 /// both spellings of `https_proxy`/`http_proxy` (curl reads `http_proxy` in
-/// lowercase only) and `no_proxy` for loopback. S6 sets them at spawn;
-/// `ai-env egress env` prints them.
+/// lowercase only) and `no_proxy` for loopback and the relay ([`RELAY_IP`]),
+/// which a VM reaches directly, never through squid (S13). S6 sets them at
+/// spawn; `ai-env egress env` prints them.
 #[must_use]
 pub fn proxy_env(ip: &str, port: u16) -> Vec<(&'static str, String)> {
     let url = proxy_url(ip, port);
-    let no_proxy = "localhost,127.0.0.1,::1".to_string();
+    let no_proxy = NO_PROXY.to_string();
     vec![("https_proxy", url.clone()), ("HTTPS_PROXY", url.clone()), ("http_proxy", url.clone()), ("HTTP_PROXY", url), ("no_proxy", no_proxy.clone()), ("NO_PROXY", no_proxy)]
 }
 
@@ -740,13 +775,15 @@ pub const DNS_PLATFORM_PREFIX: &str = "platform-dns:";
 /// asked and a platform reply passed whatever its status — evidence the
 /// gate cannot tell from the new, so it is never honoured.
 pub const DNS_RULE: u32 = 1;
-/// The egress check's rule a record passed by (`VerifiedRecord::egress_rule`,
-/// S9): 1, the transcript store's seven cases (`s3-own`, the fronting
-/// refusals, `s3-imds-role`, `proxy-s3-other-host`, `s3-direct`); 0 (no
-/// field) for every record written before S9: a pass that never showed our
-/// bucket confined, which the credential gate never honours (condition
-/// `egress_rule`, [`credential_precheck`]) and `--if-needed` checks again.
-pub const EGRESS_RULE: u32 = 1;
+/// The egress check's rule a record passed by (`VerifiedRecord::egress_rule`):
+/// 2 (S13): the relay's cases ran (`relay-other-port` judged closed,
+/// `relay-port` recorded) and the network verification judged the relay's
+/// rows (`relay-sg`, `relay-endpoint`) and the VM security group's and NACL's
+/// relay rules `ok`; 1 (S9): the transcript store's seven cases; 0 (no field):
+/// before S9. A pass by an earlier rule never describes this network: the
+/// credential gate never honours it (condition `egress_rule`,
+/// [`credential_precheck`]) and `--if-needed` checks again.
+pub const EGRESS_RULE: u32 = 2;
 
 /// Does `verdict` let credentials in? `no-dns` always; `platform-dns:` only
 /// followed by a non-empty list in which every entry parses, is a platform
@@ -952,7 +989,7 @@ impl GatePass {
 /// recorded for the row's image, image version and that connector, no older
 /// than [`MAX_RECORD_AGE_S`], with complete facts and a known build; that record
 /// judged DNS by the current rule ([`DNS_RULE`]), passed the current egress
-/// rule ([`EGRESS_RULE`]: S9's transcript store's cases ran) and its DNS
+/// rule ([`EGRESS_RULE`]: S13's relay cases and rows ran) and its DNS
 /// verdict is accepted ([`dns_verdict_ok`] with `[egress].accept_platform_dns`); and `dns_path`, the
 /// newest dns-path verdict as [`newest_dns_path`] read it (the network-wide kill
 /// switch), is readable, recorded and accepted too.
@@ -973,7 +1010,11 @@ pub fn credential_precheck(cfg: &BridgeConfig, row: &VmRow, verified: &EgressVer
     if record.egress_rule < EGRESS_RULE {
         return Err(GateRefusal::new(
             "egress_rule",
-            "the recorded `ai-env egress check` passed by an earlier rule, before the transcript store's cases (our bucket allowed, fronting refused): run `ai-env egress check`",
+            format!(
+                "the recorded `ai-env egress check` passed by an earlier rule ({}, now {EGRESS_RULE}): before the relay path's cases (S13: the VMs reach {RELAY_IP}:{RELAY_PORT} and nothing else of the relay){}: run `ai-env egress check`",
+                record.egress_rule,
+                if record.egress_rule == 0 { " and the transcript store's (S9)" } else { "" }
+            ),
         ));
     }
     let accepted = cfg.egress.accepted_resolvers();
@@ -1125,8 +1166,11 @@ mod tests {
             assert_eq!(got, want, "{k}");
         }
         assert_eq!(obj.len(), EGRESS_CONSTS.len(), "every key of egress-config.json has a Rust constant");
+        assert_eq!(EGRESS_CONSTS.len(), 29, "S5's 22, then S13's seven relay keys");
         assert_eq!(RESOLVERS.join(","), EGRESS_CONSTS.iter().find(|(k, _)| *k == "resolvers").unwrap().1);
         assert_eq!(PROXY_PORT.to_string(), "3128");
+        assert_eq!(RELAY_PORT.to_string(), "7443");
+        assert_eq!(relay_param_name("workers"), "/ai-env/relay/workers");
         // One scalar key per line: the Makefile reads it with sed.
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().filter(|l| l.trim_start().starts_with('"')).count(), EGRESS_CONSTS.len());
@@ -1267,14 +1311,25 @@ mod tests {
         for k in ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"] {
             assert_eq!(get(k), Some("http://10.42.0.10:3128"), "{k}");
         }
-        assert_eq!(get("no_proxy"), Some("localhost,127.0.0.1,::1"));
-        assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1"));
+        assert_eq!(get("no_proxy"), Some("localhost,127.0.0.1,::1,10.42.0.20"));
+        assert_eq!(get("NO_PROXY"), Some("localhost,127.0.0.1,::1,10.42.0.20"));
         let state = InfraState { proxy_private_ip: Some("10.42.0.11".into()), ..InfraState::default() };
         assert_eq!(effective_proxy_ip(None, None), (PROXY_IP, "the default"));
         assert_eq!(effective_proxy_ip(None, Some(&state)), ("10.42.0.11", "state/infra.toml"));
         assert_eq!(effective_proxy_ip(Some(" 192.168.1.5 "), Some(&state)), ("192.168.1.5", "[aws].proxy_private_ip"));
         let public = InfraState { proxy_private_ip: Some("8.8.8.8".into()), ..InfraState::default() };
         assert_eq!(effective_proxy_ip(Some("8.8.4.4"), Some(&public)), (PROXY_IP, "the default"), "never a public address");
+    }
+
+    /// S13 (I-T27): `no_proxy` is loopback, then the relay's address (a VM
+    /// reaches it directly, never through squid); `tls` is the relay's one
+    /// secret parameter, fetched last.
+    #[test]
+    fn no_proxy_is_loopback_then_the_relay() {
+        assert_eq!(NO_PROXY, format!("localhost,127.0.0.1,::1,{RELAY_IP}"));
+        assert_eq!(RELAY_PARAMETERS.iter().filter(|p| **p == "tls").count(), 1);
+        assert_eq!(RELAY_PARAMETERS.last(), Some(&"tls"));
+        assert_eq!(relay_param_name("tls"), format!("{RELAY_PARAMETER_PREFIX}/tls"));
     }
 
     #[test]
@@ -1739,12 +1794,19 @@ mod tests {
         old_rule.record(VerifiedRecord { dns_rule: 0, at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
         assert_eq!(pre(&cfg, &row, &old_rule, &at(DNS_NONE), NOW).condition, "dns_rule");
         // S9: a pass from before the transcript store's cases (a record without the field reads as rule 0) never
-        // counts, whatever its DNS; the current rule's does.
+        // counts, whatever its DNS; S13 (I-T26): nor does one of S9's rule 1, before the relay's cases; the current
+        // rule's does.
+        assert_eq!(EGRESS_RULE, 2);
         let mut pre_s9 = EgressVerified::default();
         pre_s9.record(VerifiedRecord { egress_rule: 0, at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
         let r = pre(&cfg, &row, &pre_s9, &at(DNS_NONE), NOW);
-        assert!(r.condition == "egress_rule" && r.why.contains("transcript store's cases") && r.why.contains("run `ai-env egress check`"), "{r:?}");
+        assert!(r.condition == "egress_rule" && r.why.contains("(0, now 2)") && r.why.contains("transcript store") && r.why.contains("run `ai-env egress check`"), "{r:?}");
         assert_eq!(gate(&cfg, &row, &live, &pre_s9, &at(DNS_NONE)).condition, "egress_rule", "the gate's too");
+        let mut pre_s13 = EgressVerified::default();
+        pre_s13.record(VerifiedRecord { egress_rule: 1, at: REC_AT.into(), ..rec("2.0", CONN) }, 100);
+        let r = pre(&cfg, &row, &pre_s13, &at(DNS_NONE), NOW);
+        assert!(r.condition == "egress_rule" && r.why.contains("(1, now 2)") && r.why.contains("10.42.0.20:7443") && !r.why.contains("transcript store"), "{r:?}");
+        assert_eq!(gate(&cfg, &row, &live, &pre_s13, &at(DNS_NONE)).condition, "egress_rule", "a rule-1 pass is refused by the gate too");
         assert_eq!(rec("2.0", CONN).egress_rule, EGRESS_RULE);
         credential_precheck(&cfg, &row, &verified, &at(DNS_NONE), NOW).unwrap();
         let mut leaky = EgressVerified::default();

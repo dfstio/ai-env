@@ -1,0 +1,46 @@
+[package]
+name = "ai-env-relay-client"
+description = "ai-env's VM side of the relay: each chat's relay client (ai-env-net) and the stdio MCP server claude starts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "ai_env_relay_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ai-env-relay-client"
+path = "src/bin/ai-env-relay-client.rs"
+test = false
+
+[[bin]]
+name = "ai-env-relay-mcp"
+path = "src/bin/ai-env-relay-mcp.rs"
+test = false
+
+[dependencies]
+ai-env-relay-proto = { path = "../ai-env-relay-proto" }
+base64 = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+hyper-util = { workspace = true }
+libc = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
+tonic = { workspace = true, features = ["channel"] }
+tower = { workspace = true, features = ["util"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["channel", "server", "router"] }

@@ -64,7 +64,7 @@ pub fn aws_cmd(service: &str, args: &[&str]) -> Result<Command, String> {
         return Err(format!("aws {service}: no operation"));
     }
     let mut cmd = Command::new("aws");
-    cmd.arg(service).args(args).args(["--region", REGION, "--endpoint-url", url, "--output", "json"]).env("AWS_PAGER", "").env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    cmd.arg(service).args(args).args(["--region", REGION, "--endpoint-url", url, "--output", "json"]).env("AWS_PAGER", "").env("AWS_CLI_AUTO_PROMPT", "off").env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     Ok(cmd)
 }
 
@@ -90,12 +90,13 @@ pub fn operator_cmd(service: &str, args: &[&str]) -> Result<Command, String> {
 }
 
 /// `aws <args>` for a service without a pinned endpoint (iam,
-/// lambda-microvms, service-quotas): `AWS_PAGER=""`, without the OAuth token;
+/// lambda-microvms, service-quotas): `AWS_PAGER=""`, `AWS_CLI_AUTO_PROMPT=off` (a user's `on` would wait for
+/// keystrokes), without the OAuth token;
 /// the caller's args carry `--region eu-central-1`. Pure.
 #[must_use]
 pub fn program_cmd(args: &[&str]) -> Command {
     let mut cmd = Command::new("aws");
-    cmd.args(args).env("AWS_PAGER", "").env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    cmd.args(args).env("AWS_PAGER", "").env("AWS_CLI_AUTO_PROMPT", "off").env_remove("CLAUDE_CODE_OAUTH_TOKEN");
     cmd
 }
 

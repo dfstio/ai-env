@@ -2,5 +2,7 @@
 /plans
 /logs
 .DS_Store
-# cross-built VM shim binary (image/Dockerfile is committed, the binary is not)
+# cross-built VM binaries (image/Dockerfile is committed, the binaries are not)
 /image/ai-env
+/image/ai-env-relay-client
+/image/ai-env-relay-mcp

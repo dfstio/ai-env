@@ -268,6 +268,12 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ProxyCmd,
     },
+    /// The S13 relay: this Mac's keys and signing agent (keygen, pubkey, agent), the whitelist, grants and TLS (allow, revoke, grant, tls: as ai-env-deployer), the relay CA's certificate (ca), the relay instance (status, start, stop: as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
+    #[cfg(feature = "bridge")]
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCmd,
+    },
     /// Run CMD as one AWS operator identity: deployer (its key pasted from Strongbox), ops (credentials/ops.env, one Touch ID), root (the bootstrap and break-glass only) or ambient (the aws CLI's own credentials, never the root)
     #[cfg(feature = "bridge")]
     As {
@@ -799,6 +805,110 @@ pub enum ProxyCmd {
     Start,
     /// Security updates through SSM (dnf upgrade --security), then restart squid
     Patch,
+}
+
+/// `ai-env relay …` (feature `bridge`).
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum RelayCmd {
+    /// Make this Mac's two relay keys (its worker key and its session key) and seal them into credentials/relay-worker.env (no Touch ID); prints the public keys only
+    Keygen {
+        /// Replace the keys sealed there (the old container is kept as a .bak)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print this Mac's relay public keys from the sealed container's notes (no Touch ID; --verify checks them: one Touch ID)
+    Pubkey {
+        /// Only the worker key's text
+        #[arg(long, conflicts_with = "session")]
+        worker: bool,
+        /// Only the session key's text
+        #[arg(long)]
+        session: bool,
+        /// Unseal the keys (one Touch ID) and check the recorded public keys against them
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)
+    Allow {
+        /// The worker's id (with --token-signer: the token signer's)
+        id: String,
+        /// Its public key, ed25519:<base64>, as keygen printed it
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// The source names it may register: globs (`*` any run), comma-separated or repeated
+        #[arg(long, value_delimiter = ',', required_unless_present = "token_signer", conflicts_with = "token_signer")]
+        sources: Vec<String>,
+        /// A signer of VM session tokens, not a worker
+        #[arg(long)]
+        token_signer: bool,
+        /// The last valid day, UTC (default: a year from today; at most two years ahead)
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        not_after: Option<String>,
+    },
+    /// Remove a worker (or with --token-signer a token signer) from the relay's lists (as ai-env-deployer)
+    Revoke {
+        /// The worker's id (with --token-signer: the token signer's)
+        id: String,
+        /// Remove a token signer, not a worker
+        #[arg(long)]
+        token_signer: bool,
+    },
+    /// Set a grant's rules, <source-glob>/<op-glob> (as ai-env-deployer); --remove deletes the grant
+    Grant {
+        /// The grant's id, as [relay].grant or a workspace's relay_grant names it
+        grant_id: String,
+        /// Its rules, <source-glob>/<op-glob>, 1 to 32 (they replace the grant's whole set; grants are default-deny)
+        #[arg(required_unless_present = "remove", conflicts_with = "remove")]
+        rules: Vec<String>,
+        /// Delete the grant
+        #[arg(long)]
+        remove: bool,
+    },
+    /// The relay instance, its lists, and this Mac's keys and agent (AWS reads as ai-env-ops)
+    Status {
+        /// One JSON object: the instance, the lists and this Mac's keys (each key as its fingerprint) and agent, and the verdict with its rows as printed
+        #[arg(long)]
+        json: bool,
+        /// This Mac's keys and agent only: no AWS call, no Touch ID
+        #[arg(long)]
+        local: bool,
+    },
+    /// Start the relay instance and wait until it runs with SSM online (as ai-env-ops)
+    Start,
+    /// Stop the relay instance (as ai-env-ops): VM relay calls answer unavailable and workers keep dialing until ai-env relay start
+    Stop,
+    /// Unseal this Mac's relay keys (one Touch ID), then sign worker handshakes and mint VM session tokens over a 0600 socket until Ctrl-C or --hours
+    Agent {
+        /// Hours until the agent drops its keys and exits, 1 to 24 (default [relay].agent_hours, 12)
+        #[arg(long)]
+        hours: Option<u32>,
+    },
+    /// The relay's TLS (as ai-env-deployer): make the relay CA and the relay's certificate, or a new certificate
+    Tls {
+        #[command(subcommand)]
+        cmd: RelayTlsCmd,
+    },
+    /// Print the relay CA's certificate (public), for a worker's relay_ca file (no AWS call, no Touch ID)
+    Ca {
+        /// Its DER in standard base64 rather than PEM
+        #[arg(long)]
+        der: bool,
+    },
+}
+
+/// `ai-env relay tls …` (feature `bridge`).
+#[cfg(feature = "bridge")]
+#[derive(Subcommand)]
+pub enum RelayTlsCmd {
+    /// Make the relay CA (its key sealed into credentials/relay-ca.env) and the relay's certificate, written to /ai-env/relay/tls
+    Init {
+        /// Replace an existing CA: every worker's relay_ca file must then be replaced
+        #[arg(long)]
+        force: bool,
+    },
+    /// Issue a new certificate for the relay under the sealed CA (one Touch ID) and write /ai-env/relay/tls
+    Rotate,
 }
 
 /// `ai-env infra …` (feature `bridge`): the S3 infrastructure helpers the Makefile drives.
@@ -1711,6 +1821,8 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "bridge")]
         Cmd::Proxy { cmd } => crate::bridge::egress::cli::proxy_main(cmd),
         #[cfg(feature = "bridge")]
+        Cmd::Relay { cmd } => crate::bridge::relay::cli::main(&store, cmd),
+        #[cfg(feature = "bridge")]
         Cmd::As { identity, account, check, command } => crate::bridge::identity::cmd_as(&store, identity, account.as_deref(), check, &command),
         #[cfg(feature = "shim")]
         Cmd::Shim(_) => unreachable!("shim is dispatched before the keystore is resolved"),
@@ -1746,7 +1858,7 @@ fn doctor(store: &Keystore, file: &std::path::Path, json: bool) -> Result<()> {
 
 #[cfg(all(test, feature = "bridge"))]
 mod tests {
-    use super::{BoxCmd, Cli, Cmd, SessionCmd, VmCmd, WrapperCmd, WrapperModeArg};
+    use super::{BoxCmd, Cli, Cmd, RelayCmd, RelayTlsCmd, SessionCmd, VmCmd, WrapperCmd, WrapperModeArg};
     use clap::{CommandFactory as _, Parser as _};
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -1979,8 +2091,73 @@ mod tests {
             assert!(text.contains("(as ai-env-ops: the key of ai-env as …, else credentials/ops.env") && !text.contains("aws CLI"), "{name}: {text}");
         }
         assert!(about("egress").ends_with("; allow as ai-env-deployer)"), "{}", about("egress"));
+        // S13 (WM-T42): the relay's writers are the deployer's, its instance commands ops'.
+        let relay = about("relay");
+        assert!(relay.contains("as ai-env-deployer") && relay.contains("as ai-env-ops: the key of ai-env as …, else credentials/ops.env") && !relay.contains("aws CLI"), "{relay}");
         let doctor = about("doctor");
         assert!(doctor.ends_with("(exit 1 when any row is [NO ], 5 when AWS refuses the key of the identity ai-env as declared)") && !doctor.contains("credentials are unavailable"), "{doctor}");
+    }
+
+    /// S13 (WM-T42): each `relay` command parses with its flags: `--sources a,b --sources c` is three globs;
+    /// `allow` takes exactly one of `--sources` and `--token-signer` (both, or neither, is a usage error, exit 2),
+    /// `grant` its rules or `--remove`, `pubkey` at most one of `--worker` and `--session`; `agent --hours 0`
+    /// parses (the range is the command's: exit 2 there). `relay` comes right after `proxy`.
+    #[test]
+    fn relay_commands_parse() {
+        let relay = |args: &[&str]| -> RelayCmd {
+            let all: Vec<&str> = std::iter::once("relay").chain(args.iter().copied()).collect();
+            match cmd(&all) {
+                Cmd::Relay { cmd } => cmd,
+                _ => panic!("{args:?}: not relay"),
+            }
+        };
+        let RelayCmd::Keygen { force: false } = relay(&["keygen"]) else { panic!("keygen") };
+        let RelayCmd::Keygen { force: true } = relay(&["keygen", "--force"]) else { panic!("keygen --force") };
+        let RelayCmd::Pubkey { worker: false, session: false, verify: false } = relay(&["pubkey"]) else { panic!("pubkey") };
+        let RelayCmd::Pubkey { worker: true, session: false, verify: true } = relay(&["pubkey", "--worker", "--verify"]) else { panic!("pubkey --worker --verify") };
+        let RelayCmd::Pubkey { worker: false, session: true, verify: false } = relay(&["pubkey", "--session"]) else { panic!("pubkey --session") };
+        let RelayCmd::Allow { id, key, sources, token_signer: false, not_after } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
+            panic!("allow --sources")
+        };
+        assert_eq!((id.as_str(), key.as_str(), not_after.as_deref()), ("worker-a", "ed25519:K", Some("2027-10-29")));
+        assert_eq!(sources, ["a", "b", "c"], "comma-separated and repeated: three globs");
+        let RelayCmd::Allow { id, sources, token_signer: true, not_after: None, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K"]) else { panic!("allow --token-signer") };
+        assert!(id == "mac" && sources.is_empty());
+        let RelayCmd::Revoke { id, token_signer: false } = relay(&["revoke", "worker-a"]) else { panic!("revoke") };
+        assert_eq!(id, "worker-a");
+        let RelayCmd::Revoke { token_signer: true, .. } = relay(&["revoke", "mac", "--token-signer"]) else { panic!("revoke --token-signer") };
+        let RelayCmd::Grant { grant_id, rules, remove: false } = relay(&["grant", "default", "example-*/get", "example-*/list"]) else { panic!("grant") };
+        assert_eq!((grant_id.as_str(), rules), ("default", vec!["example-*/get".to_string(), "example-*/list".to_string()]));
+        let RelayCmd::Grant { rules, remove: true, .. } = relay(&["grant", "default", "--remove"]) else { panic!("grant --remove") };
+        assert!(rules.is_empty());
+        let RelayCmd::Status { json: false, local: false } = relay(&["status"]) else { panic!("status") };
+        let RelayCmd::Status { json: true, local: true } = relay(&["status", "--json", "--local"]) else { panic!("status --json --local") };
+        let RelayCmd::Start = relay(&["start"]) else { panic!("start") };
+        let RelayCmd::Stop = relay(&["stop"]) else { panic!("stop") };
+        let RelayCmd::Agent { hours: None } = relay(&["agent"]) else { panic!("agent") };
+        let RelayCmd::Agent { hours: Some(0) } = relay(&["agent", "--hours", "0"]) else { panic!("agent --hours 0 parses: the range is the command's") };
+        let RelayCmd::Tls { cmd: RelayTlsCmd::Init { force: false } } = relay(&["tls", "init"]) else { panic!("tls init") };
+        let RelayCmd::Tls { cmd: RelayTlsCmd::Init { force: true } } = relay(&["tls", "init", "--force"]) else { panic!("tls init --force") };
+        let RelayCmd::Tls { cmd: RelayTlsCmd::Rotate } = relay(&["tls", "rotate"]) else { panic!("tls rotate") };
+        let RelayCmd::Ca { der: false } = relay(&["ca"]) else { panic!("ca") };
+        let RelayCmd::Ca { der: true } = relay(&["ca", "--der"]) else { panic!("ca --der") };
+        for bad in [
+            &["relay", "allow", "w", "--key", "ed25519:K", "--sources", "a", "--token-signer"][..],
+            &["relay", "allow", "w", "--key", "ed25519:K"],
+            &["relay", "allow", "w", "--sources", "a"],
+            &["relay", "grant", "g"],
+            &["relay", "grant", "g", "a/b", "--remove"],
+            &["relay", "pubkey", "--worker", "--session"],
+            &["relay", "tls"],
+            &["relay", "agent", "--hours", "x"],
+            &["relay", "start", "now"],
+        ] {
+            let e = parse(bad).err().unwrap_or_else(|| panic!("{bad:?} parsed"));
+            assert_eq!(e.exit_code(), 2, "{bad:?}: a usage error");
+        }
+        let names: Vec<String> = Cli::command().get_subcommands().map(|c| c.get_name().to_string()).collect();
+        let proxy = names.iter().position(|n| n == "proxy").expect("proxy");
+        assert_eq!(names.get(proxy + 1).map(String::as_str), Some("relay"), "{names:?}");
     }
 
     /// `wrapper status` parses with and without `--json`, takes nothing else

@@ -16,6 +16,12 @@
 //! (an explicit list keeps its own); a name of [`HOST_REFRESH_NAMES`] in
 //! either list refuses the session (R2-3: exit 9), since the wrapper answers
 //! a remote CLI's credential refreshes itself, with no token.
+//!
+//! S13 (A6): the default list also carries extension 2.1.312's
+//! `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS`; its
+//! `CLAUDE_CODE_SDK_READS_STARTUP_MARKS` and `CLAUDE_CODE_STARTUP_FAILURE_RESULTS`
+//! are reviewed (`drift::ENV_REVIEWED`), never forwarded by default, and a list
+//! may still name them.
 use crate::bridge::agent::exec::{is_env_name, is_proxy_name, refused_name, PROXY_VARS};
 use crate::bridge::config::BridgeConfig;
 use crate::wire::frame::ENV_MAX_ENTRIES;
@@ -120,7 +126,10 @@ mod tests {
     /// of its environment (a token, an AWS key, its own HOME and PATH), and
     /// the wrapper's six names, which win over a forwarded value. S12 (R2-1):
     /// the extension's two names cross with Cursor's values; neither refresh
-    /// name does (R2-4: no list configures them).
+    /// name does (R2-4: no list configures them). S13 (A6): of extension
+    /// 2.1.312's three, `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS`
+    /// crosses with Cursor's value; `CLAUDE_CODE_SDK_READS_STARTUP_MARKS` and
+    /// `CLAUDE_CODE_STARTUP_FAILURE_RESULTS` do not (reviewed, never forwarded by default).
     #[test]
     fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
         let token = format!("{}-{}-{}", "sk", "ant", "x".repeat(40));
@@ -130,6 +139,9 @@ mod tests {
             ("TERM", "xterm-256color"),
             ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
             ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+            ("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"),
+            ("CLAUDE_CODE_SDK_READS_STARTUP_MARKS", "1"),
+            ("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1"),
             ("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH", "1"),
             ("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH", "1"),
             ("CLAUDE_CODE_OAUTH_TOKEN", &token),
@@ -146,6 +158,7 @@ mod tests {
             ("TERM", "xterm-256color"),
             ("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT", "markdown"),
             ("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1"),
+            ("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS", "1"),
             ("DISABLE_AUTOUPDATER", "1"),
             ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
             ("CLAUDE_CODE_DISABLE_ARTIFACT", "1"),
@@ -243,7 +256,7 @@ mod tests {
         for name in ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"] {
             assert_eq!(env.get(name), Some(&proxy), "{name}");
         }
-        assert_eq!((env.get("no_proxy").map(String::as_str), env.get("NO_PROXY").map(String::as_str)), (Some("localhost,127.0.0.1,::1"), Some("localhost,127.0.0.1,::1")));
+        assert_eq!((env.get("no_proxy").map(String::as_str), env.get("NO_PROXY").map(String::as_str)), (Some(crate::bridge::egress::NO_PROXY), Some(crate::bridge::egress::NO_PROXY)));
         assert_eq!(env.len(), session.len() + PROXY_VARS, "{env:?}");
         assert!(session.iter().all(|(k, v)| env.get(k) == Some(v)), "the session's names after them");
     }

@@ -176,16 +176,20 @@ fn lines_of(p: &Path) -> Vec<String> {
 const BASE_SETTINGS: &str = "{\"permissions\":{\"defaultMode\":\"default\",\"allow\":[]}}\n";
 
 /// The repository's image files under `<tmp>/img`, its settings as the
-/// repository holds them, with a stand-in for the cross-built shim.
+/// repository holds them, with stand-ins for the cross-built shim and (S13)
+/// the relay client and MCP server.
 fn copied_image(tmp: &Path) -> PathBuf {
     let src = Path::new(REPO).join("image");
     let dst = tmp.join("img");
-    for rel in ["Dockerfile", "MANIFEST", "claude.lock", "managed-settings.json", "claude/settings.json", "claude/CLAUDE.md", "claude/claude.json"] {
+    for rel in ["Dockerfile", "MANIFEST", "claude.lock", "managed-settings.json", "claude/settings.json", "claude/CLAUDE.md", "claude/claude.json", "relay-mcp.json"] {
         let to = dst.join(rel);
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
         std::fs::copy(src.join(rel), &to).unwrap_or_else(|e| panic!("{rel}: {e}"));
     }
     std::fs::write(dst.join("ai-env"), "stand-in for the cross-built shim\n").unwrap();
+    for bin in ["ai-env-relay-client", "ai-env-relay-mcp"] {
+        std::fs::write(dst.join(bin), format!("stand-in for the cross-built {bin}\n")).unwrap();
+    }
     dst
 }
 
@@ -227,10 +231,12 @@ fn image_stage_scan_passes_on_the_repo_image_files() {
     }
     let out = stage_scan(t.path(), &img);
     assert!(out.status.success(), "{}", all(&out));
-    assert!(stdout(&out).contains("scan: clean (7 files)"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("scan: clean (10 files)"), "{}", stdout(&out));
     let staged = t.path().join("out/stage");
     let mode = |rel: &str| std::fs::metadata(staged.join(rel)).unwrap().permissions().mode() & 0o777;
     assert_eq!((mode("claude/claude.json"), mode("ai-env"), mode("claude/agents")), (0o600, 0o755, 0o755), "MANIFEST modes are applied");
+    // S13: the relay programs and their config (M-V26).
+    assert_eq!((mode("ai-env-relay-client"), mode("ai-env-relay-mcp"), mode("relay-mcp.json")), (0o755, 0o755, 0o644), "the relay files' MANIFEST modes");
     assert!(!staged.join("MANIFEST").exists(), "the manifest itself is not staged");
     assert!(!t.path().join("out/stage.tmp").exists() && !t.path().join("out/stage.tmp.listed").exists(), "the scanned stage is published whole");
 }
@@ -280,6 +286,15 @@ fn image_stage_scan_aborts_on_bypass_permissions_and_unlisted_files() {
     let all_v = all(&out);
     assert!(!out.status.success() && all_v.contains("make vm-build"), "a missing shim names the fix: {all_v}");
     assert_no_stage(v.path(), "a missing shim");
+
+    // S13 (V-R41): a missing relay client stops staging naming the same fix.
+    let w = tempfile::tempdir().unwrap();
+    let img = planted_image(w.path());
+    std::fs::remove_file(img.join("ai-env-relay-client")).unwrap();
+    let out = stage_scan(w.path(), &img);
+    let all_w = all(&out);
+    assert!(!out.status.success() && all_w.contains("ai-env-relay-client is missing or not a regular file") && all_w.contains("  run: make vm-build"), "a missing relay client names the fix: {all_w}");
+    assert_no_stage(w.path(), "a missing relay client");
 }
 
 #[test]
@@ -314,7 +329,7 @@ fn image_stage_scan_refuses_symlinks_before_staging() {
     let link = v.path().join("img-link");
     std::os::unix::fs::symlink(&img, &link).unwrap();
     let out = stage_scan(v.path(), &link);
-    assert!(out.status.success() && stdout(&out).contains("scan: clean (7 files)"), "{}", all(&out));
+    assert!(out.status.success() && stdout(&out).contains("scan: clean (10 files)"), "{}", all(&out));
 }
 
 // ---- S8 T8.7: settings-sync, then the image scan ----
@@ -360,7 +375,7 @@ fn synced_settings_pass_the_image_scan() {
     assert_eq!(read(&t.path().join("bridge").join("settings-policy.txt")), "allow Bash(cargo test:*)\nallow Bash(git status)\n");
     let scan = stage_scan(t.path(), &img);
     assert!(scan.status.success(), "{}", all(&scan));
-    assert!(stdout(&scan).contains("scan: clean (7 files)"), "{}", stdout(&scan));
+    assert!(stdout(&scan).contains("scan: clean (10 files)"), "{}", stdout(&scan));
     let staged: Value = serde_json::from_str(&read(&t.path().join("out/stage/claude/settings.json"))).unwrap();
     assert_eq!(staged["permissions"]["allow"], json!(["Bash(cargo test:*)", "Bash(git status)"]), "{staged}");
     assert_eq!(staged["permissions"]["defaultMode"], "default");
@@ -659,9 +674,11 @@ exit 0"#;
 
 /// `claude_under_test` and its mounts (S11, D2): what `make claude-admit-docker` runs, its usage and its local image
 /// checks before cargo; then one cargo test of the three claude-facing L2 tests, by their exact names, in its own target
-/// dir, with the claude under test and no key.
+/// dir, with the claude under test and no key: the refusing line. S13 (LD-V11, V-R45): a second cargo test then runs
+/// `l2_the_pinned_claude_starts_the_relay_mcp_server` alone, the same way, as a recorded check: its failure prints one
+/// `[warn]` line and never fails the target.
 #[test]
-fn claude_admit_docker_runs_the_three_tests_on_the_claude_under_test() {
+fn claude_admit_docker_refuses_on_three_tests_and_records_the_relay_check() {
     let t = tempfile::tempdir().unwrap();
     let bin = bin_with(t.path(), &[("docker.sh", "docker")]);
     let log = t.path().join("cargo.log");
@@ -678,15 +695,13 @@ fn claude_admit_docker_runs_the_three_tests_on_the_claude_under_test() {
     assert_eq!(out.status.code(), Some(2), "{}", all(&out));
     assert!(all(&out).contains("claude-admit-docker: ai-env-agent:local is missing: make image-build-local"), "{}", all(&out));
     assert!(!log.exists(), "cargo ran without the image");
-    // The image there: one cargo test, the three tests by name, the claude under test, its own target dir, no key.
+    // The image there: the refusing cargo test (the three tests by name), then the recorded relay check, each with the
+    // claude under test, its own target dir and no key.
     let out = make(t.path(), &bin, &args).arg(&sha_arg).env("CARGO_LOG", &log).env("FAKE_DOCKER_IMAGE_ID", "sha256:0123").env("AWS_SECRET_ACCESS_KEY", "x").env("AI_ENV_BRIDGE_AS", "ops:9002").bounded();
     assert!(out.status.success(), "{}", all(&out));
     let calls = lines_of(&log);
-    assert_eq!(
-        calls[0],
-        "+1.98.1 test -p ai-env-cli --features bridge --test docker_exec --test shim_docker -- --ignored --exact --test-threads=1 l2_wrapper_remote_session_initializes_the_pinned_claude l2_claude_auth_status_json_is_logged_out_with_no_network l2_claude_version_matches_the_lock",
-        "{calls:#?}"
-    );
+    let refusing = "+1.98.1 test -p ai-env-cli --features bridge --test docker_exec --test shim_docker -- --ignored --exact --test-threads=1 l2_wrapper_remote_session_initializes_the_pinned_claude l2_claude_auth_status_json_is_logged_out_with_no_network l2_claude_version_matches_the_lock";
+    let recorded = "+1.98.1 test -p ai-env-cli --features bridge --test shim_docker -- --ignored --exact --test-threads=1 l2_the_pinned_claude_starts_the_relay_mcp_server";
     let want = [
         format!("CARGO_TARGET_DIR={}/target/claude-admit", std::fs::canonicalize(REPO).unwrap().display()),
         "AI_ENV_DOCKER_TESTS=1".to_string(),
@@ -697,12 +712,72 @@ fn claude_admit_docker_runs_the_three_tests_on_the_claude_under_test() {
         "AWS_SECRET_ACCESS_KEY=unset".to_string(),
         "AI_ENV_BRIDGE_AS=unset".to_string(),
     ];
-    assert_eq!(calls[1..], want, "{calls:#?}");
+    assert_eq!(calls.len(), 2 * (1 + want.len()), "{calls:#?}");
+    assert_eq!(calls[0], refusing, "S11's three tests alone refuse: {calls:#?}");
+    assert_eq!(calls[1..=want.len()], want, "{calls:#?}");
+    assert_eq!(calls[1 + want.len()], recorded, "the relay check runs alone, after: {calls:#?}");
+    assert_eq!(calls[2 + want.len()..], want, "{calls:#?}");
+    // The relay check failing: a [warn] line, and the target still succeeds.
+    let failing = "printf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\ncase \"$*\" in *l2_the_pinned_claude_starts_the_relay_mcp_server*) exit 101;; esac\nexit 0";
+    script(&bin.join("cargo"), failing);
+    let out = make(t.path(), &bin, &args).arg(&sha_arg).env("CARGO_LOG", t.path().join("cargo2.log")).env("FAKE_DOCKER_IMAGE_ID", "sha256:0123").bounded();
+    assert!(out.status.success(), "a failed relay check never fails the target: {}", all(&out));
+    assert!(all(&out).contains("claude-admit-docker: [warn] l2_the_pinned_claude_starts_the_relay_mcp_server failed: this claude may not start the relay's MCP server (recorded, not refused)"), "{}", all(&out));
+    let mk = read(&Path::new(REPO).join("Makefile"));
+    let line = mk.lines().find(|l| l.contains(" l2_the_pinned_claude_starts_the_relay_mcp_server \\")).expect("the recorded check's cargo line");
+    assert!(!line.contains("l2_claude_version_matches_the_lock"), "the relay check is not in the refusing list: {line}");
     // Each test the target names exists, as a Docker test of its file.
-    for (file, name) in [("docker_exec.rs", "l2_wrapper_remote_session_initializes_the_pinned_claude"), ("docker_exec.rs", "l2_claude_auth_status_json_is_logged_out_with_no_network"), ("shim_docker.rs", "l2_claude_version_matches_the_lock")] {
+    for (file, name) in [
+        ("docker_exec.rs", "l2_wrapper_remote_session_initializes_the_pinned_claude"),
+        ("docker_exec.rs", "l2_claude_auth_status_json_is_logged_out_with_no_network"),
+        ("shim_docker.rs", "l2_claude_version_matches_the_lock"),
+        ("shim_docker.rs", "l2_the_pinned_claude_starts_the_relay_mcp_server"),
+    ] {
         let text = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join(file));
         assert!(text.contains(&format!("#[ignore = \"Docker: make test-docker\"]\nfn {name}() {{")), "{file}: {name}");
         assert!(text.contains("fn claude_under_test() -> Option<(PathBuf, String)>") && text.contains("fn expected_claude() -> String"), "{file}: the harness");
+    }
+}
+
+/// S13 (V-R43, V-R44, V-R46): `WS_VERSION` is the workspace's version (every bin's), `RELAY_PKG` the relay client's
+/// package, `VM_BINS` the image's three binaries; the Makefile holds §V-vm.3.10's guards as written: the shim graph's
+/// regex (with P's words folded in), the relay client's forbidden crates, its five required crates and its duplicates,
+/// its two clippy lines, its four lint lines, its machete line, its MSRV build, the derived MSRV literal and check-bins'
+/// three relay lines.
+#[test]
+fn the_makefile_guards_the_shim_and_relay_client_graphs() {
+    let t = tempfile::tempdir().unwrap();
+    let vars = make_vars(t.path(), &[]);
+    assert_eq!(vars.get("WS_VERSION").map(String::as_str), Some(env!("CARGO_PKG_VERSION")), "the workspace's version");
+    assert_eq!(vars.get("RELAY_PKG").map(String::as_str), Some("ai-env-relay-client"));
+    assert_eq!(vars.get("VM_BINS").map(String::as_str), Some("ai-env ai-env-relay-client ai-env-relay-mcp"));
+    let mk = read(&Path::new(REPO).join("Makefile"));
+    for want in [
+        "grep -E '^(aws-|rustls|reqwest|hyper-rustls|aws-lc|ring |webpki-roots|security-framework|tonic|prost|h2 |tokio-rustls|ai-env-relay)'); \\",
+        "\t@out=$$($(CARGO) tree -p $(RELAY_PKG) -e normal --target $(TARGET) --prefix none | sort -u | grep -E '^(aws-config|aws-sdk-|aws-smithy-|reqwest |hyper-rustls |ring |webpki-roots |rustls-native-certs |openssl|native-tls |security-framework|tokio-tungstenite |tungstenite |axum |ai-env-cli )'); \\",
+        "\t  test -z \"$$out\" || { echo \"forbidden crates in the relay client graph:\"; echo \"$$out\"; exit 1; }",
+        "\t  for c in rustls aws-lc-rs tonic tokio-rustls ai-env-relay-proto; do grep -qE \"^$$c v\" <<<\"$$out\" || { echo \"the relay client graph lacks $$c\"; exit 1; }; done",
+        "\t@out=$$($(CARGO) tree -p $(RELAY_PKG) -e normal --target $(TARGET) -d --depth 0 | grep -E '^(hyper|h2|rustls|tokio|tonic|prost|tokio-rustls|aws-lc-rs) '); \\",
+        "\t$(CARGO) clippy -p $(RELAY_PKG) --all-targets -- -D warnings\n",
+        "\t$(CARGO) clippy -p $(RELAY_PKG) --lib --bins --target $(TARGET) -- -D warnings\n",
+        "\t@bad=$$(grep -rlE 'ClientConfig::builder|builder_with_provider' crates/$(RELAY_PKG)/src | grep -vE 'src/tls\\.rs$$' || true); test -z \"$$bad\" || { echo \"$$bad\"; echo \"lint: the relay client's TLS config is built in src/tls.rs alone\"; exit 1; }",
+        "\t@bad=$$(grep -rlE 'TcpStream::connect|connect_with_connector' crates/$(RELAY_PKG)/src | grep -vE 'src/dial\\.rs$$' || true); test -z \"$$bad\" || { echo \"$$bad\"; echo \"lint: the relay client dials in src/dial.rs alone\"; exit 1; }",
+        "\t@bad=$$(grep -rlE 'UnixListener::(bind|from_)|UnixSocket::new_stream|(\\.|::)listen\\(' crates/$(RELAY_PKG)/src | grep -vE 'src/serve\\.rs$$' || true); test -z \"$$bad\" || { echo \"$$bad\"; echo \"lint: the relay client listens in src/serve.rs alone\"; exit 1; }",
+        "\t@bad=$$(grep -rnE 'TcpListener|\\.dangerous\\(' crates/$(RELAY_PKG)/src || true); test -z \"$$bad\" || { echo \"$$bad\"; echo \"lint: the relay client opens no TCP listener and no dangerous TLS\"; exit 1; }",
+        "\tcargo machete crates/$(RELAY_PKG)\n",
+        "\tcargo +$(MSRV_OLD) build -p $(RELAY_PKG)\n",
+        "grep -q 'ai-env-cli@$(WS_VERSION) requires rustc 1.94.1' <<<\"$$out\"",
+        "\tCARGO_TARGET_DIR=target/matrix/relay $(CARGO) build -p $(RELAY_PKG)\n",
+        "\t@test -x target/matrix/relay/debug/ai-env-relay-client && test -x target/matrix/relay/debug/ai-env-relay-mcp && test ! -e target/matrix/relay/debug/ai-env || { echo \"check-bins: the relay package builds ai-env-relay-client and ai-env-relay-mcp, and no ai-env\"; exit 1; }",
+        "\t@for b in ai-env-relay-client ai-env-relay-mcp; do v=$$(target/matrix/relay/debug/$$b --version); test \"$$v\" = \"$$b $(WS_VERSION)\" || { echo \"check-bins: $$b --version printed $$v\"; exit 1; }; done",
+        "RELAY_PINNED := ai-env-worker ai-env-relay-client\n",
+    ] {
+        assert!(mk.contains(want), "the Makefile lacks {want:?}");
+    }
+    assert!(!mk.contains("ai-env-cli@0.11.0"), "the MSRV literal is derived from WS_VERSION");
+    let shim = mk.lines().find(|l| l.contains("--no-default-features --features shim --target $(TARGET) --prefix none | sort -u | grep -E")).expect("the shim graph's guard");
+    for word in ["tonic|", "prost|", "h2 |", "ai-env-relay)"] {
+        assert!(shim.contains(word), "the shim graph's regex lacks {word}: {shim}");
     }
 }
 
@@ -1351,46 +1426,80 @@ fn arm64_elf(marker: &str) -> Vec<u8> {
     b
 }
 
+/// `make vm-build` in a working tree of its own (`w`, beside `t`'s fakes), `FAKE_CL_BOOTSTRAP` `<t>/fresh` (the
+/// cargo-lambda wrapper's stem: the fake copies `fresh-<NAME>`), `objdump` the fake llvm-objdump's body.
+fn vm_build_in(t: &Path, objdump: &str) -> Output {
+    let w = t.join("w");
+    script(&t.join("llvm/llvm-objdump"), objdump);
+    let bin = t.join("bin");
+    let mut cmd = Command::new("make");
+    isolate(&mut cmd, t).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    cmd.args(["-s", "--no-print-directory", "-f", &format!("{REPO}/Makefile"), "-C"])
+        .arg(&w)
+        .arg("vm-build")
+        .arg(format!("CARGO_LAMBDA={}", bin.join("cargo-lambda").display()))
+        .arg(format!("LLVM_BIN={}", t.join("llvm").display()))
+        .env("CARGO_TARGET_DIR", t.join("elsewhere"))
+        // A make under `cargo run` (S10's claude-update passes, logs/test34.txt; retired in S11): cargo hands its child CARGO, a program's
+        // path; make must not export its own CARGO (`cargo +1.98.1`) under that name to cargo-lambda.
+        .env("CARGO", "/usr/bin/true")
+        .env("FAKE_CL_BOOTSTRAP", t.join("fresh"))
+        .env("FAKE_CL_LOG", t.join("cl.log"))
+        .bounded()
+}
+
+/// S13 (V-R40): stale bootstraps planted for the three VM binaries; after `make vm-build`, `image/ai-env`,
+/// `image/ai-env-relay-client` and `image/ai-env-relay-mcp` are this build's bytes, each its own binary's (the fake
+/// cargo-lambda, I-R55, builds `<lambda dir>/<NAME>/bootstrap` per `--bin NAME`, from `fresh-<NAME>` here), from three
+/// cargo-lambda runs with `--lambda-dir target/lambda` (the shim's, then one per relay binary), none of which gets
+/// CARGO; a second run whose llvm-objdump reports GLIBC_2.39 for `image/ai-env-relay-mcp` alone fails naming it.
 #[test]
 fn vm_build_copies_the_bootstrap_it_built_whatever_the_cargo_target_dir() {
-    // A working tree of its own (vm-build writes target/lambda/ and image/ai-env
-    // relative to it); the Makefile under test is the repo's.
+    // A working tree of its own (vm-build writes target/lambda/ and image/ relative to it); the Makefile under test is
+    // the repo's.
     let t = tempfile::tempdir().unwrap();
     let w = t.path().join("w");
     for rel in ["infra/infra.mk", "infra/image-config.json", "image/Dockerfile"] {
         std::fs::create_dir_all(w.join(rel).parent().unwrap()).unwrap();
         std::fs::copy(Path::new(REPO).join(rel), w.join(rel)).unwrap();
     }
-    let stale = w.join("target/lambda/ai-env/bootstrap");
-    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
-    std::fs::write(&stale, arm64_elf("stale bootstrap of an earlier build")).unwrap();
-    std::fs::write(t.path().join("fresh"), arm64_elf("fresh bootstrap")).unwrap();
-    let bin = bin_with(t.path(), &[("cargo-lambda.sh", "cargo-lambda")]);
+    let vm_bins = ["ai-env", "ai-env-relay-client", "ai-env-relay-mcp"];
+    let fresh = |b: &str| arm64_elf(&format!("fresh bootstrap of {b}"));
+    for b in vm_bins {
+        let stale = w.join(format!("target/lambda/{b}/bootstrap"));
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, arm64_elf("stale bootstrap of an earlier build")).unwrap();
+        std::fs::write(t.path().join(format!("fresh-{b}")), fresh(b)).unwrap();
+    }
+    // Distinct bytes per binary (M-V31: one binary's bootstrap copied as another's shows): a wrapper hands the fake
+    // `fresh-<NAME>` for `--bin NAME` (`ai-env` without one, as cargo-lambda's default) and runs it as it is.
+    let bin = bin_with(t.path(), &[("cargo-lambda.sh", "cargo-lambda-fake")]);
+    script(
+        &bin.join("cargo-lambda"),
+        "b=ai-env; prev=\nfor a in \"$@\"; do\n  case \"$prev\" in --bin) b=$a ;; esac\n  case \"$a\" in --bin=*) b=${a#--bin=} ;; esac\n  prev=$a\ndone\nexport FAKE_CL_BOOTSTRAP=\"$FAKE_CL_BOOTSTRAP-$b\"\nexec \"$(dirname \"$0\")/cargo-lambda-fake\" \"$@\"",
+    );
     script(&bin.join("rustup"), "echo aarch64-unknown-linux-gnu");
     script(&t.path().join("llvm/llvm-nm"), "exit 0");
-    script(&t.path().join("llvm/llvm-objdump"), "echo '0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.17) memcpy'");
-    let mut cmd = Command::new("make");
-    isolate(&mut cmd, t.path()).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
-    let out = cmd
-        .args(["-s", "--no-print-directory", "-f", &format!("{REPO}/Makefile"), "-C"])
-        .arg(&w)
-        .arg("vm-build")
-        .arg(format!("CARGO_LAMBDA={}", bin.join("cargo-lambda").display()))
-        .arg(format!("LLVM_BIN={}", t.path().join("llvm").display()))
-        .env("CARGO_TARGET_DIR", t.path().join("elsewhere"))
-        // A make under `cargo run` (S10's claude-update passes, logs/test34.txt; retired in S11): cargo hands its child CARGO, a program's
-        // path; make must not export its own CARGO (`cargo +1.98.1`) under that name to cargo-lambda.
-        .env("CARGO", "/usr/bin/true")
-        .env("FAKE_CL_BOOTSTRAP", t.path().join("fresh"))
-        .env("FAKE_CL_LOG", t.path().join("cl.log"))
-        .bounded();
+    let out = vm_build_in(t.path(), "echo '0000000000000000      DF *UND*  0000000000000000 (GLIBC_2.17) memcpy'");
     let all = all(&out);
     assert!(out.status.success(), "{all}");
-    assert_eq!(std::fs::read(w.join("image/ai-env")).unwrap(), arm64_elf("fresh bootstrap"), "image/ai-env is this build's: {all}");
+    for b in vm_bins {
+        assert_eq!(std::fs::read(w.join("image").join(b)).unwrap(), fresh(b), "image/{b} is this build's {b}: {all}");
+        assert!(all.contains(&format!("vm-build: image/{b} max glibc symbol version GLIBC_2.17")), "{all}");
+    }
     let cl = lines_of(&t.path().join("cl.log"));
-    assert!(cl.iter().any(|l| l.contains("build") && l.contains("--lambda-dir target/lambda")), "{all}");
+    let builds: Vec<&String> = cl.iter().filter(|l| l.starts_with("lambda build ")).collect();
+    assert_eq!(builds.len(), 3, "{cl:?}");
+    for (line, what) in builds.iter().zip(["-p ai-env-cli --bin ai-env --no-default-features --features shim", "-p ai-env-relay-client --bin ai-env-relay-client", "-p ai-env-relay-client --bin ai-env-relay-mcp"]) {
+        assert!(line.contains("--release --arm64 --lambda-dir target/lambda ") && line.ends_with(what), "{line}: {what}");
+    }
     assert!(!cl.iter().any(|l| l.ends_with(" [CARGO]")), "no recipe gets CARGO (unexport): {cl:?}");
     assert!(!t.path().join("elsewhere/lambda").exists(), "{all}");
+    // A relay binary past the glibc ceiling fails the build, naming it.
+    let out = vm_build_in(t.path(), "case \"$2\" in *ai-env-relay-mcp) v=2.39;; *) v=2.17;; esac; echo \"0000000000000000      DF *UND*  0000000000000000 (GLIBC_$v) memcpy\"");
+    let text = format!("{}{}", stdout(&out), stderr(&out));
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("vm-build: image/ai-env-relay-mcp exceeds the glibc ceiling (GLIBC_2.39 > GLIBC_2.34)"), "{text}");
 }
 
 // ---- AI_ENV and the image parameters ----
@@ -1925,6 +2034,98 @@ fn the_replacement_guard_refuses_what_the_connector_pins_and_names_a_new_proxy()
     }
 }
 
+/// S13 (I-T45): a replaced relay instance passes, named with its own line (never the proxy's "vpc VMs have no
+/// egress"); a replaced Elastic IP is refused whatever the connectors (every worker's relay URL names its address);
+/// the proxy's line is unchanged beside the relay's.
+#[test]
+fn the_replacement_guard_names_a_new_relay_and_refuses_a_new_relay_address() {
+    let t = tempfile::tempdir().unwrap();
+    let bin = s5_bin(t.path());
+    let relay = ("aws:ec2/instance:Instance", "ai-env-relay");
+    let mut replaced = plan(&[("replace", relay.0, relay.1), ("same", "pulumi:pulumi:Stack", "ai-env-dev")]);
+    replaced["steps"][0]["replaceReasons"] = json!(["userData"]);
+    let out = guard(t.path(), &bin, &replaced.to_string(), &[]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("replacement guard: aws:ec2/instance:Instance ai-env-relay will be replaced (userData): the relay is down until the new instance boots and its reload unit installs the binary (a few minutes): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"),
+        "{text}"
+    );
+    assert!(!text.contains("vpc VMs have no egress") && text.contains("nothing the connector's ENIs pin is replaced"), "{text}");
+    // The Elastic IP, whatever the connectors: none listed (none exists), then one.
+    for connector in [false, true] {
+        if connector {
+            seed_connector(t.path(), CONNECTOR, "ACTIVE");
+        }
+        for op in ["replace", "create-replacement", "delete-replaced"] {
+            let out = guard(t.path(), &bin, &plan(&[(op, "aws:ec2/eip:Eip", "ai-env-relay")]).to_string(), &[]);
+            let text = all(&out);
+            assert!(
+                !out.status.success() && text.contains("replacement guard: aws:ec2/eip:Eip ai-env-relay would be replaced: every worker's relay URL names its address: refused (a new address is the account root's, after make destroy)"),
+                "{op}, a connector {connector}: {text}"
+            );
+        }
+    }
+    // An update of the address in place (its tags) passes; the proxy's line stays as it was beside the relay's.
+    assert!(guard(t.path(), &bin, &plan(&[("update", "aws:ec2/eip:Eip", "ai-env-relay")]).to_string(), &[]).status.success());
+    let out = guard(t.path(), &bin, &plan(&[("replace", PROXY_INSTANCE.0, PROXY_INSTANCE.1), ("replace", relay.0, relay.1)]).to_string(), &[]);
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("replacement guard: aws:ec2/instance:Instance ai-env-egress-proxy will be replaced (the plan names no reason; a change to a file embedded in its user-data is one): vpc VMs have no egress until the new instance serves; it reads its parameters at boot"), "{text}");
+    assert!(text.contains("replacement guard: aws:ec2/instance:Instance ai-env-relay will be replaced (the plan names no reason): the relay is down"), "{text}");
+}
+
+/// S13 (I-T49): `make relay-artifact` cross-builds the relay through the cargo-lambda vm-build-pick prints, with no
+/// key, marker or passphrase in its environment (D18: here all of them in make's), checks the aarch64 ELF and the glibc
+/// ceiling, and writes relay.json: the binary's sha256, its S3 key and the workspace version.
+#[test]
+fn relay_artifact_cross_builds_the_relay_and_writes_relay_json() {
+    use sha2::{Digest, Sha256};
+    let t = tempfile::tempdir().unwrap();
+    let w = t.path().join("w");
+    for rel in ["Makefile", "infra/infra.mk", "infra/image-config.json", "infra/egress-config.json", "image/Dockerfile", "Cargo.toml"] {
+        std::fs::create_dir_all(w.join(rel).parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(REPO).join(rel), w.join(rel)).unwrap();
+    }
+    let stale = w.join("target/lambda/ai-env-relay/bootstrap");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, arm64_elf("stale relay of an earlier build")).unwrap();
+    let fresh = arm64_elf("fresh relay");
+    std::fs::write(t.path().join("fresh"), &fresh).unwrap();
+    let bin = bin_with(t.path(), &[("cargo-lambda.sh", "cargo-lambda")]);
+    script(&bin.join("rustup"), "echo aarch64-unknown-linux-gnu");
+    let passphrase = super::aws_keys::passphrase();
+    let keyed = [super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL), vec![("PULUMI_CONFIG_PASSPHRASE".to_string(), passphrase)]].concat();
+    let build = |glibc: &str| {
+        script(&t.path().join("llvm/llvm-objdump"), &format!("echo '0000000000000000      DF *UND*  0000000000000000 ({glibc}) memcpy'"));
+        let _ = std::fs::remove_file(t.path().join("cl.log"));
+        let mut cmd = Command::new("make");
+        isolate(&mut cmd, t.path()).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        cmd.args(["-s", "--no-print-directory", "-C"])
+            .arg(&w)
+            .arg("relay-artifact")
+            .arg(format!("CARGO_LAMBDA={}", bin.join("cargo-lambda").display()))
+            .arg(format!("LLVM_BIN={}", t.path().join("llvm").display()))
+            .env("FAKE_CL_BOOTSTRAP", t.path().join("fresh"))
+            .env("FAKE_CL_LOG", t.path().join("cl.log"))
+            .envs(pairs(&keyed))
+            .bounded()
+    };
+    let out = build("GLIBC_2.17");
+    let text = all(&out);
+    assert!(out.status.success(), "{text}");
+    let builds: Vec<String> = lines_of(&t.path().join("cl.log")).into_iter().filter(|l| l.contains(" build ")).collect();
+    assert_eq!(builds, ["lambda build --release --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay"], "one build, without a key, marker or passphrase: {text}");
+    assert_eq!(std::fs::read(w.join("target/relay/ai-env-relay")).unwrap(), fresh, "this build's binary: {text}");
+    let sha = hex::encode(Sha256::digest(&fresh));
+    let cargo = read(&w.join("Cargo.toml"));
+    let version = cargo.split("[workspace.package]").nth(1).and_then(|s| s.lines().find_map(|l| l.strip_prefix("version = \""))).and_then(|v| v.strip_suffix('"')).unwrap();
+    assert_eq!(read(&w.join("target/relay/relay.json")), format!("{{\"binary\":\"target/relay/ai-env-relay\",\"sha256\":\"{sha}\",\"key\":\"relay/ai-env-relay-{}\",\"version\":\"{version}\"}}\n", &sha[..16]));
+    // Over the ceiling: refused.
+    let out = build("GLIBC_2.35");
+    assert!(!out.status.success() && all(&out).contains("relay-artifact: glibc ceiling exceeded (GLIBC_2.35 > GLIBC_2.34)"), "{}", all(&out));
+}
+
 /// A plan updating the egress VPC from `old` to `new` DNS attributes (support, hostnames); `outputs` puts the old
 /// values in the old state's outputs, else in its inputs.
 fn vpc_dns_plan(old: (bool, bool), new: (bool, bool), outputs: bool) -> String {
@@ -2435,6 +2636,41 @@ fn post_deploy_names_a_transcript_store_change_as_lag_never_drift() {
         assert!(out.status.success(), "{what}: {text}");
         assert!(text.contains(&format!("predates this deploy ({lag} differ from the stack outputs): make infra-status WRITE=1")), "{what}: {text}");
         assert!(!text.contains("DRIFT") && !c.iter().any(|l| l.starts_with("egress status")), "{what}: no egress status against the old state: {text}");
+    }
+}
+
+/// S13 (I-T46): post-deploy's lag check covers the relay: outputs naming another relay instance than the recorded
+/// state (the deploy that replaced it), or a state from before the S13 deploy, name the relay's keys and run no egress
+/// status (its relay rows would judge the new relay by the old ids); a current state runs it.
+#[test]
+fn post_deploy_names_the_relays_lag_and_skips_egress_status() {
+    let relay = |id: &str| {
+        let mut o = outputs();
+        o["relayInstanceId"] = json!(id);
+        o["relayPrivateIp"] = json!("10.42.0.20");
+        o["relayPublicIp"] = json!("203.0.113.20");
+        o["relaySecurityGroupId"] = json!("sg-0ccc9999dddd0000e");
+        o
+    };
+    let deployed = relay("i-0123456789abcdef1");
+    let cases = [
+        ("a replaced relay", relay("i-0fedcba9876543211"), "relay_instance_id"),
+        ("a state from before the S13 deploy", outputs(), "relay_instance_id relay_private_ip relay_public_ip relay_security_group_id"),
+        ("a current state", deployed.clone(), ""),
+    ];
+    for (what, recorded, lag) in &cases {
+        let (t, bin) = post_deploy_tree(Some(recorded), "running", "2", "2");
+        write_outputs(t.path(), &deployed);
+        let out = ops5(t.path(), &bin, &["post-deploy"]).bounded();
+        let text = all(&out);
+        assert!(out.status.success(), "{what}: {text}");
+        let c = calls(t.path());
+        if lag.is_empty() {
+            assert!(c.iter().any(|l| l.starts_with("egress status")), "{what}: a current state runs egress status: {c:#?}");
+            continue;
+        }
+        assert!(text.contains(&format!("predates this deploy ({lag} differ from the stack outputs): make infra-status WRITE=1")), "{what}: {text}");
+        assert!(!c.iter().any(|l| l.starts_with("egress status")), "{what}: no egress status against the old state: {c:#?}");
     }
 }
 
@@ -2974,9 +3210,21 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
         "no ai-env-* policy left (ai-env-deploy, ai-env-deploy-egress, ai-env-deploy-dns, ai-env-deployer, ai-env-ops)",
         "\n     cd infra && pulumi stack rm dev\n",
         "the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README \"Break-glass\"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)",
+        // S13 (I-T53): the relay instance and its Elastic IP (billed while allocated), its log group, its artifact
+        // parameter and the four writes of ai-env relay Pulumi never held (deleted by hand), its role and profile.
+        " 12. the relay instance, terminated only, and no Elastic IP of the stack left (one still allocated is billed):\n     aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-relay --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n     aws ec2 describe-addresses --filters Name=tag:Name,Values=ai-env-relay --query 'Addresses[].[AllocationId,PublicIp]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n",
+        " 13. no relay log group; the relay's artifact parameter listed as invalid; the four ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/relay --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/tls --query InvalidParameters --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm delete-parameters --names /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/tls --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        " 14. NoSuchEntity for each:\n",
+        "\n     aws iam get-role --role-name ai-env-relay --region eu-central-1; aws iam get-instance-profile --instance-profile-name ai-env-relay --region eu-central-1\n",
+        " 17. the account root ran this destroy (BREAKGLASS=1)",
     ] {
         assert!(text.contains(want), "want {want}: {text}");
     }
+    let deletes: Vec<&str> = text.lines().filter(|l| l.contains("delete-parameters")).collect();
+    assert!(deletes.len() == 1 && !deletes[0].contains("/artifact"), "the stack's artifact parameter is never deleted by hand: {deletes:?}");
+    assert!(!text.contains("--with-decryption"), "nothing decrypted: {text}");
     assert!(!text.contains("PolicyName=='ai-env-deploy'"), "every ai-env-* policy, not ai-env-deploy alone: {text}");
     // Pasted into zsh, whose interactive shell takes a `#` for an argument (no INTERACTIVE_COMMENTS by default), and an
     // unquoted `(`, `*`, `?` or `[` for syntax or a glob (D25): each command stands on a line of its own, after the
@@ -3032,11 +3280,13 @@ impl DeployTree {
     fn new(check: &str) -> DeployTree {
         let t = tempfile::tempdir().unwrap();
         let w = planted_repo(t.path(), true);
-        for rel in ["MANIFEST", "claude.lock", "managed-settings.json", "claude/settings.json", "claude/CLAUDE.md", "claude/claude.json"] {
+        for rel in ["MANIFEST", "claude.lock", "managed-settings.json", "claude/settings.json", "claude/CLAUDE.md", "claude/claude.json", "relay-mcp.json"] {
             let to = w.join("image").join(rel);
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
             std::fs::copy(Path::new(REPO).join("image").join(rel), &to).unwrap();
         }
+        // S13: the deploy's keyless build makes relay-artifact too, which reads the workspace version from Cargo.toml.
+        std::fs::copy(Path::new(REPO).join("Cargo.toml"), w.join("Cargo.toml")).unwrap();
         script(&w.join("infra/scripts/check-plan.sh"), check);
         script(&w.join("infra/scripts/check-policies.sh"), CHECK_POLICIES_FAKE);
         let bin = s5_bin(t.path());
@@ -3378,6 +3628,8 @@ const TIERED: &[(&str, &str, &[&str])] = &[
     ("connector-wait", "ops", &[]),
     ("logs", "ops", &[]),
     ("egress-logs", "ops", &[]),
+    // S13: the relay's log group (plans/s13-contracts.md §I-infra.4.7, I-R51).
+    ("relay-logs", "ops", &[]),
     ("acceptance", "ops", &[]),
     ("operator-keys", "root", &[]),
     ("destroy", "root", &["CONFIRM=destroy-dev", "BREAKGLASS=1"]),
@@ -3505,7 +3757,7 @@ fn every_tiered_target_runs_exactly_one_runner_line() {
         let key = if *tier == "root" { "" } else { " [KEY]" };
         let run = format!("make --no-print-directory {target}-run [AS={}]{key}{pass}", marker_of(tier));
         let built: Vec<String> = match *target {
-            "deploy" | "preview" | "deploy-policies" => vec!["make --no-print-directory image-zip".to_string()],
+            "deploy" | "preview" | "deploy-policies" => vec!["make --no-print-directory image-zip relay-artifact".to_string()],
             "test-egress" => vec!["cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run".to_string()],
             _ => vec![],
         };
@@ -4049,6 +4301,26 @@ fn deploy_policies_updates_the_five_stack_policies_only_and_preview_refreshes_on
     let out = d.deploy(&policies_plan("ai-env-ops", ""), &[]);
     assert!(out.status.success() && !all(&out).contains("deploy-policies:"), "{}", all(&out));
 
+    // S13 (I-T50, LD-I8): ONLY=<policy>... on the command line: the gate's known documents and the targeted up are
+    // those alone (S13's first deploy updates ai-env-deploy-egress before the relay exists, ai-env-ops' document unknown);
+    // a name that is no stack policy is refused by the gate before pulumi up; ONLY in the environment is ignored.
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run_with("deploy-policies", &["ONLY=ai-env-deploy-egress"], &policies_plan("ai-env-ops", ""), &[]);
+    let text = all(&out);
+    assert!(out.status.success() && text.contains("deploy-policies: the plan holds every document of ai-env-deploy-egress known"), "{text}");
+    let up: Vec<String> = calls(d.t.path()).into_iter().filter(|l| l.starts_with("pulumi up")).collect();
+    assert_eq!(up, ["pulumi up --stack dev --target urn:pulumi:dev::ai-env::aws:iam/policy:Policy::ai-env-deploy-egress [PASS]"], "{text}");
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run_with("deploy-policies", &["ONLY=not-a-policy"], &policies_plan("", ""), &[]);
+    let text = all(&out);
+    assert!(!out.status.success() && text.contains("deploy-policies: the plan holds no step of the policy not-a-policy") && text.contains("deploy: refused before pulumi up: nothing deployed"), "{text}");
+    assert!(!calls(d.t.path()).iter().any(|l| l.starts_with("pulumi up")), "{text}");
+    let d = DeployTree::new(CHECK_PLAN_FAKE);
+    let out = d.run("deploy-policies", &policies_plan("", ""), &[("ONLY", "ai-env-deploy-egress")]);
+    assert!(out.status.success(), "{}", all(&out));
+    let up: Vec<String> = calls(d.t.path()).into_iter().filter(|l| l.starts_with("pulumi up")).collect();
+    assert_eq!(up, [format!("pulumi up --stack dev {} [PASS]", urns.join(" "))], "ONLY in the environment is ignored");
+
     // preview: REFRESH=1 on the command line adds --refresh.
     let tmp = tempfile::tempdir().unwrap();
     let fakes: Vec<(&str, &str)> = MUST_NOT_RUN.iter().map(|n| ("logged.sh", *n)).collect();
@@ -4173,7 +4445,7 @@ fn make_help_lists_the_new_targets_and_every_make_line_is_a_sub_make_or_a_tier_l
     // or destroy of the real stack unseal it, and no other wrapper checks it.
     for target in ["deploy", "preview", "deploy-policies"] {
         let zip = usize::from(target != "preview");
-        assert_eq!(recipe(target)[zip], "$(NO_KEY) $(MAKE) --no-print-directory image-zip", "{target}: the zip built first, without a key");
+        assert_eq!(recipe(target)[zip], "$(NO_KEY) $(MAKE) --no-print-directory image-zip relay-artifact", "{target}: the zip and (S13) the relay's binary built first, without a key");
     }
     for target in ["deploy", "deploy-policies"] {
         assert_eq!(recipe(target)[0], format!("@$(call PASS_CHECK,{target})"), "{target}: the passphrase checked first");
@@ -4281,13 +4553,13 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
     let unseal = |x: &str| cli(&format!("run -f <t>/.config/ai-env/pulumi.env -- /bin/bash infra/scripts/pass-exec.sh {x} <t>/.config/ai-env/pulumi.env <bin>/fake-make --no-print-directory {x}-run")) + d;
     let mut cases: Vec<Case> = ["deploy", "preview", "deploy-policies"]
         .into_iter()
-        .map(|x| (vec![x], deployer.clone(), true, vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, unseal(x), format!("make --no-print-directory {x}-run{d} [PASS]")]))
+        .map(|x| (vec![x], deployer.clone(), true, vec![s("make --no-print-directory image-zip relay-artifact"), build.clone(), cli("as --check deployer") + d, unseal(x), format!("make --no-print-directory {x}-run{d} [PASS]")]))
         .collect();
     // A make typed under `ai-env run -f` of the sealed passphrase and the runner (README "Identities"): nothing unsealed
     // again; the zip and the build without the passphrase, the check and X-run with it.
     let passphrase = super::aws_keys::passphrase();
     let under_pass = [deployer.clone(), vec![(s("PULUMI_CONFIG_PASSPHRASE"), passphrase.clone())]].concat();
-    let passed_deploy = vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d + " [PASS]", format!("make --no-print-directory deploy-run{d} [PASS]")];
+    let passed_deploy = vec![s("make --no-print-directory image-zip relay-artifact"), build.clone(), cli("as --check deployer") + d + " [PASS]", format!("make --no-print-directory deploy-run{d} [PASS]")];
     cases.push((vec!["deploy"], under_pass.clone(), true, passed_deploy.clone()));
     cases.extend([
         (vec!["test-egress"], deployer.clone(), true, vec![s("cargo +1.98.1 test -p ai-env-cli --features bridge --test aws --no-run"), build.clone(), cli("as --check deployer") + d, format!("make --no-print-directory test-egress-run{d}")]),
@@ -4339,7 +4611,7 @@ fn a_make_under_a_runner_compiles_nothing_with_the_key() {
             vec!["test-docker", "deploy"],
             deployer.clone(),
             true,
-            [docker.clone(), vec![s("make --no-print-directory image-zip"), build.clone(), cli("as --check deployer") + d, unseal("deploy"), format!("make --no-print-directory deploy-run{d} [PASS]")]].concat(),
+            [docker.clone(), vec![s("make --no-print-directory image-zip relay-artifact"), build.clone(), cli("as --check deployer") + d, unseal("deploy"), format!("make --no-print-directory deploy-run{d} [PASS]")]].concat(),
         ),
         // The same under the passphrase too: test-docker's steps never carry it either.
         (vec!["test-docker", "deploy"], under_pass, true, [docker, passed_deploy].concat()),
@@ -4747,7 +5019,7 @@ fn a_passphrase_already_in_the_environment_is_never_unsealed_again() {
             let runner = format!("as deployer -- {} --no-print-directory deploy-run [AI_ENV=unset] [PASS]", bin.join("fake-make").display());
             assert_eq!(c.contains(&runner), !under, "{what}: the runner under the passphrase, unless one covers the tier: {c:#?}");
             assert!(c.contains(&"make --no-print-directory deploy-run [AS=deployer:9001] [KEY] [PASS]".to_string()), "{what}: X-run under it: {c:#?}");
-            assert!(c.contains(&"make --no-print-directory image-zip".to_string()) && c.iter().filter(|l| l.starts_with("--version ")).all(|l| !l.contains("[PASS]")), "{what}: the zip and the build without it: {c:#?}");
+            assert!(c.contains(&"make --no-print-directory image-zip relay-artifact".to_string()) && c.iter().filter(|l| l.starts_with("--version ")).all(|l| !l.contains("[PASS]")), "{what}: the zip and the build without it: {c:#?}");
             assert!(!text.contains(&passphrase) && c.iter().all(|l| !l.contains(&passphrase)), "{what}: the value shown");
         }
     }
@@ -4781,7 +5053,7 @@ fn breakglass_under_a_runner_unseals_only_where_the_root_runs() {
     let deployer = super::aws_keys::identity_env("deployer", super::aws_keys::DEPLOYER_TAIL);
     for target in ["deploy", "preview", "deploy-policies", "destroy"] {
         let argv: Vec<&str> = if target == "destroy" { vec![target, "CONFIRM=destroy-dev", "BREAKGLASS=1"] } else { vec![target, "BREAKGLASS=1"] };
-        let zip: Vec<String> = if target == "destroy" { vec![] } else { vec!["make --no-print-directory image-zip".to_string()] };
+        let zip: Vec<String> = if target == "destroy" { vec![] } else { vec!["make --no-print-directory image-zip relay-artifact".to_string()] };
         let tmp = tempfile::tempdir().unwrap();
         let t = tmp.path();
         let bin = tier_world(t);
@@ -5642,6 +5914,9 @@ fn the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read() {
     assert_eq!(lacks(&removed, &want), Vec::<String>::new(), "REMOVED_ENV (tests/common/mod.rs) lacks these");
     // S12 (Q-R10): the one real CLI variable the fake claude obeys (R2's state frames); a test run from a Claude Code chat inherits it.
     assert!(removed.contains("CLAUDE_CODE_SDK_READS_SESSION_STATE"), "REMOVED_ENV (tests/common/mod.rs) lacks CLAUDE_CODE_SDK_READS_SESSION_STATE");
+    // S13 (A6): the two real CLI variables of extension 2.1.312 the fake obeys (FAKE_PROMPT_HOOK is the scan's above).
+    assert!(removed.contains("CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS"), "REMOVED_ENV (tests/common/mod.rs) lacks CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS");
+    assert!(removed.contains("CLAUDE_CODE_SDK_READS_STARTUP_MARKS"), "REMOVED_ENV (tests/common/mod.rs) lacks CLAUDE_CODE_SDK_READS_STARTUP_MARKS");
     assert!(spawn_sets.iter().all(|n| !removed.contains(*n)), "Prepared::spawn sets {spawn_sets:?} before it removes REMOVED_ENV");
 
     let wrapper = const_list(&dir.join("tests/wrapper.rs"), "WRAPPER_ENV");
@@ -5696,18 +5971,20 @@ fn make_n_perf_wrapper_adds_the_prewarm_run_only_with_prewarm_1_on_the_command_l
 /// S9 phase 4 (the surviving mutant M38): the S3 gateway endpoint's policy
 /// as `infra/policies.ts` builds it (`s3EndpointPolicy`, printed by
 /// `scripts/print-policies.ts`, compiled with the infra's own tsc as
-/// check-policies.sh compiles it and run with node, offline) is contracts
-/// §7.3's for the example account: its canonical hash, in Rust
-/// (`canonical_policy_sha256`) and in TypeScript (`canonicalPolicySha256`),
-/// is the one `bridge::infra`'s test pins for §7.3's literal. Nothing else
-/// holds policies.ts's document to it offline: the egress guard, the plan
-/// check and the stack output compare policies.ts with itself, and
-/// check-policies' simulation that our bucket outside `v1/` is denied needs
-/// AWS. A widened resource (`<bucket>/*`), an action or a condition more or
-/// less, fails here.
+/// check-policies.sh compiles it and run with node, offline) is the pinned
+/// one for the example account, in Rust (`canonical_policy_sha256`) and in
+/// TypeScript (`canonicalPolicySha256`). S13 (I-T47) added its third
+/// statement, the relay role's binary through the endpoint
+/// (plans/s13-contracts.md I-R40), so the pin moved from S9's §7.3 literal
+/// (`0e80ca5a…ec27`, which `bridge::infra`'s test still pins as a test of
+/// the hash function). Nothing else holds policies.ts's document to it
+/// offline: the egress guard, the plan check and the stack output compare
+/// policies.ts with itself, and check-policies' simulations need AWS. A
+/// widened resource (`<bucket>/*`), an action or a condition more or less,
+/// fails here.
 #[test]
 fn the_endpoint_policy_of_policies_ts_is_the_pinned_one() {
-    const PINNED: &str = "0e80ca5ab63a4465e3921f4247d90b35f8c941fdd124370bad974db63765ec27";
+    const PINNED: &str = "1e30d2178ae4648b2aca53e97c05e22c42d207c2295e1478ded56de73034cc47";
     let infra = Path::new(REPO).join("infra");
     let tsc = infra.join("node_modules/.bin/tsc");
     assert!(tsc.exists(), "{} is missing: make infra-install", tsc.display());
@@ -5726,7 +6003,7 @@ fn the_endpoint_policy_of_policies_ts_is_the_pinned_one() {
         .bounded();
     assert!(o.status.success(), "print-policies: {}", String::from_utf8_lossy(&o.stderr));
     let doc = String::from_utf8(o.stdout).unwrap();
-    assert_eq!(ai_env_cli::bridge::infra::canonical_policy_sha256(doc.trim()).unwrap(), PINNED, "policies.ts's endpoint policy is not §7.3's: {doc}");
+    assert_eq!(ai_env_cli::bridge::infra::canonical_policy_sha256(doc.trim()).unwrap(), PINNED, "policies.ts's endpoint policy is not the pinned one: {doc}");
     let policies = out.path().join("policies.js");
     let script = format!(
         "const p = require({:?}); process.stdout.write(p.canonicalPolicySha256(p.s3EndpointPolicy({{ accountId: '123456789012', transcriptsBucket: p.transcriptsBucketName('123456789012') }})));",

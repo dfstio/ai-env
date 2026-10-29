@@ -20,5 +20,12 @@
   "proxySecurityGroupName": "ai-env-proxy",
   "reloadDocumentName": "ai-env-proxy-reload",
   "statusDocumentName": "ai-env-proxy-status",
-  "patchDocumentName": "ai-env-proxy-patch"
+  "patchDocumentName": "ai-env-proxy-patch",
+  "relayIp": "10.42.0.20",
+  "relayPort": 7443,
+  "relayInstanceType": "t4g.nano",
+  "relaySecurityGroupName": "ai-env-relay",
+  "relayParameterPrefix": "/ai-env/relay",
+  "relayLogGroup": "/ai-env/relay",
+  "relayLogRetentionDays": 90
 }

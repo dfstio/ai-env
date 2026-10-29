@@ -175,6 +175,9 @@ fn passing_markers() -> String {
             "direct-ipv6" => "rc=7 code=000 size=0 conn=0 hc=000 t403=no sq=no".to_string(),
             "imds" | "imds-v6" => "rc=0 code=401 size=0 conn=1 hc=000 t403=no sq=no".to_string(),
             "proxy-http-8080" => "rc=0 code=403 size=3900 conn=1 hc=000 t403=no sq=yes".to_string(),
+            // S13 (I-T34's): the relay's internet face timed out without a connection; its private port answered (TLS
+            // under the relay's own CA: rc 60), recorded only.
+            "relay-other-port" | "relay-port" => if c.name == "relay-port" { "rc=60 code=000 size=0 conn=1 hc=000 t403=no sq=no" } else { "rc=28 code=000 size=0 conn=0 hc=000 t403=no sq=no" }.to_string(),
             // The S9 S3 cases (§7.7): s3-own 200/200, the S3Denied cases 403 AccessDenied, proxy-s3-other-host a
             // CONNECT 403 (the proxy- arm below), s3-direct no connection (the direct-name arm above).
             "s3-own" => "rc=0 put=200 get=200 hc=200 s3=-".to_string(),

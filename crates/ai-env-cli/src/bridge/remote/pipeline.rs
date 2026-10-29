@@ -1292,12 +1292,13 @@ fn argv_fits(argv: &[String]) -> Result<(), Failure> {
 }
 
 /// The spawn frame P4 sends (the proxy variables included, as the vpc row
-/// gets them, and S11's claude refs at their most: `CLAUDE_REFS_MAX` of the
+/// gets them, S11's claude refs at their most: `CLAUDE_REFS_MAX` of the
 /// longest version, since a later generation reads the records again and may
-/// name more than P0's plan) fits `CONTROL_FRAME_MAX`, else exit 9: the shim
+/// name more than P0's plan, and S13's relay session at its largest, since P4
+/// mints it after this check) fits `CONTROL_FRAME_MAX`, else exit 9: the shim
 /// would close the socket on it.
 fn spawn_frame_fits(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMap<String, String>) -> Result<(), Failure> {
-    let size = spawn_frame_size(ctx, argv, ws, env, worst_claude_refs());
+    let size = spawn_frame_size(ctx, argv, ws, env, worst_claude_refs(), Some(worst_relay()));
     if size > CONTROL_FRAME_MAX {
         return Err(Failure::Refused { what: format!("the session's argv and environment make a {size}-byte spawn frame (at most {CONTROL_FRAME_MAX})") });
     }
@@ -1310,8 +1311,25 @@ fn worst_claude_refs() -> Vec<crate::wire::workspace::ClaudeRef> {
     vec![r; crate::wire::workspace::CLAUDE_REFS_MAX]
 }
 
-/// The JSON size of the spawn frame P4 would send with `argv`, `env` and `claude` (the vpc row's proxy variables).
-fn spawn_frame_size(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMap<String, String>, claude: Vec<crate::wire::workspace::ClaudeRef>) -> usize {
+/// The largest relay session `RelaySpawn::check` passes: a token of `TOKEN_MAX` bytes, the longest private address,
+/// a 253-byte name and a CA of `CA_DER_MAX` bytes.
+fn worst_relay() -> crate::wire::relay::RelaySpawn {
+    use base64::Engine;
+    use crate::wire::relay::{CA_DER_MAX, SERVER_NAME_MAX, TOKEN_MAX};
+    let label = "a".repeat(63);
+    let mut server_name = [label.as_str(); 4].join(".");
+    server_name.truncate(SERVER_NAME_MAX);
+    crate::wire::relay::RelaySpawn {
+        token: crate::wire::redact::Secret::new("A".repeat(TOKEN_MAX)),
+        addr: "192.168.255.255:65535".into(),
+        server_name,
+        ca_der_b64: base64::engine::general_purpose::STANDARD.encode(vec![0x30; CA_DER_MAX]),
+    }
+}
+
+/// The JSON size of the spawn frame P4 would send with `argv`, `env`, `claude` and `relay` (the vpc row's proxy
+/// variables).
+fn spawn_frame_size(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMap<String, String>, claude: Vec<crate::wire::workspace::ClaudeRef>, relay: Option<crate::wire::relay::RelaySpawn>) -> usize {
     let vpc = VmRow { egress: Egress::Vpc.as_str().to_string(), ..VmRow::default() };
     let pairs: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let frame = Frame::Spawn {
@@ -1324,6 +1342,7 @@ fn spawn_frame_size(ctx: &Ctx, argv: &[String], ws: &WorkspaceRef, env: &BTreeMa
         detach_grace_s: Some(u32::MAX),
         credential: None,
         claude,
+        relay,
     };
     frame.to_json().len()
 }
@@ -2081,6 +2100,12 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Spawn, e, at))?;
     let spawn_id = SpawnId::new_v7();
     let Spawning { argv, session: session_id, why, account } = spawning;
+    // S13 (WM-R50 to WM-R53): this spawn's relay session token, asked of this Mac's relay agent within 2 s (a
+    // resumed or moved chat's id as `chat_id`); it rides the delivery to this VM only, and the word goes in
+    // `session_remote_start` (`for_spawn` says WM-R53's note itself: the agent's refusal code is known there).
+    let relay = crate::bridge::relay::mint::for_spawn(&plan.cfg, &plan.paths, &plan.ws, &row, &spawn_id, session_id.as_deref(), crate::wire::time::unix_now()).await;
+    let relay_word = relay.word();
+    let delivery = delivery.with_relay(relay.into_spawn());
     // S11 (A.4): the staged claudes this spawn may name ([`claude_ask`]), and V's fetch into the VM after the CLI's
     // first output for the next generation (the link starts it only when V did not run). Nothing here waits.
     let claude = claude_ask(plan, gen, &row);
@@ -2107,6 +2132,9 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     }
     let mut pairs = vec![("id", id.clone()), ("spawn", spawn_id.to_string()), ("gen", gen.to_string()), ("why", why)];
     pairs.extend(account.map(|a| ("account", a)));
+    if relay_word != "off" {
+        pairs.push(("relay", relay_word.to_string()));
+    }
     audit_event(&plan.paths, event::SESSION_REMOTE_START, &pairs);
     tracing::info!(gen, vm = %id, spawn = %spawn_id, "the remote spawn went to its session");
     Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report, claude, after_output })
@@ -5840,7 +5868,7 @@ mod tests {
         let f = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
         assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{}", f.line());
         let line = f.line();
-        let why = "refused before any Touch ID: no credential for a vpc VM of image version 1.0: the recorded `ai-env egress check` passed by an earlier rule, before the transcript store's cases";
+        let why = "refused before any Touch ID: no credential for a vpc VM of image version 1.0: the recorded `ai-env egress check` passed by an earlier rule (0, now 2): before the relay path's cases";
         assert!(line.starts_with(why) && line.ends_with('\u{2026}'), "the reason within the cut: {line}");
         let audit = crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap();
         let gate: Vec<_> = audit.iter().filter(|r| r["event"] == "credential_gate").map(|r| ["condition", "half", "image_version"].map(|k| r["detail"][k].as_str().unwrap_or_default().to_string())).collect();
@@ -7352,8 +7380,9 @@ mod a3_tests {
         assert_eq!(plan.argv_now(), now, "a session flag is never dropped (`drop_option` refuses it)");
     }
 
-    /// W2: P0 measures the spawn frame with `CLAUDE_REFS_MAX` refs of the longest version P4 can send, so an argv
-    /// within that margin of `CONTROL_FRAME_MAX` is refused (exit 9) rather than closing the shim's socket at P4.
+    /// W2: P0 measures the spawn frame with `CLAUDE_REFS_MAX` refs of the longest version P4 can send, and S13's
+    /// largest relay session, so an argv within that margin of `CONTROL_FRAME_MAX` is refused (exit 9) rather than
+    /// closing the shim's socket at P4.
     #[test]
     fn p0_measures_the_spawn_frame_with_the_most_refs_p4_can_send() {
         let d = tempfile::tempdir().unwrap();
@@ -7361,8 +7390,14 @@ mod a3_tests {
         let ctx = plan.ctx();
         let worst = worst_claude_refs();
         assert!(worst.len() == crate::wire::workspace::CLAUDE_REFS_MAX && worst.iter().all(|r| r.check().is_ok()), "refs P4 could send: {worst:?}");
+        let relay = worst_relay();
+        assert_eq!(relay.check(), Ok(()), "a session P4 could send");
+        assert_eq!((relay.server_name.len(), relay.token.expose().len()), (crate::wire::relay::SERVER_NAME_MAX, crate::wire::relay::TOKEN_MAX));
+        let no_relay = spawn_frame_size(&ctx, &plan.argv, &plan.ws, &plan.env, Vec::new(), None);
+        let with_relay = spawn_frame_size(&ctx, &plan.argv, &plan.ws, &plan.env, Vec::new(), Some(relay));
+        assert!(with_relay - no_relay > crate::wire::relay::TOKEN_MAX + crate::wire::relay::CA_DER_MAX, "the relay's margin: {}", with_relay - no_relay);
         let padded = |pad: usize| -> Vec<String> { plan.argv.iter().cloned().chain(["x".repeat(pad)]).collect() };
-        let size = |pad: usize, refs: Vec<ClaudeRef>| spawn_frame_size(&ctx, &padded(pad), &plan.ws, &plan.env, refs);
+        let size = |pad: usize, refs: Vec<ClaudeRef>| spawn_frame_size(&ctx, &padded(pad), &plan.ws, &plan.env, refs, Some(worst_relay()));
         let (bare, full) = (size(0, Vec::new()), size(0, worst.clone()));
         assert!(full - bare > CLAUDE_REFS_MAX_BYTES_FLOOR, "the refs' margin: {}", full - bare);
         // Just inside the cap without refs, past it with them: refused.

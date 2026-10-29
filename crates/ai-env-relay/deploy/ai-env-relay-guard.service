@@ -1,0 +1,14 @@
+[Unit]
+Description=ai-env relay: its user opens no connection and never reaches IMDS (S13)
+After=nftables.service firewalld.service
+Conflicts=firewalld.service
+Before=ai-env-relay.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/ai-env-relay/guard.nft
+ExecStop=/usr/sbin/nft delete table inet ai_env_relay_guard
+
+[Install]
+RequiredBy=ai-env-relay.service

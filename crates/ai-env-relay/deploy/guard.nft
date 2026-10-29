@@ -1,0 +1,14 @@
+#!/usr/sbin/nft -f
+# ai-env relay (S13, plans/s13-contracts.md §R-relay.3.4): the relay's user answers connections and opens none;
+# it never reaches IMDS, the Amazon DNS or any link-local service. Stateless; idempotent: the table is replaced whole.
+table inet ai_env_relay_guard
+delete table inet ai_env_relay_guard
+table inet ai_env_relay_guard {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        meta skuid "ai-env-relay" ip daddr 169.254.0.0/16 counter reject
+        meta skuid "ai-env-relay" ip6 daddr fd00:ec2::/32 counter reject
+        meta skuid "ai-env-relay" tcp flags & (syn | ack) == syn counter reject with tcp reset
+        meta skuid "ai-env-relay" meta l4proto != tcp counter reject
+    }
+}

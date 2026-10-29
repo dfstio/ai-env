@@ -239,4 +239,33 @@ mod tests {
         child(&mut st, &idle);
         assert_eq!(verdict(&st), Verdict::Idle, "answered, its result, then idle: idle");
     }
+
+    /// S13 (A6-2, a control): a UserPromptSubmit hook's `hook_started` and `hook_response` frames (extension
+    /// 2.1.312 sets `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS`, the wrapper forwards it) are forwarded
+    /// unchanged and leave the verdict to the frames around them: on a fresh state idle; inside a turn busy until
+    /// its result.
+    #[test]
+    fn prompt_hook_frames_never_change_the_verdict() {
+        use crate::bridge::hoststate::ChildVerdict;
+        let sid = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let started = format!(r#"{{"type":"system","subtype":"hook_started","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","uuid":"00000001-0000-4000-2000-000000000001","session_id":"{sid}"}}"#);
+        let response = format!(
+            r#"{{"type":"system","subtype":"hook_response","hook_id":"00000001-0000-4000-2200-000000000001","hook_name":"fake-hook","hook_event":"UserPromptSubmit","output":"","stdout":"","stderr":"","exit_code":0,"outcome":"success","uuid":"00000001-0000-4000-2100-000000000001","session_id":"{sid}"}}"#
+        );
+        for line in [&started, &response] {
+            assert_eq!(HostState::new().on_child_frame(&classify_child(line.as_bytes()), line.as_bytes()), ChildVerdict::Forward, "{line}");
+        }
+        let mut st = HostState::new();
+        child(&mut st, &started);
+        child(&mut st, &response);
+        assert_eq!(verdict(&st), Verdict::Idle, "both on a fresh session: idle");
+        let mut st = HostState::new();
+        host(&mut st, USER);
+        child(&mut st, &started);
+        assert_eq!(verdict(&st), Verdict::Busy, "the turn's hook started: a turn at work");
+        child(&mut st, &response);
+        assert_eq!(verdict(&st), Verdict::Busy, "its response: still the turn");
+        child(&mut st, RESULT);
+        assert_eq!(verdict(&st), Verdict::Idle, "the result retired the line");
+    }
 }

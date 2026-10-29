@@ -1,0 +1,13 @@
+[package]
+name = "relay-protogen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Regenerates crates/ai-env-relay-proto/src/gen from the relay proto (needs protoc). Not part of the workspace."
+
+# A workspace of its own, so consumers of ai-env-relay-proto never build the generator.
+[workspace]
+
+[dependencies]
+tonic-prost-build = "=0.14.6"

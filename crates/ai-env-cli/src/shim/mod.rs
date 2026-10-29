@@ -17,6 +17,8 @@
 //! adds git smart-HTTP on the code port (`gitcgi`) and the transcript
 //! store's transfers on the app port (`s3xfer`: curl as `ai-env-net`). S11
 //! adds the VM's claude cache (`claudebin`: staged claudes a spawn may run).
+//! S13 adds a spawn's relay session (`relay`: the spawn's relay client as
+//! `ai-env-net`, and claude's relay MCP config).
 //!
 //! Every log line goes through `errln!`: stderr is whatever PID 1 was
 //! given, and a reader that went away must not panic a hook (`eprintln!`
@@ -49,6 +51,7 @@ pub mod health;
 pub mod hooks;
 pub mod init;
 pub mod peer;
+pub mod relay;
 pub mod replay;
 pub mod s3xfer;
 pub mod spawn;
@@ -114,6 +117,12 @@ pub struct ShimArgs {
     /// The curl the transcript transfers run as ai-env-net (S9; native tests point it at a fake)
     #[arg(long, value_name = "PATH", hide = true, default_value = health::CURL_DEFAULT)]
     pub curl: PathBuf,
+    /// The relay client the shim starts as ai-env-net for a spawn's relay session (S13; native tests point it at a fake)
+    #[arg(long, value_name = "PATH", hide = true, default_value = crate::wire::relay::CLIENT_BIN)]
+    pub relay_client: PathBuf,
+    /// The MCP config claude gets with a relay session (S13; native tests point it at their own)
+    #[arg(long, value_name = "PATH", hide = true, default_value = crate::wire::relay::MCP_CONFIG)]
+    pub relay_mcp_config: PathBuf,
     /// The cold-start warm (S10, chosen from B0's numbers): off (the image's default), read or run
     #[arg(long, value_enum, hide = true, default_value_t = health::ColdWarm::Off)]
     pub cold_warm: health::ColdWarm,
@@ -249,6 +258,8 @@ async fn serve(args: ShimArgs) -> Result<()> {
         curl: args.curl.clone(),
         net_uid: health::NET_UID,
         net_gid: health::NET_GID,
+        relay_client: args.relay_client.clone(),
+        relay_mcp_config: args.relay_mcp_config.clone(),
         cold_warm: args.cold_warm,
     };
     let probe = health::ProbeSpec::for_agent(args.uid, args.gid);

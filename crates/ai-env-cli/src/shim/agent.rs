@@ -1275,7 +1275,7 @@ mod tests {
         let s = state(true);
         let mut c = hello_ok(&s, FAST).await;
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec![], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), relay: None };
         send(&mut c, &spawn).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::SpawnErr { spawn_id, .. }) if spawn_id == id));
         let unknown = SpawnId::new_v7();
@@ -1372,7 +1372,7 @@ mod tests {
         let (held, mut queued) = mpsc::channel(CONTROL_QUEUE);
         let mut reader = Session { state: s.clone(), gen, tx: held, unannounced, authenticated: true, idle: Duration::from_secs(60), idle_unit: FAST.idle_unit, deadline: Instant::now() + Duration::from_secs(60), summary: String::new() };
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new() };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/echo".into(), "hi".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: None, credential: None, claude: Vec::new(), relay: None };
         assert!(matches!(reader.on_frame(spawn).await, Flow::Continue));
         let until = Instant::now() + Duration::from_secs(5);
         while s.spawns.status(None).iter().all(|st| st.exit.is_none()) {
@@ -1452,7 +1452,7 @@ mod tests {
         send(&mut c, &hello_frame(&token(), vec![], Some(IDLE_MIN_S))).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::HelloOk { caps, .. }) if caps.iter().any(|c| c == CAP_PARK_V1)));
         let id = SpawnId::new_v7();
-        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new() };
+        let spawn = Frame::Spawn { spawn_id: id.clone(), argv: vec!["/bin/cat".into()], cwd: None, env: BTreeMap::new(), secrets: BTreeMap::new(), deliver_secret: crate::wire::frame::Deliver::Fd, detach_grace_s: Some(60), credential: None, claude: Vec::new(), relay: None };
         send(&mut c, &spawn).await;
         assert!(matches!(next(&mut c).await, Ok(Frame::Spawned { spawn_id, .. }) if spawn_id == id));
         let owner = ParkOwner { pid: 51_234, started: 1_792_483_200 };

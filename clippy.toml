@@ -13,6 +13,17 @@ await-holding-invalid-types = [
     { path = "tracing::span::EnteredSpan", reason = "use `Instrument::instrument`; never hold `entered()` across .await" },
     { path = "std::io::StdoutLock", reason = "stdout is the JSON channel: write one whole line, drop the lock, then await" },
     { path = "std::io::StdinLock", reason = "use tokio::io::stdin in async code" },
+    # S13 relay (R-74): a DashMap guard held across an `.await` deadlocks its shard. `allow-invalid` keeps crates
+    # without dashmap quiet; the relay's examples/dashmap_lint_negative.rs (`make lint-negative`) proves each path.
+    { path = "dashmap::mapref::one::Ref", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::one::RefMut", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::multiple::RefMulti", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::multiple::RefMutMulti", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::entry::Entry", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::entry::OccupiedEntry", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::mapref::entry::VacantEntry", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::iter::Iter", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
+    { path = "dashmap::iter::IterMut", reason = "clone out of the map and drop the guard before .await (S13 relay)", allow-invalid = true },
 ]
 
 # TLS/WS policy (plan §2.8 invariant 15): exactly one client configuration —
