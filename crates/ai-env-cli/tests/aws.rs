@@ -684,7 +684,7 @@ fn i2_a_live_tests_archive_holds_no_title() {
     }
     let line = |at: &str, event: &str, session: Option<&str>, detail: serde_json::Value| serde_json::json!({ "v": 2, "ts": at, "event": event, "session_id": session, "pid": 4242, "detail": detail }).to_string();
     let lines = [
-        line("2026-10-25T09:00:00Z", "vm_run", None, serde_json::json!({ "actor": "wrapper", "id": X, "purpose": "session", "image_version": "13.0", "egress": "internet", "shell": "false", "client_token": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f12a3" })),
+        line("2026-10-25T09:00:00Z", "vm_run", None, serde_json::json!({ "actor": "wrapper", "id": X, "purpose": "session", "image_version": "13.0", "egress": "internet", "shell": "false", "client_token": "0199a1b2-0000-7000-8000-0000000012a3" })),
         line("2026-10-25T09:00:20Z", "session_remote_start", Some(SID), serde_json::json!({ "actor": "wrapper", "id": X, "spawn": "s-1", "gen": "1", "why": "first" })),
         line("2026-10-25T09:01:00Z", "transcript_view", Some(SID), serde_json::json!({ "actor": "wrapper", "session": SID, "vm": X, "messages": "2", "masked": "0", "bytes": "640", "outcome": "written" })),
         line("2026-10-25T09:01:05Z", "transcript_stage", Some(SID), serde_json::json!({ "actor": "cli", "session": SID, "bytes": "640", "parts": "1", "outcome": "staged", "ms": "80" })),
