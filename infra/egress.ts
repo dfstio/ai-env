@@ -465,7 +465,10 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             eq("privateIp", relay ? cfg.relayIp : cfg.proxyIp);
             eq("associatePublicIpAddress", true);
             eq("instanceType", relay ? cfg.relayInstanceType : cfg.instanceType);
-            eq("iamInstanceProfile", relay ? RELAY_INSTANCE_PROFILE_NAME : cfg.proxyInstanceProfileName);
+            // Its profile's name: unknown only while that profile is a create the run skips (S13 part B: deploy-policies'
+            // `pulumi up --target` before the relay exists), and then the instance is skipped too. check-plan.ts holds it
+            // by URN in the whole plan; once the profile exists or is created, the name is known and compared here.
+            if (props.iamInstanceProfile !== UNKNOWN) eq("iamInstanceProfile", relay ? RELAY_INSTANCE_PROFILE_NAME : cfg.proxyInstanceProfileName);
             const md = (props.metadataOptions ?? {}) as Props;
             if (md.httpTokens !== "required" || md.httpPutResponseHopLimit !== 1) bad("metadataOptions must require IMDSv2 with hop limit 1");
             break;

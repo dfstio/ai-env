@@ -847,6 +847,100 @@ console.log(JSON.stringify({
     assert_eq!(r["kept"], json!({"ok": "x=a @DIR@\n"}));
 }
 
+/// The tsc output of egress.ts (the guard) and image.ts, compiled once per test run beside [`compiled`]'s: its own
+/// directory, so only the guard's test pays for the Pulumi SDK's types.
+fn compiled_guard() -> &'static Path {
+    static OUT: OnceLock<PathBuf> = OnceLock::new();
+    OUT.get_or_init(|| {
+        let infra = infra();
+        let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("relay-guard-tsc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let mut cmd = Command::new(infra.join("node_modules/.bin/tsc"));
+        cmd.args(["--strict", "--target", "es2022", "--module", "commonjs", "--moduleResolution", "node", "--types", "node", "--rootDir", ".", "--outDir"])
+            .arg(&out)
+            .args(["egress.ts", "image.ts"])
+            .current_dir(&infra)
+            .stdin(Stdio::null());
+        let o = bounded(&mut cmd, "tsc");
+        assert!(o.status.success(), "tsc: {}", all(&o));
+        out
+    })
+}
+
+/// I-T56 (S13 part B): deploy-policies' `pulumi up --target` before the relay exists skips the relay's creates, so the
+/// guard sees every input computed from one of them unknown (the profile's name, the group's and the Elastic IP's ids):
+/// it lets them through, as check-plan.ts holds them by URN in the whole plan, and still refuses a known wrong profile.
+/// The guard is called as the engine calls the transform; the existing resources' ids are known, the relay's unknown.
+#[test]
+fn the_guard_passes_a_targeted_runs_skipped_relay_creates() {
+    let infra = infra();
+    let body = r#"const path = require('path');
+const out = process.env.RT_OUT, infra = process.env.RT_INFRA;
+const pulumi = require('@pulumi/pulumi');
+let transform;
+pulumi.runtime.registerResourceTransform = (t) => { transform = t; };
+const spec = require(path.join(out, 'egress-spec.js')), pol = require(path.join(out, 'policies.js'));
+const cfg = spec.loadEgressConfig(path.join(infra, 'egress-config.json'));
+const egress = spec.egressSpec(cfg);
+const guard = require(path.join(out, 'egress.js')).guardEgress(egress, require(path.join(out, 'image.js')).loadImageConfig(path.join(infra, 'image-config.json')),
+  spec.readProxyDocuments(path.join(infra, 'proxy', 'documents')));
+const U = pulumi.unknown, UO = pulumi.output(pulumi.unknown);
+for (const [k, v] of [['vpc', 'vpc-1'], ['subnet:proxy', 'subnet-p'], ['subnet:vms', 'subnet-v'], ['sg:vm', 'sg-vm'], ['sg:proxy', 'sg-proxy']]) guard.track(k, pulumi.output(v));
+for (const k of ['sg:relay', 'relay-instance', 'relay-eip']) guard.track(k, UO);
+const tags = { Project: 'ai-env' };
+const instance = (profile, sg) => ({ ami: 'ami-1', instanceType: cfg.relayInstanceType, subnetId: 'subnet-p', privateIp: cfg.relayIp, associatePublicIpAddress: true,
+  vpcSecurityGroupIds: [sg], iamInstanceProfile: profile, metadataOptions: { httpEndpoint: 'enabled', httpTokens: 'required', httpPutResponseHopLimit: 1, instanceMetadataTags: 'disabled' },
+  rootBlockDevice: { volumeType: 'gp3', volumeSize: 8, encrypted: true, deleteOnTermination: true }, creditSpecification: { cpuCredits: 'standard' },
+  userData: '#!/bin/bash\n', userDataReplaceOnChange: true, tags, volumeTags: tags });
+const cases = [
+  ['instance, unknown profile and group', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(U, U)],
+  ['instance, unknown Outputs', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(UO, UO)],
+  ['instance, its profile', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(pol.RELAY_INSTANCE_PROFILE_NAME, U)],
+  ['instance, the proxy profile', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(cfg.proxyInstanceProfileName, U)],
+  ['eip', 'aws:ec2/eip:Eip', spec.NET.relayEip, { domain: 'vpc', tags }],
+  ['eip association', 'aws:ec2/eipAssociation:EipAssociation', spec.NET.relayEip, { allocationId: U, instanceId: UO }],
+  ['group', 'aws:ec2/securityGroup:SecurityGroup', cfg.relaySecurityGroupName, { name: cfg.relaySecurityGroupName, description: egress.securityGroups.relay.description, vpcId: 'vpc-1', tags }],
+  ['profile', 'aws:iam/instanceProfile:InstanceProfile', pol.RELAY_INSTANCE_PROFILE_NAME, { name: pol.RELAY_INSTANCE_PROFILE_NAME, role: U, tags }],
+  ['role policy', 'aws:iam/rolePolicy:RolePolicy', pol.RELAY_ROLE_NAME, { name: pol.RELAY_ROLE_NAME, role: U, policy: UO }],
+  ['ssm attachment', 'aws:iam/rolePolicyAttachment:RolePolicyAttachment', pol.RELAY_ROLE_NAME + '-ssm', { role: U, policyArn: 'arn:aws:iam::aws:policy/AmazonSSMManagedEC2InstanceDefaultPolicy' }],
+  ['artifact parameter', 'aws:ssm/parameter:Parameter', spec.NET.relayArtifactParameter, { name: cfg.relayParameterPrefix + '/artifact', type: 'String', tier: 'Standard', dataType: 'text', insecureValue: UO, description: 'd', tags }],
+];
+for (const k of ['vm', 'relay']) for (const rule of egress.securityGroups[k].rules) {
+  const name = spec.ruleName(egress, k, rule);
+  const peer = 'sg' in rule.peer ? { referencedSecurityGroupId: 'sg-' + rule.peer.sg } : { cidrIpv4: rule.peer.cidr };
+  cases.push(['rule ' + name, 'aws:vpc/securityGroup' + (rule.direction === 'ingress' ? 'IngressRule:SecurityGroupIngressRule' : 'EgressRule:SecurityGroupEgressRule'), name,
+    { securityGroupId: k === 'relay' ? U : 'sg-vm', ipProtocol: rule.protocol, fromPort: rule.port, toPort: rule.port, description: rule.description, ...peer, tags }]);
+}
+(async () => {
+  const r = {};
+  for (const [what, type, name, props] of cases) {
+    try { await transform({ type, name, custom: true, props, opts: {} }); r[what] = ''; } catch (e) { r[what] = e.message; }
+  }
+  console.log(JSON.stringify(r));
+  process.exit(0);
+})();"#;
+    let mut cmd = Command::new("node");
+    cmd.arg("-e")
+        .arg(body)
+        .env("NODE_PATH", infra.join("node_modules"))
+        .env("RT_OUT", compiled_guard())
+        .env("RT_INFRA", &infra)
+        .stdin(Stdio::null());
+    let o = bounded(&mut cmd, "node");
+    assert!(o.status.success(), "node: {}", all(&o));
+    let r: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("node printed no JSON ({e}): {}", all(&o)));
+    let r = r.as_object().unwrap();
+    assert_eq!(
+        r["instance, the proxy profile"],
+        "egress guard (infra/egress.ts) refused aws:ec2/instance:Instance ai-env-relay: iamInstanceProfile must be \"ai-env-relay\", got \"ai-env-egress-proxy\"",
+        "a known wrong profile is still refused"
+    );
+    let refused: Vec<_> = r.iter().filter(|(k, v)| *k != "instance, the proxy profile" && *v != "").collect();
+    assert!(refused.is_empty(), "the targeted run's inputs are refused: {refused:?}");
+    // The VM group's two rules and the relay group's seven, beside the eleven resources.
+    assert_eq!(r.len(), 20, "{r:?}");
+}
+
 // ---- the reload unit (§I-infra.6.2) ----
 
 /// The bucket the tests' artifact names (the printer's placeholder suffix).
