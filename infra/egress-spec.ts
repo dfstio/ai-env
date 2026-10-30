@@ -270,6 +270,12 @@ export const VM_SG_DESCRIPTION = "ai-env MicroVM egress connector ENIs: TCP 3128
 export const PROXY_SG_DESCRIPTION = "ai-env egress proxy: TCP 3128 from the MicroVM ENIs; HTTPS and DNS out";
 /** Fixed: a changed description replaces the group. */
 export const RELAY_SG_DESCRIPTION = "ai-env relay: TCP 443 from workers anywhere, TCP 7443 from the MicroVM ENIs; HTTPS and DNS out";
+/**
+ * EC2's character set for a security group's description and a rule's (CreateSecurityGroup, AuthorizeSecurityGroup*):
+ * at most 255 of a-z A-Z 0-9, space and ._-:/()#,@[]+=&;{}!$*. Nothing but the API held it before S13 part B, whose
+ * deploy it stopped mid-way (an apostrophe in "the relay's").
+ */
+export const EC2_DESCRIPTION = /^[A-Za-z0-9 ._:\/()#,@\[\]+=&;{}!$*-]{0,255}$/;
 export const ANYWHERE = "0.0.0.0/0";
 export const HTTPS = 443;
 export const DNS = 53;
@@ -338,7 +344,7 @@ export function egressSpec(cfg: EgressConfig): EgressSpec {
                     // The proxy's address, not its security group: any interface holding the proxy SG would otherwise be a second proxy.
                     { direction: "egress", protocol: "tcp", port: cfg.proxyPort, peer: { cidr: proxyCidr(cfg) }, description: "to the egress proxy only" },
                     // S13: the relay's address and private port, never its internet face.
-                    { direction: "egress", protocol: "tcp", port: cfg.relayPort, peer: { cidr: relayCidr(cfg) }, description: "to the relay's private port" }, // scratch:vm-relay-rule
+                    { direction: "egress", protocol: "tcp", port: cfg.relayPort, peer: { cidr: relayCidr(cfg) }, description: "to the relay private port" }, // scratch:vm-relay-rule
                 ], // scratch:vm-rules
             },
             proxy: {
@@ -351,8 +357,8 @@ export function egressSpec(cfg: EgressConfig): EgressSpec {
             // S13: the relay. Its internet face is 443 (the workers dial in); its private face the relay port, from the VMs.
             relay: {
                 name: cfg.relaySecurityGroupName, description: RELAY_SG_DESCRIPTION, rules: [
-                    { direction: "ingress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "worker tunnels (the relay's internet face)" },
-                    { direction: "ingress", protocol: "tcp", port: cfg.relayPort, peer: { sg: "vm" }, description: "from the MicroVM egress ENIs (the relay's private face)" },
+                    { direction: "ingress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "worker tunnels (the relay internet face)" },
+                    { direction: "ingress", protocol: "tcp", port: cfg.relayPort, peer: { sg: "vm" }, description: "from the MicroVM egress ENIs (the relay private face)" },
                     { direction: "egress", protocol: "tcp", port: HTTPS, peer: { cidr: ANYWHERE }, description: "SSM, CloudWatch Logs, S3 through the gateway endpoint" },
                     ...dnsRules,
                 ], // scratch:relay-rules
@@ -580,6 +586,9 @@ export function assertEgressSpec(spec: EgressSpec, allowText?: string): void {
         const s = spec.securityGroups[sg];
         const want = [sgName(cfg, sg), descriptions[sg]];
         if (s.name !== want[0] || s.description !== want[1]) err(`security group ${s.name}: the name and description are fixed (${want[0]}: ${want[1]})`);
+        for (const [what, d] of [[`security group ${s.name}`, s.description], ...s.rules.map((rule) => [`rule ${ruleName(spec, sg, rule)}`, rule.description])]) {
+            if (!EC2_DESCRIPTION.test(d)) err(`${what}: description ${JSON.stringify(d)} is not EC2's (at most 255 of a-z A-Z 0-9, space and ._-:/()#,@[]+=&;{}!$*)`);
+        }
         for (const rule of s.rules) {
             const r = checkRule(cfg, sg, rule);
             if (r) err(r);

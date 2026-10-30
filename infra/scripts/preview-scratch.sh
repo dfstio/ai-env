@@ -1025,7 +1025,7 @@ relay-sg-open)
 vm-relay-wide)
     # S13: the VM group's rule to the relay widened from its address to the proxy subnet (the proxy's other ports, any host there).
     edit_file egress-spec.ts '/scratch:vm-relay-rule/s|peer: { cidr: relayCidr(cfg) }|peer: { cidr: cfg.proxySubnetCidr }|'
-    grep -qF 'peer: { cidr: cfg.proxySubnetCidr }, description: "to the relay'"'"'s private port" }, // scratch:vm-relay-rule' egress-spec.ts || fail "the scratch:vm-relay-rule marker no longer widens the VM group's rule to the relay"
+    grep -qF 'peer: { cidr: cfg.proxySubnetCidr }, description: "to the relay private port" }, // scratch:vm-relay-rule' egress-spec.ts || fail "the scratch:vm-relay-rule marker no longer widens the VM group's rule to the relay"
     expect_refusal spec "ai-env-vm-egress egress tcp 7443 10.42.0.0/24: the VM security group allows exactly two rules"
     no_spec
     expect_refusal guard "egress guard (infra/egress.ts) refused aws:vpc/securityGroupEgressRule:SecurityGroupEgressRule ai-env-vm-egress-to-10.42.0.0-24-tcp-7443"

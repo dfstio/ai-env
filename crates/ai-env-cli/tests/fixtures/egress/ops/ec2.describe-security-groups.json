@@ -24,7 +24,7 @@
                     "UserIdGroupPairs": [],
                     "IpRanges": [
                         {
-                            "Description": "to the relay's private port",
+                            "Description": "to the relay private port",
                             "CidrIp": "10.42.0.20/32"
                         }
                     ],
@@ -193,7 +193,7 @@
                     "UserIdGroupPairs": [],
                     "IpRanges": [
                         {
-                            "Description": "worker tunnels (the relay's internet face)",
+                            "Description": "worker tunnels (the relay internet face)",
                             "CidrIp": "0.0.0.0/0"
                         }
                     ],
@@ -206,7 +206,7 @@
                     "ToPort": 7443,
                     "UserIdGroupPairs": [
                         {
-                            "Description": "from the MicroVM egress ENIs (the relay's private face)",
+                            "Description": "from the MicroVM egress ENIs (the relay private face)",
                             "UserId": "123456789012",
                             "GroupId": "sg-0ddd3333eeee4444f"
                         }

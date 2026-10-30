@@ -191,7 +191,45 @@ console.log(JSON.stringify({
     }
 }
 
-/// I-T2: the VM subnet's NACL is compared as a set per direction (the provider's order is not the program's): I-R5's
+/// I-T57 (S13 part B, §Q.14): every group's and rule's description is in EC2's character set, which only the API held
+/// before: B1's deploy stopped at the VM group's relay rule, "to the relay's private port" refused for its apostrophe.
+/// The spec refuses that text again, a non-ASCII dash and 256 characters, each naming its rule; 255 characters and EC2's
+/// whole set pass.
+#[test]
+fn the_egress_spec_holds_ec2s_description_characters() {
+    let r = node(
+        r#"const allow = spec.readAllowText(path.join(infra, 'proxy'));
+const refused = (s) => { try { spec.assertEgressSpec(s, allow); return ''; } catch (e) { return e.message; } };
+const edited = (f) => { const s = spec.egressSpec(cfg); f(s); return refused(s); };
+const s = spec.egressSpec(cfg);
+const texts = spec.SG_KEYS.flatMap((k) => [s.securityGroups[k].description, ...s.securityGroups[k].rules.map((r) => r.description)]);
+console.log(JSON.stringify({
+  spec: refused(s), count: texts.length, outside: texts.filter((d) => !spec.EC2_DESCRIPTION.test(d)),
+  apostrophe: edited((s) => { s.securityGroups.vm.rules[1].description = "to the relay's private port"; }),
+  dash: edited((s) => { s.securityGroups.relay.rules[0].description = 'worker tunnels — the internet face'; }),
+  long: edited((s) => { s.securityGroups.proxy.rules[0].description = 'x'.repeat(256); }),
+  max: edited((s) => { s.securityGroups.proxy.rules[0].description = 'x'.repeat(255); }),
+  set: edited((s) => { s.securityGroups.proxy.rules[0].description = 'a-z A-Z 0-9 ._-:/()#,@[]+=&;{}!$*'; }),
+}));"#,
+        &[],
+    );
+    assert_eq!(r["spec"], "", "the spec passes");
+    assert_eq!(r["count"], 18, "three groups' descriptions and their fifteen rules'");
+    assert_eq!(r["outside"], json!([]), "every description in EC2's set");
+    let set = "is not EC2's (at most 255 of a-z A-Z 0-9, space and ._-:/()#,@[]+=&;{}!$*)";
+    for (k, want) in [
+        ("apostrophe", "rule ai-env-vm-egress-to-10.42.0.20-32-tcp-7443: description \"to the relay's private port\" "),
+        ("dash", "rule ai-env-relay-from-0.0.0.0-0-tcp-443: description \"worker tunnels \u{2014} the internet face\" "),
+        ("long", "rule ai-env-proxy-from-ai-env-vm-egress-tcp-3128: description \"xxxx"),
+    ] {
+        let got = r[k].as_str().unwrap();
+        assert!(got.contains(want) && got.contains(set), "{k}: want {want:?} and {set:?} in {got:?}");
+    }
+    assert_eq!(r["max"], "", "255 characters pass");
+    assert_eq!(r["set"], "", "EC2's whole set passes");
+}
+
+/// I-T2:the VM subnet's NACL is compared as a set per direction (the provider's order is not the program's): I-R5's
 /// entries pass in either order; a third entry, a missing one, rule 120 for 110 and a narrower ephemeral range are refused.
 #[test]
 fn check_nacl_compares_the_entries_as_a_set() {
