@@ -181,8 +181,10 @@ export interface EgressGuard {
 type Props = Record<string, unknown>;
 
 /**
- * A computed input the transform cannot see yet. The engine hands the transform every input that came from another
- * resource as an Output without dependencies: unknown in a preview of a new resource, known during an update.
+ * A computed input the transform cannot see yet. The engine hands the transform an input that came from another
+ * resource as its value, or as the unknown sentinel: in a preview, for an output of a new resource (the SDK makes it
+ * `pulumi.unknown`; settle takes an unknown Output the same way); in an update, only for an output of a create a
+ * targeted run skips, which the SDK hands over as undefined (see `ref`).
  */
 const UNKNOWN = Symbol("unknown");
 
@@ -257,6 +259,8 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
     const cfg = spec.cfg;
     const inventory = stackInventory(cfg, image);
     const ids = new Map<IdKey, Promise<string>>();
+    // Whether each tracked id is known: false for a create a targeted run skips (`ref`).
+    const known = new Map<IdKey, Promise<boolean>>();
     const counts = new Map<string, number>();
     // Maps, never object literals: a name like `constructor` must not find Object.prototype's.
     const tables = new Map<string, "proxy" | "vms">([[NET.proxy, "proxy"], [NET.vms, "vms"]]);
@@ -276,7 +280,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
     const userAttachments = new Map<string, readonly [string, string]>(USER_POLICY_ATTACHMENTS.map(([u, p]) => [attachmentName(u, p), [u, p] as const]));
     const documentRoles = new Map<string, DocumentRole>(DOCUMENT_ROLES.map((r) => [documentNames(cfg)[r], r]));
 
-    async function check(type: string, name: string, custom: boolean, props: Props, opts: pulumi.ResourceOptions): Promise<string[]> {
+    async function check(type: string, name: string, custom: boolean, props: Props, opts: pulumi.ResourceOptions, unknownInUpdate: ReadonlySet<string>): Promise<string[]> {
         const problems: string[] = [];
         const waits: Promise<void>[] = [];
         const bad = (msg: string) => problems.push(msg);
@@ -299,8 +303,21 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
         // A reference to another egress resource: unknown (a preview of a new resource), or exactly the id the
         // resource got. A literal id or another resource's id is refused. During an update the id is known by the time
         // a dependent registers; a preview of an existing stack knows it too, else (replaced) the reference is unknown.
+        // An update hands the transform an unknown input as undefined (runtime/callbacks.js deserializes without
+        // keepUnknowns; outside a preview runtime/rpc.js maps the sentinel to undefined). Such a reference, an input the
+        // program set (a field it left out is absent; a list carries undefined as null), passes only while the
+        // referenced resource's id is itself unknown: in an update, a create the targeted run skips. The engine refuses
+        // a targeted resource that depends on one (plans/s13-contracts.md §Q.14). An update's reference unknown in any
+        // other shape (UNKNOWN: an SDK that kept the sentinel, or an unknown Output) is held to the same test.
         const ref = (field: string, key: IdKey, actual: unknown) => {
-            if (actual === UNKNOWN) return;
+            const update = !pulumi.runtime.isDryRun();
+            if (actual === UNKNOWN && !update) return;
+            if (update && (actual === UNKNOWN || (actual === undefined && (field.endsWith("]") || unknownInUpdate.has(field))))) {
+                waits.push(within(known.get(key), 600_000).then((k) => {
+                    if (k !== false) bad(`${field} must reference the egress ${key} (unknown in an update while the egress ${key}'s id is ${k === true ? "known" : "not tracked"})`);
+                }));
+                return;
+            }
             if (typeof actual !== "string" || actual === "") { bad(`${field} must reference the egress ${key}`); return; }
             waits.push(within(ids.get(key), pulumi.runtime.isDryRun() ? 5_000 : 600_000).then((want) => {
                 if (actual !== want) bad(`${field} ${actual} is not the egress ${key}${want === undefined ? " (unknown or not created by egress.ts)" : ` (${want})`}`);
@@ -690,7 +707,9 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
     }
 
     const guard: pulumi.ResourceTransform = async (args) => {
-        const problems = await check(args.type, args.name, args.custom, (await settle(args.props)) as Props, args.opts ?? {});
+        // The inputs an update hands over as undefined: unknown ones (an input the program left unset is absent).
+        const unknownInUpdate = new Set(Object.keys(args.props).filter((k) => args.props[k] === undefined));
+        const problems = await check(args.type, args.name, args.custom, (await settle(args.props)) as Props, args.opts ?? {}, unknownInUpdate);
         if (problems.length > 0) throw new Error(`egress guard (infra/egress.ts) refused ${args.type} ${args.name}: ${problems.join("; ")}`);
         return undefined;
     };
@@ -706,6 +725,7 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
                     return v;
                 });
             }));
+            known.set(key, (id as unknown as { isKnown: Promise<boolean> }).isKnown);
         },
     };
 }
