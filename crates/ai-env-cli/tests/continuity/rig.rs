@@ -1086,3 +1086,92 @@ fn the_fake_claude_rejects_an_option_or_dies_before_init_and_pins_its_version() 
     let staged = g.at("staged.knobs").display().to_string();
     assert_eq!(version(&[("FAKE_KNOBS_FILE", staged.as_str())]), "2.1.402 (Claude Code)", "FAKE_KNOBS_FILE in its place, not as well");
 }
+
+/// S14 (T2, plans/s14-plan.md Phase P): the fake claude's Remote Control,
+/// Track B's fixture, in claude 2.1.314's shapes. FAKE_RC=ok: an enable
+/// (`remote_control` with `enabled` true) gets the session's two URLs, its
+/// environment, the bridge's epoch and its session (the request's
+/// `reattach_session_id` when it names one), then the `bridge_state` frame
+/// `connected`; a disable gets `{}`. FAKE_RC=refused: an enable gets the
+/// CLI's error and no frame, a disable still `{}`. FAKE_RC_PHONE=1 (with ok
+/// only): after the frame, the phone's turn (its echo, the reply, the
+/// result), then a `can_use_tool` request the CLI withdraws
+/// (`control_cancel_request`): the phone answered first.
+/// FAKE_ANALYTICS_DISABLED=1 adds `analytics_disabled` to the initialize
+/// answer. Without the knobs a `remote_control` request gets the `{}` every
+/// request gets, and the initialize answer is the pid alone. Cursor's own
+/// initialize (tests/fixtures/away/initialize-cursor-hooks.json, one line:
+/// its SDK hooks and its in-process MCP server) is answered as any.
+#[test]
+fn the_fake_claude_answers_remote_control_and_relays_a_phone_turn() {
+    fn parse(l: &str) -> Value {
+        serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}"))
+    }
+    // Each frame's shape, a system frame's by its subtype.
+    fn kinds(out: &[String]) -> Vec<String> {
+        out.iter().map(String::as_str).map(parse).map(|v| if v["type"] == "system" && !is_init(&v) { format!("system:{}", v["subtype"].as_str().unwrap_or_default()) } else { shape(&v) }).collect()
+    }
+    let fixture = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/away/initialize-cursor-hooks.json"));
+    assert_eq!(fixture.lines().count(), 1, "one stream-json line");
+    let cursor = parse(&fixture);
+    let r = &cursor["request"];
+    let pre = serde_json::json!([{"matcher": "Edit|Write|MultiEdit", "hookCallbackIds": ["hook_0"]}, {"matcher": "Edit|Write|Read", "hookCallbackIds": ["hook_1"]}]);
+    let post = serde_json::json!([{"matcher": "Edit|Write|MultiEdit", "hookCallbackIds": ["hook_2"]}]);
+    assert_eq!((r["subtype"].as_str(), &r["hooks"]["PreToolUse"], &r["hooks"]["PostToolUse"]), (Some("initialize"), &pre, &post), "{r}");
+    let tool = &r["sdkMcpServerManifests"]["claude-vscode"]["toolsListResult"]["tools"][0];
+    assert_eq!((&r["sdkMcpServers"], tool["name"].as_str()), (&serde_json::json!(["claude-vscode"]), Some("getDiagnostics")), "{r}");
+    let cursor_answer = format!("answer:{}", cursor["request_id"].as_str().expect("its request_id"));
+
+    let rc = |id: &str, body: &str| format!(r#"{{"request_id":"{id}","type":"control_request","request":{{"subtype":"remote_control",{body}}}}}"#);
+    let (enable, disable) = (rc("rc1", r#""enabled":true,"name":"away""#), rc("rc2", r#""enabled":false"#));
+    let empty = |id: &str| format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{}}}}}}"#);
+    let connected = |id: &str, bridge: &str| format!(r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"session_url":"https://example.invalid/code/session_0199a1b2","connect_url":"https://example.invalid/code?environment=env_0199a1b2","environment_id":"env_0199a1b2","bridge_epoch":1,"bridge_session_id":"{bridge}"}}}}}}"#);
+    let bridge_state = r#"{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1}"#;
+
+    // No knob: today's answers, the {} every request gets and the pid alone.
+    let f = Fake::new();
+    let (code, out, err) = f.run(&[], &[], &format!("{INIT}\n{enable}\n{disable}\n"));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(kinds(&out), ["answer:i1", "init", "answer:rc1", "answer:rc2"], "{out:#?}");
+    assert_eq!((out[2].as_str(), out[3].as_str()), (empty("rc1").as_str(), empty("rc2").as_str()));
+    let answered = parse(&out[0])["response"]["response"].clone();
+    assert!(answered.as_object().is_some_and(|o| o.len() == 1 && o["pid"].is_u64()), "the pid alone: {answered}");
+
+    // ok, under Cursor's initialize, analytics off: each enable connected (the default bridge session, then the
+    // reattached one), a disable {}.
+    let f = Fake::new();
+    let reattach = "cse_0199a1b2-0000-7000-8000-0000000000a2";
+    let again = rc("rc3", &format!(r#""enabled":true,"reattach_session_id":"{reattach}""#));
+    let (code, out, err) = f.run(&[], &[("FAKE_RC", "ok"), ("FAKE_ANALYTICS_DISABLED", "1")], &format!("{fixture}{enable}\n{again}\n{disable}\n"));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(kinds(&out), [cursor_answer.as_str(), "init", "answer:rc1", "system:bridge_state", "answer:rc3", "system:bridge_state", "answer:rc2"], "{out:#?}");
+    let init = parse(&out[0]);
+    assert_eq!((init["response"]["subtype"].as_str(), &init["response"]["response"]["analytics_disabled"]), (Some("success"), &Value::Bool(true)), "{init}");
+    assert!(init["response"]["response"]["pid"].is_u64(), "{init}");
+    assert_eq!(out[2], connected("rc1", "cse_0199a1b2-0000-7000-8000-000000000001"));
+    assert_eq!((out[3].as_str(), out[5].as_str()), (bridge_state, bridge_state));
+    assert_eq!(out[4], connected("rc3", reattach), "the reattached bridge session");
+    assert_eq!(out[6], empty("rc2"));
+
+    // refused: the CLI's error, no frame and no phone; a disable still {}.
+    let f = Fake::new();
+    let (code, out, err) = f.run(&[], &[("FAKE_RC", "refused"), ("FAKE_RC_PHONE", "1")], &format!("{INIT}\n{enable}\n{disable}\n"));
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(kinds(&out), ["answer:i1", "init", "answer:rc1", "answer:rc2"], "{out:#?}");
+    assert_eq!(out[2], r#"{"type":"control_response","response":{"subtype":"error","request_id":"rc1","error":"Remote Control initialization failed"}}"#);
+    assert_eq!(out[3], empty("rc2"));
+
+    // ok with the phone: after the frame, the phone's turn, then its prompt asked of the host and withdrawn.
+    let f = Fake::new();
+    let (code, out, err) = f.run(&[], &[("FAKE_RC", "ok"), ("FAKE_RC_PHONE", "1")], &format!("{INIT}\n{enable}\n"));
+    assert_eq!(code, Some(0), "{err}");
+    let phone = "00000001-0000-4000-1000-000000000001";
+    assert_eq!(kinds(&out), ["answer:i1", "init", "answer:rc1", "system:bridge_state", &format!("echo:{phone}"), "reply", &format!("result:{phone}"), "can_use_tool:phone-perm-1-1", "cancel:phone-perm-1-1"], "{out:#?}");
+    let (echo, reply) = (parse(&out[4]), parse(&out[5]));
+    assert_eq!((echo["message"]["content"].as_str(), reply["message"]["content"][0]["text"].as_str()), (Some("phone turn"), Some("phone reply")), "{echo} {reply}");
+    let asked = parse(&out[7]);
+    assert!(is_permission_request(&asked), "{asked}");
+    assert_eq!((asked["request"]["tool_name"].as_str(), &asked["request"]["input"]), (Some("Bash"), &serde_json::json!({"command": "ls"})), "{asked}");
+    assert_eq!(classify_child(out[7].as_bytes()), ChildFrame::ControlRequest { request_id: Some("phone-perm-1-1".into()), subtype: Some("can_use_tool".into()) });
+    assert_eq!(classify_child(out[8].as_bytes()), ChildFrame::ControlCancel { request_id: Some("phone-perm-1-1".into()) });
+}

@@ -92,13 +92,14 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// `CLAUDE_CODE_SDK_READS_SESSION_STATE`, which it obeys as the real CLI does;
 /// S13's prompt-hook knob, and extension 2.1.312's
 /// `CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS` and
-/// `CLAUDE_CODE_SDK_READS_STARTUP_MARKS`, which it obeys as the real CLI does);
+/// `CLAUDE_CODE_SDK_READS_STARTUP_MARKS`, which it obeys as the real CLI does;
+/// S14's Remote Control and `analytics_disabled` knobs of the fake claude);
 /// removed from every harness run before the test's own `envs`. Every
 /// `AI_ENV_BRIDGE_*` knob the code reads is here but the bridge root, and
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 116] = [
+pub const REMOVED_ENV: [&str; 119] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -216,6 +217,10 @@ pub const REMOVED_ENV: [&str; 116] = [
     "FAKE_PROMPT_HOOK",
     "CLAUDE_CODE_EMIT_USER_PROMPT_SUBMIT_HOOK_EVENTS",
     "CLAUDE_CODE_SDK_READS_STARTUP_MARKS",
+    // S14 (T2): the fake claude's Remote Control (its answer, the phone's turn) and its analytics_disabled.
+    "FAKE_RC",
+    "FAKE_RC_PHONE",
+    "FAKE_ANALYTICS_DISABLED",
     "GIT_ARGV_LOG",
     "GIT_REAL",
     "FAKE_GIT_FAIL",

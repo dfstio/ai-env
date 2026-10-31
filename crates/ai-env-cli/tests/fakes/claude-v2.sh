@@ -303,6 +303,28 @@
 #                             (after FAKE_REJECT_OPTION's refusal, before FAKE_DIE_BEFORE_INIT's death: a claude that
 #                             dies before its init prints it first), and {"type":"keep_alive","startup_mark":
 #                             "stdin_listen_started"} right before stdin is read; both before the initialize answer
+# S14 (T2: Remote Control, Track B's fixture; plans/s14-plan.md, Phase P). claude 2.1.314's shapes, as its shipped
+# code writes them (P1.3 records the frames of a real one); every id below is a placeholder:
+#   FAKE_RC                   ok or refused: how a `remote_control` control request is answered (without the knob,
+#                             or with another value, with the {} every request gets). ok: one with "enabled":true
+#                             gets success {"session_url":"https://example.invalid/code/session_0199a1b2",
+#                             "connect_url":"https://example.invalid/code?environment=env_0199a1b2",
+#                             "environment_id":"env_0199a1b2","bridge_epoch":1,"bridge_session_id":<the request's
+#                             reattach_session_id, else cse_0199a1b2-0000-7000-8000-000000000001>}, then the frame
+#                             {"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1};
+#                             refused: {"type":"control_response","response":{"subtype":"error","request_id":<id>,
+#                             "error":"Remote Control initialization failed"}}, no frame. Under either, one with
+#                             "enabled":false gets success {}, as the CLI answers a disable
+#   FAKE_RC_PHONE=1           with FAKE_RC=ok, after each bridge_state frame a turn the phone sent: its user frame as
+#                             --replay-user-messages echoes one (content "phone turn", isReplay, uuid
+#                             <n, %08x>-0000-4000-1000-<gen, %012x>, n this process's count of phone turns), an
+#                             assistant text frame ("phone reply", uuid kind 1100) and its result; then a
+#                             can_use_tool control_request to the host (request_id phone-perm-<gen>-<n>, tool Bash,
+#                             input {"command":"ls"}, tool_use_id toolu_phone_<gen>_<n>) and, 100 ms later, the CLI's
+#                             control_cancel_request for it: the phone answered first. Nothing else: no state, hook
+#                             or init frame, no transcript entry, no turn counted, nothing read meanwhile
+#   FAKE_ANALYTICS_DISABLED=1 the initialize answer carries "analytics_disabled":true after its pid (without the knob,
+#                             none: {"pid":<pid>} alone, as ever)
 
 # The remote link's knobs (see above), before anything reads one. S11: a
 # staged copy's embedded FAKE_KNOBS_FILE names the file in place of
@@ -706,7 +728,12 @@ on_control_request() {
   id=$(printf '%s\n' "$1" | sed -E 's/.*"request_id":"([^"]*)".*/\1/')
   case "$1" in
     *'"subtype":"initialize"'*)
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"pid":%s}}}\n' "$id" "$$"
+      # S14 (T2): FAKE_ANALYTICS_DISABLED, the CLI's analytics_disabled after the pid.
+      analytics=""
+      if [ "${FAKE_ANALYTICS_DISABLED:-0}" = "1" ]; then
+        analytics=',"analytics_disabled":true'
+      fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"pid":%s%s}}}\n' "$id" "$$" "$analytics"
       if [ -n "$fail_after_ack" ]; then
         if [ -n "${FAKE_MISS_DELAY_MS:-}" ]; then
           sleep "$((FAKE_MISS_DELAY_MS / 1000)).$(printf '%03d' $((FAKE_MISS_DELAY_MS % 1000)))"
@@ -740,10 +767,60 @@ on_control_request() {
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       fi
       ;;
+    *'"subtype":"remote_control"'*)
+      case "${FAKE_RC:-}" in
+        ok|refused) remote_control "$1" ;;
+        *) printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id" ;;
+      esac
+      ;;
     *)
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       ;;
   esac
+}
+
+# S14 (T2): FAKE_RC, the CLI's answer to the remote_control request $1 (its
+# request_id is $id): an enable connected (ok) or refused, a disable {}; with
+# FAKE_RC_PHONE=1 the phone's turn after a connected enable.
+remote_control() {
+  case "$1" in
+    *'"enabled":true'*) ;;
+    *)
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      return
+      ;;
+  esac
+  if [ "$FAKE_RC" = "refused" ]; then
+    printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Remote Control initialization failed"}}\n' "$id"
+    return
+  fi
+  bridge=$(printf '%s\n' "$1" | sed -n -E 's/.*"reattach_session_id":"([^"]*)".*/\1/p')
+  if [ -z "$bridge" ]; then
+    bridge=$(printf 'cse_%s-0000-7000-8000-%012x' 0199a1b2 1)
+  fi
+  printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"session_url":"https://example.invalid/code/session_0199a1b2","connect_url":"https://example.invalid/code?environment=env_0199a1b2","environment_id":"env_0199a1b2","bridge_epoch":1,"bridge_session_id":"%s"}}}\n' "$id" "$bridge"
+  printf '%s\n' '{"type":"system","subtype":"bridge_state","state":"connected","bridge_epoch":1}'
+  if [ "${FAKE_RC_PHONE:-0}" = "1" ]; then
+    phone_turn
+  fi
+}
+
+# S14 (T2): FAKE_RC_PHONE, a turn the phone sent over the bridge (its echo,
+# the reply, the result), then a prompt of the CLI's mirrored to the host
+# that the phone answered first: the can_use_tool request and, shortly
+# after, its withdrawal.
+phones=0
+phone_turn() {
+  phones=$((phones + 1))
+  pu=$(printf '%08x-0000-4000-1000-%012x' "$phones" "$gen")
+  pa=$(printf '%08x-0000-4000-1100-%012x' "$phones" "$gen")
+  pp="phone-perm-$gen-$phones"
+  printf '{"type":"user","message":{"role":"user","content":"phone turn"},"session_id":"%s","parent_tool_use_id":null,"uuid":"%s","isReplay":true}\n' "$sid" "$pu"
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"phone reply"}]},"parent_tool_use_id":null,"session_id":"%s","uuid":"%s"}\n' "$sid" "$pa"
+  printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"%s","user_message_uuid":"%s","user_message_uuids":["%s"]}\n' "$sid" "$pu" "$pu"
+  printf '{"type":"control_request","request_id":"%s","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"toolu_phone_%s_%s","permission_suggestions":[]}}\n' "$pp" "$gen" "$phones"
+  sleep_ms 100
+  printf '{"type":"control_cancel_request","request_id":"%s"}\n' "$pp"
 }
 
 # The transcript file of the current session, and the path a mirror frame names for it.
