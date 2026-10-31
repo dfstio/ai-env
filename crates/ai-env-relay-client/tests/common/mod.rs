@@ -549,25 +549,10 @@ impl Mcp {
         Some(serde_json::from_str(&line).unwrap())
     }
 
-    /// `tools/call` of `name` with `args`; the tool's text (parsed) and `isError`.
-    pub async fn tool(&mut self, id: u64, name: &str, args: Value) -> (Value, bool) {
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}})).await;
-        let reply = self.next().await;
-        assert_eq!(reply["id"], id, "{reply}");
-        tool_text(&reply)
-    }
-
     /// stdin closed: the server finishes and exits.
     pub fn close(&mut self) {
         self.stdin = None;
     }
-}
-
-/// A tool result's text (parsed) and `isError`.
-pub fn tool_text(reply: &Value) -> (Value, bool) {
-    let r = &reply["result"];
-    let text = r["content"][0]["text"].as_str().unwrap_or_else(|| panic!("a text content: {reply}"));
-    (serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}")), r["isError"].as_bool().unwrap())
 }
 
 /// The raw text of a tool result.

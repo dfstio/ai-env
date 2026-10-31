@@ -1,6 +1,7 @@
 /target
 /plans
 /logs
+/data
 .DS_Store
 # cross-built VM binaries (image/Dockerfile is committed, the binaries are not)
 /image/ai-env

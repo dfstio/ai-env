@@ -16,8 +16,8 @@ publish = false
 # [patch."https://github.com/dfstio/ai-env"]
 # ai-env-worker = { path = "../ai-env/crates/ai-env-worker" }
 # ai-env-source = { path = "../ai-env/crates/ai-env-source" }
-ai-env-worker = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0" }
-ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0" }
+ai-env-worker = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0" }
+ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # HttpJsonSource's client: rustls with no provider of its own; main installs aws-lc-rs, so no ring is built.
@@ -29,7 +29,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# tls-keygen's key text, cleared when dropped.
+zeroize = "1"
 
 [dev-dependencies]
-ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0", features = ["testkit"] }
+ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0", features = ["testkit"] }
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -85,6 +85,7 @@ fn worker(id: &str, seed: u8, globs: &[&str], day: &str) -> WorkerEntry {
         public_key: key_of(seed).b64(),
         sources: globs.iter().map(|g| (*g).to_string()).collect(),
         not_after: format!("{day}T23:59:59Z"),
+        tls_fp: None,
     }
 }
 
@@ -107,6 +108,13 @@ fn signers(w: &World) -> Vec<SignerEntry> {
 
 fn grants(w: &World) -> Vec<Grant> {
     lists::parse_grants(value(w, policy::GRANTS).as_bytes()).unwrap_or_else(|e| panic!("R's loader refuses M's grants: {e}")).entries
+}
+
+/// The live directory's `peers.json` (relay-security R-89, R-93): loopback, where these tests dial from, in force for
+/// 30 days, rendered with W/M's `policy::render_peers` (M's `allow-ip` writes the parameter from wave 3).
+fn peers_json() -> String {
+    let loopback = policy::PeerEntry { cidr: "127.0.0.0/8".into(), label: "loopback".into(), not_after: format!("{}T23:59:59Z", day_in(30)) };
+    policy::render_peers(&[loopback]).expect("W/M's render")
 }
 
 /// WM-J3 (with R): each render of `allow`, `revoke` and `grant` (workers and token signers added, by the default
@@ -143,6 +151,8 @@ fn the_lists_m_writes_are_the_lists_r_reads() {
     for (file, body) in &bodies {
         fs::write(dir.path().join(file), body).unwrap();
     }
+    let peers = peers_json();
+    fs::write(dir.path().join(lists::PEERS_FILE), &peers).unwrap();
     let (now, now_unix) = (SystemTime::now(), unix_now());
     fs::write(dir.path().join(FETCHED_FILE), format!("{now_unix}\n")).unwrap();
     let live = Live::new(dir.path());
@@ -151,6 +161,8 @@ fn the_lists_m_writes_are_the_lists_r_reads() {
     for (i, (name, (_, body))) in ["workers", "token-signers", "grants"].iter().zip(&bodies).enumerate() {
         assert_eq!(polled[i], (*name, Poll::Loaded { version: content_version(body.as_bytes()) }), "{name}");
     }
+    assert_eq!(polled[4], ("peers", Poll::Loaded { version: content_version(peers.as_bytes()) }), "the fifth file, peers last");
+    assert!(live.peers.fresh(now, max).is_some_and(|p| p.allows("127.0.0.1".parse().unwrap(), now_unix)), "the loopback peer in force");
     let (live_workers, live_signers, live_grants) = (live.workers.fresh(now, max).unwrap(), live.signers.fresh(now, max).unwrap(), live.grants.fresh(now, max).unwrap());
     assert!(live_workers.in_force("worker-a", now_unix).is_some_and(|e| e.allows_source("example-x") && !e.allows_source("example.beta-1")));
     assert!(live_workers.in_force("worker-b", now_unix).is_some_and(|e| e.allows_source("example.beta-1") && e.allows_source("other-x") && !e.allows_source("example-x")));
@@ -252,6 +264,8 @@ fn the_tls_value_m_writes_serves_both_faces() {
     for (file, name) in [(TLS_FILE, tls_name.as_str()), (WORKERS_FILE, policy::WORKERS), (SIGNERS_FILE, policy::TOKEN_SIGNERS), (GRANTS_FILE, policy::GRANTS)] {
         fs::write(live.path().join(file), value(&w, name)).unwrap();
     }
+    // The public face admits the peers file's networks alone (R-89): the worker dials from loopback.
+    fs::write(live.path().join(lists::PEERS_FILE), peers_json()).unwrap();
     fs::write(live.path().join(FETCHED_FILE), format!("{}\n", unix_now())).unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     rt.block_on(serve_both_faces(&w, live.path()));

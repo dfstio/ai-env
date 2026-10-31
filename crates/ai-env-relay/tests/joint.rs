@@ -120,6 +120,9 @@ async fn start() -> Relay {
     let grants = [Grant { grant_id: "g-all".into(), allow: vec!["*/*".into()] }];
     write_live(dir.path(), GRANTS_FILE, policy::render_grants(&grants).unwrap().as_bytes());
     write_live(dir.path(), TLS_FILE, certs::tls_pem(&leaf, &ca).as_bytes());
+    // The public face admits the peers file's networks alone (R-89): the workers' addresses' documentation range.
+    let peers = [policy::PeerEntry { cidr: "198.51.100.0/24".into(), label: "workers".into(), not_after: NOT_AFTER.into() }];
+    write_live(dir.path(), ai_env_relay::lists::PEERS_FILE, policy::render_peers(&peers).unwrap().as_bytes());
     write_live(dir.path(), FETCHED_FILE, format!("{T0}\n").as_bytes());
     let cfg = Config {
         relay_id: RELAY_ID.into(),
@@ -134,7 +137,9 @@ async fn start() -> Relay {
     let deps = Deps { clock: ManualClock::at(T0), sink: sink.clone(), params_key: [9; 32], notifier: Notifier::disabled() };
     let app = RelayApp::new(cfg, deps).expect("the config is valid");
     // R's I-L2 note: the in-process relay needs one poll before any handshake (the poll tick is `run`'s alone).
-    for (file, outcome) in app.poll_files() {
+    let polled = app.poll_files();
+    assert_eq!(polled.iter().map(|(file, _)| *file).collect::<Vec<_>>(), ["workers", "token-signers", "grants", "tls", "peers"]);
+    for (file, outcome) in polled {
         assert!(matches!(outcome, Poll::Loaded { .. }), "{file} is loaded by the first poll");
     }
     let (public, public_rx) = mpsc::unbounded_channel();

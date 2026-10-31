@@ -1,6 +1,6 @@
 //! The in-process relay (I-L2): `RelayApp` with a `ManualClock`, a `MemorySink` and `params_key` `[9u8; 32]`,
 //! both faces served over `tokio::io::duplex` streams wrapped in `Peered::new`, and a live directory written at
-//! run time (the three lists, `tls.pem` and `fetched`).
+//! run time (the four lists, `tls.pem` and `fetched`).
 
 use std::io;
 use std::net::IpAddr;
@@ -49,6 +49,7 @@ pub fn worker_entry(id: &str, seed: u8, globs: &[&str], not_after: &str) -> Work
         public_key: SigningKey::from_seed(&[seed; 32]).unwrap().public_key().b64(),
         sources: globs.iter().map(|g| g.to_string()).collect(),
         not_after: not_after.into(),
+        tls_fp: None,
     }
 }
 
@@ -73,6 +74,22 @@ pub fn default_grants() -> Vec<Grant> {
         Grant { grant_id: "g-alpha-get".into(), allow: vec!["example.alpha/get".into()] },
         Grant { grant_id: "g-example".into(), allow: vec!["example.*/*".into()] },
     ]
+}
+
+/// The networks of the rig's peers file (R-89): loopback and the two documentation ranges every test dials from
+/// (`WORKER_IP` among them).
+pub const PEER_NETS: [&str; 3] = ["127.0.0.0/8", "198.51.100.0/24", "203.0.113.0/24"];
+/// The rig's peers' `not_after`: after `NOT_AFTER`, so a test that lets the workers lapse meets their verdict alone.
+pub const PEERS_NOT_AFTER: &str = "2028-01-01T00:00:00Z";
+
+/// One peers entry in force through `PEERS_NOT_AFTER`.
+pub fn peer_entry(cidr: &str, label: &str) -> ai_env_worker::policy::PeerEntry {
+    ai_env_worker::policy::PeerEntry { cidr: cidr.into(), label: label.into(), not_after: PEERS_NOT_AFTER.into() }
+}
+
+/// `PEER_NETS`, labelled `loopback`, `test-net-2` and `test-net-3`.
+pub fn default_peers() -> Vec<ai_env_worker::policy::PeerEntry> {
+    PEER_NETS.iter().zip(["loopback", "test-net-2", "test-net-3"]).map(|(cidr, label)| peer_entry(cidr, label)).collect()
 }
 
 /// A source with these ops (JSON output, read-only, an object schema).
@@ -296,6 +313,9 @@ impl Rig {
             let leaf = ca.leaf(1, &["ai-env-relay"], &[[10, 42, 0, 20]], [12; 32]);
             rig.write(TLS_FILE, certs::tls_pem(&leaf, &ca).as_bytes());
         }
+        if !skip.contains(&ai_env_relay::lists::PEERS_FILE) {
+            rig.write_peers(&default_peers());
+        }
         if !skip.contains(&FETCHED_FILE) {
             rig.write_fetched(T0);
         }
@@ -330,6 +350,10 @@ impl Rig {
         self.write(GRANTS_FILE, policy::render_grants(list).unwrap().as_bytes());
     }
 
+    pub fn write_peers(&self, list: &[ai_env_worker::policy::PeerEntry]) {
+        self.write(ai_env_relay::lists::PEERS_FILE, policy::render_peers(list).unwrap().as_bytes());
+    }
+
     pub fn write_fetched(&self, unix: u64) {
         self.write(FETCHED_FILE, format!("{unix}\n").as_bytes());
     }
@@ -340,7 +364,7 @@ impl Rig {
     }
 
     /// `poll_files()`.
-    pub fn poll(&self) -> [(&'static str, ai_env_relay::files::Poll); 4] {
+    pub fn poll(&self) -> [(&'static str, ai_env_relay::files::Poll); 5] {
         self.app.poll_files()
     }
 
@@ -352,6 +376,12 @@ impl Rig {
     /// A worker's connection with these endpoint options and pipe size.
     pub async fn public_channel_with(&self, endpoint: Endpoint, pipe: usize) -> (Channel, Link) {
         connect_with(&self.public, WORKER_IP.parse().unwrap(), endpoint, pipe).await
+    }
+
+    /// A worker's connection to the public face from `ip` (every other channel dials from `WORKER_IP`): relay 37's
+    /// second address.
+    pub async fn public_channel_from(&self, ip: IpAddr) -> (Channel, Link) {
+        connect_with(&self.public, ip, Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
     }
 
     /// A VM's connection to the private face.
@@ -368,6 +398,13 @@ impl Rig {
     pub fn private_raw(&self, pipe: usize) -> DuplexStream {
         let (client, server) = tokio::io::duplex(pipe);
         self.private.send(Ok(Peered::new(server, VM_IP.parse().unwrap()))).expect("the face is served");
+        client
+    }
+
+    /// A bare connection to the public face from the worker's address, its client's end (relay 36).
+    pub fn public_raw(&self, pipe: usize) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(pipe);
+        self.public.send(Ok(Peered::new(server, WORKER_IP.parse().unwrap()))).expect("the face is served");
         client
     }
 

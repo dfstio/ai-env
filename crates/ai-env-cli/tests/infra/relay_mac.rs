@@ -402,7 +402,7 @@ fn relay_lists_are_written_by_the_deployer_only() {
     let put: Vec<String> = w.aws_calls().into_iter().filter(|l| l.starts_with("ssm put-parameter")).collect();
     assert_eq!(put.len(), 1, "{put:?}");
     assert!(put[0].contains(&format!("--name {WORKERS} ")) && put[0].contains(" --type String ") && put[0].contains(" --tier Standard ") && !put[0].contains("--overwrite"), "{}", put[0]);
-    let entry = |id: &str, seed: u8, globs: &[&str]| policy::WorkerEntry { worker_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), sources: globs.iter().map(|g| (*g).to_string()).collect(), not_after: format!("{}T23:59:59Z", default_day()) };
+    let entry = |id: &str, seed: u8, globs: &[&str]| policy::WorkerEntry { worker_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), sources: globs.iter().map(|g| (*g).to_string()).collect(), not_after: format!("{}T23:59:59Z", default_day()), tls_fp: None };
     assert_eq!(w.param(WORKERS), Some((policy::render_workers(&[entry("worker-a", 1, &["example-*"])]).unwrap(), 1)));
     assert!(stdout(&o).contains(&format!("allowed worker worker-a (key fp {}) for sources example-* until {} ({WORKERS} v1, 1 worker(s)); the relay applies it within 60 s", key_of(1).fingerprint(), default_day())), "{}", stdout(&o));
     // Created meanwhile by another writer: exit 7, run it again.
@@ -585,6 +585,7 @@ fn relay_start_stop_and_status_are_ops_commands() {
     for name in [WORKERS, SIGNERS, GRANTS] {
         w.set_param(name, "[]", 1);
     }
+    w.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "office", IN_FORCE)]), 1);
     let o = w.run(&["status"], Who::Ops);
     assert_eq!(code(&o), 1, "not a token signer yet: {}{}", stdout(&o), stderr(&o));
     let out = stdout(&o);
@@ -594,6 +595,7 @@ fn relay_start_stop_and_status_are_ops_commands() {
         format!("[ok ] {WORKERS} v1: 0 worker(s)"),
         format!("[ok ] {SIGNERS} v1: 0 token signer(s)"),
         format!("[ok ] {GRANTS} v1: 0 grant(s)"),
+        format!("[ok ] {PEERS} v1: 1 peer(s), 1 in force"),
         format!("[NO ] this Mac's session key (fp {}) is not an in-force token signer as mac", session.fingerprint()),
         "[ok ] relay 0.12.0: 2 tunnel(s), 3 source(s) live; workers 0123456789abcdef (30 s old), token-signers 1123456789abcdef (31 s old), grants 2123456789abcdef (32 s old)".to_string(),
         "[ok ] keys: sealed in credentials/relay-worker.env for worker mac".to_string(),
@@ -624,17 +626,18 @@ fn relay_start_stop_and_status_are_ops_commands() {
     let o = w.run(&["status", "--json"], Who::Ops);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    for key in ["instance", "workers", "token_signers", "grants", "status", "mac"] {
+    for key in SEVEN_KEYS {
         assert!(doc.get(key).is_some(), "{key}: {doc}");
     }
-    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(6), "the six keys alone: {doc}");
+    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(7), "the seven keys alone: {doc}");
+    assert_eq!(doc["peers"], serde_json::json!([{"label": "office", "cidr": "198.51.100.0/24", "not_after": IN_FORCE, "expired": false}]), "{doc}");
     assert_eq!(doc["instance"]["status_line"]["relay_version"].as_str(), Some("0.12.0"), "the relay's status line rides in instance: {doc}");
     assert_eq!(doc["mac"]["session_fp"].as_str(), Some(session.fingerprint().as_str()));
     assert!(!stdout(&o).contains(&session.b64()), "fingerprints, never a key, in --json");
     let o = w.run(&["status", "--local", "--json"], Who::Nobody);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert!(doc.as_object().map(serde_json::Map::len) == Some(6) && doc["instance"].is_null() && doc["grants"].is_null() && doc["mac"]["session_fp"].is_string(), "{doc}");
+    assert!(doc.as_object().map(serde_json::Map::len) == Some(7) && doc["instance"].is_null() && doc["grants"].is_null() && doc["peers"].is_null() && doc["mac"]["session_fp"].is_string(), "{doc}");
     // No status line in 10 minutes: a warning.
     w.answer("logs.filter-log-events.json", "{\"events\": []}");
     let o = w.run(&["status"], Who::Ops);
@@ -688,7 +691,8 @@ fn relay_agent_answers_a_worker_and_the_wrapper_with_one_touch_id() {
     let socket = w.paths().relay_agent_socket();
     wait_for("the agent's socket", Duration::from_secs(20), || socket.exists());
     assert!(socket.as_os_str().len() < 104);
-    assert_eq!(fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+    // The socket appears at its bind, under the agent's 077 umask; the chmod to 0600 follows it.
+    wait_for("the agent's socket at 0600", Duration::from_secs(20), || fs::metadata(&socket).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o600));
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     // A worker on this Mac signs through the agent; the signature verifies with the sealed worker key.
     let signer = rt.block_on(ai_env_worker::signer::AgentSigner::connect(Some(socket.clone()))).unwrap();
@@ -964,4 +968,917 @@ fn relay_help_says_what_each_command_does() {
         missing.extend(texts.into_iter().filter(|t| !help.contains(t)).map(|t| format!("relay {sub} --help lacks {t:?}")));
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+// ---- the relay security plan's slice M: §RS.4, §RS.3.2 ------------------------------------------------------------
+
+const PEERS: &str = "/ai-env/relay/peers";
+/// The keys of `relay status --json` (§RS.3.2 row 8).
+const SEVEN_KEYS: [&str; 7] = ["instance", "workers", "token_signers", "grants", "peers", "status", "mac"];
+/// A `not_after` in force for the life of these tests, and one long lapsed.
+const IN_FORCE: &str = "2036-01-01T00:00:00Z";
+const LAPSED: &str = "2020-01-01T00:00:00Z";
+
+/// `/ai-env/relay/peers` holding `(cidr, label, not_after)`, as the CLI renders it.
+fn peers_value(entries: &[(&str, &str, &str)]) -> String {
+    let list: Vec<policy::PeerEntry> = entries.iter().map(|(cidr, label, not_after)| policy::PeerEntry { cidr: (*cidr).into(), label: (*label).into(), not_after: (*not_after).into() }).collect();
+    policy::render_peers(&list).unwrap()
+}
+
+/// The entries of `/ai-env/relay/peers`, and its version.
+fn peers_of(w: &World) -> (Vec<policy::PeerEntry>, u64) {
+    let (value, version) = w.param(PEERS).expect("the peers list exists");
+    (policy::parse_peers(&value).unwrap(), version)
+}
+
+/// The `put-parameter`s of the last run.
+fn puts(w: &World) -> Vec<String> {
+    w.aws_calls().into_iter().filter(|l| l.starts_with("ssm put-parameter")).collect()
+}
+
+/// The keys of an audit row's detail but `actor`, sorted.
+fn detail_keys(row: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = row["detail"].as_object().unwrap().keys().filter(|k| *k != "actor" && *k != "purpose").cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// A stand-in for checkip.amazonaws.com on loopback (`AI_ENV_BRIDGE_LAB_CHECKIP`): every request gets the answer set
+/// last; the requests' heads are kept. Its thread lives as long as the test process.
+struct FakeCheckip {
+    addr: std::net::SocketAddr,
+    answer: std::sync::Arc<std::sync::Mutex<String>>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl FakeCheckip {
+    fn start() -> FakeCheckip {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (give, keep) = (answer.clone(), seen.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                keep.lock().unwrap().push(String::from_utf8_lossy(&head).into_owned());
+                let text = give.lock().unwrap().clone();
+                let _ = conn.write_all(text.as_bytes());
+            }
+        });
+        FakeCheckip { addr, answer, seen }
+    }
+
+    /// The next answers: this status and body.
+    fn says(&self, status: &str, body: &str) {
+        *self.answer.lock().unwrap() = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl World {
+    /// `relay <args>` with the fake checkip at `addr`, from clean fake logs and answer counters.
+    fn with_checkip(&self, addr: &str, args: &[&str], who: Who) -> Output {
+        self.reset();
+        run(self.cmd(args, who).env("AI_ENV_BRIDGE_LAB_CHECKIP", addr))
+    }
+}
+
+/// WM-T58 (§RS.4.1 to §RS.4.3, R-97): `allow-ip` and `revoke-ip` edit `/ai-env/relay/peers` as the deployer.
+#[test]
+fn relay_allow_ip_edits_the_peers_list() {
+    let w = World::new();
+    let checkip = FakeCheckip::start();
+    checkip.says("200 OK", "203.0.113.7\n");
+    let knob = checkip.addr.to_string();
+    let day = default_day();
+    // No marker, or an ops marker: exit 9 with WM-R41's text naming the command as given, no aws call, no checkip.
+    let wide_given = format!("allow-ip 198.51.100.0/8 --label wide --not-after {day} --wide");
+    let writers: [(&[&str], &str); 5] = [
+        (&["allow-ip", "198.51.100.7/24", "--label", "office"], "allow-ip 198.51.100.7/24 --label office"),
+        (&["allow-ip", "198.51.100.0/8", "--label", "wide", "--not-after", &day, "--wide"], &wide_given),
+        (&["allow-ip", "--mine", "--hours", "2"], "allow-ip --mine --hours 2"),
+        (&["revoke-ip", "198.51.100.0/24"], "revoke-ip 198.51.100.0/24"),
+        (&["revoke-ip", "--label", "office"], "revoke-ip --label office"),
+    ];
+    for who in [Who::Nobody, Who::Ops] {
+        for (args, given) in &writers {
+            let o = w.with_checkip(&knob, args, who);
+            assert_eq!(code(&o), 9, "{who:?} {args:?}: {}", stderr(&o));
+            let cmd = args[0];
+            assert!(stderr(&o).contains(&format!("relay {cmd}: the relay's whitelist and grants decide who reaches private data, and only ai-env-deployer writes them: run ai-env as deployer -- ai-env relay {given}")), "{who:?} {args:?}: {}", stderr(&o));
+            assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{who:?} {args:?}: {:?}", w.aws_calls());
+        }
+    }
+    assert!(checkip.requests().is_empty(), "the gate comes before the address");
+    // The first allow-ip creates the list: --type String --tier Standard, no --overwrite, version 1, the network
+    // truncated, and it says so.
+    let o = w.run(&["allow-ip", "198.51.100.7/24", "--label", "office"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let put = puts(&w);
+    assert_eq!(put.len(), 1, "{put:?}");
+    assert!(put[0].contains(&format!("--name {PEERS} ")) && put[0].contains(" --type String ") && put[0].contains(" --tier Standard ") && !put[0].contains("--overwrite"), "{}", put[0]);
+    let until = format!("{day}T23:59:59Z");
+    assert_eq!(w.param(PEERS), Some((peers_value(&[("198.51.100.0/24", "office", &until)]), 1)));
+    assert_eq!(stdout(&o), format!("allowed peer office 198.51.100.0/24 until {until} ({PEERS} v1, 1 peer(s)); the relay applies it within 60 s (198.51.100.7/24 is written as 198.51.100.0/24)\n"));
+    // The same again: nothing written, the given form noted.
+    let o = w.run(&["allow-ip", "198.51.100.200/24", "--label", "office"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("(198.51.100.200/24 is written as 198.51.100.0/24)\npeer office 198.51.100.0/24 is already allowed until {until} ({PEERS} v1); nothing written\n"));
+    assert!(puts(&w).is_empty());
+    let o = w.run(&["allow-ip", "198.51.100.0/24", "--label", "office"], Who::Deployer);
+    assert_eq!(stdout(&o), format!("peer office 198.51.100.0/24 is already allowed until {until} ({PEERS} v1); nothing written\n"), "no note without host bits");
+    // An address alone is its /32, with no note; the list is sorted by label; the count is the list's.
+    let o = w.run(&["allow-ip", "198.51.100.9", "--label", "alpha", "--not-after", &day], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("allowed peer alpha 198.51.100.9/32 until {until} ({PEERS} v2, 2 peer(s)); the relay applies it within 60 s\n"));
+    assert_eq!(peers_of(&w).0.iter().map(|p| p.label.as_str()).collect::<Vec<_>>(), ["alpha", "office"], "sorted by label");
+    assert!(puts(&w)[0].contains(" --overwrite"), "an existing list is overwritten: {:?}", puts(&w));
+    // A network another label holds: exit 9, whatever its text; nothing written.
+    let o = w.run(&["allow-ip", "198.51.100.200/24", "--label", "other"], Who::Deployer);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay allow-ip: 198.51.100.0/24 is already allowed as office: one network, one label (ai-env relay revoke-ip --label office first)"), "{}", stderr(&o));
+    assert!(puts(&w).is_empty());
+    // --mine: this Mac's address as checkip answers it, the /32 labelled mac, until now plus 24 h, to the second.
+    let before = ai_env_cli::wire::time::unix_now();
+    let o = w.with_checkip(&knob, &["allow-ip", "--mine"], Who::Deployer);
+    let after = ai_env_cli::wire::time::unix_now();
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains("LAB KNOB ACTIVE (AI_ENV_BRIDGE_LAB_CHECKIP)"), "the banner names it: {}", stderr(&o));
+    let (list, version) = peers_of(&w);
+    assert_eq!(version, 3);
+    let mac = list.iter().find(|p| p.label == "mac").expect("the mac entry");
+    assert_eq!(mac.cidr, "203.0.113.7/32");
+    assert!((before + 86_400..=after + 86_400).contains(&mac.not_after_unix()), "{} not within now plus 24 h", mac.not_after);
+    assert_eq!(stdout(&o), format!("this Mac's address is 203.0.113.7 (checkip.amazonaws.com)\nallowed peer mac 203.0.113.7/32 until {} ({PEERS} v3, 3 peer(s)); the relay applies it within 60 s\n", mac.not_after));
+    let asked = checkip.requests();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let head = asked[0].to_ascii_lowercase();
+    assert!(head.starts_with("get / http/1.1\r\n") && head.contains(&format!("host: checkip.amazonaws.com:{}\r\n", checkip.addr.port())), "{head}");
+    // Again, from another network: replaced, one mac entry, and it names the old network; --hours moves the time.
+    checkip.says("200 OK", "203.0.113.8");
+    let o = w.with_checkip(&knob, &["allow-ip", "--mine", "--hours", "168"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (list, version) = peers_of(&w);
+    assert_eq!((version, list.len()), (4, 3));
+    let mac = list.iter().find(|p| p.label == "mac").expect("the mac entry");
+    assert_eq!(mac.cidr, "203.0.113.8/32");
+    assert!(mac.not_after_unix() >= before + 168 * 3600, "{}", mac.not_after);
+    assert!(stdout(&o).ends_with(&format!("({PEERS} v4, 3 peer(s)); the relay applies it within 60 s; replaced 203.0.113.7/32\n")), "{}", stdout(&o));
+    // The address again, a later time: replaced, no network moved.
+    let o = w.with_checkip(&knob, &["allow-ip", "--mine", "--hours", "1"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).ends_with("; the relay applies it within 60 s\n"), "{}", stdout(&o));
+    assert_eq!(peers_of(&w).1, 5);
+    // --mine's refusals write nothing: exit 1 for what checkip answers, exit 2 for --hours (no request at all).
+    let requests = checkip.requests().len();
+    for (status, body) in [("200 OK", "not an address\n"), ("200 OK", "2001:db8::1\n"), ("200 OK", ""), ("200 OK", "203.0.113.7\n198.51.100.1\n"), ("500 Internal Server Error", "203.0.113.7\n")] {
+        checkip.says(status, body);
+        let o = w.with_checkip(&knob, &["allow-ip", "--mine"], Who::Deployer);
+        assert_eq!(code(&o), 1, "{status} {body:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("relay allow-ip --mine: checkip.amazonaws.com answered no IPv4 address"), "{status} {body:?}: {}", stderr(&o));
+        assert!(w.aws_calls().iter().all(|c| !c.starts_with("ssm ")), "no list read: {:?}", w.aws_calls());
+    }
+    checkip.says("200 OK", &format!("203.0.113.7{}\n", " ".repeat(64)));
+    let o = w.with_checkip(&knob, &["allow-ip", "--mine"], Who::Deployer);
+    assert_eq!(code(&o), 1, "over 64 bytes: {}", stderr(&o));
+    assert!(stderr(&o).contains("answered no IPv4 address"), "{}", stderr(&o));
+    let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+    let o = w.with_checkip(&nobody, &["allow-ip", "--mine"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay allow-ip --mine: checkip.amazonaws.com could not be reached ("), "{}", stderr(&o));
+    // A server that takes the request and never answers: the run ends at its 10 s.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let o = w.with_checkip(&silent.local_addr().unwrap().to_string(), &["allow-ip", "--mine"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay allow-ip --mine: checkip.amazonaws.com could not be reached (no answer within 10 s)"), "{}", stderr(&o));
+    let o = w.with_checkip("192.0.2.1:8080", &["allow-ip", "--mine"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("AI_ENV_BRIDGE_LAB_CHECKIP=\"192.0.2.1:8080\": expected a loopback ip:port"), "never another address: {}", stderr(&o));
+    let requests_then = checkip.requests().len();
+    assert_eq!(requests_then, requests + 6, "one request each");
+    for hours in ["0", "169"] {
+        let o = w.with_checkip(&knob, &["allow-ip", "--mine", "--hours", hours], Who::Deployer);
+        assert_eq!(code(&o), 2, "--hours {hours}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("relay allow-ip: --hours {hours}: 1 to 168")), "{}", stderr(&o));
+    }
+    assert_eq!(checkip.requests().len(), requests_then, "the arguments come first");
+    assert_eq!(peers_of(&w).1, 5, "nothing written");
+    // A prefix under 16 is exit 2 without --wide, written with it; /16 needs none.
+    for (given, network) in [("198.51.100.0/8", "198.0.0.0/8"), ("198.51.100.7/0", "0.0.0.0/0"), ("198.51.100.0/15", "198.50.0.0/15")] {
+        let o = w.run(&["allow-ip", given, "--label", "wide"], Who::Nobody);
+        assert_eq!(code(&o), 2, "{given}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("relay allow-ip: {network} is wider than /16, which admits much of the internet: pass --wide if that is meant")), "{given}: {}", stderr(&o));
+    }
+    assert_eq!(peers_of(&w).1, 5, "nothing written");
+    let o = w.run(&["allow-ip", "198.51.100.0/8", "--label", "wide", "--wide"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).starts_with("allowed peer wide 198.0.0.0/8 until "), "{}", stdout(&o));
+    let o = w.run(&["allow-ip", "192.0.2.0/16", "--label", "broad"], Who::Deployer);
+    assert_eq!(code(&o), 0, "/16 is not wider than /16: {}", stderr(&o));
+    // Usage errors come before the gate.
+    for (args, why) in [
+        (vec!["allow-ip", "198.51.100.0/33", "--label", "x"], "relay allow-ip: 198.51.100.0/33 is not an IPv4 address or network (a.b.c.d or a.b.c.d/n, n 0 to 32)"),
+        (vec!["allow-ip", "2001:db8::/32", "--label", "x"], "relay allow-ip: 2001:db8::/32 is not an IPv4 address or network"),
+        (vec!["allow-ip", "example.invalid", "--label", "x"], "relay allow-ip: example.invalid is not an IPv4 address or network"),
+        (vec!["allow-ip", "198.51.100.0/24", "--label", "Not-An-Id"], "is not an id"),
+        (vec!["allow-ip", "198.51.100.0/24", "--label", "198.51.100.7"], "relay allow-ip: --label \"198.51.100.7\" reads as an address: a label says what the network is, and the audit never holds an address"),
+        (vec!["allow-ip", "198.51.100.0/24", "--label", "x", "--not-after", "2020-01-01"], "is before today"),
+        (vec!["revoke-ip", "198.51.100.0/33"], "relay revoke-ip: 198.51.100.0/33 is not an IPv4 address or network"),
+        (vec!["revoke-ip", "--label", "Not-An-Id"], "is not an id"),
+    ] {
+        let o = w.run(&args, Who::Nobody);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(why), "{args:?}: {}", stderr(&o));
+    }
+    // A lost race: the put answered two versions on: exit 7 naming both.
+    let at = peers_of(&w).1;
+    w.answer("ssm.put-parameter.json", &format!("{{\"Version\": {}, \"Tier\": \"Standard\"}}\n", at + 2));
+    let o = w.run(&["allow-ip", "192.0.2.0/24", "--label", "race"], Who::Deployer);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay allow-ip: {PEERS} moved from v{at} to v{} while it was written (another writer): run the command again to see what it holds", at + 2)), "{}", stderr(&o));
+    let o = w.run(&["revoke-ip", "--label", "broad"], Who::Deployer);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay revoke-ip: {PEERS} moved from v{at} to v{}", at + 2)), "{}", stderr(&o));
+    w.unanswer("ssm.put-parameter.json");
+    // A list that does not parse is never overwritten (exit 1).
+    let good = w.param(PEERS).unwrap();
+    w.set_param(PEERS, "[{\"cidr\":\"not a network\"}]", at);
+    for args in [vec!["allow-ip", "192.0.2.0/24", "--label", "x"], vec!["revoke-ip", "--label", "broad"]] {
+        let o = w.run(&args, Who::Deployer);
+        assert_eq!(code(&o), 1, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("relay {}: {PEERS} does not parse (", args[0])) && stderr(&o).contains("nothing was written: correct it first (aws ssm put-parameter)"), "{}", stderr(&o));
+        assert!(puts(&w).is_empty());
+    }
+    // Over its limits: refused before any write.
+    let mut full = Vec::new();
+    for n in 0..64u8 {
+        let entry = policy::PeerEntry { cidr: format!("192.0.2.{n}/32"), label: format!("a-rather-longer-label-{n:02}"), not_after: IN_FORCE.into() };
+        full.push(entry);
+        if policy::render_peers(&full).is_err() {
+            full.pop();
+            break;
+        }
+    }
+    assert!(full.len() < 64, "the bytes limit comes first: {}", full.len());
+    w.set_param(PEERS, &policy::render_peers(&full).unwrap(), 20);
+    let o = w.run(&["allow-ip", "198.51.100.0/24", "--label", "a-rather-longer-label-that-is-over-the-limit"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay allow-ip: {PEERS} would be ")) && stderr(&o).contains("bytes, over its limit of 4096; nothing was written"), "{}", stderr(&o));
+    assert!(puts(&w).is_empty());
+    w.set_param(PEERS, &good.0, good.1);
+    // revoke-ip by network, the argument normalised, and by label; each says which it removed.
+    let o = w.run(&["revoke-ip", "198.51.100.42/24"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let v = at + 1;
+    assert_eq!(stdout(&o), format!("revoked peer office 198.51.100.0/24 ({PEERS} v{v}): the relay closes its tunnels within 60 s\n"));
+    assert!(!peers_of(&w).0.iter().any(|p| p.label == "office"));
+    let o = w.run(&["revoke-ip", "--label", "wide"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("revoked peer wide 198.0.0.0/8 ({PEERS} v{}): the relay closes its tunnels within 60 s\n", v + 1));
+    // Not listed: nothing written, exit 0, whichever way it is named; a missing list too.
+    for (args, given) in [(vec!["revoke-ip", "198.51.100.0/24"], "198.51.100.0/24"), (vec!["revoke-ip", "198.51.100.7/24"], "198.51.100.7/24"), (vec!["revoke-ip", "--label", "gone"], "gone")] {
+        let o = w.run(&args, Who::Deployer);
+        assert_eq!(code(&o), 0, "{args:?}: {}", stderr(&o));
+        assert_eq!(stdout(&o), format!("{given} is not listed in {PEERS}; nothing written\n"));
+        assert!(puts(&w).is_empty(), "{args:?}");
+    }
+    let other = World::new();
+    let o = other.run(&["revoke-ip", "--label", "gone"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("gone is not listed in {PEERS}; nothing written\n"));
+    assert!(puts(&other).is_empty() && other.param(PEERS).is_none(), "a missing list stays missing");
+    // A root or ambient marker passes the gate (IAM decides for those).
+    for (who, caller, label, cidr) in [(Who::Root, "root", "by-root", "192.0.2.1"), (Who::Ambient, "rust", "by-ambient", "192.0.2.2")] {
+        other.reset();
+        let o = run(other.cmd(&["allow-ip", cidr, "--label", label], who).env("FAKE_AWS_CALLER", caller));
+        assert_eq!(code(&o), 0, "{who:?}: {}", stderr(&o));
+        assert!(stdout(&o).starts_with(&format!("allowed peer {label} {cidr}/32 until ")), "{}", stdout(&o));
+    }
+    // An address inside a wider entry stays admitted (LD-R40): the line as ever, and a note on stderr naming the entry,
+    // whether something was removed or not. A lapsed entry admits nothing; an entry inside the named network, not all of it.
+    let nested = World::new();
+    nested.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "office", IN_FORCE), ("198.51.100.7/32", "host", IN_FORCE), ("198.51.100.8/32", "desk", IN_FORCE), ("203.0.113.0/24", "old", LAPSED)]), 1);
+    let stays = |given: &str| format!("note: {given} stays admitted by peer office 198.51.100.0/24\n");
+    let o = nested.run(&["revoke-ip", "198.51.100.42"], Who::Deployer);
+    assert_eq!((code(&o), stdout(&o)), (0, format!("198.51.100.42 is not listed in {PEERS}; nothing written\n")), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&stays("198.51.100.42")) && puts(&nested).is_empty(), "{}", stderr(&o));
+    let o = nested.run(&["revoke-ip", "198.51.100.7"], Who::Deployer);
+    assert_eq!((code(&o), stdout(&o)), (0, format!("revoked peer host 198.51.100.7/32 ({PEERS} v2): the relay closes its tunnels within 60 s\n")), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&stays("198.51.100.7")), "{}", stderr(&o));
+    let o = nested.run(&["revoke-ip", "--label", "desk"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&stays("198.51.100.8/32")), "by label, its network: {}", stderr(&o));
+    for given in ["203.0.113.9", "198.51.100.0/23", "192.0.2.1", "198.51.100.0/24"] {
+        let o = nested.run(&["revoke-ip", given], Who::Deployer);
+        assert_eq!(code(&o), 0, "{given}: {}", stderr(&o));
+        assert!(!stderr(&o).contains("stays admitted"), "{given}: {}", stderr(&o));
+    }
+    // A list corrected by hand may hold a label that reads as an address: its removal's row leaves it out.
+    let by_hand = World::new();
+    by_hand.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "198.51.100.7", IN_FORCE)]), 1);
+    let o = by_hand.run(&["revoke-ip", "--label", "198.51.100.7"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(detail_keys(&by_hand.audit("relay_revoke_ip")[0]), ["not_after", "outcome", "prefix", "version"]);
+    assert!(!fs::read_to_string(by_hand.bridge().join("audit.jsonl")).unwrap().contains("198.51.100."), "an address in the audit");
+    // Each audit row's keys, as §RS.4.3 has them; the outcomes in order; no row holds an address, nor does any other.
+    let rows = w.audit("relay_allow_ip");
+    let outcomes: Vec<&str> = rows.iter().map(|r| r["detail"]["outcome"].as_str().unwrap_or_default()).collect();
+    assert_eq!(outcomes, ["added", "unchanged", "unchanged", "added", "added", "replaced", "replaced", "added", "added"], "{rows:?}");
+    for r in &rows {
+        let mine = r["detail"]["label"] == "mac";
+        let want: &[&str] = if mine { &["label", "mine", "not_after", "outcome", "prefix", "version"] } else { &["label", "not_after", "outcome", "prefix", "version"] };
+        assert_eq!(detail_keys(r), want, "{r}");
+        assert_eq!(r["detail"]["mine"].as_str(), mine.then_some("yes"), "{r}");
+    }
+    assert_eq!(rows[0]["detail"]["label"].as_str(), Some("office"));
+    assert_eq!((rows[0]["detail"]["prefix"].as_str(), rows[0]["detail"]["not_after"].as_str(), rows[0]["detail"]["version"].as_str()), (Some("24"), Some(until.as_str()), Some("1")));
+    assert_eq!((rows[1]["detail"]["outcome"].as_str(), rows[1]["detail"]["version"].as_str()), (Some("unchanged"), Some("1")), "the version it holds");
+    let rows = w.audit("relay_revoke_ip");
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert_eq!(detail_keys(&rows[0]), ["label", "not_after", "outcome", "prefix", "version"]);
+    assert_eq!((rows[0]["detail"]["outcome"].as_str(), rows[0]["detail"]["label"].as_str(), rows[0]["detail"]["prefix"].as_str(), rows[0]["detail"]["version"].as_str()), (Some("revoked"), Some("office"), Some("24"), Some(v.to_string().as_str())));
+    assert_eq!(rows[0]["detail"]["not_after"].as_str(), Some(until.as_str()), "the removed entry's");
+    for r in &rows[2..] {
+        assert_eq!(detail_keys(r), ["outcome"], "{r}");
+        assert_eq!(r["detail"]["outcome"].as_str(), Some("absent"));
+    }
+    let audit = fs::read_to_string(w.bridge().join("audit.jsonl")).unwrap();
+    for address in ["198.51.100.", "203.0.113.", "198.0.0.", "192.0.2."] {
+        assert!(!audit.contains(address), "an address in the audit ({address}): {audit}");
+    }
+    // Its help (§RS.4.1).
+    for (sub, text) in [("allow-ip", "Allow a network on the relay's public face (as ai-env-deployer); --mine allows this Mac's current address"), ("revoke-ip", "Remove a network from the relay's public face (as ai-env-deployer)")] {
+        let o = w.run(&[sub, "--help"], Who::Nobody);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        assert!(stdout(&o).split_whitespace().collect::<Vec<_>>().join(" ").contains(text), "{}", stdout(&o));
+    }
+}
+
+/// `allow <id> --key <seed's text> --sources <glob> --tls-key <point>`'s arguments.
+fn tls_args<'a>(id: &'a str, key: &'a str, glob: &'a str, point: &'a str) -> Vec<&'a str> {
+    vec!["allow", id, "--key", key, "--sources", glob, "--tls-key", point]
+}
+
+/// A fresh P-256 public point's text, and its key made at run time, as `tls-keygen` does on a worker.
+fn point_text() -> String {
+    let key = ai_env_worker::certs::client_key().unwrap();
+    ai_env_worker::certs::client_point(&key).unwrap().text()
+}
+
+/// The one certificate of a PEM text, its DER: the text is exactly that block.
+fn one_certificate(pem: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let blocks = pem_blocks(pem);
+    assert_eq!(blocks.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), ["CERTIFICATE"], "{pem}");
+    let der = base64::engine::general_purpose::STANDARD.decode(&blocks[0].1).unwrap();
+    assert_eq!(pem, ai_env_worker::certs::pem("CERTIFICATE", &der), "exactly the PEM");
+    der
+}
+
+/// The SHA-256 of `der`, 64 lowercase hex.
+fn sha256_hex(der: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether the client certificate `der` verifies at `unix` under the CA `ca_der` as the relay's public face will verify
+/// it (R-124's `WebPkiClientVerifier`).
+fn verifies_under(ca_der: &[u8], der: &[u8], unix: u64) -> bool {
+    use rustls_pki_types::{CertificateDer, UnixTime};
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(ca_der.to_vec())).unwrap();
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(std::sync::Arc::new(roots), provider).build().unwrap();
+    verifier.verify_client_cert(&CertificateDer::from(der.to_vec()), &[], UnixTime::since_unix_epoch(Duration::from_secs(unix))).is_ok()
+}
+
+/// WM-T59 (§RS.4.2, R-131, R-123): `allow --tls-key` issues a worker's client certificate under the sealed CA.
+#[test]
+fn relay_allow_tls_key_issues_a_client_certificate() {
+    let w = World::new();
+    assert_eq!(code(&w.run(&["tls", "init"], Who::Deployer)), 0);
+    let ca = fs::read(w.bridge().join("state").join("relay-ca.der")).unwrap();
+    let (k1, k2) = (key_text(1), key_text(2));
+    let point = point_text();
+    let args = tls_args("worker-a", &k1, "example-*", &point);
+    let given = format!("allow worker-a --key {k1} --sources 'example-*' --tls-key {point}");
+    // Under no marker or ops: WM-R41's refusal; under root or ambient: §RS.4.2's own; no aws call and no unseal.
+    for (who, why) in [
+        (Who::Nobody, "relay allow: the relay's whitelist and grants decide who reaches private data, and only ai-env-deployer writes them"),
+        (Who::Ops, "relay allow: the relay's whitelist and grants decide who reaches private data, and only ai-env-deployer writes them"),
+        (Who::Root, "relay allow: --tls-key unseals the relay CA's key, which only the deployer uses"),
+        (Who::Ambient, "relay allow: --tls-key unseals the relay CA's key, which only the deployer uses"),
+    ] {
+        let o = w.run(&args, who);
+        assert_eq!(code(&o), 9, "{who:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("{why}: run ai-env as deployer -- ai-env relay {given}")), "{who:?}: {}", stderr(&o));
+        assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{who:?}: {:?}", w.aws_calls());
+    }
+    // The first: one Touch ID, stdout exactly the PEM, the entry's tls_fp the SHA-256 of its DER, the audit its first 16.
+    let o = w.run(&args, Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 1, "one Touch ID");
+    let der = one_certificate(&stdout(&o));
+    let fp = sha256_hex(&der);
+    let day = default_day();
+    let (value, version) = w.param(WORKERS).unwrap();
+    assert_eq!(version, 1);
+    let list = policy::parse_workers(&value).unwrap();
+    assert_eq!(list[0].tls_fp.as_deref(), Some(fp.as_str()));
+    let line = format!("ai-env: allowed worker worker-a (key fp {}, cert fp {}) for sources example-* until {day} ({WORKERS} v1, 1 worker(s)); the relay applies it within 60 s\n", key_of(1).fingerprint(), &fp[..16]);
+    assert!(stderr(&o).contains(&line), "{}\nnot in\n{}", line, stderr(&o));
+    assert!(stderr(&o).contains("ai-env: the certificate on stdout goes to the worker's relay_client_cert file (0640, the worker's group)\n"), "{}", stderr(&o));
+    // It verifies under the relay CA, up to the entry's not_after and not past it.
+    let until = list[0].not_after_unix();
+    let now = ai_env_cli::wire::time::unix_now();
+    assert!(verifies_under(&ca, &der, now) && verifies_under(&ca, &der, until), "under the CA, to the entry's not_after");
+    assert!(!verifies_under(&ca, &der, until + 1), "not past it");
+    let stranger = ai_env_worker::certs::relay_ca(now).unwrap();
+    assert!(!verifies_under(&stranger.cert_der, &der, now), "another CA's");
+    let rows = w.audit("relay_allow");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["detail"]["tls_fp"].as_str(), Some(&fp[..16]));
+    assert_eq!(detail_keys(&rows[0]), ["fp", "id", "kind", "not_after", "outcome", "sources", "tls_fp", "version"]);
+    assert_eq!(rows[0]["detail"]["outcome"].as_str(), Some("added"));
+    // Without --tls-key the entry keeps it: `cert fp … kept` in the line, on a rotation of its key too; no Touch ID.
+    let o = w.run(&["allow", "worker-a", "--key", &k1, "--sources", "example-*"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("worker worker-a (key fp {}, cert fp {} kept) is already allowed for sources example-* until {day} ({WORKERS} v1); nothing written\n", key_of(1).fingerprint(), &fp[..16]));
+    assert!(puts(&w).is_empty() && w.age_calls("-d") == 0);
+    let o = w.run(&["allow", "worker-a", "--key", &k2, "--sources", "example-*"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("allowed worker worker-a (key fp {}, cert fp {} kept) for sources example-* until {day} ({WORKERS} v2, 1 worker(s)); replaced its key fp {} by fp {}; the relay applies it within 60 s\n", key_of(2).fingerprint(), &fp[..16], key_of(1).fingerprint(), key_of(2).fingerprint()));
+    assert!(!stderr(&o).contains("note:"), "the same end, and a certificate: {}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 0, "no Touch ID");
+    assert_eq!(policy::parse_workers(&w.param(WORKERS).unwrap().0).unwrap()[0].tls_fp.as_deref(), Some(fp.as_str()), "kept");
+    assert!(w.audit("relay_allow").last().unwrap()["detail"].get("tls_fp").is_none(), "tls_fp is the issued certificate's");
+    // A later end moves the entry's, not the certificate's: WM-R43's stdout, and a note on stderr. An earlier end says
+    // nothing: the certificate outlives the entry, and the entry decides.
+    let later = ai_env_cli::wire::time::rfc3339_utc(now - now % 86_400 + 400 * 86_400)[..10].to_string();
+    let o = w.run(&["allow", "worker-a", "--key", &k2, "--sources", "example-*", "--not-after", &later], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains(&format!("cert fp {} kept) for sources example-* until {later} (", &fp[..16])), "{}", stdout(&o));
+    assert!(stderr(&o).contains(&format!("note: worker worker-a: this moves the entry's end to {later}, not its client certificate's, which keeps the end it was issued with (ai-env relay allow worker-a … --tls-key p256:… issues a new one)\n")), "{}", stderr(&o));
+    let o = w.run(&["allow", "worker-a", "--key", &k2, "--sources", "example-*"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains(&format!("cert fp {} kept) for sources example-* until {day} (", &fp[..16])) && !stderr(&o).contains("note:"), "{}{}", stdout(&o), stderr(&o));
+    // A worker with none: WM-R43's stdout, the note on stderr, whether or not anything was written.
+    let k3 = key_text(3);
+    let plain = ["allow", "worker-b", "--key", k3.as_str(), "--sources", "example-*"];
+    let note = "note: worker worker-b has no client certificate: a relay that requires one refuses it (ai-env relay allow worker-b … --tls-key p256:…, after tls-keygen on the worker)\n";
+    let o = w.run(&plain, Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).starts_with(&format!("allowed worker worker-b (key fp {}) for sources example-* until ", key_of(3).fingerprint())) && stdout(&o).ends_with("; the relay applies it within 60 s\n"), "{}", stdout(&o));
+    assert!(stderr(&o).contains(note), "{}", stderr(&o));
+    let o = w.run(&plain, Who::Deployer);
+    assert!(stdout(&o).ends_with("; nothing written\n") && stderr(&o).contains(note), "{}{}", stdout(&o), stderr(&o));
+    // A token signer has no certificate, and no note.
+    let k7 = key_text(7);
+    let o = w.run(&["allow", "mac", "--token-signer", "--key", &k7], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stderr(&o).contains("note:"), "{}", stderr(&o));
+    // A certificate is issued on every run, so the run always writes: a second one replaces the first, naming both.
+    let second = point_text();
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &second), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 1, "one Touch ID");
+    let der2 = one_certificate(&stdout(&o));
+    let fp2 = sha256_hex(&der2);
+    assert!(fp2 != fp);
+    assert!(stderr(&o).contains(&format!("; the relay applies it within 60 s; replaced its client certificate fp {} by fp {}\n", &fp[..16], &fp2[..16])), "{}", stderr(&o));
+    let (value, _) = w.param(WORKERS).unwrap();
+    assert_eq!(policy::parse_workers(&value).unwrap().iter().find(|e| e.worker_id == "worker-a").and_then(|e| e.tls_fp.clone()), Some(fp2.clone()));
+    assert_eq!(w.audit("relay_allow").last().unwrap()["detail"]["outcome"].as_str(), Some("replaced"));
+    let at = w.param(WORKERS).unwrap().1;
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &second), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.param(WORKERS).unwrap().1, at + 1, "the same point again still writes: a new certificate");
+    // `--sources '*'`: stdout stays exactly the PEM.
+    let o = w.run(&tls_args("worker-c", &key_text(4), "*", &point_text()), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    one_certificate(&stdout(&o));
+    assert!(stderr(&o).contains("ai-env: this worker may register any source name\n"), "{}", stderr(&o));
+    // Refused before the Touch ID, nothing written: a key another id or the other list holds, a list that does not parse.
+    for (key, why) in [(k3.as_str(), "is already allowed as worker-b: one key, one id"), (k7.as_str(), "is already allowed as token signer mac: one key, one role")] {
+        let o = w.run(&tls_args("worker-z", key, "example-*", &point), Who::Deployer);
+        assert_eq!(code(&o), 9, "{}", stderr(&o));
+        assert!(stderr(&o).contains(why), "{}", stderr(&o));
+        assert!(w.age_calls("-d") == 0 && puts(&w).is_empty(), "no Touch ID");
+    }
+    let held = w.param(WORKERS).unwrap();
+    w.set_param(WORKERS, "[{\"worker_id\":\"A\"}]", 40);
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay allow: {WORKERS} does not parse (")) && w.age_calls("-d") == 0 && puts(&w).is_empty(), "{}", stderr(&o));
+    // Over its limits, with the certificate's fingerprint counted: no Touch ID either.
+    let mut full = Vec::new();
+    for n in 10..200u8 {
+        full.push(policy::WorkerEntry { worker_id: format!("w{n:03}"), alg: "ed25519".into(), public_key: key_of(n).b64(), sources: vec!["example-*".into()], not_after: IN_FORCE.into(), tls_fp: None });
+        if policy::render_workers(&full).is_err() {
+            full.pop();
+            break;
+        }
+    }
+    w.set_param(WORKERS, &policy::render_workers(&full).unwrap(), 41);
+    let o = w.run(&tls_args("worker-new", &key_text(250), "example-*", &point), Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay allow: {WORKERS} would be ")) && stderr(&o).contains("over its limit"), "{}", stderr(&o));
+    assert!(w.age_calls("-d") == 0 && puts(&w).is_empty(), "no Touch ID, nothing written");
+    w.set_param(WORKERS, &held.0, held.1);
+    // A failed write prints no certificate, and says so.
+    let not_printed = "; the certificate it issued was not printed: run the command again";
+    w.answer("ssm.put-parameter.rc", "254");
+    w.answer("ssm.put-parameter.stderr", "\nAn error occurred (InternalServerError) when calling the PutParameter operation: try again.\n");
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer);
+    assert_eq!((code(&o), stdout(&o)), (7, String::new()), "{}", stderr(&o));
+    assert!(stderr(&o).contains(not_printed), "{}", stderr(&o));
+    w.unanswer("ssm.put-parameter.rc");
+    w.unanswer("ssm.put-parameter.stderr");
+    assert_eq!(w.param(WORKERS).unwrap(), held, "nothing written");
+    // A lost race (the put answered two versions on, WM-T45's case): the list may now name a certificate this run dropped.
+    w.answer("ssm.put-parameter.json", &format!("{{\"Version\": {}, \"Tier\": \"Standard\"}}\n", held.1 + 2));
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer);
+    assert_eq!((code(&o), stdout(&o)), (7, String::new()), "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 1, "the Touch ID was spent");
+    assert!(stderr(&o).contains(&format!("relay allow: {WORKERS} moved from v{} to v{} while it was written (another writer): run the command again to see what it holds{not_printed}", held.1, held.1 + 2)), "{}", stderr(&o));
+    let o = w.run(&["allow", "worker-a", "--key", &k2, "--sources", "other-*"], Who::Deployer);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("moved from v{} to v{}", held.1, held.1 + 2)) && !stderr(&o).contains(not_printed), "no certificate, no word of one: {}", stderr(&o));
+    w.unanswer("ssm.put-parameter.json");
+    assert_eq!(w.param(WORKERS).unwrap(), held, "nothing written");
+    // A stdout that cannot take the certificate fails the run (never exit 0, a closed pipe's): it held the only copy, and
+    // the list and the audit already name that certificate. The next run issues another.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    w.reset();
+    let child = w.cmd(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer).stdout(Stdio::from(writer)).stderr(Stdio::piped()).spawn().unwrap();
+    let o = finish(child, RUN_LIMIT, "ai-env with a closed stdout");
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let tls_fp_of = |value: &str| policy::parse_workers(value).unwrap().into_iter().find(|e| e.worker_id == "worker-a").and_then(|e| e.tls_fp).unwrap();
+    let (value, version) = w.param(WORKERS).unwrap();
+    assert_eq!(version, held.1 + 1, "the write came first");
+    assert!(stderr(&o).contains("relay allow: the certificate could not be written to stdout (") && stderr(&o).contains(&format!("); {WORKERS} v{version} already names it: run the command again")), "{}", stderr(&o));
+    assert_eq!(w.audit("relay_allow").last().unwrap()["detail"]["tls_fp"].as_str(), Some(&tls_fp_of(&value)[..16]));
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(tls_fp_of(&w.param(WORKERS).unwrap().0), sha256_hex(&one_certificate(&stdout(&o))), "the next run's");
+    w.set_param(WORKERS, &held.0, held.1);
+    // A CA certificate that is not the sealed key's: exit 9 as tls rotate says, nothing written.
+    fs::write(w.bridge().join("state").join("relay-ca.der"), &stranger.cert_der).unwrap();
+    let o = w.run(&tls_args("worker-a", &k2, "example-*", &point), Who::Deployer);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay allow: credentials/relay-ca.env does not hold the key of state/relay-ca.der: make a new CA with ai-env relay tls init --force"), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "", "no certificate");
+    assert_eq!(w.param(WORKERS).unwrap(), held, "nothing written");
+    fs::write(w.bridge().join("state").join("relay-ca.der"), &ca).unwrap();
+    // No CA on this Mac: exit 5 naming tls init, no Touch ID.
+    let bare = World::new();
+    let o = bare.run(&tls_args("worker-a", &k1, "example-*", &point), Who::Deployer);
+    assert_eq!(code(&o), 5, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay allow: state/relay-ca.der does not exist: make the relay CA with ai-env relay tls init"), "{}", stderr(&o));
+    assert!(bare.age_calls("-d") == 0 && bare.param(WORKERS).is_none(), "no Touch ID, nothing written");
+    // Exit 2, before the gate: a text that is no point, --tls-key beside --token-signer.
+    let off_curve = format!("p256:{}", {
+        use base64::Engine as _;
+        let mut point = vec![0x04u8];
+        point.extend([1u8; 64]);
+        base64::engine::general_purpose::STANDARD.encode(point)
+    });
+    for bad in ["p256:short", "ed25519:AAAA", "", off_curve.as_str()] {
+        let o = w.run(&tls_args("worker-a", &k1, "example-*", bad), Who::Nobody);
+        assert_eq!(code(&o), 2, "{bad:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("relay allow: --tls-key is not a P-256 public point's text, p256:<base64 of 65 bytes> (93 characters), as tls-keygen prints it"), "{bad:?}: {}", stderr(&o));
+    }
+    let o = w.run(&["allow", "mac", "--token-signer", "--key", &k7, "--tls-key", &point], Who::Deployer);
+    assert_eq!(code(&o), 2, "{}", stderr(&o));
+    assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0);
+    // Its help (§RS.4.1).
+    let o = w.run(&["allow", "--help"], Who::Nobody);
+    let help = stdout(&o).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains("--tls-key <P256>") && help.contains("Issue the worker a client certificate for this P-256 point, p256:<base64>, as tls-keygen printed it (one Touch ID: the relay CA)"), "{help}");
+    // R-131: a new CA strands every client certificate as it strands every relay_ca file, and init says so.
+    let o = w.run(&["tls", "init"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("every worker's relay_ca file and client certificate must then be replaced"), "{}", stderr(&o));
+    let o = w.run(&["tls", "init", "--force"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("every worker's relay_ca file and client certificate must then be replaced"), "{}", stdout(&o));
+    let new_ca = fs::read(w.bridge().join("state").join("relay-ca.der")).unwrap();
+    assert!(!verifies_under(&new_ca, &der2, now), "the old certificate is stranded");
+}
+
+/// The `filter-log-events` answer holding these lines of the request log.
+fn log_answer(lines: &[serde_json::Value]) -> String {
+    let events: Vec<serde_json::Value> = lines.iter().enumerate().map(|(i, l)| serde_json::json!({"logStreamName": format!("{INSTANCE}/requests"), "timestamp": 1_793_268_000_000u64 + i as u64, "message": l.to_string(), "ingestionTime": 1_793_268_000_100u64, "eventId": i.to_string()})).collect();
+    serde_json::json!({"events": events}).to_string()
+}
+
+/// A status line of a relay: its `client_certs` when given (an older relay's line has no such key, R-132), its peers
+/// list's keys when `peers`.
+fn status_of(client_certs: Option<bool>, peers: bool) -> serde_json::Value {
+    let mut line = serde_json::json!({"ts": "2026-10-29T10:00:00.000Z", "ev": "status", "relay_version": "0.12.0", "protocol": 1, "uptime_s": 600, "tunnels": 2, "sources_live": 3, "sources_offline": 0, "calls_in_flight": 0, "sessions": 1, "workers_version": "0123456789abcdef", "workers_age_s": 30, "signers_version": "1123456789abcdef", "signers_age_s": 31, "grants_version": "2123456789abcdef", "grants_age_s": 32, "tls_loaded": true, "unknown_frames": 0, "log_dropped": 0, "log_suppressed": 0});
+    if peers {
+        line["peers_version"] = serde_json::json!("3123456789abcdef");
+        line["peers_age_s"] = serde_json::json!(33);
+    }
+    if let Some(on) = client_certs {
+        line["client_certs"] = serde_json::json!(on);
+    }
+    line
+}
+
+/// One `relay status` world: the instance running, SSM online, this Mac a token signer, every list valid, the three log
+/// reads (the status line, the refused hour, the reload's why=disk) answered in order.
+struct StatusWorld {
+    w: World,
+}
+
+impl StatusWorld {
+    fn new() -> StatusWorld {
+        let w = World::new();
+        w.answer("ec2.describe-instances.json", &instance_doc("running"));
+        w.answer("ssm.describe-instance-information.json", &ping_doc(Some("Online")));
+        assert_eq!(code(&w.run(&["keygen"], Who::Nobody)), 0);
+        let (_, session) = sealed_keys(&w);
+        let o = w.run(&["allow", "mac", "--token-signer", "--key", &session.text()], Who::Deployer);
+        assert_eq!(code(&o), 0, "{}", stderr(&o));
+        for name in [WORKERS, GRANTS] {
+            w.set_param(name, "[]", 1);
+        }
+        w.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "office", IN_FORCE)]), 1);
+        let s = StatusWorld { w };
+        s.logs(status_of(Some(false), true), &[], &[]);
+        s
+    }
+
+    /// The three log reads' answers: the status line, the lines of the refused hour, the reload's.
+    fn logs(&self, status: serde_json::Value, refused: &[serde_json::Value], reload: &[&str]) {
+        self.w.answer("logs.filter-log-events.1.json", &log_answer(&[status]));
+        self.w.answer("logs.filter-log-events.2.json", &log_answer(refused));
+        let events: Vec<serde_json::Value> = reload.iter().enumerate().map(|(i, l)| serde_json::json!({"logStreamName": format!("{INSTANCE}/reload"), "timestamp": 1_793_268_000_000u64 + 60_000 * i as u64, "message": l, "ingestionTime": 1_793_268_000_100u64, "eventId": i.to_string()})).collect();
+        self.w.answer("logs.filter-log-events.3.json", &serde_json::json!({"events": events}).to_string());
+    }
+
+    /// `relay status` as ops: its exit, its rows.
+    fn status(&self) -> (i32, String) {
+        let o = self.w.run(&["status"], Who::Ops);
+        (code(&o), stdout(&o))
+    }
+
+    /// `relay status --json` as ops: its exit, its object.
+    fn json(&self) -> (i32, serde_json::Value) {
+        let o = self.w.run(&["status", "--json"], Who::Ops);
+        let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap_or_else(|e| panic!("{e}: {}\n{}", stdout(&o), stderr(&o)));
+        (code(&o), doc)
+    }
+}
+
+/// WM-T60 (§RS.3.2, R-97, R-139, R-95, R-132, §RS.3.1): `relay status` shows the peers list, the workers' certificates,
+/// the refused hour and the disk, from fake lists and fake log lines. The probe's three rows are
+/// `ops::tests::the_probe_tells_a_refusal_from_an_open_port_and_no_connect`'s: the command dials port 443 only, which a
+/// test cannot bind; here its word and its row agree, whichever 127.0.0.1:443 gives.
+#[test]
+fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
+    let s = StatusWorld::new();
+    let w = &s.w;
+    // The peers list in force, its rows and its JSON, the probe's word with its row, and the rows in §RS.3.2's order.
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    let order = ["[ok ] keys: sealed", "[-  ] agent:", "[ok ] instance ", "[ok ] ssm: Online", "probe: 127.0.0.1:443", "[ok ] relay 0.12.0: ", "refused in the last hour:", &format!("{WORKERS} v1"), &format!("{SIGNERS} v1"), "this Mac's session key", &format!("{GRANTS} v1"), &format!("[ok ] {PEERS} v1")];
+    let at: Vec<usize> = order.iter().map(|t| out.find(t).unwrap_or_else(|| panic!("{t}\n{out}"))).collect();
+    assert!(at.windows(2).all(|p| p[0] < p[1]), "not in §RS.3.2's order: {at:?}\n{out}");
+    assert!(out.contains(&format!("[ok ] {PEERS} v1: 1 peer(s), 1 in force\n[-  ]   peer office 198.51.100.0/24 until {IN_FORCE}\n")), "{out}");
+    assert!(out.contains("grants 2123456789abcdef (32 s old), peers 3123456789abcdef (33 s old)\n"), "{out}");
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 0, "{doc}");
+    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(7), "{doc}");
+    for key in SEVEN_KEYS {
+        assert!(doc.get(key).is_some(), "{key}: {doc}");
+    }
+    assert_eq!(doc["peers"], serde_json::json!([{"label": "office", "cidr": "198.51.100.0/24", "not_after": IN_FORCE, "expired": false}]));
+    let word = doc["instance"]["probe"].as_str().unwrap();
+    let row = match word {
+        "refused" => "[warn] probe: 127.0.0.1:443 closed the connection before TLS: this Mac's address is not in /ai-env/relay/peers, or is banned (ai-env relay allow-ip --mine)",
+        "open" => "[ok ] probe: 127.0.0.1:443 accepts a TCP connection",
+        "closed" => "[warn] probe: 127.0.0.1:443 did not accept a TCP connection within 3 s (",
+        other => panic!("{other}"),
+    };
+    let (_, out) = s.status();
+    assert!(out.contains(row), "{word}: {out}");
+    // An older relay's line: no peers version, and nothing more. A line with an empty one: no peers file loaded, whatever
+    // row 8 reads in SSM, so a warning of its own; never the exit code.
+    let not_loaded = "[warn] relay: its peers list is not loaded: it admits no worker\n";
+    assert!(!out.contains(not_loaded), "{out}");
+    s.logs(status_of(None, false), &[], &[]);
+    let (_, out) = s.status();
+    assert!(out.contains("grants 2123456789abcdef (32 s old), peers -\n") && !out.contains(not_loaded), "{out}");
+    let mut unloaded = status_of(None, true);
+    unloaded["peers_version"] = serde_json::json!("");
+    s.logs(unloaded, &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("grants 2123456789abcdef (32 s old), peers -\n{not_loaded}")), "{out}");
+    assert!(out.contains(&format!("[ok ] {PEERS} v1: 1 peer(s), 1 in force\n")), "row 8 stands: {out}");
+    // The peers list absent: [NO ], exit 1, `[]`.
+    let held = w.param(PEERS).unwrap();
+    let peers_file = w.root().join("ssm").join(PEERS.trim_start_matches('/'));
+    fs::remove_file(&peers_file).unwrap();
+    fs::remove_file(format!("{}.version", peers_file.display())).unwrap();
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] {PEERS}: absent: the relay admits no worker (ai-env relay allow-ip creates it)\n")), "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["peers"], serde_json::json!([]), "{doc}");
+    // Not parsing: [NO ], exit 1, `null`.
+    w.set_param(PEERS, "[{\"cidr\":\"not a network\"}]", 3);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] {PEERS} v3 does not parse (")), "{out}");
+    let (_, doc) = s.json();
+    assert!(doc["peers"].is_null(), "{doc}");
+    // No entry in force, mac among them: [NO ], exit 1, each entry shown, its lapse named.
+    w.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "office", LAPSED), ("203.0.113.7/32", "mac", LAPSED)]), 4);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] {PEERS} v4: 2 peer(s), none in force: the relay admits no worker\n")), "{out}");
+    assert!(out.contains(&format!("[-  ]   peer office 198.51.100.0/24 until {LAPSED} EXPIRED\n")), "{out}");
+    assert!(out.contains(&format!("[warn] peer mac lapsed at {LAPSED}: this Mac's worker is refused (ai-env relay allow-ip --mine)\n")), "{out}");
+    // Another in force, mac lapsed: [ok ], and the warning alone; never the exit code.
+    w.set_param(PEERS, &peers_value(&[("198.51.100.0/24", "office", IN_FORCE), ("203.0.113.7/32", "mac", LAPSED)]), 5);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("[ok ] {PEERS} v5: 2 peer(s), 1 in force\n")), "{out}");
+    assert!(out.contains(&format!("[warn] peer mac lapsed at {LAPSED}: this Mac's worker is refused (ai-env relay allow-ip --mine)\n")), "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["peers"][0], serde_json::json!({"label": "mac", "cidr": "203.0.113.7/32", "not_after": LAPSED, "expired": true}), "{doc}");
+    // A /8 entry in force warns, a /16 does not, a lapsed /8 does not.
+    w.set_param(PEERS, &peers_value(&[("198.0.0.0/8", "wide", IN_FORCE), ("192.0.0.0/16", "broad", IN_FORCE), ("203.0.0.0/8", "old", LAPSED)]), 6);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("[warn] peer wide 198.0.0.0/8 is wider than /16: it admits much of the internet (ai-env relay revoke-ip --label wide)\n"), "{out}");
+    assert!(!out.contains("peer broad 192.0.0.0/16 is wider") && !out.contains("peer old 203.0.0.0/8 is wider"), "{out}");
+    w.set_param(PEERS, &held.0, held.1);
+    // Row 8's own read: a denial is [?? ] for it alone, exit 7; rows 5 to 7 stand, read by their own call.
+    w.answer("ssm.get-parameters.2.rc", "254");
+    w.answer("ssm.get-parameters.2.stderr", "\nAn error occurred (AccessDeniedException) when calling the GetParameters operation: not authorized\n");
+    let (rc, out) = s.status();
+    assert_eq!(rc, 7, "{out}");
+    assert!(out.contains(&format!("[?? ] {PEERS} could not be read (")) && out.contains("AccessDeniedException"), "{out}");
+    assert_eq!(out.matches("[?? ]").count(), 1, "for it alone: {out}");
+    assert!(out.contains(&format!("[ok ] {WORKERS} v1")) && out.contains(&format!("[ok ] {GRANTS} v1")) && out.contains(&format!("[ok ] {SIGNERS} v")), "{out}");
+    let names: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
+    assert_eq!(names.len(), 2, "two reads: {names:?}");
+    assert!(names[0].contains(WORKERS) && names[0].contains(SIGNERS) && names[0].contains(GRANTS) && !names[0].contains(PEERS), "{names:?}");
+    assert!(names[1].contains(&format!("--names {PEERS} ")) && !names[1].contains(WORKERS), "{names:?}");
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 7, "{doc}");
+    assert!(doc["peers"].is_null() && doc["workers"].is_array(), "{doc}");
+    w.unanswer("ssm.get-parameters.2.rc");
+    w.unanswer("ssm.get-parameters.2.stderr");
+    // A worker with no certificate: [NO ] under `client_certs: true`, naming the command with its key and globs.
+    let entry = |id: &str, seed: u8, not_after: &str, tls_fp: Option<String>| policy::WorkerEntry { worker_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), sources: vec!["example-*".into(), "other".into()], not_after: not_after.into(), tls_fp };
+    let cert = "ab".repeat(32);
+    let list = [entry("worker-a", 1, IN_FORCE, None), entry("worker-b", 2, IN_FORCE, Some(cert.clone())), entry("worker-c", 3, LAPSED, None)];
+    w.set_param(WORKERS, &policy::render_workers(&list).unwrap(), 2);
+    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow worker-a --key {} --sources 'example-*,other' --tls-key <its p256 text>", key_text(1));
+    let no = format!("[NO ] worker worker-a has no client certificate: the relay refuses it ({command})\n");
+    let warned = format!("[warn] worker worker-a has no client certificate yet: a relay that requires client certificates would refuse it ({command})\n");
+    s.logs(status_of(Some(true), true), &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "a finding: {out}");
+    assert!(out.contains(&no) && !out.contains(&warned), "{out}");
+    assert!(out.contains(&format!("[-  ]   worker worker-a (key fp {}, no cert fp) for sources example-*,other until {IN_FORCE}\n", key_of(1).fingerprint())), "{out}");
+    assert!(out.contains(&format!("[-  ]   worker worker-b (key fp {}, cert fp {}) for sources example-*,other until {IN_FORCE}\n", key_of(2).fingerprint(), &cert[..16])), "{out}");
+    assert!(out.contains(&format!("[-  ]   worker worker-c (key fp {}, no cert fp) for sources example-*,other until {LAPSED} EXPIRED\n", key_of(3).fingerprint())), "{out}");
+    assert!(!out.contains("worker worker-b has no client") && !out.contains("worker worker-c has no client"), "in force and without one alone: {out}");
+    let (_, doc) = s.json();
+    let certs: Vec<&serde_json::Value> = doc["workers"].as_array().unwrap().iter().map(|e| &e["cert_fp"]).collect();
+    assert_eq!(certs, [&serde_json::Value::Null, &serde_json::json!(cert[..16]), &serde_json::Value::Null], "{doc}");
+    assert!(doc["workers"].as_array().unwrap().iter().all(|e| e.get("cert_fp").is_some()), "the key on each: {doc}");
+    // [warn] under `false`, without the key, and when the line was not read; never the exit code.
+    for status in [status_of(Some(false), true), status_of(None, true)] {
+        s.logs(status, &[], &[]);
+        let (rc, out) = s.status();
+        assert_eq!(rc, 0, "{out}");
+        assert!(out.contains(&warned) && !out.contains(&no), "{out}");
+    }
+    w.answer("logs.filter-log-events.1.json", "{\"events\": []}");
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains("[warn] relay: no status line in 10 min") && out.contains(&warned), "{out}");
+    // A relay from before the plan (no peers_version): no command at all, since running it now would unload that relay's
+    // whole whitelist (RO-3).
+    s.logs(status_of(None, false), &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("[warn] worker worker-a has no client certificate yet: a relay that requires client certificates would refuse it (not yet: this relay refuses a list with tls_fp and unloads its whole whitelist (RO-3))\n"), "{out}");
+    assert!(!out.contains("--tls-key") && !out.contains("tls-keygen"), "{out}");
+    w.set_param(WORKERS, "[]", 3);
+    // The refused hour from fake lines: N, M, P, B, U and the top reasons, each with its suppressed, in text and JSON;
+    // [warn] for N > 0, never the exit code. The two reads name their streams, windows and filters.
+    let tunnel = |peer: &str, reason: &str, suppressed: u64| serde_json::json!({"ts": "2026-10-29T10:00:00.000Z", "ev": "tunnel", "tunnel": "", "worker": "", "peer": peer, "sdk": "", "phase": "auth", "outcome": "refused", "reason": reason, "sources": 0, "duration_ms": 0, "suppressed": suppressed});
+    let peer = |face: &str, peer: &str, reason: &str, suppressed: u64| serde_json::json!({"ts": "2026-10-29T10:00:00.000Z", "ev": "peer", "face": face, "peer": peer, "reason": reason, "suppressed": suppressed});
+    let lines = [
+        tunnel("198.51.100.1", "bad_signature", 4),
+        tunnel("198.51.100.1", "bad_signature", 0),
+        tunnel("198.51.100.2", "unknown_worker", 1),
+        peer("public", "203.0.113.50", "not_in_peers", 100),
+        peer("public", "203.0.113.51", "no_peers", 2),
+        peer("public", "198.51.100.3", "banned", 1),
+        peer("public", "198.51.100.3", "banned", 0),
+        peer("public", "198.51.100.4", "banned", 0),
+        peer("public", "198.51.100.5", "tls_failed", 0),
+        peer("private", "192.0.2.9", "auth_timeout", 0),
+    ];
+    s.logs(status_of(Some(false), true), &lines, &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "never the exit code: {out}");
+    assert!(out.contains("[warn] refused in the last hour: 8 handshake(s) from 2 address(es), 6 connection(s) refused or cut, 2 address(es) banned, 104 connection(s) from unlisted addresses; top reasons: banned 3, bad_signature 2, auth_timeout 1\n"), "{out}");
+    let logs: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("logs filter-log-events")).collect();
+    assert_eq!(logs.len(), 3, "{logs:?}");
+    assert!(logs[1].contains(&format!("--log-group-name /ai-env/relay --log-stream-names {INSTANCE}/requests --start-time ")) && logs[1].contains(r#"--filter-pattern { ($.ev = "peer") || ($.ev = "tunnel" && $.outcome = "refused") }"#), "{}", logs[1]);
+    assert!(logs[2].contains(&format!("--log-group-name /ai-env/relay --log-stream-names {INSTANCE}/reload --start-time ")) && logs[2].contains(r#"--filter-pattern "why=disk""#), "{}", logs[2]);
+    let start = |call: &str| -> u64 {
+        let mut words = call.split_whitespace();
+        words.find(|w| *w == "--start-time");
+        words.next().unwrap().parse().unwrap()
+    };
+    let now_ms = ai_env_cli::wire::time::unix_now() * 1000;
+    assert!(now_ms.abs_diff(start(&logs[1]) + 3_600_000) < 60_000 && now_ms.abs_diff(start(&logs[2]) + 600_000) < 60_000, "the last 3600 s, the last 600 s: {logs:?}");
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 0, "{doc}");
+    assert_eq!(doc["instance"]["refused"], serde_json::json!({"handshakes": 8, "addresses": 2, "connections": 6, "banned": 2, "unlisted": 104, "top": [{"reason": "banned", "count": 3}, {"reason": "bad_signature", "count": 2}, {"reason": "auth_timeout", "count": 1}]}), "{doc}");
+    // [ok ] for unlisted scanners alone, and the private face's cuts; none at all: `top reasons: none`.
+    let scanners = [peer("public", "203.0.113.50", "not_in_peers", 5000), peer("public", "203.0.113.51", "no_peers", 0)];
+    s.logs(status_of(Some(false), true), &scanners, &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("[ok ] refused in the last hour: 0 handshake(s) from 0 address(es), 0 connection(s) refused or cut, 0 address(es) banned, 5002 connection(s) from unlisted addresses; top reasons: none\n"), "{out}");
+    s.logs(status_of(Some(false), true), &[peer("private", "192.0.2.9", "idle", 0)], &[]);
+    let (_, out) = s.status();
+    assert!(out.contains("[ok ] refused in the last hour: 0 handshake(s) from 0 address(es), 1 connection(s) refused or cut, 0 address(es) banned, 0 connection(s) from unlisted addresses; top reasons: idle 1\n"), "{out}");
+    s.logs(status_of(Some(false), true), &[peer("public", "198.51.100.3", "banned", 0)], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains("[warn] refused in the last hour: 0 handshake(s) from 0 address(es), 1 connection(s) refused or cut, 1 address(es) banned, "), "B > 0 warns: {out}");
+    // A failed read warns, never the exit code; `null`.
+    s.logs(status_of(Some(false), true), &[], &[]);
+    let denied = "\nAn error occurred (AccessDeniedException) when calling the FilterLogEvents operation: not authorized\n";
+    w.answer("logs.filter-log-events.2.rc", "254");
+    w.answer("logs.filter-log-events.2.stderr", denied);
+    w.unanswer("logs.filter-log-events.2.json");
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("[warn] relay: the refusals of the last hour could not be read (") && out.contains("AccessDeniedException"), "{out}");
+    let (rc, doc) = s.json();
+    assert!(rc == 0 && doc["instance"]["refused"].is_null(), "{doc}");
+    w.unanswer("logs.filter-log-events.2.rc");
+    w.unanswer("logs.filter-log-events.2.stderr");
+    // The disk: a fake reload line warns with its time, the newest; none adds no row, `false`; a failed read warns, `null`.
+    let reload = "ai-env-relay-reload: ok fetched=2026-10-29T10:00:00Z changed=none absent=none artifact=none tls=present relay=active why=disk";
+    s.logs(status_of(Some(false), true), &[], &[reload, reload]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "never the exit code: {out}");
+    let at = ai_env_cli::wire::time::rfc3339_utc((1_793_268_000_000u64 + 60_000) / 1000);
+    assert!(out.contains(&format!("[warn] relay: the root volume is over 90 % full (the reload's why=disk at {at})\n")), "{out}");
+    let (rc, doc) = s.json();
+    assert!(rc == 0 && doc["instance"]["disk_full"] == serde_json::json!(true), "{doc}");
+    s.logs(status_of(Some(false), true), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains("root volume") && !out.contains("reload's"), "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["instance"]["disk_full"], serde_json::json!(false), "{doc}");
+    w.answer("logs.filter-log-events.3.rc", "254");
+    w.answer("logs.filter-log-events.3.stderr", denied);
+    w.unanswer("logs.filter-log-events.3.json");
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("[warn] relay: the reload's log could not be read (") && out.contains("AccessDeniedException"), "{out}");
+    let (rc, doc) = s.json();
+    assert!(rc == 0 && doc["instance"]["disk_full"].is_null(), "{doc}");
+    // A stopped relay: neither row, nor a read of the log; both keys `null`, not absent.
+    let unread = |doc: &serde_json::Value| (doc["instance"].get("refused").cloned(), doc["instance"].get("disk_full").cloned()) == (Some(serde_json::Value::Null), Some(serde_json::Value::Null));
+    w.answer("ec2.describe-instances.json", &instance_doc("stopped"));
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(!out.contains("refused in the last hour") && !w.aws_calls().iter().any(|c| c.starts_with("logs ")), "{out}");
+    let (rc, doc) = s.json();
+    assert!(rc == 1 && unread(&doc), "{doc}");
+    // An instance that could not be read: the same.
+    w.unanswer("ec2.describe-instances.json");
+    w.answer("ec2.describe-instances.rc", "254");
+    w.answer("ec2.describe-instances.stderr", "\nAn error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: not authorized\n");
+    let (rc, doc) = s.json();
+    assert!(rc == 7 && unread(&doc), "{doc}");
 }

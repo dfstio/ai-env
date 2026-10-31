@@ -26,9 +26,9 @@
 //
 // S13 (plans/s13-contracts.md §I-infra.4.2): the relay's security group `ai-env-relay` and its seven rules join the SG
 // loop (SG_KEYS), the VM group gets its second rule (to the relay's private port), and the guard checks the relay's
-// resources (relay.ts): its instance by name, its Elastic IP and association, its artifact object, parameter, log group
-// and SSM attachment. The template renderer is egress-spec.ts's renderTemplate (LD-I14): the proxy's files render byte
-// for byte as before.
+// resources (relay.ts): its instance by name, its Elastic IP and association, its boot object (LD-R56), its artifact
+// object, parameter, log group and SSM attachment. The template renderer is egress-spec.ts's renderTemplate (LD-I14): the
+// proxy's files render byte for byte as before.
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -46,7 +46,7 @@ import {
     SSM_INSTANCE_POLICY_ARN, TRANSCRIPTS_RESOURCE, USER_POLICY_ATTACHMENTS, attachmentName, canonicalPolicyText, operatorRolePolicy, operatorTrustPolicy, proxyRolePolicy,
     proxyTrustPolicy, s3EndpointPolicy, transcriptsBucketName, transcriptsBucketPolicy,
 } from "./policies";
-import { RELAY_KEY_RE } from "./relay-spec";
+import { RELAY_BOOT_KEY_RE, RELAY_KEY_RE, relayBootPin } from "./relay-spec";
 import { TRANSCRIPTS_LIFECYCLE } from "./transcripts";
 
 /** The operator role must be assumable before CreateNetworkConnector (IAM is eventually consistent; image.ts waits 15 s). */
@@ -501,7 +501,15 @@ export function guardEgress(spec: EgressSpec, image: ImageNames, documents: Prox
             ref("instanceId", "relay-instance", props.instanceId);
             break;
         // S13: the relay's artifact object (the image zip falls through, as before): its hash-keyed key, a binary.
+        // LD-R56: its boot object likewise: its one key shape, the hash of its literal content, and no other property.
         case T.bucketObject:
+            if (name === NET.relayBoot) {
+                only("bucket", "key", "content", "contentType", "tags", "region");
+                if (!(typeof props.key === "string" && RELAY_BOOT_KEY_RE.test(props.key))) bad(`key must be relay/ai-env-relay-boot-<sha256[:16]>, got ${show(props.key)}`);
+                else if (typeof props.content !== "string" || relayBootPin(props.content).bootKey !== props.key) bad(`content must be the literal text whose SHA-256 the key ${props.key} names`);
+                eq("contentType", "text/x-shellscript");
+                break;
+            }
             if (name !== NET.relayArtifact) break;
             only("bucket", "key", "source", "contentType", "tags", "region");
             if (props.key !== UNKNOWN && !(typeof props.key === "string" && RELAY_KEY_RE.test(props.key))) bad(`key must be relay/ai-env-relay-<sha256[:16]>, got ${show(props.key)}`);

@@ -19,7 +19,7 @@ pub const PARAMS_MAX: usize = 65_536;
 pub const DEFAULT_MAX_BYTES: u64 = 65_536;
 /// The largest byte cap the client asks of the relay (R may lower it, never raise it).
 pub const MAX_BYTES_CAP: u64 = 1_048_576;
-/// A catalog answer's line, sources dropped from the end until it fits (V-R22).
+/// A catalog answer's line, ops cleared from the end and then sources dropped from the end until it fits (V-R22).
 pub const CATALOG_MAX: usize = 262_144;
 /// The largest `deadline_ms` a request may name.
 pub const DEADLINE_CAP_MS: u32 = 300_000;

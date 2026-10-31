@@ -23,9 +23,13 @@ pub fn main(store: &Keystore, cmd: RelayCmd) -> Result<()> {
     match cmd {
         RelayCmd::Keygen { force } => super::keys::cmd_keygen(store, force),
         RelayCmd::Pubkey { worker, session, verify } => super::keys::cmd_pubkey(store, worker, session, verify),
-        RelayCmd::Allow { id, key, sources, token_signer, not_after } => super::params::cmd_allow(&id, &key, &sources, token_signer, not_after.as_deref()),
+        RelayCmd::Allow { id, key, sources, token_signer, not_after, tls_key } => {
+            super::params::cmd_allow(store, &super::params::AllowArgs { id: &id, key: &key, sources: &sources, token_signer, not_after: not_after.as_deref(), tls_key: tls_key.as_deref() })
+        }
         RelayCmd::Revoke { id, token_signer } => super::params::cmd_revoke(&id, token_signer),
         RelayCmd::Grant { grant_id, rules, remove } => super::params::cmd_grant(&grant_id, &rules, remove),
+        RelayCmd::AllowIp { cidr, label, not_after, wide, mine, hours } => super::params::cmd_allow_ip(&super::params::AllowIpArgs { cidr: cidr.as_deref(), label: label.as_deref(), not_after: not_after.as_deref(), wide, mine, hours }),
+        RelayCmd::RevokeIp { cidr, label } => super::params::cmd_revoke_ip(cidr.as_deref(), label.as_deref()),
         RelayCmd::Status { json, local } => super::ops::cmd_status(json, local),
         RelayCmd::Start => super::ops::cmd_start(),
         RelayCmd::Stop => super::ops::cmd_stop(),

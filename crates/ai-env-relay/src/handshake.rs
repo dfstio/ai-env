@@ -2,11 +2,14 @@
 //!
 //! The worker signs P's transcript (R-8), which the relay builds with P's own function and never re-implements;
 //! the signature is checked with W/M's `PublicKey::verify` against the whitelisted key (R-10). Every fault reaches
-//! the worker as the same `authentication failed` (R-11): the fault's word is for the tunnel line only.
+//! the worker as the same `authentication failed` (R-11): the fault's word is for the tunnel line only, and every
+//! shaped `Hello` costs the same one verify (F5), so a refusal takes as long whether or not the id is whitelisted.
 
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use ai_env_relay_proto::v1::{AuthProof, Hello, SigAlg};
+use ai_env_worker::keys::{PublicKey, SigningKey};
 
 use crate::files::{Loaded, Watched};
 use crate::lists::{WorkerEntry, Workers};
@@ -74,9 +77,47 @@ impl AuthFault {
             AuthFault::Eof => "eof",
         }
     }
+
+    /// R-102: a fault of the peer's, counted toward its address's ban: every fault but the relay's own (`NotLoaded`,
+    /// `Stale`) and `Eof` (the client left; a shutdown yields it too).
+    pub fn is_fault(self) -> bool {
+        match self {
+            AuthFault::NotLoaded | AuthFault::Stale | AuthFault::Eof => false,
+            AuthFault::Malformed
+            | AuthFault::BadProtocol
+            | AuthFault::BadAlg
+            | AuthFault::UnknownWorker
+            | AuthFault::Expired
+            | AuthFault::BadSignature
+            | AuthFault::OutOfOrder
+            | AuthFault::Timeout => true,
+        }
+    }
+}
+
+/// The throw-away key's seed (F5): a constant, the same in every relay. Its private half is public knowledge, so a
+/// signature it verifies admits nobody: `verify_proof` checks against it only on its way to a fault.
+const THROWAWAY_SEED: [u8; 32] = *b"ai-env relay: a key of no worker";
+
+/// The throw-away key, made once: `RelayApp::new` makes it, so no refusal pays for it.
+pub(crate) fn throwaway_key() -> PublicKey {
+    static KEY: OnceLock<PublicKey> = OnceLock::new();
+    *KEY.get_or_init(|| SigningKey::from_seed(&THROWAWAY_SEED).expect("a constant 32-byte seed is an Ed25519 key").public_key())
+}
+
+/// The one Ed25519 verify of a handshake (F5); the unit tests count the calls.
+fn verify_once(key: &PublicKey, signed: &[u8], signature: &[u8]) -> bool {
+    #[cfg(test)]
+    tests::VERIFIES.with(|n| n.set(n.get() + 1));
+    key.verify(signed, signature)
 }
 
 /// R-10's checks once both frames are in; the signature through WM's `PublicKey::verify`.
+///
+/// Every shaped `Hello` runs exactly one verify (F5): the entry's key for a pair in force, else the throw-away key,
+/// and the fault R-10's order names first is returned after it. So a worker id that is unknown, holds another key or
+/// lapsed costs what a whitelisted one does, and the time of a refusal says nothing about the whitelist. An unshaped
+/// one (an id that is no id, a key or a signature of another length) is refused before anything is hashed.
 pub fn verify_proof(
     workers: Option<&Workers>,
     relay_id: &str,
@@ -85,33 +126,45 @@ pub fn verify_proof(
     proof: &AuthProof,
     now_unix: u64,
 ) -> Result<WorkerEntry, AuthFault> {
-    let workers = workers.ok_or(AuthFault::NotLoaded)?;
     let shaped = ai_env_worker::globs::valid_id(&hello.worker_id)
         && hello.public_key.len() == ai_env_source::wire::ED25519_PUBLIC_KEY_LEN
         && proof.signature.len() == ai_env_source::wire::ED25519_SIGNATURE_LEN;
     if !shaped {
-        return Err(AuthFault::Malformed);
-    }
-    if !SUPPORTED_PROTOCOLS.contains(&hello.protocol) {
-        return Err(AuthFault::BadProtocol);
-    }
-    if hello.alg != SigAlg::Ed25519 as i32 {
-        return Err(AuthFault::BadAlg);
+        // The lengths and the name before anything is hashed (P-R25), so a peer-sized field never reaches the
+        // transcript (R-73). This fault is the frame's own, so refusing at once says nothing of the whitelist; R-10's
+        // order still names `NotLoaded` first.
+        return Err(if workers.is_none() { AuthFault::NotLoaded } else { AuthFault::Malformed });
     }
     // One key per worker id (LD-R6): the Hello's key must be the entry's byte for byte, else the pair is unknown.
-    let entry = workers.entry(&hello.worker_id).ok_or(AuthFault::UnknownWorker)?;
-    let key = entry.key();
-    if entry.alg != "ed25519" || key.bytes().as_slice() != hello.public_key.as_slice() {
-        return Err(AuthFault::UnknownWorker);
-    }
-    if workers.in_force(&hello.worker_id, now_unix).is_none() {
-        return Err(AuthFault::Expired);
-    }
+    let entry = workers
+        .and_then(|w| w.entry(&hello.worker_id))
+        .filter(|e| e.alg == "ed25519")
+        .map(|e| (e, e.key()))
+        .filter(|(_, key)| key.bytes().as_slice() == hello.public_key.as_slice());
+    let fault = if workers.is_none() {
+        Some(AuthFault::NotLoaded)
+    } else if !SUPPORTED_PROTOCOLS.contains(&hello.protocol) {
+        Some(AuthFault::BadProtocol)
+    } else if hello.alg != SigAlg::Ed25519 as i32 {
+        Some(AuthFault::BadAlg)
+    } else if entry.is_none() {
+        Some(AuthFault::UnknownWorker)
+    } else if workers.and_then(|w| w.in_force(&hello.worker_id, now_unix)).is_none() {
+        Some(AuthFault::Expired)
+    } else {
+        None
+    };
+    let key = match (fault, entry) {
+        (None, Some((_, key))) => key,
+        _ => throwaway_key(),
+    };
     let signed = transcript(relay_id, nonce, &hello.worker_id, hello.alg as u32, &hello.public_key, hello.protocol);
-    if !key.verify(&signed, &proof.signature) {
-        return Err(AuthFault::BadSignature);
+    let verified = verify_once(&key, &signed, &proof.signature);
+    match (fault, entry) {
+        (Some(fault), _) => Err(fault),
+        (None, Some((e, _))) if verified => Ok(e.clone()),
+        _ => Err(AuthFault::BadSignature),
     }
-    Ok(entry.clone())
 }
 
 /// The workers file as R-10's first check reads it: loaded (`NotLoaded`) and fresh (`Stale`, R-17).
@@ -139,8 +192,19 @@ pub(crate) struct Authed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_env_worker::keys::SigningKey;
     use ai_env_worker::policy;
+
+    thread_local! {
+        /// `verify_once`'s calls on this thread.
+        pub(super) static VERIFIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `f`'s result and how many verifies it ran.
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, u32) {
+        VERIFIES.with(|n| n.set(0));
+        let out = f();
+        (out, VERIFIES.with(std::cell::Cell::get))
+    }
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
@@ -166,7 +230,7 @@ mod tests {
 
     fn workers(not_after: &str) -> Workers {
         let key = SigningKey::from_seed(&[1; 32]).unwrap().public_key().b64();
-        let entry = WorkerEntry { worker_id: "worker-a".into(), alg: "ed25519".into(), public_key: key, sources: vec!["example.alpha*".into()], not_after: not_after.into() };
+        let entry = WorkerEntry { worker_id: "worker-a".into(), alg: "ed25519".into(), public_key: key, sources: vec!["example.alpha*".into()], not_after: not_after.into(), tls_fp: None };
         crate::lists::parse_workers(policy::render_workers(&[entry]).unwrap().as_bytes()).unwrap()
     }
 
@@ -239,6 +303,89 @@ mod tests {
         watched.poll(Some(clock), crate::lists::parse_workers);
         assert!(whitelist(&watched, clock, max).is_ok());
         assert!(matches!(whitelist(&watched, clock + Duration::from_secs(901), max), Err(AuthFault::Stale)));
+    }
+
+    /// F5: every outcome of `verify_proof` for a shaped `Hello` runs exactly one verify, a refusal's as a success's;
+    /// an unshaped one runs none and hashes nothing, however large its id (P-R25). The throw-away key is no test
+    /// list's key, and a proof made with it (its seed is in the source) admits nobody.
+    #[test]
+    fn every_outcome_verifies_once() {
+        let not_after = "2027-01-01T23:59:59Z";
+        let w = workers(not_after);
+        let now = policy::unix_of(not_after).unwrap() - 3600;
+        let n = nonce();
+        let h = hello("worker-a", 1);
+        let good = sign(1, "relay-test", &n, &h);
+        let hb = Hello { worker_id: "worker-b".into(), ..h.clone() };
+        let h2 = hello("worker-a", 2);
+        let h0 = Hello { alg: 0, ..h.clone() };
+        let hp = Hello { protocol: 2, ..h.clone() };
+        let mut flipped = good.clone();
+        flipped.signature[10] ^= 0x01;
+        let short = AuthProof { signature: good.signature[..63].to_vec() };
+        // A Hello as large as the public face decodes (`catalog_max_bytes`), its id all of it.
+        let huge = Hello { worker_id: "w".repeat(256 * 1024), ..h.clone() };
+        let lapsed = policy::unix_of(not_after).unwrap() + 1;
+        let cases = [
+            ("the golden proof", Some(&w), &h, good.clone(), now, Ok("worker-a"), 1),
+            ("a flipped signature", Some(&w), &h, flipped, now, Err(AuthFault::BadSignature), 1),
+            ("an unknown id", Some(&w), &hb, sign(1, "relay-test", &n, &hb), now, Err(AuthFault::UnknownWorker), 1),
+            ("another key", Some(&w), &h2, sign(2, "relay-test", &n, &h2), now, Err(AuthFault::UnknownWorker), 1),
+            ("a lapsed entry", Some(&w), &h, good.clone(), lapsed, Err(AuthFault::Expired), 1),
+            ("another alg", Some(&w), &h0, sign(1, "relay-test", &n, &h0), now, Err(AuthFault::BadAlg), 1),
+            ("another protocol", Some(&w), &hp, sign(1, "relay-test", &n, &hp), now, Err(AuthFault::BadProtocol), 1),
+            ("no whitelist", None, &h, good.clone(), now, Err(AuthFault::NotLoaded), 1),
+            ("a short signature", Some(&w), &h, short.clone(), now, Err(AuthFault::Malformed), 0),
+            ("a 256 KiB worker id", Some(&w), &huge, good.clone(), now, Err(AuthFault::Malformed), 0),
+            ("no whitelist, a short signature", None, &h, short, now, Err(AuthFault::NotLoaded), 0),
+        ];
+        for (what, list, hello, proof, at, want, n_verifies) in cases {
+            let (got, verifies) = counted(|| verify_proof(list, "relay-test", &n, hello, &proof, at));
+            assert_eq!(got.as_ref().map(|e| e.worker_id.as_str()), want.as_ref().copied(), "{what}");
+            assert_eq!(verifies, n_verifies, "{what}: one verify for a shaped Hello, whatever the outcome; none for an unshaped one");
+        }
+
+        let decoy = SigningKey::from_seed(&THROWAWAY_SEED).unwrap();
+        assert_eq!(throwaway_key(), decoy.public_key());
+        let test_keys: Vec<PublicKey> = [1u8, 2, 5, 7].iter().map(|s| SigningKey::from_seed(&[*s; 32]).unwrap().public_key()).collect();
+        assert!(!test_keys.contains(&throwaway_key()), "no test seed's key");
+        assert!(w.entries.iter().all(|e| e.key() != throwaway_key()), "in no list");
+        let with_decoy = |worker_id: &str| {
+            let hd = Hello { worker_id: worker_id.into(), public_key: decoy.public_key().bytes().to_vec(), ..h.clone() };
+            let t = transcript("relay-test", &n, &hd.worker_id, hd.alg as u32, &hd.public_key, hd.protocol);
+            let pd = AuthProof { signature: decoy.sign(&t).to_vec() };
+            (hd, pd)
+        };
+        for (worker_id, at, want) in [("worker-a", now, AuthFault::UnknownWorker), ("worker-b", now, AuthFault::UnknownWorker)] {
+            let (hd, pd) = with_decoy(worker_id);
+            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hd, &pd, at), Err(want), "{worker_id}: the decoy's own proof");
+        }
+        // Signed with the decoy for the entry's own key: the decoy is never the entry's key, lapsed or not.
+        let t = transcript("relay-test", &n, &h.worker_id, h.alg as u32, &h.public_key, h.protocol);
+        let pd = AuthProof { signature: decoy.sign(&t).to_vec() };
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, now), Err(AuthFault::BadSignature));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, lapsed), Err(AuthFault::Expired));
+    }
+
+    /// Unit 51 (R-102): which faults count toward an address's ban: all but the relay's own and the client's leaving.
+    #[test]
+    fn a_fault_of_the_peers_counts_and_no_other() {
+        let table = [
+            (AuthFault::NotLoaded, false),
+            (AuthFault::Stale, false),
+            (AuthFault::Malformed, true),
+            (AuthFault::BadProtocol, true),
+            (AuthFault::BadAlg, true),
+            (AuthFault::UnknownWorker, true),
+            (AuthFault::Expired, true),
+            (AuthFault::BadSignature, true),
+            (AuthFault::OutOfOrder, true),
+            (AuthFault::Timeout, true),
+            (AuthFault::Eof, false),
+        ];
+        for (fault, counts) in table {
+            assert_eq!(fault.is_fault(), counts, "{}", fault.word());
+        }
     }
 
     /// Unit 9.

@@ -1,8 +1,9 @@
-//! The relay's three lists (S13, WM-R41 to WM-R45, WM-R7): `/ai-env/relay/workers` (the whitelist of worker
-//! keys and the source names each may register), `/ai-env/relay/token-signers` (the keys whose VM session tokens
-//! the relay takes: each Mac's session key) and `/ai-env/relay/grants` (the source and op rules a token's grant
-//! reaches). Each is one SSM String parameter holding a compact JSON array, rendered and parsed by
-//! `ai_env_worker::policy` (the relay reads them with the same code), and written only by ai-env-deployer.
+//! The relay's four lists (S13, WM-R41 to WM-R45, WM-R7; the relay security plan, §RS.4): `/ai-env/relay/workers`
+//! (the whitelist of worker keys and the source names each may register), `/ai-env/relay/token-signers` (the keys
+//! whose VM session tokens the relay takes: each Mac's session key), `/ai-env/relay/grants` (the source and op rules
+//! a token's grant reaches) and `/ai-env/relay/peers` (the networks the public face admits). Each is one SSM String
+//! parameter holding a compact JSON array, rendered and parsed by `ai_env_worker::policy` (the relay reads them with
+//! the same code), and written only by ai-env-deployer.
 //!
 //! - The identity gate (WM-R41): no marker (the resolver would pick `credentials/ops.env`) and an ops marker are
 //!   refused, exit 9, before any unseal or AWS call: the lists decide who reaches private data. A deployer,
@@ -16,8 +17,16 @@
 //!   otherwise: another writer). The lists are created at their first write, never by Pulumi (B-4).
 //! - One key, one id and one role (WM-R43, Q-WM18): a key another id holds in the same list, or that the other
 //!   list holds, is refused (exit 9): a worker key allowed as a token signer would let a server mint tokens.
-use super::cli::{audit, runtime, say, shell_word, RelayCtx};
-use crate::bridge::audit::event::{RELAY_ALLOW, RELAY_GRANT, RELAY_REVOKE};
+//! - A worker's client certificate (§RS.4.2, R-131): `allow --tls-key` unseals the relay CA's key (one Touch ID, the
+//!   deployer alone: a root or ambient marker is refused too), issues a certificate for the worker's P-256 point up
+//!   to the entry's `not_after`, prints it on stdout and writes its SHA-256 as the entry's `tls_fp`; stdout holds the
+//!   only copy, so a failed print is a failed run. `allow` without it keeps the entry's `tls_fp`, and that certificate
+//!   keeps the end it was issued with.
+//! - One network, one label (§RS.4.2, R-86): `allow-ip` is an upsert by label, `revoke-ip` a removal by network or
+//!   by label. A prefix under 16 needs `--wide`: a typo such as `/0` must not lift the allowlist (Q-R22). `--mine`
+//!   asks checkip.amazonaws.com for this Mac's address and writes it as the `/32` of the label `mac`.
+use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
+use crate::bridge::audit::event::{RELAY_ALLOW, RELAY_ALLOW_IP, RELAY_GRANT, RELAY_REVOKE, RELAY_REVOKE_IP};
 use crate::bridge::awscli::{aws_cmd_as, CALL_TIMEOUT};
 use crate::bridge::doctor::run_capture_cmd;
 use crate::bridge::egress::ops;
@@ -25,12 +34,15 @@ use crate::bridge::identity::{self, Operator, Role};
 use crate::bridge::registry::ensure_private_dir;
 use crate::bridge::vm::lock::lock_exclusive;
 use crate::errors::{CliError, Result};
+use crate::store::Keystore;
 use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc, unix_now};
+use ai_env_worker::certs::{self, ClientPoint};
 use ai_env_worker::globs::{valid_glob, valid_id, valid_rule};
 use ai_env_worker::keys::PublicKey;
-use ai_env_worker::policy::{self, Grant, SignerEntry, WorkerEntry, ENTRIES_MAX, GRANTS, PARAMETER_MAX, RULES_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
+use ai_env_worker::policy::{self, Grant, PeerEntry, SignerEntry, WorkerEntry, ENTRIES_MAX, GRANTS, PARAMETER_MAX, PEERS, RULES_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
 use serde_json::Value;
 use std::io::Write as _;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -41,6 +53,17 @@ const NOT_AFTER_MAX_DAYS: u64 = 731;
 /// `--not-after`'s default, from today.
 const NOT_AFTER_DEFAULT_DAYS: u64 = 365;
 const DAY_S: u64 = 86_400;
+/// The label of this Mac's own entry in the peers list (§RS.4.2).
+pub(crate) const MAC_LABEL: &str = "mac";
+/// A network wider than /16 needs `--wide`, and `relay status` warns of it (Q-R22).
+pub(crate) const WIDE_BELOW: u8 = 16;
+/// `--mine`'s `--hours` (§RS.4.2).
+const MINE_HOURS_DEFAULT: u32 = 24;
+const MINE_HOURS_MAX: u32 = 168;
+/// The host that tells this Mac its address, and what `--mine` allows it (§RS.4.2).
+const CHECKIP_HOST: &str = "checkip.amazonaws.com";
+const CHECKIP_TIMEOUT: Duration = Duration::from_secs(10);
+const CHECKIP_BODY_MAX: usize = 64;
 
 /// The type `put-parameter` creates a parameter with: the lists are Strings (a second SecureString would fail the
 /// relay's whole fetch on `NoOtherDecrypt`, I §5.2); `tls` alone is a SecureString under `alias/aws/ssm`.
@@ -158,6 +181,17 @@ pub(crate) fn tls_gate(cmd: &str, args: &[String]) -> Result<()> {
     )))
 }
 
+/// [`gate`], then the refusal of `allow --tls-key` under a root or ambient marker (§RS.4.2, exit 9), both before any
+/// unseal or AWS call: only the deployer takes the relay CA's key out of its seal.
+fn tls_key_gate(args: &[String]) -> Result<()> {
+    gate("allow", args)?;
+    if !tls_refused(identity::declared().as_ref()) {
+        return Ok(());
+    }
+    let given = as_given("allow", args);
+    Err(CliError::Policy(format!("relay allow: --tls-key unseals the relay CA's key, which only the deployer uses: run ai-env as deployer -- ai-env relay {given}")))
+}
+
 // ---- the pure edits ---------------------------------------------------------------------------
 
 /// A list entry of `workers` or `token-signers`.
@@ -264,6 +298,76 @@ pub(crate) fn remove_grant(list: &mut Vec<Grant>, grant_id: &str) -> bool {
     let before = list.len();
     list.retain(|g| g.grant_id != grant_id);
     list.len() != before
+}
+
+/// What an `allow-ip` did to the peers list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeerEdit {
+    Added,
+    /// The label's entry changed; its old network when the network itself moved.
+    Replaced { old: Option<String> },
+    Unchanged,
+}
+
+impl PeerEdit {
+    fn word(&self) -> &'static str {
+        match self {
+            PeerEdit::Added => "added",
+            PeerEdit::Replaced { .. } => "replaced",
+            PeerEdit::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// `a.b.c.d/n`.
+fn network_text((addr, prefix): (Ipv4Addr, u8)) -> String {
+    format!("{addr}/{prefix}")
+}
+
+/// `<CIDR>` (§RS.4.2): `a.b.c.d` (read as `/32`) or `a.b.c.d/n` by R-86's grammar, which `render_peers` alone holds:
+/// the network it would write.
+pub(crate) fn network_of(given: &str) -> Option<(Ipv4Addr, u8)> {
+    let cidr = if given.contains('/') { given.to_string() } else { format!("{given}/32") };
+    let probe = PeerEntry { cidr, label: MAC_LABEL.to_string(), not_after: "2000-01-01T00:00:00Z".to_string() };
+    policy::render_peers(std::slice::from_ref(&probe)).ok()?;
+    Some(probe.network())
+}
+
+/// `entry` in the peers list (§RS.4.2): a network another label holds is refused (`Err` that label: one network, one
+/// label); the label's entry is replaced, or the entry added; the same network and time again changes nothing.
+pub(crate) fn upsert_peer(list: &mut Vec<PeerEntry>, entry: PeerEntry) -> std::result::Result<PeerEdit, String> {
+    let network = entry.network();
+    if let Some(other) = list.iter().find(|p| p.network() == network && p.label != entry.label) {
+        return Err(other.label.clone());
+    }
+    match list.iter_mut().find(|p| p.label == entry.label) {
+        Some(p) if p.network() == network && p.not_after == entry.not_after => Ok(PeerEdit::Unchanged),
+        Some(p) => {
+            let old = (p.network() != network).then(|| network_text(p.network()));
+            *p = entry;
+            Ok(PeerEdit::Replaced { old })
+        }
+        None => {
+            list.push(entry);
+            Ok(PeerEdit::Added)
+        }
+    }
+}
+
+/// Which entry a `revoke-ip` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeerNamed {
+    Network((Ipv4Addr, u8)),
+    Label(String),
+}
+
+/// The entry `named` out of the peers list: the entry, if there was one.
+pub(crate) fn remove_peer(list: &mut Vec<PeerEntry>, named: &PeerNamed) -> Option<PeerEntry> {
+    let at = list.iter().position(|p| match named {
+        PeerNamed::Network(network) => p.network() == *network,
+        PeerNamed::Label(label) => p.label == *label,
+    })?;
+    Some(list.remove(at))
 }
 
 // ---- the lists in SSM -------------------------------------------------------------------------
@@ -415,23 +519,61 @@ impl Kind {
     }
 }
 
-/// `allow`'s arguments, as given (for the gate's refusal).
-fn allow_args(id: &str, key: &str, sources: &[String], token_signer: bool, not_after: Option<&str>) -> Vec<String> {
-    let mut args = vec![id.to_string(), "--key".into(), key.to_string()];
-    if token_signer {
-        args.push("--token-signer".into());
-    } else {
-        args.extend(["--sources".to_string(), sources.join(",")]);
-    }
-    if let Some(day) = not_after {
-        args.extend(["--not-after".to_string(), day.to_string()]);
-    }
-    args
+/// `allow`'s arguments, as clap parsed them.
+pub struct AllowArgs<'a> {
+    pub id: &'a str,
+    pub key: &'a str,
+    pub sources: &'a [String],
+    pub token_signer: bool,
+    pub not_after: Option<&'a str>,
+    pub tls_key: Option<&'a str>,
 }
 
-/// `ai-env relay allow <id> --key <text> (--sources <globs> | --token-signer) [--not-after <YYYY-MM-DD>]`
-/// (WM-R43): the arguments checked first (exit 2), then the gate (exit 9), then the lists.
-pub fn cmd_allow(id: &str, key: &str, sources: &[String], token_signer: bool, not_after: Option<&str>) -> Result<()> {
+impl AllowArgs<'_> {
+    /// As given (for the gate's refusals).
+    fn given(&self) -> Vec<String> {
+        let mut args = vec![self.id.to_string(), "--key".into(), self.key.to_string()];
+        if self.token_signer {
+            args.push("--token-signer".into());
+        } else {
+            args.extend(["--sources".to_string(), self.sources.join(",")]);
+        }
+        if let Some(day) = self.not_after {
+            args.extend(["--not-after".to_string(), day.to_string()]);
+        }
+        if let Some(point) = self.tls_key {
+            args.extend(["--tls-key".to_string(), point.to_string()]);
+        }
+        args
+    }
+}
+
+/// What an `allow` of a worker did about its client certificate (§RS.4.2).
+enum WorkerCert {
+    /// `--tls-key`: the new certificate's DER, and the fingerprint of the one it replaced.
+    Issued { der: Vec<u8>, old: Option<String> },
+    /// None asked for: the entry's stays, the first 16 of its `tls_fp`; `outrun` when this run moves the entry's end
+    /// later, which a certificate does not follow (only its fingerprint is on the list, so no row can show it).
+    Kept { fp: String, outrun: bool },
+    /// None asked for, and the entry has none.
+    None,
+}
+
+/// The first 16 of a `tls_fp`: the form every row and line shows (LD-R44).
+pub(crate) fn fp16(tls_fp: &str) -> &str {
+    tls_fp.get(..16).unwrap_or(tls_fp)
+}
+
+/// One `note: …` line on stderr (never a panic on a closed pipe): stdout keeps the lines the contract gives it.
+fn side_note(line: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "note: {line}");
+}
+
+/// `ai-env relay allow <id> --key <text> (--sources <globs> [--tls-key <p256:…>] | --token-signer)
+/// [--not-after <YYYY-MM-DD>]` (WM-R43, §RS.4.2): the arguments checked first (exit 2), then the gate (exit 9), then
+/// the lists; `--tls-key`'s one Touch ID comes after the read and WM-R43's checks and before the write.
+pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
+    let AllowArgs { id, key, sources, token_signer, not_after, tls_key } = *args;
     let usage = |why: String| CliError::Usage(format!("relay allow: {why}"));
     if !valid_id(id) {
         return Err(usage(format!("{id:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
@@ -440,6 +582,12 @@ pub fn cmd_allow(id: &str, key: &str, sources: &[String], token_signer: bool, no
     if token_signer && !sources.is_empty() {
         return Err(usage("--sources and --token-signer: a token signer registers no source".into()));
     }
+    if token_signer && tls_key.is_some() {
+        return Err(usage("--tls-key and --token-signer: a token signer has no client certificate".into()));
+    }
+    let point = tls_key
+        .map(|text| ClientPoint::parse_text(text).map_err(|_| usage("--tls-key is not a P-256 public point's text, p256:<base64 of 65 bytes> (93 characters), as tls-keygen prints it".into())))
+        .transpose()?;
     let mut globs: Vec<String> = sources.to_vec();
     globs.sort();
     globs.dedup();
@@ -453,7 +601,11 @@ pub fn cmd_allow(id: &str, key: &str, sources: &[String], token_signer: bool, no
     }
     let day = not_after_day(not_after, unix_now()).map_err(usage)?;
     let until = policy::not_after_of_day(&day).map_err(|e| usage(format!("--not-after {day}: {e}")))?;
-    gate("allow", &allow_args(id, key, sources, token_signer, not_after))?;
+    if point.is_some() {
+        tls_key_gate(&args.given())?;
+    } else {
+        gate("allow", &args.given())?;
+    }
     let ctx = RelayCtx::load()?;
     let op = ctx.operator("relay allow")?;
     let kind = Kind::of(token_signer);
@@ -469,36 +621,70 @@ pub fn cmd_allow(id: &str, key: &str, sources: &[String], token_signer: bool, no
         if let Some(other) = elsewhere {
             return Err(CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {} {other}: one key, one role", kind.other().noun())));
         }
-        let (outcome, value, count) = match kind {
+        let one_id = |other: String| CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {other}: one key, one id"));
+        let (outcome, value, count, cert) = match kind {
             Kind::Worker => {
                 let mut list = policy::parse_workers(&mine.value).map_err(|e| unparsed("allow", mine.name, &e))?;
-                let entry = WorkerEntry { worker_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), sources: globs.clone(), not_after: until.clone() };
-                let outcome = upsert(&mut list, entry).map_err(|other| CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {other}: one key, one id")))?;
-                (outcome, rendered("allow", mine.name, &list, policy::render_workers)?, list.len())
+                let old = list.iter().find(|w| w.worker_id == id);
+                let old_end = old.map(WorkerEntry::not_after_unix);
+                let held = old.and_then(|w| w.tls_fp.clone());
+                let mut entry = WorkerEntry { worker_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), sources: globs.clone(), not_after: until.clone(), tls_fp: held.clone() };
+                let cert = match &point {
+                    Some(point) => {
+                        // WM-R43's checks and the limits on the entry as it will be, so a refusal costs no Touch ID.
+                        let mut trial = list.clone();
+                        upsert(&mut trial, WorkerEntry { tls_fp: Some("0".repeat(64)), ..entry.clone() }).map_err(one_id)?;
+                        rendered("allow", mine.name, &trial, policy::render_workers)?;
+                        let not_after_unix = policy::unix_of(&until).map_err(|e| usage(format!("--not-after {day}: {e}")))?;
+                        let der = super::tls::client_certificate(store, &ctx.paths, id, point, not_after_unix)?;
+                        entry.tls_fp = Some(certs::tls_fp(&der));
+                        WorkerCert::Issued { der, old: held.map(|t| fp16(&t).to_string()) }
+                    }
+                    None => held.map_or(WorkerCert::None, |t| WorkerCert::Kept { fp: fp16(&t).to_string(), outrun: old_end.is_some_and(|end| entry.not_after_unix() > end) }),
+                };
+                let outcome = upsert(&mut list, entry).map_err(one_id)?;
+                (outcome, rendered("allow", mine.name, &list, policy::render_workers)?, list.len(), cert)
             }
             Kind::TokenSigner => {
                 let mut list = policy::parse_signers(&mine.value).map_err(|e| unparsed("allow", mine.name, &e))?;
                 let entry = SignerEntry { signer_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), not_after: until.clone() };
-                let outcome = upsert(&mut list, entry).map_err(|other| CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {other}: one key, one id")))?;
-                (outcome, rendered("allow", mine.name, &list, policy::render_signers)?, list.len())
+                let outcome = upsert(&mut list, entry).map_err(one_id)?;
+                (outcome, rendered("allow", mine.name, &list, policy::render_signers)?, list.len(), WorkerCert::None)
             }
         };
         let scope = match kind {
             Kind::Worker => format!(" for sources {}", globs.join(",")),
             Kind::TokenSigner => String::new(),
         };
+        // `(key fp <fp>)`, or with the certificate: issued, or kept.
+        let shown = match &cert {
+            WorkerCert::Issued { der, .. } => format!("key fp {fp}, cert fp {}", certs::fingerprint(der)),
+            WorkerCert::Kept { fp: cert_fp, .. } => format!("key fp {fp}, cert fp {cert_fp} kept"),
+            WorkerCert::None => format!("key fp {fp}"),
+        };
+        // On stderr: stdout keeps WM-R43's lines.
+        let cert_note = || match &cert {
+            WorkerCert::None if kind == Kind::Worker => side_note(&format!("worker {id} has no client certificate: a relay that requires one refuses it (ai-env relay allow {id} … --tls-key p256:…, after tls-keygen on the worker)")),
+            WorkerCert::Kept { outrun: true, .. } => side_note(&format!("worker {id}: this moves the entry's end to {day}, not its client certificate's, which keeps the end it was issued with (ai-env relay allow {id} … --tls-key p256:… issues a new one)")),
+            _ => {}
+        };
         let mut pairs = vec![("kind", kind.word().to_string()), ("id", id.to_string()), ("fp", fp.clone()), ("outcome", outcome.word().to_string())];
         if kind == Kind::Worker {
             pairs.push(("sources", globs.len().to_string()));
         }
         pairs.push(("not_after", day.clone()));
+        if let WorkerCert::Issued { der, .. } = &cert {
+            pairs.push(("tls_fp", certs::fingerprint(der)));
+        }
         if outcome == Allowed::Unchanged {
-            say(&format!("{} {id} (key fp {fp}) is already allowed{scope} until {day} ({} v{}); nothing written", kind.noun(), mine.name, mine.version));
+            say(&format!("{} {id} ({shown}) is already allowed{scope} until {day} ({} v{}); nothing written", kind.noun(), mine.name, mine.version));
             pairs.push(("version", mine.version.to_string()));
             audit(&ctx.paths, RELAY_ALLOW, &pairs);
+            cert_note();
             return Ok(());
         }
-        let version = write(&ctx, &op, "allow", mine, &value)?;
+        // A put that lost a race landed all the same, so the list may name a certificate nobody got.
+        let version = write(&ctx, &op, "allow", mine, &value).map_err(|e| if matches!(cert, WorkerCert::Issued { .. }) { CliError::Aws(format!("{e}; the certificate it issued was not printed: run the command again")) } else { e })?;
         pairs.push(("version", version.to_string()));
         audit(&ctx.paths, RELAY_ALLOW, &pairs);
         let replaced = match &outcome {
@@ -509,9 +695,28 @@ pub fn cmd_allow(id: &str, key: &str, sources: &[String], token_signer: bool, no
             Kind::Worker => "the relay applies it within 60 s",
             Kind::TokenSigner => "the relay takes its tokens within 60 s",
         };
-        say(&format!("allowed {} {id} (key fp {fp}){scope} until {day} ({} v{version}, {count} {}(s)){replaced}; {applies}", kind.noun(), mine.name, kind.noun()));
-        if kind == Kind::Worker && globs.iter().any(|g| g == "*") {
-            say("this worker may register any source name");
+        let line = format!("allowed {} {id} ({shown}){scope} until {day} ({} v{version}, {count} {}(s)){replaced}; {applies}", kind.noun(), mine.name, kind.noun());
+        let any_source = kind == Kind::Worker && globs.iter().any(|g| g == "*");
+        if let WorkerCert::Issued { der, old } = &cert {
+            // stdout is exactly the certificate (public): every line goes to stderr.
+            let new = certs::fingerprint(der);
+            note(&old.as_ref().map_or_else(|| line.clone(), |old| format!("{line}; replaced its client certificate fp {old} by fp {new}")));
+            note("the certificate on stdout goes to the worker's relay_client_cert file (0640, the worker's group)");
+            if any_source {
+                note("this worker may register any source name");
+            }
+            // The only copy, its serial random, and the list already names it. Never `?`: `From<io::Error>` makes a
+            // closed pipe exit 0.
+            let mut out = std::io::stdout().lock();
+            if let Err(e) = out.write_all(certs::pem("CERTIFICATE", der).as_bytes()).and_then(|()| out.flush()) {
+                return Err(CliError::Msg(format!("relay allow: the certificate could not be written to stdout ({e}); {} v{version} already names it: run the command again", mine.name)));
+            }
+        } else {
+            say(&line);
+            if any_source {
+                say("this worker may register any source name");
+            }
+            cert_note();
         }
         Ok(())
     })
@@ -561,6 +766,267 @@ pub fn cmd_revoke(id: &str, token_signer: bool) -> Result<()> {
             Kind::Worker => say(&format!("revoked worker {id} ({} v{version}): the relay closes its tunnel within 60 s", held.name)),
             Kind::TokenSigner => say(&format!("revoked token signer {id} ({} v{version}): the relay refuses its tokens within 60 s", held.name)),
         }
+        Ok(())
+    })
+}
+
+// ---- the peers list -----------------------------------------------------------------------------
+
+/// `allow-ip`'s arguments, as clap parsed them.
+pub struct AllowIpArgs<'a> {
+    pub cidr: Option<&'a str>,
+    pub label: Option<&'a str>,
+    pub not_after: Option<&'a str>,
+    pub wide: bool,
+    pub mine: bool,
+    pub hours: Option<u32>,
+}
+
+impl AllowIpArgs<'_> {
+    /// As given (for the gate's refusal).
+    fn given(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        args.extend(self.cidr.map(str::to_string));
+        if let Some(label) = self.label {
+            args.extend(["--label".to_string(), label.to_string()]);
+        }
+        if let Some(day) = self.not_after {
+            args.extend(["--not-after".to_string(), day.to_string()]);
+        }
+        if self.wide {
+            args.push("--wide".to_string());
+        }
+        if self.mine {
+            args.push("--mine".to_string());
+        }
+        if let Some(hours) = self.hours {
+            args.extend(["--hours".to_string(), hours.to_string()]);
+        }
+        args
+    }
+}
+
+/// What `allow-ip` writes, its arguments checked (§RS.4.2).
+enum PeerWanted {
+    /// `--mine`: the label `mac`, the address asked for after the gate.
+    Mine { hours: u32 },
+    /// A network, as given, and its label until the end of a day.
+    Network { given: String, network: (Ipv4Addr, u8), label: String, until: String },
+}
+
+/// One IPv4 address and an optional newline, at most 64 bytes (§RS.4.2).
+pub(crate) fn checkip_address(body: &[u8]) -> Option<Ipv4Addr> {
+    if body.len() > CHECKIP_BODY_MAX {
+        return None;
+    }
+    let text = std::str::from_utf8(body).ok()?;
+    text.strip_suffix('\n').unwrap_or(text).parse().ok()
+}
+
+/// An error and its causes on one line: reqwest's own text says only that a request failed.
+fn with_causes(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
+}
+
+/// The client and the URL of a loopback checkip, in plain http (`AI_ENV_BRIDGE_LAB_CHECKIP`, debug builds).
+#[cfg(debug_assertions)]
+fn lab_checkip(addr: std::net::SocketAddr) -> std::result::Result<(reqwest::Client, String), String> {
+    note(&format!("LAB KNOB ACTIVE ({}): {CHECKIP_HOST} is {addr} (debug build)", crate::bridge::lab::VM_KNOBS[11]));
+    let client = crate::bridge::tls::lab_http_client(addr, CHECKIP_HOST).map_err(|e| e.to_string())?;
+    Ok((client, format!("http://{CHECKIP_HOST}:{}/", addr.port())))
+}
+
+/// Release builds never read the knob, so nothing asks for this.
+#[cfg(not(debug_assertions))]
+fn lab_checkip(_addr: std::net::SocketAddr) -> std::result::Result<(reqwest::Client, String), String> {
+    Err("no lab knob in a release build".to_string())
+}
+
+/// `GET` `url`: the body of a 2xx answer, or `None` for another status or a body over 64 bytes.
+async fn checkip_body(client: &reqwest::Client, url: &str) -> std::result::Result<Option<Vec<u8>>, reqwest::Error> {
+    let mut answer = client.get(url).send().await?;
+    if !answer.status().is_success() {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = answer.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > CHECKIP_BODY_MAX {
+            return Ok(None);
+        }
+    }
+    Ok(Some(body))
+}
+
+/// This Mac's address as `https://checkip.amazonaws.com/` answers it (§RS.4.2), through the one TLS client (its trust
+/// store holds the Amazon roots), within 10 s; anything but one IPv4 address is exit 1.
+fn checkip() -> Result<Ipv4Addr> {
+    let unreached = |e: String| CliError::Msg(format!("relay allow-ip --mine: {CHECKIP_HOST} could not be reached ({e})"));
+    let (client, url) = match crate::bridge::lab::vm_knobs().checkip_addr().map_err(CliError::Msg)? {
+        Some(addr) => lab_checkip(addr).map_err(unreached)?,
+        None => (crate::bridge::tls::reqwest_client().map_err(|e| unreached(with_causes(&e)))?, format!("https://{CHECKIP_HOST}/")),
+    };
+    let rt = runtime()?;
+    let answered = rt.block_on(async { tokio::time::timeout(CHECKIP_TIMEOUT, checkip_body(&client, &url)).await });
+    // A stalled name lookup stays on the blocking pool: dropping the runtime would wait for it, past the 10 s.
+    rt.shutdown_background();
+    let body = match answered {
+        Ok(Ok(body)) => body,
+        Ok(Err(e)) => return Err(unreached(with_causes(&e))),
+        Err(_) => return Err(unreached(format!("no answer within {} s", CHECKIP_TIMEOUT.as_secs()))),
+    };
+    body.as_deref().and_then(checkip_address).ok_or_else(|| CliError::Msg(format!("relay allow-ip --mine: {CHECKIP_HOST} answered no IPv4 address")))
+}
+
+/// `ai-env relay allow-ip <CIDR> --label <id> [--not-after <YYYY-MM-DD>] [--wide]`, `ai-env relay allow-ip --mine
+/// [--hours <N>]` (§RS.4.2): the arguments (exit 2), the gate (exit 9), the context, the address, the operator, then
+/// WM-R42's read-modify-write of `/ai-env/relay/peers`, one audit row (never the address) and the lines.
+pub fn cmd_allow_ip(args: &AllowIpArgs<'_>) -> Result<()> {
+    let usage = |why: String| CliError::Usage(format!("relay allow-ip: {why}"));
+    let wanted = if args.mine {
+        let hours = args.hours.unwrap_or(MINE_HOURS_DEFAULT);
+        if !(1..=MINE_HOURS_MAX).contains(&hours) {
+            return Err(usage(format!("--hours {hours}: 1 to {MINE_HOURS_MAX}")));
+        }
+        PeerWanted::Mine { hours }
+    } else {
+        let (Some(given), Some(label)) = (args.cidr, args.label) else {
+            return Err(usage("a network and --label, or --mine".to_string()));
+        };
+        let network = network_of(given).ok_or_else(|| usage(format!("{given} is not an IPv4 address or network (a.b.c.d or a.b.c.d/n, n 0 to 32)")))?;
+        if network.1 < WIDE_BELOW && !args.wide {
+            return Err(usage(format!("{} is wider than /16, which admits much of the internet: pass --wide if that is meant", network_text(network))));
+        }
+        if !valid_id(label) {
+            return Err(usage(format!("--label {label:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
+        }
+        // A label goes into the audit rows, which never hold an address (§RS.4.3).
+        if network_of(label).is_some() {
+            return Err(usage(format!("--label {label:?} reads as an address: a label says what the network is, and the audit never holds an address")));
+        }
+        let day = not_after_day(args.not_after, unix_now()).map_err(usage)?;
+        let until = policy::not_after_of_day(&day).map_err(|e| usage(format!("--not-after {day}: {e}")))?;
+        PeerWanted::Network { given: given.to_string(), network, label: label.to_string(), until }
+    };
+    gate("allow-ip", &args.given())?;
+    let ctx = RelayCtx::load()?;
+    // `(<given> is written as <network>)`, when host bits were set; this Mac's address, under --mine.
+    let mut written_as = None;
+    let mut address = None;
+    let entry = match wanted {
+        PeerWanted::Mine { hours } => {
+            let ip = checkip()?;
+            address = Some(ip);
+            PeerEntry { cidr: network_text((ip, 32)), label: MAC_LABEL.to_string(), not_after: rfc3339_utc(unix_now() + u64::from(hours) * 3600) }
+        }
+        PeerWanted::Network { given, network, label, until } => {
+            if given.split('/').next() != Some(network.0.to_string().as_str()) {
+                written_as = Some(format!("({given} is written as {})", network_text(network)));
+            }
+            PeerEntry { cidr: network_text(network), label, not_after: until }
+        }
+    };
+    let op = ctx.operator("relay allow-ip")?;
+    let network = network_text(entry.network());
+    let prefix = entry.network().1;
+    let (label, until) = (entry.label.clone(), entry.not_after.clone());
+    locked(&ctx, || {
+        let held = read("allow-ip", &[PEERS])?.remove(0);
+        let mut list = policy::parse_peers(&held.value).map_err(|e| unparsed("allow-ip", held.name, &e))?;
+        let edit = upsert_peer(&mut list, entry).map_err(|other| CliError::Policy(format!("relay allow-ip: {network} is already allowed as {other}: one network, one label (ai-env relay revoke-ip --label {other} first)")))?;
+        let address_line = || {
+            if let Some(ip) = address {
+                say(&format!("this Mac's address is {ip} ({CHECKIP_HOST})"));
+            }
+        };
+        let mut pairs = vec![("label", label.clone()), ("prefix", prefix.to_string()), ("outcome", edit.word().to_string()), ("not_after", until.clone())];
+        if address.is_some() {
+            pairs.push(("mine", "yes".to_string()));
+        }
+        if edit == PeerEdit::Unchanged {
+            pairs.push(("version", held.version.to_string()));
+            audit(&ctx.paths, RELAY_ALLOW_IP, &pairs);
+            address_line();
+            if let Some(written_as) = &written_as {
+                say(written_as);
+            }
+            say(&format!("peer {label} {network} is already allowed until {until} ({} v{}); nothing written", held.name, held.version));
+            return Ok(());
+        }
+        let value = rendered("allow-ip", held.name, &list, policy::render_peers)?;
+        let version = write(&ctx, &op, "allow-ip", &held, &value)?;
+        pairs.push(("version", version.to_string()));
+        audit(&ctx.paths, RELAY_ALLOW_IP, &pairs);
+        address_line();
+        let moved = match &edit {
+            PeerEdit::Replaced { old: Some(old) } => format!("; replaced {old}"),
+            _ => String::new(),
+        };
+        let noted = written_as.as_ref().map_or_else(String::new, |n| format!(" {n}"));
+        say(&format!("allowed peer {label} {network} until {until} ({} v{version}, {} peer(s)); the relay applies it within 60 s{noted}{moved}", held.name, list.len()));
+        Ok(())
+    })
+}
+
+/// A note for each entry of `list` in force now that still admits all of `network` (`given`, as the line names it): a
+/// `/32` may sit inside another label's `/24` (LD-R40), and whoever cuts an address off must hear it still passes.
+fn note_admitted(list: &[PeerEntry], network: (Ipv4Addr, u8), given: &str) {
+    let now = unix_now();
+    for p in list.iter().filter(|p| p.network().1 <= network.1 && p.contains(network.0) && now <= p.not_after_unix()) {
+        side_note(&format!("{given} stays admitted by peer {} {}", p.label, network_text(p.network())));
+    }
+}
+
+/// `ai-env relay revoke-ip <CIDR>`, `ai-env relay revoke-ip --label <id>` (§RS.4.2): the entry removed; one not listed
+/// (a missing list too) writes nothing and exits 0.
+pub fn cmd_revoke_ip(cidr: Option<&str>, label: Option<&str>) -> Result<()> {
+    let usage = |why: String| CliError::Usage(format!("relay revoke-ip: {why}"));
+    let (named, given, args) = match (cidr, label) {
+        (Some(given), None) => {
+            let network = network_of(given).ok_or_else(|| usage(format!("{given} is not an IPv4 address or network (a.b.c.d or a.b.c.d/n, n 0 to 32)")))?;
+            (PeerNamed::Network(network), given, vec![given.to_string()])
+        }
+        (None, Some(given)) => {
+            if !valid_id(given) {
+                return Err(usage(format!("--label {given:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
+            }
+            (PeerNamed::Label(given.to_string()), given, vec!["--label".to_string(), given.to_string()])
+        }
+        _ => return Err(usage("a network or --label, exactly one".to_string())),
+    };
+    gate("revoke-ip", &args)?;
+    let ctx = RelayCtx::load()?;
+    let op = ctx.operator("relay revoke-ip")?;
+    locked(&ctx, || {
+        let held = read("revoke-ip", &[PEERS])?.remove(0);
+        let mut list = policy::parse_peers(&held.value).map_err(|e| unparsed("revoke-ip", held.name, &e))?;
+        let Some(removed) = remove_peer(&mut list, &named) else {
+            say(&format!("{given} is not listed in {}; nothing written", held.name));
+            audit(&ctx.paths, RELAY_REVOKE_IP, &[("outcome", "absent".to_string())]);
+            if let PeerNamed::Network(network) = named {
+                note_admitted(&list, network, given);
+            }
+            return Ok(());
+        };
+        let value = rendered("revoke-ip", held.name, &list, policy::render_peers)?;
+        let version = write(&ctx, &op, "revoke-ip", &held, &value)?;
+        let (network, prefix) = (network_text(removed.network()), removed.network().1);
+        let mut pairs = vec![("outcome", "revoked".to_string())];
+        // `allow-ip` writes no such label, but a list corrected by hand may hold one: the audit never holds an address.
+        if network_of(&removed.label).is_none() {
+            pairs.push(("label", removed.label.clone()));
+        }
+        pairs.extend([("prefix", prefix.to_string()), ("not_after", removed.not_after.clone()), ("version", version.to_string())]);
+        audit(&ctx.paths, RELAY_REVOKE_IP, &pairs);
+        say(&format!("revoked peer {} {network} ({} v{version}): the relay closes its tunnels within 60 s", removed.label, held.name));
+        note_admitted(&list, removed.network(), if matches!(named, PeerNamed::Network(_)) { given } else { &network });
         Ok(())
     })
 }
@@ -637,7 +1103,7 @@ mod tests {
     }
 
     fn worker(id: &str, seed: u8, sources: &[&str]) -> WorkerEntry {
-        WorkerEntry { worker_id: id.into(), alg: "ed25519".into(), public_key: key(seed).b64(), sources: sources.iter().map(|s| (*s).to_string()).collect(), not_after: "2027-10-29T23:59:59Z".into() }
+        WorkerEntry { worker_id: id.into(), alg: "ed25519".into(), public_key: key(seed).b64(), sources: sources.iter().map(|s| (*s).to_string()).collect(), not_after: "2027-10-29T23:59:59Z".into(), tls_fp: None }
     }
 
     fn signer(id: &str, seed: u8) -> SignerEntry {
@@ -700,6 +1166,59 @@ mod tests {
             assert!(tls_refused(Some(&declared_operator(Marker::parse(word), None, None))), "tls as {word}");
         }
         assert!(!tls_refused(Some(&key_env("deployer"))) && !tls_refused(Some(&Err("a refused marker".to_string()))), "tls: the deployer, and a marker left to its own refusal");
+    }
+
+    fn peer(cidr: &str, label: &str, not_after: &str) -> PeerEntry {
+        PeerEntry { cidr: cidr.into(), label: label.into(), not_after: not_after.into() }
+    }
+
+    /// §RS.4.2's pure edits of the peers list. `<CIDR>`: an address reads as `/32`, host bits are cleared, and R-86's
+    /// refusals hold (WM-T51's grammar, through `render_peers`). An upsert is by label: added, replaced (naming the old
+    /// network when it moved), unchanged for the same network and time; a network another label holds is refused,
+    /// host bits or not, and a `/32` inside another label's `/24` is a new network (LD-R40). A removal by network or by
+    /// label returns the entry; one not listed returns none.
+    #[test]
+    fn peer_edits_upsert_by_label_and_remove_by_network_or_label() {
+        const T1: &str = "2027-10-29T23:59:59Z";
+        const T2: &str = "2027-10-30T23:59:59Z";
+        let net = |a: &str, n: u8| (a.parse::<Ipv4Addr>().unwrap(), n);
+        assert_eq!(network_of("198.51.100.7"), Some(net("198.51.100.7", 32)));
+        assert_eq!(network_of("198.51.100.7/24"), Some(net("198.51.100.0", 24)));
+        assert_eq!(network_of("0.0.0.0/0"), Some(net("0.0.0.0", 0)));
+        assert_eq!(network_of("203.0.113.9/0"), Some(net("0.0.0.0", 0)));
+        for bad in ["", "/", "198.51.100.0/33", "198.51.100.0/", "198.51.100/24", "198.051.100.0/24", "198.51.100.0/08", "198.51.100.0/-1", "2001:db8::/32", "2001:db8::1", "example.invalid", "198.51.100.0/24/8", " 198.51.100.0/24"] {
+            assert_eq!(network_of(bad), None, "{bad:?}");
+        }
+        let mut list = Vec::new();
+        assert_eq!(upsert_peer(&mut list, peer("198.51.100.0/24", "office", T1)), Ok(PeerEdit::Added));
+        assert_eq!(upsert_peer(&mut list, peer("198.51.100.0/24", "office", T1)), Ok(PeerEdit::Unchanged));
+        assert_eq!(upsert_peer(&mut list, peer("198.51.100.0/24", "office", T2)), Ok(PeerEdit::Replaced { old: None }), "a new time, the same network");
+        assert_eq!(upsert_peer(&mut list, peer("203.0.113.0/24", "office", T2)), Ok(PeerEdit::Replaced { old: Some("198.51.100.0/24".to_string()) }), "it moved");
+        assert_eq!(list, [peer("203.0.113.0/24", "office", T2)]);
+        assert_eq!(upsert_peer(&mut list, peer("203.0.113.0/24", "lab", T1)), Err("office".to_string()), "one network, one label");
+        assert_eq!(upsert_peer(&mut list, peer("203.0.113.9/24", "lab", T1)), Err("office".to_string()), "the network, not its text");
+        assert_eq!(list.len(), 1, "nothing changed by the refusal");
+        assert_eq!(upsert_peer(&mut list, peer("203.0.113.9/32", "lab", T1)), Ok(PeerEdit::Added), "a /32 inside another label's /24 is its own network (LD-R40)");
+        assert_eq!(policy::render_peers(&list).map(|t| policy::parse_peers(&t).map(|p| p.len())), Ok(Ok(2)), "and the list renders");
+        assert_eq!(remove_peer(&mut list, &PeerNamed::Network(net("198.51.100.0", 24))), None);
+        assert_eq!(remove_peer(&mut list, &PeerNamed::Label("nobody".to_string())), None);
+        assert_eq!(remove_peer(&mut list, &PeerNamed::Network(net("203.0.113.9", 32))), Some(peer("203.0.113.9/32", "lab", T1)));
+        assert_eq!(remove_peer(&mut list, &PeerNamed::Label("office".to_string())), Some(peer("203.0.113.0/24", "office", T2)));
+        assert!(list.is_empty());
+    }
+
+    /// §RS.4.2: checkip's body is one IPv4 address and an optional newline, at most 64 bytes.
+    #[test]
+    fn checkip_answers_one_ipv4_address() {
+        let ip: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        assert_eq!(checkip_address(b"203.0.113.7"), Some(ip));
+        assert_eq!(checkip_address(b"203.0.113.7\n"), Some(ip));
+        for bad in [&b""[..], b"\n", b"203.0.113.7\n\n", b"203.0.113.7\r\n", b" 203.0.113.7", b"203.0.113.7 ", b"203.0.113.7\n198.51.100.1\n", b"2001:db8::1\n", b"203.0.113.07\n", b"<html></html>\n", b"\xff\xfe"] {
+            assert_eq!(checkip_address(bad), None, "{bad:?}");
+        }
+        let mut long = b"203.0.113.7".to_vec();
+        long.resize(65, b'\n');
+        assert_eq!(checkip_address(&long), None, "over 64 bytes");
     }
 
     /// `--not-after`: a real day, today to 731 days ahead; none is a year from today.

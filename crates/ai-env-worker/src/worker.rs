@@ -381,7 +381,8 @@ pub enum WorkerError {
     /// The dial failed.
     #[error("connect: {0}")]
     Connect(String),
-    /// TLS failed.
+    /// TLS failed: the handshake, or the relay's alert of a client certificate just after it (R-121: `the relay
+    /// requires a client certificate`, or `the relay refused this worker's client certificate (<alert>)`).
     #[error("tls: {0}")]
     Tls(String),
     /// The handshake broke a rule.

@@ -102,8 +102,9 @@ source's credential for them.
 - `relay_catalog` (optional `source`, one exact name): the sources this chat may read, each with its
   `name`, `kind`, `description`, `available` (false: its worker is offline) and `ops`, each op with
   its `params_schema` (a JSON Schema), `output` (`json`, `text` or `stream`), `read_only`,
-  `default_limits`, `max_limits` and `examples`; `truncated` is true when the catalog was cut. Call it
-  first.
+  `default_limits`, `max_limits` and `examples`; `truncated` is true when the catalog was cut to fit:
+  a source listed with empty `ops` lost them (ask for it by `source`, which returns them unless they
+  alone are too large), and the last sources may be gone. Call it first.
 - `relay_call` (`source`, `op`, `params`, and optionally `max_bytes`, 1 to 262144, 65536 by default,
   and `deadline_ms`, 1 to 300000): `params` must match the op's `params_schema`. The result holds
   `source`, `op`, `request_id`, `content_type`, `truncated`, `bytes`, `limit` and the output as one of

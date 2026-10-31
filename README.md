@@ -2078,7 +2078,7 @@ The panel's start and stop are audited (`panel_serve`).
 
 **The audit.** `audit.jsonl` is at schema v2: every row's `detail.actor` says who wrote it (`cli`,
 `wrapper` or `panel`; the wrapper's detached `vm warm` says `wrapper`, `claude admit --auto` `cli`), and
-a registry of every event (94, S13's seven `relay_*` included, with their keys, the key that names a
+a registry of every event (96, S13's seven `relay_*` and the relay security plan's two included, with their keys, the key that names a
 VM, where the session comes from and what each means for the cost) is frozen in
 `tests/fixtures/audit/schema-v2.json`: names and keys
 are never renamed. S11's events: `claude_admit`, `claude_stage`, `claude_fetch`, `claude_object_bad`,
@@ -2342,9 +2342,11 @@ private repositories, and ai-env never names a private source, host or grant. S1
 from the phone with the Mac off ("away mode"), is planned and gated on live probes: none of it is built.
 
 **What a remote chat gets.** Two tools, `relay_catalog` (the sources and ops the chat's grant reaches,
-each op with its params JSON Schema) and `relay_call(source, op, params)` (the op's output, with
-truncation flags), which claude names `mcp__ai-env-relay__relay_catalog` and
-`mcp__ai-env-relay__relay_call`, and only when the Mac gave the chat a relay session. Each new spawn
+each op with its params JSON Schema; past 256 KiB the answer says `truncated`: it loses ops from its end,
+leaving those sources with empty `ops` to ask for by name, and only then sources) and
+`relay_call(source, op, params)` (the op's output, with truncation flags), which claude names
+`mcp__ai-env-relay__relay_catalog` and `mcp__ai-env-relay__relay_call`, and only when the Mac gave the
+chat a relay session. Each new spawn
 (a new chat, a retry, a move; never a reattach) asks this Mac's `ai-env relay agent` for a session
 token within 2 s. The token names the VM, the spawn, the chat and the grant (the workspace's
 `relay_grant`, else `[relay].grant`), and lives at most 8 h, never past the VM's wall. With no grant,

@@ -1,4 +1,4 @@
-//! The relay in-process (§R-relay.7, relay 1 to 33): tonic over `tokio::io::duplex` with the rig of
+//! The relay in-process (§R-relay.7, relay 1 to 44 and 49 to 51): tonic over `tokio::io::duplex` with the rig of
 //! `tests/common`. Tests marked "paused" run on tokio's paused clock and assert virtual time.
 
 mod common;
@@ -577,6 +577,105 @@ async fn a_stopped_worker_past_its_not_after_is_listed_no_more() {
     assert_eq!((s.tunnels, s.sources_live, s.sources_offline), (0, 0, 1));
 }
 
+/// `TestWorker::connect` over a connection from `ip` (`Rig::public_channel_from`), once no tunnel is live.
+async fn connect_from(rig: &Rig, ip: &str, worker_id: &str, seed: u8, sources: Vec<ai_env_relay_proto::v1::SourceDescriptor>) -> TestWorker {
+    let before = rig.app.snapshot().sources_live;
+    let n = sources.len() as u64;
+    let (channel, link) = rig.public_channel_from(ip.parse().unwrap()).await;
+    let mut w = TestWorker::open_on(channel).await.expect("the Challenge");
+    w.link = Some(link);
+    w.authenticate(worker_id, seed).await.expect("authenticated");
+    w.register(sources).await;
+    rig.until(Duration::from_secs(10), "the catalog installed", |r| r.app.snapshot().sources_live >= before + n).await;
+    w
+}
+
+/// Relay 37 (R-90): every poll judges each live tunnel's peer against the peers file. A (from `WORKER_IP`,
+/// `198.51.100.10`) and C (from `198.51.100.12`) live; the file rewritten with C's `/32` alone and polled: its reload
+/// line says `loaded` with its own version and entries (R-88), A gets `Close{1, "peer revoked"}`, its close line
+/// `peer_revoked`, and C stays. C's entry then lapses while the file stays
+/// unchanged and fresh (an `allow-ip --mine` past its day): C stays through its `not_after` second and gets
+/// `Close{1, "peer revoked"}` (close line `peer_revoked`) one second later. The file removed and polled: C's next
+/// tunnel gets `Close{6, "the peers list is not loaded"}` (close line `stale`). A peers file loaded while the clock is
+/// past its `fetched` + 900 s (the reload's stamp of T0 + 99 with the clock at T0 + 1000, the whitelist still fresh
+/// from T0 + 1000's fetch): C's next tunnel gets `Close{6, "the peers list is stale"}`.
+#[tokio::test]
+async fn a_peer_no_longer_listed_loses_its_tunnel() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let c = connect_from(&rig, "198.51.100.12", "worker-c", 5, catalog_c()).await.serve(Script::silent());
+    rig.tunnels(2).await;
+    rig.write_peers(&[peer_entry("198.51.100.12/32", "worker-c")]);
+    let polled = rig.poll();
+    assert!(matches!(polled[4], ("peers", Poll::Loaded { .. })), "{polled:?}");
+    // R-88: its reload line names the file's own version and entries.
+    let line = reloads(&rig, "peers").pop().expect("a reload line of peers");
+    assert_eq!(line["outcome"], "loaded");
+    assert_eq!(line["version"], format!("{:016x}", content_version(&rig.read(ai_env_relay::lists::PEERS_FILE))));
+    assert_eq!(line["entries"], 1);
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (1, "peer revoked"));
+    let closed = |r: &Rig, worker: &str, reason: &str| r.lines("tunnel").iter().any(|l| l["phase"] == "close" && l["worker"] == worker && l["reason"] == reason);
+    rig.until(Duration::from_secs(10), "A's close line", |r| closed(r, "worker-a", "peer_revoked")).await;
+    rig.tunnels(1).await;
+    rig.poll();
+    let mut client = rig.client().await;
+    let listed = list(&mut client, &rig.token("g-all")).await.unwrap();
+    assert_eq!(names(&listed), vec![("example.gamma".to_string(), true)], "A's sources removed, as a revocation's: {:?}", names(&listed));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(c.closes().is_empty(), "C's /32 is listed: its tunnel stays");
+    assert_eq!(rig.app.snapshot().tunnels, 1);
+
+    // C's entry in force until T0 + 5, then the clock and the reload's fetch moving on while the file stays as it is:
+    // fresh at every poll, C allowed through its not_after second and revoked the second after.
+    const C_NOT_AFTER: &str = "2027-01-15T08:00:05Z";
+    let c_not_after = ai_env_worker::policy::unix_of(C_NOT_AFTER).unwrap();
+    assert_eq!(c_not_after, T0 + 5);
+    rig.write_peers(&[ai_env_worker::policy::PeerEntry { not_after: C_NOT_AFTER.into(), ..peer_entry("198.51.100.12/32", "worker-c") }]);
+    assert!(matches!(rig.poll()[4], ("peers", Poll::Loaded { .. })));
+    rig.clock.set(c_not_after);
+    rig.write_fetched(c_not_after);
+    assert_eq!(rig.poll()[4], ("peers", Poll::Unchanged));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(c.closes().is_empty(), "in force through its not_after second");
+    rig.clock.set(c_not_after + 1);
+    rig.write_fetched(c_not_after + 1);
+    let polled = rig.poll();
+    assert!(polled.iter().all(|(_, p)| *p == Poll::Unchanged), "every file as it was, and fresh: {polled:?}");
+    let close = c.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (1, "peer revoked"));
+    rig.until(Duration::from_secs(10), "C's close line", |r| closed(r, "worker-c", "peer_revoked")).await;
+    rig.until(Duration::from_secs(10), "no tunnel", |r| r.app.snapshot().tunnels == 0 && r.app.snapshot().sources_live == 0).await;
+
+    // Listed again: C's next tunnel, then the file removed and polled.
+    rig.write_peers(&default_peers());
+    rig.poll();
+    let c = connect_from(&rig, "198.51.100.12", "worker-c", 5, catalog_c()).await.serve(Script::silent());
+    rig.remove(ai_env_relay::lists::PEERS_FILE);
+    assert_eq!(rig.poll()[4].1, Poll::Missing);
+    let close = c.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (6, "the peers list is not loaded"));
+    rig.until(Duration::from_secs(10), "C's close line", |r| closed(r, "worker-c", "stale")).await;
+    rig.until(Duration::from_secs(10), "no tunnel", |r| r.app.snapshot().tunnels == 0 && r.app.snapshot().sources_live == 0).await;
+
+    // Listed again, then every list fetched at T0 + 1000: C's next tunnel lives.
+    rig.write_peers(&default_peers());
+    rig.poll();
+    let c = connect_from(&rig, "198.51.100.12", "worker-c", 5, catalog_c()).await.serve(Script::silent());
+    rig.clock.set(T0 + 1000);
+    rig.write_fetched(T0 + 1000);
+    rig.poll();
+    assert!(c.closes().is_empty(), "every list fresh");
+    // The peers file rewritten while `fetched` holds T0 + 99: it loads as of that fetch, 901 s before the clock, while
+    // the whitelist keeps T0 + 1000 (a fetch time only ever moves a file's freshness forward, R-16).
+    rig.write_fetched(T0 + 99);
+    rig.write_peers(&[peer_entry("198.51.100.12/32", "worker-c"), peer_entry("203.0.113.0/24", "office")]);
+    let polled = rig.poll();
+    assert!(matches!(polled[0], ("workers", Poll::Unchanged)) && matches!(polled[4], ("peers", Poll::Loaded { .. })), "{polled:?}");
+    let close = c.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (6, "the peers list is stale"));
+}
+
 /// Relay 13.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_thousand_interleaved_calls_never_cross() {
@@ -614,7 +713,11 @@ async fn a_thousand_interleaved_calls_never_cross() {
     let tokens: Vec<String> = (0..4).map(|_| rig.token("g-all")).collect();
     let mut clients = Vec::new();
     for _ in 0..8 {
-        clients.push(rig.client().await);
+        // One answer first: it brings the face's SETTINGS (16 streams, R-5) to the client, which then queues its calls
+        // instead of opening a seventeenth stream to be refused.
+        let mut client = rig.client().await;
+        list(&mut client, &tokens[0]).await.expect("listed");
+        clients.push(client);
     }
     let mut tasks = Vec::new();
     for i in 0..1000u32 {
@@ -832,10 +935,11 @@ async fn grants_default_deny() {
     assert_eq!((s.code(), s.message()), (Code::Unavailable, "grants not loaded"));
 }
 
-/// Relay 19.
+/// Relay 19 (amended: its many refused tokens on one connection are R-53's subject, not R-105's, so the connection's
+/// fault cap is out of the way).
 #[tokio::test]
 async fn session_tokens_gate_the_private_face_alike() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_with(Limits { private_faults_max: 1000, ..limits() }).await;
     let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
     let mut client = rig.client().await;
     let now = rig.clock.unix();
@@ -1105,7 +1209,9 @@ async fn a_wedged_caller_is_evicted_and_others_flow() {
     a.send(worker_frame::Msg::Chunk(data(&call2, 0, b"{}".to_vec(), true))).await;
     let (chunks2, _) = drain(s2).await;
     assert_eq!(chunks2.len(), 1);
-    assert!(t0.elapsed() <= Duration::from_millis(2500), "{:?}", t0.elapsed());
+    // R-111 (amended): the eviction comes at once, with no hand-off wait: no time passes.
+    a.until("call 1 cancelled", |r| r.cancels.iter().any(|c| c.request_id == call1)).await;
+    assert!(t0.elapsed() < Duration::from_millis(100), "evicted at once, not after 2 s: {:?}", t0.elapsed());
     let evicted = a.cancels().into_iter().find(|c| c.request_id == call1).expect("call 1 cancelled");
     assert_eq!(evicted.reason, "caller_too_slow");
     wedged_link.resume();
@@ -1297,7 +1403,12 @@ async fn the_request_log_carries_ids_and_hashes_only() {
         assert!(!line.contains(&token) && !line.contains(&token[3..40]), "a token in {line}");
         assert!(key_texts.iter().all(|k| !line.contains(k.as_str())), "a key in {line}");
         assert!(!line.contains('*'), "a glob in {line}");
+        assert!(PEER_NETS.iter().all(|net| !line.contains(net)), "a peers network in {line}");
     }
+    // The status line's values (§RS.3.1): every key of STATUS_KEYS but `ts` and `ev`, the peers file's among them.
+    let status = serde_json::to_value(rig.app.snapshot()).unwrap();
+    assert_eq!(keys_of(&status), sorted(&STATUS_KEYS[2..]));
+    assert_eq!(status["peers_version"], format!("{:016x}", content_version(&rig.read(ai_env_relay::lists::PEERS_FILE))));
 }
 
 /// Relay 26 (paused).
@@ -1366,10 +1477,14 @@ mod h2raw {
     pub const HEADERS: u8 = 0x1;
     pub const RST_STREAM: u8 = 0x3;
     pub const SETTINGS: u8 = 0x4;
+    pub const PING: u8 = 0x6;
+    pub const WINDOW_UPDATE: u8 = 0x8;
     pub const END_STREAM: u8 = 0x1;
     pub const END_HEADERS: u8 = 0x4;
     pub const ACK: u8 = 0x1;
-    /// SETTINGS_MAX_CONCURRENT_STREAMS and SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2).
+    /// SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS and SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113
+    /// §6.5.2).
+    pub const INITIAL_WINDOW_SIZE: u16 = 0x4;
     pub const MAX_CONCURRENT_STREAMS: u16 = 0x3;
     pub const MAX_HEADER_LIST_SIZE: u16 = 0x6;
     /// RST_STREAM's NO_ERROR and REFUSED_STREAM (RFC 9113 §7).
@@ -1481,7 +1596,8 @@ mod h2raw {
 async fn unfinished_private_requests_are_capped_and_cut() {
     use ai_env_relay_proto::prost::Message as _;
     use h2raw::*;
-    let rig = Rig::start().await;
+    // Amended: R-103's token deadline after R-5's 10 s, so its connections outlive their unfinished streams.
+    let rig = Rig::start_with(Limits { handshake_timeout_ms: 30_000, ..limits() }).await;
     let _a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
     let headers = block(&[
         (":method", b"POST"),
@@ -1535,6 +1651,7 @@ async fn unfinished_private_requests_are_capped_and_cut() {
         let (c, settings, seen) = reader.await.unwrap();
         assert!(settings.contains(&(MAX_CONCURRENT_STREAMS, 16)), "{settings:?}");
         assert!(settings.contains(&(MAX_HEADER_LIST_SIZE, 4096)), "{settings:?}");
+        assert!(settings.contains(&(INITIAL_WINDOW_SIZE, 65_536 + 16_384 + 16_384)), "F28: the decode cap (params_max_bytes and 16 KiB) and 16 KiB: {settings:?}");
         for (stream, frames) in &seen {
             if *stream <= 31 {
                 // At 10 s: answered (tonic's `Timeout expired`, a trailers-only HEADERS), then reset NO_ERROR, the
@@ -1668,15 +1785,1231 @@ async fn the_status_line_counts_and_names_nothing_secret() {
     let mut client = rig.client().await;
     let token = rig.token("g-all");
     let _ = drain(call(&mut client, &token, "example.alpha", "get", b"{\"q\":\"ZZ-SENTINEL-PARAM\"}").await.unwrap()).await;
+    // The wall clock 42 s past the rig's fetch at T0: the line's ages count from that fetch.
+    rig.clock.set(T0 + 42);
     tokio::time::sleep(Duration::from_secs(301)).await;
     let status = rig.lines("status");
     assert_eq!(status.len(), 1, "one line at 300 s");
     let line = &status[0];
     assert_eq!(keys_of(line), sorted(&STATUS_KEYS));
+    assert!(line["log_suppressed"].as_u64().is_some(), "F23's count: {line}");
     assert_eq!((line["tunnels"].as_u64(), line["sources_live"].as_u64(), line["calls_in_flight"].as_u64()), (Some(1), Some(2), Some(0)));
     assert_eq!(line["workers_version"], format!("{:016x}", content_version(&rig.read(WORKERS_FILE))));
+    // §RS.3.1: the peers file's version and age, never its networks or labels.
+    assert_eq!(line["peers_version"], format!("{:016x}", content_version(&rig.read(ai_env_relay::lists::PEERS_FILE))));
+    assert_eq!(line["peers_age_s"].as_u64(), Some(42), "fetched at the rig's T0, the wall clock at T0 + 42");
     let text = line.to_string();
+    assert!(PEER_NETS.iter().all(|net| !text.contains(net)) && !text.contains("test-net-2"), "a peers entry in {text}");
     assert!(!text.contains('*') && !text.contains("ZZ-SENTINEL") && !text.contains(&token[3..40]));
     let key = ai_env_worker::keys::SigningKey::from_seed(&[1; 32]).unwrap().public_key().b64();
     assert!(!text.contains(&key));
+}
+
+/// relay.log's lines, as `reqlog::log_subscriber`'s formatter wrote them.
+#[derive(Clone, Default)]
+struct Written(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Written {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Written {
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap().lines().map(str::to_string).collect()
+    }
+}
+
+/// Relay 36 (F23): a thousand PING frames with the ACK flag that answer no ping of the relay's, on a public connection
+/// with no `Open`, as a peer that never authenticates may send them. h2 writes a `warn` for each; through the
+/// subscriber `ai-env-relay` installs (`reqlog::log_subscriber`, production's filter and cap) relay.log gains no line
+/// but the relay's own (which the cap exempts, and which a poll may write meanwhile), and none of them reaches the
+/// cap (the filter holds h2 at `error`). With an operator's module directive that lets them through, the cap (here
+/// one line a minute) writes exactly one and counts the rest. The face's SETTINGS and its connection's WINDOW_UPDATE
+/// give its windows (F28): `catalog_max_bytes` and 16 KiB.
+#[tokio::test]
+async fn unsolicited_ping_acks_write_no_log_lines() {
+    use h2raw::*;
+    let rig = Rig::start().await;
+    let window = ai_env_source::wire::FRAME_MAX as u32 + 16_384;
+    let per_min = Limits::default().log_refusals_per_min;
+    for (spec, cap) in [(None, per_min), (Some("info,h2::proto=warn"), 1)] {
+        let written = Written::default();
+        let w = written.clone();
+        let _guard = tracing::subscriber::set_default(ai_env_relay::reqlog::log_subscriber(spec, cap, move || w.clone()));
+        let before = rig.app.snapshot().log_suppressed;
+        let mut c = Conn::open(rig.public_raw(1 << 20), Instant::now()).await;
+        for i in 0..1000u64 {
+            c.send(PING, ACK, 0, &i.to_be_bytes()).await;
+        }
+        // A ping of the test's own: its answer comes after the relay read all thousand.
+        c.send(PING, 0, 0, b"probe-01").await;
+        let (mut settings, mut increment) = (Vec::new(), None);
+        loop {
+            let f = tokio::time::timeout(PATIENCE, c.next()).await.expect("a frame in time").expect("the connection stays up");
+            match f.kind {
+                SETTINGS if f.flags & ACK == 0 => settings.extend(pairs(&f.payload)),
+                WINDOW_UPDATE if f.stream == 0 => increment = Some(u32::from_be_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]) & 0x7fff_ffff),
+                PING if f.flags & ACK != 0 && f.payload == b"probe-01" => break,
+                _ => {}
+            }
+        }
+        assert!(settings.contains(&(INITIAL_WINDOW_SIZE, window)), "each stream's window: {settings:?}");
+        assert_eq!(increment, Some(window - 65_535), "the connection's window");
+        // The lines of any target but the relay's own (`ai_env_relay`, `ai_env_relay::…`).
+        let lines: Vec<String> = written.lines().into_iter().filter(|l| !l.contains(" ai_env_relay::") && !l.contains(" ai_env_relay: ")).collect();
+        let suppressed = rig.app.snapshot().log_suppressed - before;
+        match spec {
+            None => {
+                assert!(lines.is_empty(), "{} lines: {:?}", lines.len(), &lines[..lines.len().min(3)]);
+                assert_eq!(suppressed, 0, "the filter held them before the cap");
+            }
+            Some(_) => {
+                assert_eq!(lines.len(), 1, "{spec:?}: the cap's one line: {:?}", &lines[..lines.len().min(3)]);
+                assert!(lines[0].contains(" h2::proto::ping_pong: recv PING ack that we never sent"), "{lines:?}");
+                assert!(suppressed >= 999, "the cap took the rest: {suppressed}");
+            }
+        }
+    }
+}
+
+/// A VM's client that never reads (relays 39 and 44): its streams' window is 0, so the relay can send them nothing.
+/// hyper 1.11 takes one frame of a response body before it waits for send capacity, and tonic packs a frame with the
+/// chunks at hand up to 32 KiB: such a stream takes its first frame's chunks out of the call's buffer, and the chunks
+/// after them stay there.
+async fn deaf_client(rig: &Rig) -> (ai_env_relay_proto::v1::relay_client::RelayClient<tonic::transport::Channel>, Link) {
+    let endpoint = tonic::transport::Endpoint::from_static("http://10.42.0.20").initial_stream_window_size(0);
+    let (channel, link) = rig.private_channel_with(endpoint, 1 << 20).await;
+    (ai_env_relay_proto::v1::relay_client::RelayClient::new(channel), link)
+}
+
+/// Runs the other tasks until `f` holds, without moving tokio's clock (a budget refills with time).
+async fn settle(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..200_000 {
+        if f() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("never: {what}");
+}
+
+/// A script that answers each call with `n` chunks of `size` bytes, none final, in one write (no await between them).
+fn burst(n: u64, size: usize) -> Script {
+    Script::with(move |inv, out| {
+        for seq in 0..n {
+            let _ = out.try_send(wf(worker_frame::Msg::Chunk(data(&inv.request_id, seq, vec![b'x'; size], false))));
+        }
+    })
+}
+
+/// Relay 38 (paused): eight refused tokens on one private connection fault it (R-105). Each `ListSources` is 16 and
+/// the eighth's status arrives; a ninth with a valid token, sent within the next second, is refused 16 all the same
+/// (no token is verified on a faulted connection); a second after the eighth the connection is cut, with one peer
+/// line `bad_tokens`, and a request then fails at the transport. Refusals while the token signers are not loaded are
+/// the relay's own and count nothing. On a fresh connection the eighth is the one that faults, and a verified token
+/// resets nothing: seven refused, a valid one served, one more refused, then a valid one 16 and the cut a second after
+/// the eighth. On another, a request with no header counts too: four refused, a valid one served, three refused, and
+/// the one with no header faults it.
+#[tokio::test(start_paused = true)]
+async fn eight_refused_tokens_cut_their_connection() {
+    let rig = Rig::start().await;
+    assert_eq!(Limits::default().private_faults_max, 8);
+    let (channel, link) = rig.private_channel().await;
+    let mut client = ai_env_relay_proto::v1::relay_client::RelayClient::new(channel);
+    let refused = mint(4, &rig.claims("g-all"));
+    for i in 0..8 {
+        let s = list(&mut client, &refused).await.expect_err("refused");
+        assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"), "refusal {i}");
+    }
+    let eighth = Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let valid = rig.token("g-all");
+    let s = list(&mut client, &valid).await.expect_err("faulted: refused before any token is verified");
+    assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"));
+    rig.until(Duration::from_secs(5), "the cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(eighth + Duration::from_secs(1)), "cut a second after the eighth refusal");
+    let s = list(&mut client, &valid).await.expect_err("the connection is cut");
+    assert_ne!(s.code(), Code::Unauthenticated, "a transport failure, not the relay's 16: {s:?}");
+    let peers = rig.lines("peer");
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!((peers[0]["face"].as_str(), peers[0]["reason"].as_str(), peers[0]["peer"].as_str()), (Some("private"), Some("bad_tokens"), Some(VM_IP)));
+    let lists = rig.lines("list");
+    assert!(lists.len() == 9 && lists.iter().all(|l| l["outcome"] == "unauthenticated" && l["code"] == 16), "{lists:?}");
+
+    // The token signers gone: ten refusals on a new connection count nothing, so once they are back its valid token
+    // is served.
+    let signers = rig.read(SIGNERS_FILE);
+    rig.remove(SIGNERS_FILE);
+    rig.poll();
+    let mut other = rig.client().await;
+    for _ in 0..10 {
+        assert_eq!(list(&mut other, &valid).await.expect_err("no signers").code(), Code::Unauthenticated);
+    }
+    rig.write(SIGNERS_FILE, &signers);
+    rig.poll();
+    list(&mut other, &valid).await.expect("not faulted: the relay's own refusals count nothing");
+    assert_eq!(rig.lines("peer").len(), 1);
+
+    // The count of eight, exactly, with a verified token among them.
+    let (channel, link) = rig.private_channel().await;
+    let mut client = ai_env_relay_proto::v1::relay_client::RelayClient::new(channel);
+    for i in 0..7 {
+        let s = list(&mut client, &refused).await.expect_err("refused");
+        assert_eq!(s.code(), Code::Unauthenticated, "refusal {i}");
+    }
+    list(&mut client, &valid).await.expect("seven refused: not faulted yet");
+    list(&mut client, &refused).await.expect_err("the eighth refused");
+    let eighth = Instant::now();
+    let s = list(&mut client, &valid).await.expect_err("the eighth faulted it: a verified token resets nothing");
+    assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"));
+    rig.until(Duration::from_secs(5), "the cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(eighth + Duration::from_secs(1)), "cut a second after the eighth");
+    assert_eq!(rig.lines("peer").len(), 2);
+
+    // A request with no header is a refused token too.
+    let (channel, link) = rig.private_channel().await;
+    let mut client = ai_env_relay_proto::v1::relay_client::RelayClient::new(channel);
+    for _ in 0..4 {
+        list(&mut client, &refused).await.expect_err("refused");
+    }
+    list(&mut client, &valid).await.expect("four refused: served");
+    for _ in 0..3 {
+        list(&mut client, &refused).await.expect_err("refused");
+    }
+    let s = client.list_sources(tonic::Request::new(ai_env_relay_proto::v1::ListSourcesRequest {})).await.expect_err("no token");
+    assert_eq!(s.code(), Code::Unauthenticated);
+    let eighth = Instant::now();
+    list(&mut client, &valid).await.expect_err("the one with no header was the eighth");
+    rig.until(Duration::from_secs(5), "the cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(eighth + Duration::from_secs(1)), "cut a second after the eighth");
+    let peers = rig.lines("peer");
+    assert!(peers.len() == 3 && peers.iter().all(|p| p["reason"] == "bad_tokens"), "{peers:?}");
+}
+
+/// Relay 39 (paused): a call evicted while its client holds its stream and never reads it frees its session's pass
+/// at once (R-106: `calls_per_session` 1, and the session's next call is admitted), while the stream keeps the
+/// relay's permit (`calls_in_flight` 1, then 2) until its connection is cut 10 s after the eviction with a peer line
+/// `undrained` (R-103), and `calls_in_flight` is 0 again. With `calls_in_flight_max` 2, the two make a third call 8
+/// `too many calls in flight` until the cut. A call answered by one final chunk of 64 KiB, to such a client, concludes
+/// `ok` at once, but hyper holds the final's frame unsent, so its stream keeps the relay's permit (`calls_in_flight`
+/// 1) until the connection is cut `undrained` 10 s after the call concluded: the permit goes when hyper drops the
+/// stream, not when the stream yields its last item (review B finding 1).
+#[tokio::test(start_paused = true)]
+async fn an_undrained_call_frees_its_session_at_once_and_its_relay_permit_at_the_cut() {
+    let rig = Rig::start_with(Limits { calls_in_flight_max: 2, calls_per_session: 1, ..limits() }).await;
+    // Six chunks of 64 KiB at once: the deaf stream takes the first, four fill the caller's buffer, the sixth evicts.
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(burst(6, 65_536));
+    let (mut deaf, link) = deaf_client(&rig).await;
+    let token = rig.token("g-all");
+    let evictions = |a: &Served| a.cancels().iter().filter(|c| c.reason == "caller_too_slow").count();
+    let first = call(&mut deaf, &token, "example.alpha", "get", b"{}").await.expect("the first call");
+    a.until("the first eviction", |r| r.cancels.iter().any(|c| c.reason == "caller_too_slow")).await;
+    let evicted = Instant::now();
+    assert_eq!(evictions(&a), 1);
+    assert_eq!(rig.app.snapshot().calls_in_flight, 1, "its unread stream keeps the relay's permit");
+    let second = call(&mut deaf, &token, "example.alpha", "get", b"{}").await.expect("the session's pass came back with the eviction");
+    a.until("the second eviction", |r| r.cancels.iter().filter(|c| c.reason == "caller_too_slow").count() == 2).await;
+    assert_eq!(rig.app.snapshot().calls_in_flight, 2);
+    let mut other = rig.client().await;
+    let third = call(&mut other, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect_err("both permits held");
+    assert_eq!((third.code(), third.message()), (Code::ResourceExhausted, "too many calls in flight"));
+    tokio::time::sleep_until(evicted + Duration::from_millis(9_900)).await;
+    assert_eq!(rig.app.snapshot().calls_in_flight, 2, "held until the cut");
+    assert!(link.peer_closed_at().is_none() && rig.lines("peer").is_empty());
+    rig.until(Duration::from_secs(1), "the undrained cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(evicted + Duration::from_secs(10)), "10 s after the first eviction");
+    rig.until(Duration::from_secs(1), "the permits back", |r| r.app.snapshot().calls_in_flight == 0).await;
+    let peers = rig.lines("peer");
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!((peers[0]["face"].as_str(), peers[0]["reason"].as_str()), (Some("private"), Some("undrained")));
+    let _ = call(&mut other, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("a permit is free again");
+    drop((first, second));
+
+    // One final chunk of 64 KiB, sent as the Invoke comes: the call concludes at that instant.
+    let rig = Rig::start().await;
+    let w = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::with(|inv, out| {
+        let _ = out.try_send(wf(worker_frame::Msg::Chunk(data(&inv.request_id, 0, vec![b'x'; 65_536], true))));
+    }));
+    let (mut deaf, link) = deaf_client(&rig).await;
+    let parked = call(&mut deaf, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("the call");
+    w.until("its invoke", |r| r.invokes.len() == 1).await;
+    let concluded = Instant::now();
+    settle("the call concluded", || rig.lines("call").iter().any(|l| l["outcome"] == "ok")).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(rig.app.snapshot().calls_in_flight, 1, "hyper holds the final's frame, its stream and the stream's permit");
+    assert!(link.peer_closed_at().is_none() && rig.lines("peer").is_empty());
+    rig.until(Duration::from_secs(10), "the undrained cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(concluded + Duration::from_secs(10)), "10 s after the call concluded");
+    rig.until(Duration::from_secs(1), "the permit back", |r| r.app.snapshot().calls_in_flight == 0).await;
+    let peers = rig.lines("peer");
+    assert!(peers.len() == 1 && peers[0]["reason"] == "undrained", "{peers:?}");
+    drop(parked);
+}
+
+/// Relay 40 (paused): a tunnel over its inbound budget is closed `Close{3, "inbound rate"}`, close reason `rate`
+/// (R-107). (a) Frames: its first catalog and 599 frames with no variant pass, the 601st frame closes it. (b) Bytes,
+/// with `call_bytes_max` and `tunnel_bytes_per_min` both 1 MiB: two live calls' chunks of 600 KiB each are no charge
+/// (LD-R53), a cancelled call's late chunks then run the budget out, and each caller gets its final chunk (14). (c)
+/// Bytes at the defaults: frames of 64 KiB of fields no variant knows (a decoded length of 0) exhaust the 32 MiB
+/// within the frames budget. (d) Short of frames, as of bytes, the connection reads nothing more until R-2a's cut
+/// (review B finding 5): on a bare HTTP/2 tunnel, a PING sent after the Close is never answered, and the connection
+/// ends 1 s after the close. (e) to (i), below: LD-R53's exemption, and what it leaves charged.
+#[tokio::test(start_paused = true)]
+async fn a_tunnel_over_its_inbound_budget_is_closed_rate() {
+    // (a) No virtual time passes from the AuthOk to the close, so the bucket gains nothing.
+    let rig = Rig::start().await;
+    assert_eq!(Limits::default().tunnel_frames_per_min, 600);
+    let mut a = TestWorker::open(&rig).await;
+    a.authenticate("worker-a", 1).await.expect("authenticated");
+    a.register(catalog_a()).await;
+    for _ in 0..599 {
+        a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    }
+    settle("599 frames with no variant counted", || rig.app.snapshot().unknown_frames == 599).await;
+    assert_eq!(rig.app.snapshot().tunnels, 1, "600 frames pass");
+    a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    let close = a.close().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    assert_eq!(rig.app.snapshot().unknown_frames, 599, "the 601st frame closed it before anything acted on it");
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+
+    // (b)
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let late = cancelled_call(&rig, &a).await;
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+    let mut calls = Vec::new();
+    for i in 1..=2 {
+        let stream = call(&mut client, &token, "example.alpha", "get", b"{}").await.expect("a call");
+        calls.push((a.invoke(i).await.request_id, tokio::spawn(drain(stream))));
+    }
+    for seq in 0..10 {
+        for (rid, _) in &calls {
+            a.send(chunk_of(rid, seq, 61_440, false)).await;
+        }
+    }
+    read_so_far(&rig, &a, 1).await;
+    send_until_closed(&a, (0..20).map(|seq| chunk_of(&late, seq, 65_536, false))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    for (_, c) in calls {
+        let (chunks, end) = c.await.unwrap();
+        assert!(end.is_ok());
+        assert_eq!(chunks.len(), 11, "its ten chunks and the final");
+        let last = chunks.last().expect("a final chunk");
+        assert!(last.r#final && final_code(last) == Some(14), "{last:?}");
+    }
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+
+    // (c)
+    let rig = Rig::start().await;
+    let mut w = raw_tunnel(&rig).await;
+    let out = w.out.clone();
+    let sender = tokio::spawn(async move {
+        for _ in 0..560 {
+            if out.send(raw::padded(65_536)).await.is_err() {
+                return;
+            }
+        }
+    });
+    let close = w.close().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    let unknown = rig.app.snapshot().unknown_frames;
+    assert!((500..560).contains(&unknown), "32 MiB of 64 KiB frames, within the frames budget: {unknown} frames");
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+    sender.abort();
+
+    // (d) As (a), on a bare HTTP/2 connection; no virtual time passes from the AuthOk to the close.
+    use ai_env_relay_proto::v1::RelayFrame;
+    let rig = Rig::start().await;
+    let (mut c, mut pending, mut acks) = bare_tunnel(&rig, 1 << 20).await;
+    c.send(h2raw::DATA, 0, 1, &bare_message(None).repeat(599)).await;
+    settle("599 frames with no variant counted", || rig.app.snapshot().unknown_frames == 599).await;
+    c.send(h2raw::DATA, 0, 1, &bare_message(None)).await;
+    let close = bare_close(&mut c, &mut pending, &mut acks).await;
+    let closed = Instant::now();
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    c.send(h2raw::PING, 0, 0, b"after-01").await;
+    while grpc_message::<RelayFrame>(&mut c, &mut pending, &mut acks).await.is_some() {}
+    assert_eq!(acks, 0, "the PING after the Close was never read");
+    assert_eq!(Instant::now() - closed, Duration::from_secs(1), "the connection ended at R-2a's cut, 1 s after the close");
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+}
+
+/// The rig's limits with this bytes budget and this largest call, the budget's floor (§RS.2).
+fn bytes_budget(bytes: u64) -> Limits {
+    Limits { call_bytes_max: bytes, call_bytes_default: bytes, tunnel_bytes_per_min: bytes as u32, ..limits() }
+}
+
+/// The tunnels closed `rate`.
+fn rate_lines(rig: &Rig) -> usize {
+    rig.lines("tunnel").into_iter().filter(|l| l["phase"] == "close" && l["reason"] == "rate").count()
+}
+
+/// A chunk of `size` bytes.
+fn chunk_of(request_id: &str, seq: u64, size: usize, last: bool) -> worker_frame::Msg {
+    worker_frame::Msg::Chunk(data(request_id, seq, vec![b'x'; size], last))
+}
+
+/// A chunk of an id no call of the tunnel ever carried.
+fn stray_chunk(i: u64, size: usize) -> worker_frame::Msg {
+    chunk_of(&format!("0199a1b2-0000-7000-8000-{:012x}", 0xa00 + i), 0, size, true)
+}
+
+/// A call of `example.alpha`'s uncapped `list`, asking these caps.
+fn capped_request(max_bytes: u64, max_chunks: u32) -> CallRequest {
+    CallRequest { limits: Some(WireLimits { max_bytes, max_rows: 0, max_chunks }), ..request("example.alpha", "list", b"{}") }
+}
+
+/// A call its caller dropped, its Cancel read: its id, whose chunks are `Late` from now on.
+async fn cancelled_call(rig: &Rig, a: &Served) -> String {
+    let mut client = rig.client().await;
+    let n = a.invokes().len();
+    let gone = call(&mut client, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("a call");
+    let rid = a.invoke(n).await.request_id;
+    drop(gone);
+    a.until("its Cancel", |r| r.cancels.iter().any(|c| c.request_id == rid && c.reason == "caller_gone")).await;
+    rid
+}
+
+/// Sends `frames` until the request stream goes: they run a budget out on the way.
+async fn send_until_closed(a: &Served, frames: impl Iterator<Item = worker_frame::Msg>) {
+    for msg in frames {
+        if a.out.send(wf(msg)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Sends one frame with no variant and waits for it to make `counted` of them, with no virtual time for a refill:
+/// every frame sent before it has been read, and the tunnel serves on.
+async fn read_so_far(rig: &Rig, a: &Served, counted: u64) {
+    a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    settle("the frames sent so far", || rig.app.snapshot().unknown_frames == counted).await;
+    assert!(a.closes().is_empty(), "the tunnel serves on: {:?}", a.closes());
+}
+
+/// Relay 40 (e) (paused; LD-R53): a chunk of a live call takes no frames token. Three 256-chunk answers at once, 768
+/// frames past the burst of 600 with no virtual time for a refill, close nothing; and the frames budget is whole after
+/// them: with the catalog's token, 599 frames with no variant pass and the next closes the tunnel. It is still a sign
+/// of life (R-29): with no Pong, a live call's chunks 30 s apart keep a tunnel past the 45 s of silence that close it
+/// after the last of them.
+#[tokio::test(start_paused = true)]
+async fn a_live_call_s_chunks_take_no_frames_token() {
+    let rig = Rig::start().await;
+    let together = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::with(move |inv, out| {
+        let together = std::sync::Arc::clone(&together);
+        tokio::spawn(async move {
+            together.wait().await;
+            for seq in 0..256 {
+                if out.send(wf(chunk_of(&inv.request_id, seq, 2, seq == 255))).await.is_err() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+    }));
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+    let mut calls = Vec::new();
+    for _ in 0..3 {
+        let stream = call_with(&mut client, &token, capped_request(0, 256)).await.expect("a call");
+        calls.push(tokio::spawn(drain(stream)));
+    }
+    for c in calls {
+        let (chunks, end) = c.await.unwrap();
+        assert!(end.is_ok());
+        assert!(chunks.len() == 256 && chunks.iter().all(|c| c.error.is_none()) && chunks[255].r#final, "{} chunks", chunks.len());
+    }
+    assert!(a.closes().is_empty(), "768 chunks of live calls: {:?}", a.closes());
+    let lines = rig.lines("call");
+    assert!(lines.len() == 3 && lines.iter().all(|l| l["outcome"] == "ok" && l["chunks"] == 256), "{lines:?}");
+    for _ in 0..598 {
+        a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    }
+    read_so_far(&rig, &a, 599).await;
+    a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script { pong: false, on_invoke: Box::new(|_, _| {}) });
+    let mut client = rig.client().await;
+    let req = CallRequest { deadline_ms: 120_000, ..capped_request(0, 0) };
+    let stream = call_with(&mut client, &rig.token("g-all"), req).await.expect("a call");
+    let caller = tokio::spawn(drain(stream));
+    let rid = a.invoke(0).await.request_id;
+    for seq in 0..3 {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        a.send(chunk_of(&rid, seq, 2, false)).await;
+    }
+    let last_chunk = Instant::now();
+    assert!(a.closes().is_empty(), "90 s of a live call's chunks: {:?}", a.closes());
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (5, "no frame for 45 s"));
+    assert_eq!(last_chunk.elapsed(), Duration::from_secs(45), "from the last chunk");
+    assert_eq!(caller.await.unwrap().0.len(), 4, "its three chunks and the final");
+}
+
+/// Relay 40 (f) (paused; LD-R53): a live call's chunk's `encoded_len()` goes back to the bytes bucket. Three answers
+/// of 16 MiB within a minute, 48 MiB past the burst of 32 MiB, close nothing. All of it goes back, not just enough:
+/// at a budget of 1 MiB, after three answers of 1 MiB, 15 late chunks of 64 KiB still fit, and a few more close it.
+#[tokio::test(start_paused = true)]
+async fn a_live_call_s_bytes_go_back_to_the_budget() {
+    let rig = Rig::start().await;
+    assert_eq!((Limits::default().tunnel_bytes_per_min, Limits::default().call_bytes_max, Limits::default().call_chunks_max), (32 << 20, 16 << 20, 256));
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(streaming(256, 65_536, Duration::from_millis(1)));
+    let t0 = Instant::now();
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+    let mut calls = Vec::new();
+    for _ in 0..3 {
+        let stream = call_with(&mut client, &token, capped_request(16 << 20, 256)).await.expect("a call");
+        calls.push(tokio::spawn(drain(stream)));
+    }
+    for c in calls {
+        let (chunks, end) = c.await.unwrap();
+        assert!(end.is_ok());
+        let bytes: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert_eq!(bytes, 16 << 20, "{} chunks", chunks.len());
+        assert!(chunks.iter().all(|c| c.error.is_none()) && chunks.last().unwrap().r#final);
+    }
+    assert!(t0.elapsed() < Duration::from_secs(1), "well within a minute: {:?}", t0.elapsed());
+    assert!(a.closes().is_empty(), "48 MiB of live calls: {:?}", a.closes());
+    let lines = rig.lines("call");
+    assert!(lines.len() == 3 && lines.iter().all(|l| l["outcome"] == "ok" && l["bytes"] == 16 << 20), "{lines:?}");
+
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    // `list` answers, and the `get` of `cancelled_call` does not.
+    let answer = streaming(16, 65_536, Duration::from_millis(1)).on_invoke;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::with(move |inv, out| {
+        if inv.op == "list" {
+            answer(inv, out);
+        }
+    }));
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+    for _ in 0..3 {
+        let (chunks, end) = drain(call_with(&mut client, &token, capped_request(0, 0)).await.expect("a call")).await;
+        assert!(end.is_ok() && chunks.len() == 16 && chunks.iter().all(|c| c.error.is_none()), "{} chunks", chunks.len());
+    }
+    let late = cancelled_call(&rig, &a).await;
+    for seq in 0..15 {
+        a.send(chunk_of(&late, seq, 65_536, false)).await;
+    }
+    read_so_far(&rig, &a, 1).await;
+    send_until_closed(&a, (15..20).map(|seq| chunk_of(&late, seq, 65_536, false))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+}
+
+/// Relay 40 (g) (paused; LD-R53): a chunk of no live call is charged as R-107 says, `Late` and `Unknown` alike. A
+/// cancelled call's late chunks: with the catalog's token 599 frames pass, and the next late chunk closes `inbound
+/// rate`. Chunks of ids never carried, besides R-109's bucket: with 584 frames with no variant, 15 of them pass, and
+/// the 16th, though R-109's bucket holds a token more, closes `inbound rate`. Their bytes do not come back: at a
+/// budget of 1 MiB, late chunks of 64 KiB close it `inbound rate`, and 16 chunks of ids never carried close it
+/// `inbound rate` before R-109's 17th.
+#[tokio::test(start_paused = true)]
+async fn chunks_of_no_live_call_stay_charged() {
+    let silent = |rig| async move { TestWorker::connect(rig, "worker-a", 1, catalog_a()).await.serve(Script::silent()) };
+
+    let rig = Rig::start().await;
+    let a = silent(&rig).await;
+    let late = cancelled_call(&rig, &a).await;
+    for seq in 0..598 {
+        a.send(chunk_of(&late, seq, 2, false)).await;
+    }
+    read_so_far(&rig, &a, 1).await;
+    a.send(chunk_of(&late, 598, 2, false)).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "the 601st frame");
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+
+    let rig = Rig::start().await;
+    let a = silent(&rig).await;
+    for _ in 0..583 {
+        a.out.send(WorkerFrame { msg: None }).await.unwrap();
+    }
+    for i in 0..15 {
+        a.send(stray_chunk(i, 2)).await;
+    }
+    read_so_far(&rig, &a, 584).await;
+    a.send(stray_chunk(15, 2)).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "the 601st frame, R-109's bucket not yet empty");
+
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    let a = silent(&rig).await;
+    let late = cancelled_call(&rig, &a).await;
+    send_until_closed(&a, (0..20).map(|seq| chunk_of(&late, seq, 65_536, false))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "late chunks' bytes do not come back");
+
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    let a = silent(&rig).await;
+    send_until_closed(&a, (0..17).map(|i| stray_chunk(i, 65_536))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "unknown chunks' bytes do not come back");
+}
+
+/// Relay 40 (h) (paused; LD-R53): a live call's chunk that breaks its caps ends the call as it did (R-39), and
+/// takes no token itself: the chunk cap's and the byte cap's truncated finals, and a `seq` out of order's code 13, each
+/// with its Cancel, four live chunks in all. From then on the calls' chunks are late, and charged: with the catalog's
+/// token 599 of them pass, and the next closes `inbound rate`. At a budget of 1 MiB the byte cap's chunk of 64 KiB
+/// goes back, the chunks after it do not, and they close it `inbound rate`.
+#[tokio::test(start_paused = true)]
+async fn a_chunk_over_its_call_s_caps_ends_the_call_and_its_later_chunks_are_charged() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+
+    let stream = call_with(&mut client, &token, capped_request(0, 2)).await.unwrap();
+    let chunk_capped = a.invoke(0).await.request_id;
+    a.send(chunk_of(&chunk_capped, 0, 2, false)).await;
+    a.send(chunk_of(&chunk_capped, 1, 2, false)).await;
+    let (chunks, end) = drain(stream).await;
+    assert!(end.is_ok() && chunks.len() == 2 && chunks[1].r#final && chunks[1].truncated, "{chunks:?}");
+    a.until("chunk_cap", |r| r.cancels.iter().any(|c| c.request_id == chunk_capped && c.reason == "chunk_cap")).await;
+
+    let stream = call_with(&mut client, &token, capped_request(100, 0)).await.unwrap();
+    let byte_capped = a.invoke(1).await.request_id;
+    a.send(chunk_of(&byte_capped, 0, 65_536, false)).await;
+    let (chunks, end) = drain(stream).await;
+    assert!(end.is_ok() && chunks.len() == 1 && chunks[0].r#final && chunks[0].truncated && chunks[0].data.len() == 100, "{} chunks", chunks.len());
+    a.until("byte_cap", |r| r.cancels.iter().any(|c| c.request_id == byte_capped && c.reason == "byte_cap")).await;
+
+    let stream = call_with(&mut client, &token, capped_request(0, 0)).await.unwrap();
+    let broken = a.invoke(2).await.request_id;
+    a.send(chunk_of(&broken, 5, 2, false)).await;
+    let (chunks, end) = drain(stream).await;
+    assert!(end.is_ok() && chunks.len() == 1 && final_code(&chunks[0]) == Some(13), "{chunks:?}");
+    a.until("protocol", |r| r.cancels.iter().any(|c| c.request_id == broken && c.reason == "protocol")).await;
+
+    let outcomes: Vec<String> = rig.lines("call").iter().map(|l| l["outcome"].as_str().unwrap().to_string()).collect();
+    assert_eq!(outcomes, ["truncated", "truncated", "violation"]);
+    let ended = [&chunk_capped, &byte_capped, &broken];
+    for seq in 0..598 {
+        a.send(chunk_of(ended[seq % 3], seq as u64, 2, false)).await;
+    }
+    read_so_far(&rig, &a, 1).await;
+    a.send(chunk_of(&broken, 598, 2, false)).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "the 601st frame charged");
+
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let mut client = rig.client().await;
+    let stream = call_with(&mut client, &rig.token("g-all"), capped_request(100, 0)).await.unwrap();
+    let byte_capped = a.invoke(0).await.request_id;
+    a.send(chunk_of(&byte_capped, 0, 65_536, false)).await;
+    assert!(drain(stream).await.0[0].truncated);
+    send_until_closed(&a, (1..20).map(|seq| chunk_of(&byte_capped, seq, 65_536, false))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "its later chunks' bytes do not come back");
+}
+
+/// Relay 40 (i) (paused; LD-R53; M-R170's case): only what a chunk's `encoded_len()` counts goes back. At a budget of
+/// 1 MiB, a live call's chunks of two bytes that each carry 64 KiB of fields `WorkerFrame` has not (a decoded length of
+/// about 60) close `inbound rate`, its caller getting its final (14). At a budget of 64 KiB, on a bare HTTP/2 tunnel: a
+/// live call's chunks, each in a DATA frame with 255 bytes of padding; then PINGs, and frames of a type HTTP/2 does
+/// not know, none of which decodes to anything.
+#[tokio::test(start_paused = true)]
+async fn what_a_decoded_chunk_does_not_count_stays_charged() {
+    use ai_env_relay_proto::prost::Message as _;
+    let rig = Rig::start_with(bytes_budget(1 << 20)).await;
+    let mut w = raw_tunnel(&rig).await;
+    let mut client = rig.client().await;
+    let stream = call_with(&mut client, &rig.token("g-all"), capped_request(0, 64)).await.expect("a call");
+    let rid = loop {
+        if let Some(relay_frame::Msg::Invoke(i)) = w.inbound.message().await.unwrap().and_then(|f| f.msg) {
+            break i.request_id;
+        }
+    };
+    let caller = tokio::spawn(drain(stream));
+    let out = w.out.clone();
+    let sender = tokio::spawn(async move {
+        for seq in 0..32 {
+            let mut frame = wf(chunk_of(&rid, seq, 2, false)).encode_to_vec();
+            frame.extend(raw::padded(65_536));
+            if out.send(frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    let close = w.close().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"));
+    let (chunks, end) = caller.await.unwrap();
+    assert!(end.is_ok());
+    let last = chunks.last().expect("a final chunk");
+    assert!(last.r#final && final_code(last) == Some(14) && (10..=17).contains(&chunks.len()), "{} chunks, the last {last:?}", chunks.len());
+    rig.until(Duration::from_secs(5), "its close line", |r| rate_lines(r) == 1).await;
+    sender.abort();
+
+    // HTTP/2's padding: at most 255 bytes a DATA frame (and h2 ends a connection for its empty DATA frames), so about
+    // 240 chunks, which the call's chunk cap allows. Each is read before the next is sent: its length goes back first.
+    const PADDED: u8 = 0x8;
+    let budget = 65_536usize;
+    let rig = Rig::start_with(bytes_budget(budget as u64)).await;
+    let (mut c, mut pending, mut acks) = bare_tunnel(&rig, 1 << 22).await;
+    let mut client = rig.client().await;
+    let stream = call_with(&mut client, &rig.token("g-all"), capped_request(0, 256)).await.expect("a call");
+    let rid = loop {
+        let frame = grpc_message::<ai_env_relay_proto::v1::RelayFrame>(&mut c, &mut pending, &mut acks).await.expect("its Invoke");
+        if let Some(relay_frame::Msg::Invoke(i)) = frame.msg {
+            break i.request_id;
+        }
+    };
+    let caller = tokio::spawn(drain(stream));
+    for seq in 0..255 {
+        let frame = [&[255u8][..], &bare_message(Some(chunk_of(&rid, seq, 2, false))), &[0u8; 255][..]].concat();
+        c.send(h2raw::DATA, PADDED, 1, &frame).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let close = bare_close(&mut c, &mut pending, &mut acks).await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "the padding of a live call's chunks");
+    let (chunks, end) = caller.await.unwrap();
+    assert!(end.is_ok());
+    let last = chunks.last().expect("a final chunk");
+    // 270 bytes of each frame stay charged (the padding, its length, the gRPC prefix and the frame's head): about 243
+    // of them, where a chunk's length not given back would make it about 192.
+    assert!(last.r#final && final_code(last) == Some(14) && (230..=250).contains(&chunks.len()), "{} chunks, the last {last:?}", chunks.len());
+
+    for (what, kind, payload) in [("PINGs", h2raw::PING, vec![0u8; 8]), ("frames of an unknown type", 0xfa, vec![0u8; 16_384])] {
+        let rig = Rig::start_with(bytes_budget(budget as u64)).await;
+        let (mut c, mut pending, mut acks) = bare_tunnel(&rig, 1 << 22).await;
+        for _ in 0..(budget + budget / 8) / (9 + payload.len()) + 1 {
+            c.send(kind, 0, 0, &payload).await;
+        }
+        let close = bare_close(&mut c, &mut pending, &mut acks).await;
+        assert_eq!((close.code, close.reason.as_str()), (3, "inbound rate"), "{what}");
+        assert_eq!(rig.app.snapshot().unknown_frames, 0, "{what}: no frame decoded");
+    }
+}
+
+/// One frame of a bare tunnel, as a gRPC message.
+fn bare_message(msg: Option<worker_frame::Msg>) -> Vec<u8> {
+    use ai_env_relay_proto::prost::Message as _;
+    let m = WorkerFrame { msg }.encode_to_vec();
+    h2raw::grpc(m.len() as u32, &m)
+}
+
+/// A tunnel on a bare HTTP/2 connection, a pipe of `pipe` bytes each way (relay 40's (d) and (i)): worker-a
+/// authenticated, its catalog sent, its AuthOk read. Returns what `grpc_message` keeps.
+async fn bare_tunnel(rig: &Rig, pipe: usize) -> (h2raw::Conn, Vec<u8>, usize) {
+    use ai_env_relay_proto::v1::RelayFrame;
+    let mut c = h2raw::Conn::open(rig.public_raw(pipe), Instant::now()).await;
+    let headers = h2raw::block(&[
+        (":method", b"POST"),
+        (":scheme", b"http"),
+        (":path", b"/ai_env.relay.v1.WorkerTunnel/Open"),
+        (":authority", b"ai-env-relay"),
+        ("content-type", b"application/grpc"),
+        ("te", b"trailers"),
+    ]);
+    c.send(h2raw::HEADERS, h2raw::END_HEADERS, 1, &headers).await;
+    let (mut pending, mut acks) = (Vec::new(), 0);
+    let challenge = match grpc_message::<RelayFrame>(&mut c, &mut pending, &mut acks).await.and_then(|f| f.msg) {
+        Some(relay_frame::Msg::Challenge(ch)) => ch,
+        other => panic!("the Challenge first, not {other:?}"),
+    };
+    let h = hello("worker-a", 1);
+    let p = proof(&challenge, &h, 1);
+    let mut auth = bare_message(Some(worker_frame::Msg::Hello(h)));
+    auth.extend(bare_message(Some(worker_frame::Msg::AuthProof(p))));
+    auth.extend(bare_message(Some(worker_frame::Msg::Catalog(Catalog { sources: catalog_a() }))));
+    c.send(h2raw::DATA, 0, 1, &auth).await;
+    let ok = grpc_message::<RelayFrame>(&mut c, &mut pending, &mut acks).await.and_then(|f| f.msg);
+    assert!(matches!(ok, Some(relay_frame::Msg::AuthOk(_))), "{ok:?}");
+    (c, pending, acks)
+}
+
+/// The Close a bare tunnel gets, the frames before it skipped.
+async fn bare_close(c: &mut h2raw::Conn, pending: &mut Vec<u8>, acks: &mut usize) -> ai_env_relay_proto::v1::Close {
+    use ai_env_relay_proto::v1::RelayFrame;
+    loop {
+        match grpc_message::<RelayFrame>(c, pending, acks).await.map(|f| f.msg) {
+            Some(Some(relay_frame::Msg::Close(close))) => return close,
+            Some(_) => {}
+            None => panic!("a Close before the connection's end"),
+        }
+    }
+}
+
+/// A tunnel whose frames are sent as bytes, so one can carry a field `WorkerFrame` has not (relay 40's (c) and (i)):
+/// worker-a authenticated, its catalog sent, its AuthOk read.
+async fn raw_tunnel(rig: &Rig) -> raw::Tunnel {
+    use ai_env_relay_proto::prost::Message as _;
+    let (channel, link) = rig.public_channel().await;
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.unwrap();
+    let (out, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let path = tonic::codegen::http::uri::PathAndQuery::from_static("/ai_env.relay.v1.WorkerTunnel/Open");
+    let request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let mut inbound = grpc.streaming(request, path, raw::Codec).await.expect("the Open").into_inner();
+    let challenge = match inbound.message().await.unwrap().and_then(|f| f.msg) {
+        Some(relay_frame::Msg::Challenge(c)) => c,
+        other => panic!("the Challenge first, not {other:?}"),
+    };
+    let h = hello("worker-a", 1);
+    let p = proof(&challenge, &h, 1);
+    for msg in [worker_frame::Msg::Hello(h), worker_frame::Msg::AuthProof(p), worker_frame::Msg::Catalog(Catalog { sources: catalog_a() })] {
+        out.send(wf(msg).encode_to_vec()).await.unwrap();
+    }
+    assert!(matches!(inbound.message().await.unwrap().and_then(|f| f.msg), Some(relay_frame::Msg::AuthOk(_))));
+    raw::Tunnel { out, inbound, _grpc: grpc, _link: link }
+}
+
+/// A bare HTTP/2 client's read of the relay's next gRPC message on stream 1 (relays 40 (d) and (i), and 44), decoded
+/// from its DATA frames (`pending` holds the bytes of one not whole yet), each PING ACK on the way counted in `acks`;
+/// None once the relay ends the connection.
+async fn grpc_message<M: ai_env_relay_proto::prost::Message + Default>(c: &mut h2raw::Conn, pending: &mut Vec<u8>, acks: &mut usize) -> Option<M> {
+    loop {
+        if pending.len() >= 5 {
+            let len = u32::from_be_bytes([pending[1], pending[2], pending[3], pending[4]]) as usize;
+            if pending.len() >= 5 + len {
+                let message = M::decode(&pending[5..5 + len]).expect("a message of its type");
+                pending.drain(..5 + len);
+                return Some(message);
+            }
+        }
+        let f = tokio::time::timeout(PATIENCE, c.next()).await.expect("a frame in time")?;
+        match f.kind {
+            h2raw::DATA if f.stream == 1 => pending.extend_from_slice(&f.payload),
+            h2raw::PING if f.flags & h2raw::ACK != 0 => *acks += 1,
+            _ => {}
+        }
+    }
+}
+
+/// Relay 40 (c)'s and (i)'s worker stream: frames sent as bytes, so one can carry a field no variant of `WorkerFrame`
+/// knows.
+mod raw {
+    use ai_env_relay_proto::prost::bytes::BufMut as _;
+    use ai_env_relay_proto::tonic_prost::ProstCodec;
+    use ai_env_relay_proto::v1::{relay_frame, Close, RelayFrame};
+    use tonic::codec::{EncodeBuf, Encoder};
+
+    /// `raw_tunnel`'s tunnel.
+    pub struct Tunnel {
+        pub out: tokio::sync::mpsc::Sender<Vec<u8>>,
+        pub inbound: tonic::Streaming<RelayFrame>,
+        pub _grpc: tonic::client::Grpc<tonic::transport::Channel>,
+        pub _link: super::Link,
+    }
+
+    impl Tunnel {
+        /// The Close it gets, the frames before it skipped.
+        pub async fn close(&mut self) -> Close {
+            loop {
+                match self.inbound.message().await {
+                    Ok(Some(f)) => {
+                        if let Some(relay_frame::Msg::Close(c)) = f.msg {
+                            return c;
+                        }
+                    }
+                    other => panic!("a Close before the end: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Encodes each frame's bytes as they are; decodes `RelayFrame`s.
+    pub struct Codec;
+
+    impl tonic::codec::Codec for Codec {
+        type Encode = Vec<u8>;
+        type Decode = RelayFrame;
+        type Encoder = AsIs;
+        type Decoder = <ProstCodec<RelayFrame, RelayFrame> as tonic::codec::Codec>::Decoder;
+
+        fn encoder(&mut self) -> AsIs {
+            AsIs
+        }
+
+        fn decoder(&mut self) -> Self::Decoder {
+            tonic::codec::Codec::decoder(&mut ProstCodec::<RelayFrame, RelayFrame>::default())
+        }
+    }
+
+    pub struct AsIs;
+
+    impl Encoder for AsIs {
+        type Item = Vec<u8>;
+        type Error = tonic::Status;
+
+        fn encode(&mut self, item: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), tonic::Status> {
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+
+    /// A frame of `n` bytes in field 99 (length-delimited), which no variant of `WorkerFrame` has: it decodes as a
+    /// frame with no variant, whose decoded length is 0.
+    pub fn padded(n: usize) -> Vec<u8> {
+        // (99 << 3) | 2 = 794, a two-byte varint.
+        let mut b = vec![0x9a, 0x06];
+        let mut len = n;
+        while len >= 0x80 {
+            b.push((len & 0x7f) as u8 | 0x80);
+            len >>= 7;
+        }
+        b.push(len as u8);
+        b.resize(b.len() + n, b'p');
+        b
+    }
+}
+
+/// Relay 41 (paused): a `Pong` must answer one of the relay's last eight unanswered Pings (R-108). A Pong of the
+/// outstanding seq keeps the tunnel, a late one of the older of two outstanding too; a Pong with no Ping outstanding,
+/// one of a seq never sent, and one answering a Ping twice close `Close{3, "unexpected pong"}`, reason `protocol`. With
+/// frames of no variant as signs of life, a Pong of the oldest of eight unanswered Pings keeps its tunnel; of nine
+/// unanswered, a Pong of seq 1 finds it forgotten and closes `unexpected pong`.
+#[tokio::test(start_paused = true)]
+async fn a_pong_must_answer_a_ping() {
+    let rig = Rig::start().await;
+    let quiet = || Script { pong: false, on_invoke: Box::new(|_, _| {}) };
+    let pong = |seq: u64| worker_frame::Msg::Pong(ai_env_relay_proto::v1::Pong { seq });
+    let protocol_lines = |rig: &Rig| rig.lines("tunnel").into_iter().filter(|l| l["phase"] == "close" && l["reason"] == "protocol").count();
+
+    // Answered, the newest and then a late one of the older.
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(quiet());
+    a.until("two pings", |r| r.pings.len() == 2).await;
+    a.send(pong(2)).await;
+    a.send(pong(1)).await;
+    a.until("a third ping", |r| r.pings.len() == 3).await;
+    a.send(pong(3)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(a.closes().is_empty(), "every Pong answered a Ping");
+
+    // No Ping outstanding: the first frame after the catalog.
+    let b = TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(quiet());
+    b.send(pong(1)).await;
+    let close = b.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "unexpected pong"));
+
+    // A seq never sent.
+    let c = TestWorker::connect(&rig, "worker-c", 5, catalog_c()).await.serve(quiet());
+    c.until("a ping", |r| !r.pings.is_empty()).await;
+    c.send(pong(99)).await;
+    let close = c.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "unexpected pong"));
+
+    // A Ping answered twice.
+    a.send(pong(3)).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "unexpected pong"));
+    rig.until(Duration::from_secs(5), "three close lines", |r| protocol_lines(r) == 3).await;
+    rig.tunnels(0).await;
+
+    // Quiet tunnels, each kept off its silence timer (45 s) by a frame of no variant at each Ping, every 15 s: one wait a
+    // Ping, since nine Pings take 135 s and one wait gives up at PATIENCE.
+    let unanswered = |w: Served, n: usize| async move {
+        for k in 1..=n {
+            w.until(&format!("ping {k}"), |r| r.pings.len() == k).await;
+            w.out.send(WorkerFrame { msg: None }).await.unwrap();
+        }
+        w
+    };
+    let eight = unanswered(TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(quiet()), 8).await;
+    eight.send(pong(1)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(eight.closes().is_empty(), "the oldest of eight is remembered: {:?}", eight.closes());
+    let nine = unanswered(TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(quiet()), 9).await;
+    nine.send(pong(1)).await;
+    let close = nine.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "unexpected pong"), "the ninth forgot the oldest");
+}
+
+/// Relay 42 (paused): chunks of no call have a budget (R-109). 40 late chunks of a cancelled call (one of the table's
+/// recent calls) never count against it (R-107's frames and bytes charge them, relay 40 (g)); 16 chunks of ids never
+/// carried are dropped, the tunnel serving on; the 17th closes it `Close{3, "chunks of no call"}`, reason `protocol`.
+/// Every one of them is counted, the 17th before its token is asked (`dropped_chunks`). On a new tunnel, the bucket's
+/// refill: after the 16, exactly one token's wait (3.75 s at 16 a minute) buys one more, and the next closes.
+#[tokio::test(start_paused = true)]
+async fn chunks_of_no_call_are_budgeted() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let mut client = rig.client().await;
+    let token = rig.token("g-all");
+    let gone = call(&mut client, &token, "example.alpha", "get", b"{}").await.unwrap();
+    let rid = a.invoke(0).await.request_id;
+    drop(gone);
+    a.until("the Cancel", |r| r.cancels.iter().any(|c| c.reason == "caller_gone")).await;
+    for seq in 0..40 {
+        a.send(worker_frame::Msg::Chunk(data(&rid, seq, b"{}".to_vec(), false))).await;
+    }
+    for i in 0..16 {
+        a.send(worker_frame::Msg::Chunk(data(&format!("0199a1b2-0000-7000-8000-{:012x}", 0x900 + i), 0, b"{}".to_vec(), true))).await;
+    }
+    // A call still answered: the frames before it were taken, and the tunnel serves on.
+    let stream = call(&mut client, &token, "example.alpha", "get", b"{}").await.unwrap();
+    let rid2 = a.invoke(1).await.request_id;
+    a.send(worker_frame::Msg::Chunk(data(&rid2, 0, b"{\"ok\":1}".to_vec(), true))).await;
+    let (chunks, _) = drain(stream).await;
+    assert!(chunks.len() == 1 && final_code(&chunks[0]).is_none(), "{chunks:?}");
+    assert!(a.closes().is_empty());
+    assert_eq!(rig.app.dropped_chunks(), 56, "40 late and 16 unknown, dropped and counted");
+    a.send(worker_frame::Msg::Chunk(data("0199a1b2-0000-7000-8000-000000000999", 0, b"{}".to_vec(), true))).await;
+    let close = a.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "chunks of no call"));
+    assert_eq!(rig.app.dropped_chunks(), 57, "the 17th is counted too");
+    rig.until(Duration::from_secs(5), "its close line", |r| r.lines("tunnel").iter().any(|l| l["phase"] == "close" && l["reason"] == "protocol")).await;
+
+    // The refill: 16 a minute, a token every 3.75 s exactly.
+    rig.tunnels(0).await;
+    let b = TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(Script::silent());
+    for i in 0..16 {
+        b.send(stray_chunk(i, 2)).await;
+    }
+    read_so_far(&rig, &b, 1).await;
+    assert_eq!(rig.app.dropped_chunks(), 57 + 16);
+    tokio::time::sleep(Duration::from_millis(3750)).await;
+    b.send(stray_chunk(16, 2)).await;
+    read_so_far(&rig, &b, 2).await;
+    assert_eq!(rig.app.dropped_chunks(), 57 + 17, "one token's wait bought one more, and the tunnel serves on");
+    b.send(stray_chunk(17, 2)).await;
+    let close = b.closed().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "chunks of no call"), "and only one");
+}
+
+/// Relay 43 (paused): a catalog identical to the installed one touches no lock (R-110: no validation, no registry
+/// install), and catalogs have a budget: three identical catalogs make one install; a fourth within the minute
+/// closes `Close{3, "catalog rate"}`, reason `rate`. On a new tunnel, the bucket's refill: after the burst of three,
+/// exactly one token's wait (10 s at 6 a minute) buys one more, which installs, and the next closes.
+#[tokio::test(start_paused = true)]
+async fn identical_catalogs_touch_no_lock_and_catalogs_are_budgeted() {
+    let rig = Rig::start().await;
+    let mut a = TestWorker::open(&rig).await;
+    a.authenticate("worker-a", 1).await.expect("authenticated");
+    for _ in 0..3 {
+        a.register(catalog_a()).await;
+    }
+    a.register(vec![source("example.alpha", &["get"])]).await;
+    let close = a.close().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "catalog rate"));
+    assert_eq!(rig.app.catalog_installs(), 1, "the identical two installed nothing; the fourth met the bucket first");
+    rig.until(Duration::from_secs(5), "its close line", |r| r.lines("tunnel").iter().any(|l| l["phase"] == "close" && l["reason"] == "rate")).await;
+
+    // The refill: 6 a minute, a token every 10 s exactly.
+    let narrower = || vec![source("example.beta", &["get"])];
+    let mut b = TestWorker::open(&rig).await;
+    b.authenticate("worker-b", 2).await.expect("authenticated");
+    for _ in 0..3 {
+        b.register(catalog_b()).await;
+    }
+    settle("the first of its catalogs", || rig.app.catalog_installs() == 2).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    b.register(narrower()).await;
+    settle("one token's wait bought one more", || rig.app.catalog_installs() == 3).await;
+    b.register(catalog_b()).await;
+    let close = b.close().await;
+    assert_eq!((close.code, close.reason.as_str()), (3, "catalog rate"), "and only one");
+    assert_eq!(rig.app.catalog_installs(), 3, "the fifth met the bucket first");
+}
+
+/// A script answering by its params' `mode` (relay 44): `paced` sends `n` chunks of 1 KiB 300 ms apart (the first at
+/// once; the last final when `last`); `burst12` twelve chunks of 1 KiB in one write, the last final; `burst6` six
+/// chunks of 64 KiB in one write, none final (`burst6final`: the sixth final).
+fn by_mode() -> Script {
+    Script::with(|inv, out| {
+        let params: serde_json::Value = serde_json::from_slice(&inv.params_json).unwrap_or_default();
+        let rid = inv.request_id.clone();
+        let chunk = move |seq: u64, last: bool| wf(worker_frame::Msg::Chunk(data(&rid, seq, vec![b'x'; 1024], last)));
+        match params["mode"].as_str().unwrap_or_default() {
+            "burst12" => (0..12).for_each(|seq| drop(out.try_send(chunk(seq, seq == 11)))),
+            mode @ ("burst6" | "burst6final") => {
+                let (rid, last) = (inv.request_id.clone(), mode == "burst6final");
+                (0..6).for_each(|seq| drop(out.try_send(wf(worker_frame::Msg::Chunk(data(&rid, seq, vec![b'x'; 65_536], last && seq == 5))))));
+            }
+            "paced" => {
+                let (n, last) = (params["n"].as_u64().unwrap_or(1), params["last"].as_bool().unwrap_or(false));
+                tokio::spawn(async move {
+                    for seq in 0..n {
+                        if seq > 0 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        if out.send(chunk(seq, last && seq + 1 == n)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
+    })
+}
+
+/// Relay 44 (paused): a caller that stops reading never stalls its tunnel (R-111), and its evictions are charged
+/// only when it left a chunk unread a second (R-112). Two sessions on one tunnel: the slow one never reads (a stream
+/// window of 0) and calls again after each eviction, its worker sending each call's chunks 300 ms apart; the other's
+/// 16 chunks, 300 ms apart too, complete within its 6 s deadline. The slow stream takes its first chunk (hyper's one
+/// frame, `deaf_client`); the next four fill its buffer, and each slow call is evicted as the chunk after them finds
+/// the buffer full after one yield, 1.5 s after the call, with no wait (`Cancel{"caller_too_slow"}`), its oldest
+/// buffered chunk 1.2 s old, so charged; after the third eviction the slow session's fourth call is refused 8 `rate
+/// limited`. A worker's burst of 12 chunks in one write, to a caller that reads, completes with no eviction (the
+/// yield); bursts of 6 chunks to a caller that never reads (the first taken, four buffered, the sixth evicting) evict
+/// without a charge (their oldest buffered chunk 0 s old), so a fourth such call is admitted.
+#[tokio::test(start_paused = true)]
+async fn a_caller_that_stops_reading_never_stalls_its_tunnel() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(by_mode());
+    let evicted = |r: &Recorded, rid: &str| r.cancels.iter().any(|c| c.request_id == rid && c.reason == "caller_too_slow");
+
+    let mut reader = rig.client().await;
+    let reader_token = rig.token("g-all");
+    let t0 = Instant::now();
+    let other = tokio::spawn(async move {
+        let req = CallRequest { deadline_ms: 6000, ..request("example.alpha", "get", br#"{"mode":"paced","n":16,"last":true}"#) };
+        drain(call_with(&mut reader, &reader_token, req).await.expect("the other call")).await
+    });
+    let (mut deaf, _deaf_link) = deaf_client(&rig).await;
+    let slow = rig.token("g-all");
+    let mut held = Vec::new();
+    for i in 0..3 {
+        let started = Instant::now();
+        let resp = call_response(&mut deaf, &slow, request("example.alpha", "get", br#"{"mode":"paced","n":8,"last":false}"#)).await.expect("a slow call");
+        let rid = request_id(resp.metadata());
+        a.until("its eviction", |r| evicted(r, &rid)).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(1500), "slow call {i}: evicted as its sixth chunk came, with no wait");
+        held.push(resp);
+    }
+    let refused = call(&mut deaf, &slow, "example.alpha", "get", br#"{"mode":"paced","n":8}"#).await.expect_err("three charged evictions");
+    assert_eq!((refused.code(), refused.message()), (Code::ResourceExhausted, "rate limited"));
+    let (chunks, end) = other.await.unwrap();
+    assert!(end.is_ok());
+    assert!(chunks.len() == 16 && chunks.iter().all(|c| c.error.is_none()) && chunks[15].r#final, "{} chunks", chunks.len());
+    assert_eq!(t0.elapsed(), Duration::from_millis(4500), "the other call's chunks came as they were sent");
+    let lines = rig.lines("call");
+    assert_eq!(lines.iter().filter(|l| l["outcome"] == "evicted").count(), 3);
+    assert_eq!(lines.iter().filter(|l| l["outcome"] == "rate_limited").count(), 1);
+
+    // A burst to a caller that reads: the yield lets it drain, so nothing is evicted.
+    let mut reader = rig.client().await;
+    let (chunks, end) = drain(call(&mut reader, &rig.token("g-all"), "example.alpha", "get", br#"{"mode":"burst12"}"#).await.unwrap()).await;
+    assert!(end.is_ok());
+    assert!(chunks.len() == 12 && chunks.iter().all(|c| c.error.is_none()) && chunks[11].r#final, "{chunks:?}");
+
+    // Bursts to a caller that never reads: evicted, and never charged.
+    let (mut deaf, _deaf_link) = deaf_client(&rig).await;
+    let bursty = rig.token("g-all");
+    for _ in 0..3 {
+        let resp = call_response(&mut deaf, &bursty, request("example.alpha", "get", br#"{"mode":"burst6"}"#)).await.expect("a burst call");
+        let rid = request_id(resp.metadata());
+        a.until("its eviction", |r| evicted(r, &rid)).await;
+        held.push(resp);
+    }
+    let fourth = call(&mut deaf, &bursty, "example.alpha", "get", br#"{"mode":"burst6"}"#).await;
+    assert!(fourth.is_ok(), "uncharged evictions: a fourth call is admitted: {:?}", fourth.err());
+    assert!(a.closes().is_empty(), "the tunnel never stalled nor closed");
+
+    // A last chunk that finds the buffer full is kept, and evicts nothing (R-42, R-111): a bare client whose streams
+    // have no window, then a burst of six chunks of 64 KiB, the sixth final (hyper takes the first, four fill the
+    // buffer); once the client grants a window it reads all six, the sixth its worker's own final.
+    use ai_env_relay_proto::prost::Message as _;
+    let mut c = h2raw::Conn::open(rig.private_raw(1 << 20), Instant::now()).await;
+    c.send(h2raw::SETTINGS, 0, 0, &[0x00, 0x04, 0, 0, 0, 0]).await;
+    let token = rig.token("g-all");
+    let headers = h2raw::block(&[
+        (":method", b"POST"),
+        (":scheme", b"http"),
+        (":path", b"/ai_env.relay.v1.Relay/Call"),
+        (":authority", b"10.42.0.20"),
+        ("content-type", b"application/grpc"),
+        ("te", b"trailers"),
+        ("x-ai-env-session", token.as_bytes()),
+    ]);
+    c.send(h2raw::HEADERS, h2raw::END_HEADERS, 1, &headers).await;
+    let params = br#"{"mode":"burst6final"}"#;
+    let req = request("example.alpha", "get", params).encode_to_vec();
+    c.send(h2raw::DATA, h2raw::END_STREAM, 1, &h2raw::grpc(req.len() as u32, &req)).await;
+    a.until("its invoke", |r| r.invokes.iter().any(|i| i.params_json == params)).await;
+    let rid = a.invokes().into_iter().find(|i| i.params_json == params).expect("its invoke").request_id;
+    rig.until(Duration::from_secs(5), "its call line", |r| r.lines("call").iter().any(|l| l["request_id"] == rid.as_str())).await;
+    let line = rig.lines("call").into_iter().find(|l| l["request_id"] == rid.as_str()).expect("its call line");
+    assert_eq!(line["outcome"], "ok", "the full buffer's last chunk ended the call, and evicted nothing");
+    assert!(!a.cancels().iter().any(|c| c.request_id == rid), "no Cancel for it");
+    for stream in [1u32, 0] {
+        c.send(h2raw::WINDOW_UPDATE, 0, stream, &(1u32 << 20).to_be_bytes()).await;
+    }
+    let (mut pending, mut acks) = (Vec::new(), 0);
+    let mut chunks = Vec::new();
+    while chunks.len() < 6 {
+        chunks.push(grpc_message::<CallChunk>(&mut c, &mut pending, &mut acks).await.expect("the call's chunks"));
+    }
+    assert_eq!(chunks.iter().map(|c| c.seq).collect::<Vec<u64>>(), (0..6).collect::<Vec<u64>>());
+    let last = &chunks[5];
+    assert!(last.r#final && last.error.is_none() && last.data.len() == 65_536, "the worker's own final: {:?}", (last.r#final, &last.error, last.data.len()));
+    assert!(chunks[..5].iter().all(|c| !c.r#final && c.error.is_none()));
+}
+
+/// Relay 49 (R-49): an answer over `list_max_bytes` is refused 8 `catalog too large`, with its list line, and the bound
+/// is the encoded answer's after the grant's filter: a grant narrowed to one op is served the same source.
+#[tokio::test]
+async fn a_list_over_its_cap_is_refused() {
+    assert_eq!(Limits::default().list_max_bytes, 507_904, "LD-R50's share of a stream, 496 KiB");
+    let rig = Rig::start_with(Limits { list_max_bytes: 65_536, ..limits() }).await;
+    let ops: Vec<String> = (0..48).map(|i| if i == 0 { "get".to_string() } else { format!("op-{i}") }).collect();
+    let mut large = source("example.alpha", &ops.iter().map(String::as_str).collect::<Vec<_>>());
+    large.ops.iter_mut().for_each(|op| op.description = "d".repeat(2048));
+    let _a = TestWorker::connect(&rig, "worker-a", 1, vec![large]).await.serve(Script::silent());
+    let mut client = rig.client().await;
+    let s = list(&mut client, &rig.token("g-all")).await.expect_err("over the cap");
+    assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "catalog too large"));
+    let line = rig.lines("list").pop().unwrap();
+    assert_eq!((line["outcome"].as_str(), line["code"].as_i64()), (Some("too_large"), Some(8)));
+    let listed = list(&mut client, &rig.token("g-alpha-get")).await.expect("its one op fits");
+    assert_eq!(names(&listed), vec![("example.alpha".to_string(), true)]);
+}
+
+/// Relay 50 (paused; R-103's last bullet): the relay's stop cuts a private connection a second later with no line. A
+/// client that never reads holds a silent call at the stop: its connection closes one second after the stop (an idle
+/// one would close at once, on tonic's GOAWAY; the undrained cut would come at 10 s), and no peer line is written.
+#[tokio::test(start_paused = true)]
+async fn the_stop_cuts_a_private_connection_a_second_later_with_no_line() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let (mut deaf, link) = deaf_client(&rig).await;
+    let held = call(&mut deaf, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("a silent call");
+    a.invoke(0).await;
+    let stop = Instant::now();
+    rig.app.shutdown();
+    rig.until(Duration::from_secs(20), "the cut", |_| link.peer_closed_at().is_some()).await;
+    assert_eq!(link.peer_closed_at(), Some(stop + Duration::from_secs(1)), "a second after the stop");
+    assert!(rig.lines("peer").is_empty(), "{:?}", rig.lines("peer"));
+    drop(held);
+}
+
+/// Relay 51 (paused; R-103's last bullet): a stop already seen beats a cut due at the same instant. 32 private
+/// connections with no request, their token deadline due at 5 s, and the stop at exactly 5 s, before any of their
+/// watches ran (`advance` fires their timers and returns here first: a current-thread runtime polls its `block_on`
+/// future before the tasks those timers woke). Every watch then sees both, and no `auth_timeout` is written. An
+/// unbiased select would pick the due cut for about a quarter of them.
+#[tokio::test(start_paused = true)]
+async fn a_stop_beats_a_cut_due_at_the_same_instant() {
+    let rig = Rig::start().await;
+    let t0 = Instant::now();
+    let mut idle = Vec::new();
+    for _ in 0..32 {
+        idle.push(rig.private_channel().await);
+    }
+    tokio::time::sleep_until(t0 + Duration::from_millis(4999)).await;
+    assert!(rig.lines("peer").is_empty());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(t0.elapsed(), Duration::from_secs(5));
+    assert!(rig.lines("peer").is_empty(), "no watch ran before the stop");
+    rig.app.shutdown();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(rig.lines("peer").is_empty(), "{:?}", rig.lines("peer"));
+    drop(idle);
 }

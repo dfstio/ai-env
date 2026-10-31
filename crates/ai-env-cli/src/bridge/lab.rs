@@ -122,9 +122,10 @@ pub fn pump_knobs() -> PumpKnobs {
 
 /// The S4 knob names (and S6's agent address, S7's unseal budget, S9's
 /// loopback S3 and code-token minutes, S10's park quiet, S11's release curl,
-/// gpgv and admission make), for the banner and the test harnesses' scrub
-/// lists. S11's clock ([`NOW_KNOB`]) is none of them: it prints no banner.
-pub const VM_KNOBS: [&str; 11] = [
+/// gpgv and admission make, the relay security plan's checkip), for the banner
+/// and the test harnesses' scrub lists. S11's clock ([`NOW_KNOB`]) is none of
+/// them: it prints no banner.
+pub const VM_KNOBS: [&str; 12] = [
     "AI_ENV_BRIDGE_LAB_FAKE_API",
     "AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL",
     "AI_ENV_BRIDGE_LAB_BACKOFF_MS",
@@ -136,6 +137,7 @@ pub const VM_KNOBS: [&str; 11] = [
     "AI_ENV_BRIDGE_LAB_RELEASE_CURL",
     "AI_ENV_BRIDGE_LAB_GPGV",
     "AI_ENV_BRIDGE_LAB_ADMIT_MAKE",
+    "AI_ENV_BRIDGE_LAB_CHECKIP",
 ];
 
 /// `AI_ENV_BRIDGE_LAB_PARK_AFTER_MS`'s range (S10 §9): 1 ms to an hour.
@@ -190,6 +192,12 @@ pub struct VmKnobs {
     /// `AI_ENV_BRIDGE_LAB_ADMIT_MAKE=<path>` (S11): make, for the admission's
     /// Docker tests, as the release curl.
     pub admit_make: Option<std::path::PathBuf>,
+    /// `AI_ENV_BRIDGE_LAB_CHECKIP=127.0.0.1:<port>` (relay security plan
+    /// §RS.4.2): `relay allow-ip --mine` asks a test's loopback server for
+    /// this Mac's address, in plain http through `tls::lab_http_client`,
+    /// instead of `https://checkip.amazonaws.com/`; honoured without the fake
+    /// API. See [`VmKnobs::checkip_addr`].
+    pub checkip_addr: Option<String>,
 }
 
 impl VmKnobs {
@@ -231,6 +239,9 @@ impl VmKnobs {
         }
         if self.admit_make.is_some() {
             out.push(VM_KNOBS[10]);
+        }
+        if self.checkip_addr.is_some() {
+            out.push(VM_KNOBS[11]);
         }
         out
     }
@@ -302,6 +313,19 @@ impl VmKnobs {
         }
     }
 
+    /// The validated checkip address (§RS.4.2): `Ok(None)` when unset; an
+    /// error when not a loopback `ip:port` with a port. Nothing but `relay
+    /// allow-ip --mine` reads it, so no fake API is asked for.
+    pub fn checkip_addr(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let Some(raw) = &self.checkip_addr else {
+            return Ok(None);
+        };
+        match raw.trim().parse::<std::net::SocketAddr>() {
+            Ok(a) if a.ip().is_loopback() && a.port() != 0 => Ok(Some(a)),
+            _ => Err(format!("{}={raw:?}: expected a loopback ip:port", VM_KNOBS[11])),
+        }
+    }
+
     /// A 9418 token's minutes (S9): the knob's value from 1 to 15, else none.
     #[must_use]
     pub fn code_token_minutes(&self) -> Option<u16> {
@@ -337,6 +361,7 @@ pub fn parse_vm_knobs(fake_api: Option<&str>, unseal: Option<&str>, backoff_ms: 
         release_curl: None,
         gpgv: None,
         admit_make: None,
+        checkip_addr: None,
     }
 }
 
@@ -361,6 +386,7 @@ pub fn vm_knobs() -> VmKnobs {
         release_curl: get(VM_KNOBS[8]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
         gpgv: get(VM_KNOBS[9]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
         admit_make: get(VM_KNOBS[10]).filter(|v| !v.trim().is_empty()).map(std::path::PathBuf::from),
+        checkip_addr: get(VM_KNOBS[11]).filter(|v| !v.trim().is_empty()),
         ..parse_vm_knobs(get(VM_KNOBS[0]).as_deref(), get(VM_KNOBS[1]).as_deref(), get(VM_KNOBS[2]).as_deref())
     }
 }
@@ -549,7 +575,7 @@ mod tests {
     #[test]
     fn the_s11_knobs_need_the_fake_api() {
         use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(VM_KNOBS[8..], ["AI_ENV_BRIDGE_LAB_RELEASE_CURL", "AI_ENV_BRIDGE_LAB_GPGV", "AI_ENV_BRIDGE_LAB_ADMIT_MAKE"]);
+        assert_eq!(VM_KNOBS[8..11], ["AI_ENV_BRIDGE_LAB_RELEASE_CURL", "AI_ENV_BRIDGE_LAB_GPGV", "AI_ENV_BRIDGE_LAB_ADMIT_MAKE"]);
         assert!(!VM_KNOBS.contains(&NOW_KNOB), "the clock prints no banner");
         let d = tempfile::tempdir().unwrap();
         let exe = d.path().join("fake-curl");
@@ -571,6 +597,23 @@ mod tests {
         assert_eq!((VmKnobs::default().release_curl(), VmKnobs::default().gpgv(), VmKnobs::default().admit_make()), (Ok(None), Ok(None), Ok(None)));
         let parsed = parse_vm_knobs(Some("/f.json"), None, None);
         assert_eq!((parsed.release_curl, parsed.gpgv, parsed.admit_make), (None, None, None), "set by vm_knobs alone");
+    }
+
+    /// §RS.4.2: the checkip knob is the twelfth, a loopback `ip:port` with a
+    /// port, honoured and announced without the fake API; blank is no knob;
+    /// `parse_vm_knobs` never sets it.
+    #[test]
+    fn the_checkip_knob_is_a_loopback_address_and_announced() {
+        assert_eq!((VM_KNOBS.len(), VM_KNOBS[11]), (12, "AI_ENV_BRIDGE_LAB_CHECKIP"));
+        let at = |addr: &str| VmKnobs { checkip_addr: Some(addr.to_string()), ..VmKnobs::default() };
+        assert_eq!(VmKnobs::default().checkip_addr(), Ok(None));
+        assert_eq!(at("127.0.0.1:18080").checkip_addr(), Ok(Some("127.0.0.1:18080".parse().unwrap())), "no fake API asked for");
+        assert_eq!(at(" [::1]:18080 ").checkip_addr(), Ok(Some("[::1]:18080".parse().unwrap())));
+        for bad in ["192.0.2.1:18080", "checkip.amazonaws.com:80", "127.0.0.1", "127.0.0.1:0", "garbage"] {
+            assert!(at(bad).checkip_addr().unwrap_err().starts_with("AI_ENV_BRIDGE_LAB_CHECKIP="), "{bad}");
+        }
+        assert_eq!(at("127.0.0.1:1").active(), vec![VM_KNOBS[11]], "announced");
+        assert_eq!(parse_vm_knobs(None, None, None).checkip_addr, None, "set by vm_knobs alone");
     }
 
     /// S11 (B §B1.4): the views' clock takes 1 to 2100-01-01 in digits only.

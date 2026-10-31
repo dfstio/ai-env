@@ -4,11 +4,13 @@
 //! `serde_json::to_vec(&SessionClaims)` wrote, and the verifier parses the very bytes that were signed, so no
 //! canonical JSON is needed.
 
+use std::sync::OnceLock;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use crate::globs::{valid_id, valid_uuid, valid_vm_id};
-use crate::keys::SIGNATURE_LEN;
+use crate::keys::{PublicKey, SigningKey, SIGNATURE_LEN};
 
 /// The signing input's domain.
 pub const SESSION_DOMAIN: &[u8] = b"ai-env/relay/session/v1";
@@ -91,14 +93,43 @@ pub fn mint(key: &crate::keys::SigningKey, claims: &SessionClaims, now: u64) -> 
     Ok(token)
 }
 
-/// WM-R6's checks, in order.
+/// The throw-away key's seed (F17): a constant, so its private half is public knowledge and a signature it
+/// verifies admits nobody: `verify` checks against it only on its way to a fault.
+const THROWAWAY_SEED: [u8; 32] = *b"ai-env session: a key of no Mac.";
+
+/// The throw-away key, made once.
+fn throwaway_key() -> PublicKey {
+    static KEY: OnceLock<PublicKey> = OnceLock::new();
+    *KEY.get_or_init(|| SigningKey::from_seed(&THROWAWAY_SEED).expect("a constant 32-byte seed is an Ed25519 key").public_key())
+}
+
+/// The one Ed25519 verify of a token (F17); the unit tests count the calls.
+fn verify_once(key: &PublicKey, input: &[u8], signature: &[u8]) -> bool {
+    #[cfg(test)]
+    tests::VERIFIES.with(|n| n.set(n.get() + 1));
+    key.verify(input, signature)
+}
+
+/// WM-R6's checks, in order. Every token that parses runs exactly one verify (F17): the signer's key while it is in
+/// force, else the throw-away key, with `UnknownSigner` or `SignerExpired` returned after it; so the time of a
+/// refusal says nothing about which `kid`s are signers.
 pub fn verify(token: &str, now: u64, signer: &dyn Fn(&str) -> Option<SignerKey>) -> Result<VerifiedSession, SessionError> {
     let shape = parse(token)?;
-    let key = signer(&shape.claims.kid).ok_or(SessionError::UnknownSigner)?;
-    if now > key.not_after {
-        return Err(SessionError::SignerExpired);
+    let key = signer(&shape.claims.kid);
+    let fault = match &key {
+        None => Some(SessionError::UnknownSigner),
+        Some(k) if now > k.not_after => Some(SessionError::SignerExpired),
+        Some(_) => None,
+    };
+    let checked = match (&fault, &key) {
+        (None, Some(k)) => k.public_key,
+        _ => throwaway_key(),
+    };
+    let verified = verify_once(&checked, &signing_input(&shape.json), &shape.signature);
+    if let Some(fault) = fault {
+        return Err(fault);
     }
-    if !key.public_key.verify(&signing_input(&shape.json), &shape.signature) {
+    if !verified {
         return Err(SessionError::BadSignature);
     }
     check_claims(&shape.claims, now)?;
@@ -203,7 +234,11 @@ pub enum SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::SigningKey;
+
+    thread_local! {
+        /// `verify_once`'s calls on this thread.
+        pub(super) static VERIFIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
 
     fn sha256(bytes: &[u8]) -> String {
         aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect()
@@ -334,5 +369,54 @@ mod tests {
         assert_eq!(bad(&|c| c.iat = NOW + 301), Err(SessionError::NotYetValid));
         assert_eq!(bad(&|c| c.exp = NOW), Err(SessionError::Expired));
         assert!(bad(&|c| c.vm_id = "a".repeat(128)).is_ok(), "a 128-character VM id");
+    }
+
+    /// F17: every token that parses runs exactly one verify, refused or not (an unknown or lapsed signer as a good
+    /// one); one that does not parse runs none. The throw-away key is no signer's, and a token it signs (its seed is
+    /// in the source) is refused whatever its `kid`.
+    #[test]
+    fn every_parsed_token_verifies_once() {
+        let key = seven();
+        let good = mint(&key, &claims(), NOW).expect("minted");
+        let json = serde_json::to_vec(&claims()).expect("json");
+        let with = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value = serde_json::from_slice(&json).expect("json");
+            f(&mut v);
+            token_of(&key, &serde_json::to_vec(&v).expect("json"))
+        };
+        let (claims_part, sig_part) = good[3..].split_once('.').expect("two parts");
+        let mut sig = URL_SAFE_NO_PAD.decode(sig_part).expect("b64");
+        sig[0] ^= 0x01;
+        let flipped = format!("v1.{claims_part}.{}", URL_SAFE_NO_PAD.encode(&sig));
+        let unknown = with(&|v| v["kid"] = "other".into());
+        let aud = with(&|v| v["aud"] = "relay-test".into());
+        let cases = [
+            ("a good token", good.as_str(), u64::MAX, NOW, Ok(()), 1),
+            ("a flipped signature", flipped.as_str(), u64::MAX, NOW, Err(SessionError::BadSignature), 1),
+            ("an unknown signer", unknown.as_str(), u64::MAX, NOW, Err(SessionError::UnknownSigner), 1),
+            ("a lapsed signer", good.as_str(), NOW - 1, NOW, Err(SessionError::SignerExpired), 1),
+            ("a bad claim after the signature", aud.as_str(), u64::MAX, NOW, Err(SessionError::BadClaim("aud")), 1),
+            ("an expired token", good.as_str(), u64::MAX, claims().exp, Err(SessionError::Expired), 1),
+            ("no token's shape", "v2.x.y", u64::MAX, NOW, Err(SessionError::Malformed("not v1.")), 0),
+        ];
+        for (what, token, not_after, now, want, n) in cases {
+            VERIFIES.with(|c| c.set(0));
+            let got = verify(token, now, &signers(not_after)).map(|_| ());
+            assert_eq!(got, want, "{what}");
+            assert_eq!(VERIFIES.with(std::cell::Cell::get), n, "{what}");
+        }
+
+        let decoy = SigningKey::from_seed(&THROWAWAY_SEED).expect("seed");
+        assert_eq!(throwaway_key(), decoy.public_key());
+        let test_keys: Vec<PublicKey> = [1u8, 2, 5, 7].iter().map(|s| SigningKey::from_seed(&[*s; 32]).expect("seed").public_key()).collect();
+        assert!(!test_keys.contains(&throwaway_key()), "no test seed's key");
+        let by_decoy = |kid: &str| {
+            let mut v: serde_json::Value = serde_json::from_slice(&json).expect("json");
+            v["kid"] = kid.into();
+            token_of(&decoy, &serde_json::to_vec(&v).expect("json"))
+        };
+        assert_eq!(verify(&by_decoy("other"), NOW, &signers(u64::MAX)), Err(SessionError::UnknownSigner));
+        assert_eq!(verify(&by_decoy("mac"), NOW, &signers(u64::MAX)), Err(SessionError::BadSignature));
+        assert_eq!(verify(&by_decoy("mac"), NOW, &signers(NOW - 1)), Err(SessionError::SignerExpired));
     }
 }

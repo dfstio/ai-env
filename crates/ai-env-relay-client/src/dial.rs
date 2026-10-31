@@ -170,7 +170,8 @@ impl RelayLink {
     }
 
     /// `ListSources` within [`CATALOG_CEILING`] (V-R22): each status with a descriptor as an entry, `source` keeping
-    /// that name alone; sources dropped from the end until the answer's line fits [`CATALOG_MAX`] (`true`).
+    /// that name alone; ops cleared from the end, then sources dropped from the end, until the answer's line fits
+    /// [`CATALOG_MAX`] (`true`).
     pub async fn catalog(&self, source: Option<&str>) -> Result<(Vec<SourceEntry>, bool), Failure> {
         let (channel, _busy, before) = self.channel();
         let mut client = RelayClient::new(channel);
@@ -351,13 +352,29 @@ pub(crate) fn local_ceiling(deadline_ms: u32) -> Duration {
     (Duration::from_millis(u64::from(deadline_ms)) + margin).min(cap + margin)
 }
 
-/// Drops sources from the end until the catalog answer's line fits [`CATALOG_MAX`]; whether any went.
+/// Fits the catalog answer's line to [`CATALOG_MAX`]; whether anything went (V-R22). First each source's ops, from the
+/// end, so no source's size hides another's name, and `source` still reaches a source's ops by its exact name, unless
+/// that source's own JSON passes the bound, when it answers with no ops there too; then, if the names alone do not fit,
+/// sources from the end.
 fn fit_catalog(entries: &mut Vec<SourceEntry>) -> bool {
     let empty = serde_json::to_vec(&Answer::Catalog { v: LOCAL_V, sources: Vec::new(), truncated: false }).map_or(0, |v| v.len());
-    let sizes: Vec<usize> = entries.iter().map(|e| serde_json::to_vec(e).map_or(usize::MAX / 2, |v| v.len())).collect();
+    let sized = |e: &SourceEntry| serde_json::to_vec(e).map_or(usize::MAX / 2, |v| v.len());
+    let mut sizes: Vec<usize> = entries.iter().map(sized).collect();
     // Each entry, and a comma between two.
     let mut total = empty + sizes.iter().sum::<usize>() + entries.len().saturating_sub(1);
     let mut cut = false;
+    for (entry, size) in entries.iter_mut().zip(sizes.iter_mut()).rev() {
+        if total <= CATALOG_MAX {
+            break;
+        }
+        if !entry.ops.is_empty() {
+            entry.ops.clear();
+            let stripped = sized(entry);
+            total -= size.saturating_sub(stripped);
+            *size = stripped;
+            cut = true;
+        }
+    }
     while total > CATALOG_MAX {
         let Some(size) = sizes.get(entries.len().wrapping_sub(1)).copied() else { break };
         entries.pop();
@@ -370,6 +387,7 @@ fn fit_catalog(entries: &mut Vec<SourceEntry>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local::{LimitsEntry, OpEntry};
 
     /// The local ceiling is the deadline and 5 s, at most `DEADLINE_CAP_MS` and 5 s (305 s), so the top of the range
     /// keeps the 5 s margin too; 300 s without a deadline. Kills M-V61.
@@ -409,5 +427,75 @@ mod tests {
         assert!(over.len() > CATALOG_MAX, "the next one would not fit");
         let mut few: Vec<SourceEntry> = (0..3).map(entry).collect();
         assert!(!fit_catalog(&mut few) && few.len() == 3);
+    }
+
+    /// One source with its ops, in the catalog's name order; a kilobyte of text an op.
+    fn with_ops(i: usize, ops: usize, description: usize) -> SourceEntry {
+        let limits = || LimitsEntry { max_bytes: 0, max_rows: 0, max_chunks: 0 };
+        let op = |n: usize| OpEntry {
+            name: format!("op-{n}"),
+            description: "d".repeat(1024),
+            params_schema: serde_json::json!({}),
+            output: "json".into(),
+            read_only: true,
+            default_limits: limits(),
+            max_limits: limits(),
+            examples: Vec::new(),
+        };
+        SourceEntry {
+            name: format!("test-{i:03}"),
+            version: "0.1.0".into(),
+            description: "d".repeat(description),
+            kind: "other".into(),
+            env: "test".into(),
+            sensitivity: "internal".into(),
+            available: true,
+            last_seen_unix_ms: 1,
+            ops: (0..ops).map(op).collect(),
+        }
+    }
+
+    fn line_of(sources: &[SourceEntry]) -> usize {
+        serde_json::to_vec(&Answer::Catalog { v: LOCAL_V, sources: sources.to_vec(), truncated: true }).unwrap().len()
+    }
+
+    /// Past its bound a catalog loses ops first, from its end, and no more of them than the line needs: every source
+    /// stays discoverable by name, whichever sources crowd it (a worker's sorted first, say), and `source` reaches a
+    /// source's ops alone, unless they pass the bound alone. Only when the names alone do not fit do sources go, from the
+    /// end. The line's shape is the same.
+    #[test]
+    fn a_catalog_loses_ops_from_its_end_before_any_source() {
+        let whole: Vec<SourceEntry> = (0..20).map(|i| with_ops(i, 64, 16)).collect();
+        assert!(line_of(&whole) > CATALOG_MAX, "the case: {}", line_of(&whole));
+        let mut all = whole.clone();
+        assert!(fit_catalog(&mut all));
+        assert!(line_of(&all) <= CATALOG_MAX, "{}", line_of(&all));
+        let names = |e: &[SourceEntry]| e.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&all), names(&whole), "every source is still there, by name, in order");
+        let kept = all.iter().take_while(|e| !e.ops.is_empty()).count();
+        assert!(kept >= 1 && all[kept..].iter().all(|e| e.ops.is_empty()), "cleared from the end: {kept} kept");
+        assert_eq!(all[..kept], whole[..kept], "the sources before them whole");
+        let mut one_more = all.clone();
+        one_more[kept].ops.clone_from(&whole[kept].ops);
+        assert!(line_of(&one_more) > CATALOG_MAX, "no more ops went than the line needs");
+
+        // One source's own ops past the bound: its name stays, and the answer says it was cut.
+        let mut one = vec![with_ops(0, 300, 16)];
+        assert!(line_of(&one) > CATALOG_MAX);
+        assert!(fit_catalog(&mut one));
+        assert!(one.len() == 1 && one[0].ops.is_empty());
+
+        // A catalog that fits keeps every op.
+        let mut small: Vec<SourceEntry> = (0..3).map(|i| with_ops(i, 2, 16)).collect();
+        let before = small.clone();
+        assert!(!fit_catalog(&mut small));
+        assert_eq!(small, before);
+
+        // The names alone over the bound: every op gone, then sources from the end, and the rest a prefix that fits.
+        let mut crowd: Vec<SourceEntry> = (0..300).map(|i| with_ops(i, 1, 2048)).collect();
+        assert!(fit_catalog(&mut crowd));
+        assert!(line_of(&crowd) <= CATALOG_MAX, "{}", line_of(&crowd));
+        assert!(crowd.len() > 100 && crowd.len() < 300 && crowd.iter().all(|e| e.ops.is_empty()), "{} sources", crowd.len());
+        assert!(crowd.iter().enumerate().all(|(i, e)| e.name == format!("test-{i:03}")), "a prefix");
     }
 }

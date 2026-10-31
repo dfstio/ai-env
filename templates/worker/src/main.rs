@@ -1,9 +1,10 @@
 //! my-worker: a worker behind the ai-env relay (from ai-env's `templates/worker`).
 //!
 //! `my-worker keygen --out <path>` makes its 0600 Ed25519 key and prints the public key, which the deployer
-//! allows (`ai-env relay allow`); `check --config <path>` builds the worker and, without `--offline`, dials
-//! the relay once; `run --config <path>` serves until SIGINT or SIGTERM. Logs go to stderr (`RUST_LOG`,
-//! default `info`); nothing prints a private key.
+//! allows (`ai-env relay allow`); `tls-keygen --out <path>` makes its 0600 P-256 TLS key and prints the key's
+//! point, for which the deployer issues its client certificate (`ai-env relay allow … --tls-key`); `check
+//! --config <path>` builds the worker and, without `--offline`, dials the relay once; `run --config <path>`
+//! serves until SIGINT or SIGTERM. Logs go to stderr (`RUST_LOG`, default `info`); nothing prints a private key.
 
 mod config;
 mod sources;
@@ -12,11 +13,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use ai_env_worker::certs;
 use ai_env_worker::keys::{self, SigningKey};
 use ai_env_worker::signer::{AgentSigner, FileSigner, Signer};
 use ai_env_worker::{RelayEndpoint, Worker};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "my-worker", version, about = "A worker behind the ai-env relay")]
@@ -29,6 +32,15 @@ struct Cli {
 enum Cmd {
     /// Make the worker's Ed25519 key (a new 0600 file); prints only its public key
     Keygen {
+        /// The key file to make
+        #[arg(long)]
+        out: PathBuf,
+        /// Replace an existing key file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Make the worker's P-256 TLS key (a new 0600 file) for its relay client certificate; prints only its public point
+    TlsKeygen {
         /// The key file to make
         #[arg(long)]
         out: PathBuf,
@@ -78,6 +90,15 @@ fn run(cli: Cli) -> Result<()> {
             println!("{}", key.public_key().text());
             Ok(())
         }
+        Cmd::TlsKeygen { out, force } => {
+            let key = certs::client_key()?;
+            let point = certs::client_point(&key)?.text();
+            let pem = Zeroizing::new(certs::pem("PRIVATE KEY", &key));
+            keys::write_private_pem(&out, pem.as_bytes(), force)?;
+            println!("{point}");
+            println!("next, on the Mac: ai-env as deployer -- ai-env relay allow <worker-id> --key <its ed25519 key> --sources <its globs> --tls-key {point}; the certificate it prints goes to relay_client_cert");
+            Ok(())
+        }
         Cmd::Pubkey { key } => {
             println!("{}", keys::read_key_file(&key)?.public_key().text());
             Ok(())
@@ -104,7 +125,8 @@ async fn check(path: &Path, offline: bool) -> Result<()> {
     Ok(())
 }
 
-/// The worker of a config: the relay pinned to its CA, the signer, the sources.
+/// The worker of a config: the relay pinned to its CA, the client certificate it presents, the signer, the
+/// sources.
 async fn build(cfg: &config::Config) -> Result<Worker> {
     let ca = std::fs::read(&cfg.relay_ca).with_context(|| format!("relay_ca {}", cfg.relay_ca.display()))?;
     let mut endpoint = RelayEndpoint::new(&cfg.relay)?.ca_pem(&ca)?;
@@ -113,6 +135,12 @@ async fn build(cfg: &config::Config) -> Result<Worker> {
     }
     if let Some(id) = &cfg.expect_relay_id {
         endpoint = endpoint.expect_relay_id(id)?;
+    }
+    if let (Some(cert), Some(key)) = (&cfg.relay_client_cert, &cfg.relay_client_key) {
+        let cert_pem = std::fs::read(cert).with_context(|| format!("relay_client_cert {}", cert.display()))?;
+        // The key file is read as the worker key is: 0600, the worker user's own.
+        let key_pem = keys::read_private_pem(key)?;
+        endpoint = endpoint.client_identity(&cert_pem, &key_pem)?;
     }
     let signer: Arc<dyn Signer> = match cfg.signer {
         config::Signer::File => Arc::new(FileSigner::open(cfg.key_file.as_ref().context("signer = \"file\" needs key_file")?)?),

@@ -17,6 +17,11 @@ pub struct Config {
     pub server_name: Option<String>,
     /// The relay CA's certificate (PEM): the only trust anchor.
     pub relay_ca: PathBuf,
+    /// The worker's client certificate (PEM), as `ai-env relay allow … --tls-key` printed it; with
+    /// `relay_client_key`, or neither.
+    pub relay_client_cert: Option<PathBuf>,
+    /// Its 0600 P-256 key, made by `my-worker tls-keygen`; with `relay_client_cert`, or neither.
+    pub relay_client_key: Option<PathBuf>,
     /// The relay id its challenge must carry, if set.
     pub expect_relay_id: Option<String>,
     /// Who signs the handshake.
@@ -54,9 +59,13 @@ pub enum SourceConfig {
 }
 
 impl Config {
-    /// The config at `path`.
+    /// The config at `path`: the client certificate and its key go together.
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))
+        let cfg: Config = toml::from_str(&text).with_context(|| format!("{} does not parse", path.display()))?;
+        if cfg.relay_client_cert.is_some() != cfg.relay_client_key.is_some() {
+            anyhow::bail!("{}: relay_client_cert and relay_client_key go together", path.display());
+        }
+        Ok(cfg)
     }
 }

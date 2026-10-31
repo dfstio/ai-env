@@ -12,11 +12,12 @@
 #
 # The normal run must succeed, then the plan check (scripts/check-plan.sh, the same one `make deploy` runs; always
 # the repo's copy, never the edited scratch copy) must accept the --json plan: exactly the stack inventory per type
-# and name (94 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, S8 operators' 13, the users
+# and name (95 in dnsMode none: S3's 16, S5's 38 with the operator role's Deny, S8 operators' 13, the users
 # ai-env-deployer and ai-env-ops, the policies ai-env-deployer and ai-env-ops, the six user policy attachments and
 # the proxy's three SSM documents, S9's 8, the transcripts bucket with its six settings and the S3 gateway
-# endpoint, and S13's 19, the relay; EGRESS_MODE=firewall previews the copy with dnsMode firewall: 99), the pinned
-# providers, every egress input and reference, every IAM document (for the caller's account, read once from `aws sts
+# endpoint, S13's 19, the relay, and LD-R56's boot object; EGRESS_MODE=firewall previews the copy with dnsMode
+# firewall: 100), the pinned providers, every egress input and reference, every IAM document (for the caller's
+# account, read once from `aws sts
 # get-caller-identity` into a shell variable), who holds which policy, the documents' content (the files) and no
 # update of the parameters `ai-env egress` owns. A --json plan has no stack outputs, so the 40 outputs `ai-env infra
 # status` reads (S5's 14 egress outputs, S8 operators' 11, S9's 5, S13's 10) are checked in the text preview,
@@ -28,7 +29,7 @@
 # group and VPC as updates; each id in oldState only, every reference and IAM document resolved for those ids), must
 # pass too, also as the deploy that adds the operator role's Deny to it (its create step, everything else same) and
 # as the bootstrap (the stack before S8 operators: no user ai-env-deployer in the old state, the 13 creates, the three
-# deploy policies replaced for their frozen descriptions, which check-plan allows only then: D12), and twenty-five
+# deploy policies replaced for their frozen descriptions, which check-plan allows only then: D12), and twenty-six
 # tampered copies of it must be refused: the deploy policy's CreateNetworkConnector condition or the operator role's
 # Deny naming the proxy subnet, the Deny also on that create step, where its document left unknown is refused too; the
 # connector on the proxy subnet or the proxy's security group, the connector passed another role; ai-env-ops' policy
@@ -40,7 +41,7 @@
 # its five policies; the status document's content carrying a duplicate key (it parses to the file, but is not the file);
 # MacRuntimePolicy bound to ai-env-ops (the daily key would hold the runtime grants); S13: ai-env-ops sending commands to
 # the relay instance, or reading its TLS pair; the relay role without NoOtherDecrypt; the relay's artifact parameter
-# naming another key than the object's.
+# naming another key than the object's; the relay's boot object holding another text than its key and the user data pin.
 # A fresh scratch stack only creates, and a check that saw only creates once
 # refused every deploy after the first. The operator role's Deny is proven compared there only: in a fresh preview its
 # document is unknown (the subnet and group ids are), which the plan check accepts only while a resource it depends
@@ -280,12 +281,14 @@ expect_plan_refusal() {
 # document-duplicate-key (the status document's content with a second runCommand key before its own) |
 # runtime-policy-on-ops (MacRuntimePolicy binds ai-env-ops, by value and by URN) | S13: ops-relay-commands (ai-env-ops may
 # send commands to the relay instance) | ops-reads-tls (it may read the relay's TLS pair) | relay-no-other-decrypt (the
-# relay role without NoOtherDecrypt) | artifact-other-key (the artifact parameter names another key than the object's).
+# relay role without NoOtherDecrypt) | artifact-other-key (the artifact parameter names another key than the object's) |
+# boot-other-text (the relay's boot object holds another text than its key and the user data pin).
 # The relay's artifact parameter, unknown in a fresh preview (the bucket and the object are created), is rendered from
-# them and $RELAY_JSON, as the program renders it.
+# them and $RELAY_JSON, as the program renders it, and so is its user data, from the bucket and the boot object (LD-R56).
 existing_plan() {
     ACCOUNT_ID="$acct" node -e '
 const fs = require("fs");
+const path = require("path");
 const [out, egressConfig, imageConfig, variant] = process.argv.slice(1);
 const pol = require(`${out}/policies.js`);
 const spec = require(`${out}/egress-spec.js`);
@@ -355,6 +358,9 @@ const relayObjectKey = byName("aws:s3/bucketObjectv2:BucketObjectv2", spec.NET.r
 const artifactValue = () => variant === "artifact-other-key"
     ? relaySpec.relayArtifactValue({ bucket, key: "relay/ai-env-relay-ffffffffffffffff", sha256: "f".repeat(64), version: relayJson.version })
     : relaySpec.relayArtifactValue({ bucket, key: relayObjectKey, sha256: relayJson.sha256, version: relayJson.version });
+// LD-R56: the user data of the relay, as relay.ts renders it from the bucket and the text of the boot object.
+const relayBootInputs = byName("aws:s3/bucketObjectv2:BucketObjectv2", spec.NET.relayBoot).newState.inputs;
+const relayUserData = () => relaySpec.renderRelayUserData(bucket, relaySpec.relayBootPin(relayBootInputs.content), pol.REGION, path.join(path.dirname(egressConfig), "relay"));
 const render = (which, text) => {
     const e = edits[variant];
     if (e === undefined || e[0] !== which) return text;
@@ -383,6 +389,8 @@ for (const s of plan.steps) {
         inputs[k] = which && k === iamKey ? render(which, (tampered ? bad : good).get(which) ?? v) : resolve(v, (st.propertyDependencies || {})[k] || [], k);
     }
     if (st.type === "aws:ssm/parameter:Parameter" && name(s) === spec.NET.relayArtifactParameter) inputs.insecureValue = artifactValue();
+    if (st.type === "aws:ec2/instance:Instance" && name(s) === spec.NET.relayInstance) inputs.userData = relayUserData();
+    if (variant === "boot-other-text" && st.type === "aws:s3/bucketObjectv2:BucketObjectv2" && name(s) === spec.NET.relayBoot) inputs.content = `${inputs.content}# another text\n`;
     if (st.type === "aws-native:lambda:NetworkConnector") {
         // An ARN cannot be resolved from its two dependencies (the role and its attachment): it is the ARN of the operator role.
         inputs.operatorRole = pol.roleArn(names(vmSubnet), variant === "connector-operator-role" ? "ai-env-vm-exec" : cfg.operatorRoleName);
@@ -548,7 +556,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
     for v in deploy-proxy-subnet operator-proxy-subnet operator-new-proxy-subnet operator-new-unknown connector-proxy-subnet connector-proxy-sg connector-operator-role \
         ops-runshell ops-extras ops-any-instance ops-attach-admin policy-replaced deployer-detached runtime-widen provider-replaced ops-holds-deploy \
         attachment-replaced deployer-replaced bootstrap-unordered document-duplicate-key runtime-policy-on-ops \
-        ops-relay-commands ops-reads-tls relay-no-other-decrypt artifact-other-key; do
+        ops-relay-commands ops-reads-tls relay-no-other-decrypt artifact-other-key boot-other-text; do
         t2=
         case "$v" in
         deploy-proxy-subnet) t="aws:iam/policy:Policy ai-env-deploy: policy is not policies.ts deployPolicy()" ;;
@@ -587,6 +595,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
         ops-relay-commands | ops-reads-tls) t="aws:iam/policy:Policy ai-env-ops: policy is not policies.ts opsPolicy(); a statement differs" ;;
         relay-no-other-decrypt) t="aws:iam/rolePolicy:RolePolicy ai-env-relay: policy is not policies.ts relayRolePolicy(); missing NoOtherDecrypt" ;;
         artifact-other-key) t="relay artifact parameter: key relay/ai-env-relay-ffffffffffffffff is not the artifact object's key" ;;
+        boot-other-text) t="is not its content's, relay/ai-env-relay-boot-" ;;
         *) fail "existing stack, $v: no expected refusal" ;;
         esac
         tampered=$(existing_plan "$v" <<<"$plan") || fail "existing stack, $v: the plan could not be rewritten"
@@ -597,7 +606,7 @@ process.stdout.write(s ? require("crypto").createHash("sha256").update(s.newStat
             echo "existing stack, $v: $diag"
         done
     done
-    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 40 egress, operator, transcript store and relay outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-five tampered copies were refused)"
+    echo "$label: ok (dnsMode $(dns_mode): the preview, the plan check and the 40 egress, operator, transcript store and relay outputs passed; the existing-stack plans (same, update, the Deny created, the bootstrap) passed, their twenty-six tampered copies were refused)"
     ;;
 no-logging)
     edit '/scratch:logging/d'

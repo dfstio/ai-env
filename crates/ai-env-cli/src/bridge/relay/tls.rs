@@ -7,9 +7,11 @@
 //!   refused, exit 9, `params::tls_gate`): a new CA, its key sealed with no Touch ID (sealing is public-key only),
 //!   its certificate (public) written to `state/relay-ca.pem` and `state/relay-ca.der`, then a leaf for both names
 //!   a client verifies: DNS `ai-env-relay` (workers) and IP `10.42.0.20` (VMs). An existing CA is replaced only
-//!   with `--force`: a new CA strands every worker's pinned `relay_ca` file.
+//!   with `--force`: a new CA strands every worker's pinned `relay_ca` file and client certificate (R-131).
 //! - `ai-env relay tls rotate` (as ai-env-deployer): one unseal of the CA key (one Touch ID), the CA rebuilt from
 //!   it and `state/relay-ca.der` (a mismatch is exit 9), a new leaf.
+//! - `ai-env relay allow … --tls-key` ([`client_certificate`], R-131): one unseal of the CA key (one Touch ID), a
+//!   worker's client certificate under it.
 //! - `ai-env relay ca [--der]`: the CA's certificate, for a worker's `relay_ca` file; no AWS call, no Touch ID.
 //! - [`ca_der_b64`]: what a spawn's relay session pins (WM-R62).
 //!
@@ -30,7 +32,7 @@ use crate::bridge::voice;
 use crate::errors::{CliError, Result};
 use crate::store::{validate_key_name, Keystore};
 use crate::wire::time::{rfc3339_utc, unix_now};
-use ai_env_worker::certs::{self, Issued, CA_DAYS};
+use ai_env_worker::certs::{self, ClientPoint, Issued, CA_DAYS};
 use base64::Engine as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -132,7 +134,7 @@ pub fn cmd_tls_init(store: &Keystore, force: bool) -> Result<()> {
         .collect();
     if !existing.is_empty() && !force {
         return Err(CliError::Msg(format!(
-            "relay tls init: a relay CA exists ({}): ai-env relay tls init --force makes a new one, and every worker's relay_ca file must then be replaced (ai-env relay tls rotate issues a new certificate under this one)",
+            "relay tls init: a relay CA exists ({}): ai-env relay tls init --force makes a new one, and every worker's relay_ca file and client certificate must then be replaced (ai-env relay tls rotate issues a new certificate under this one)",
             existing.join(", ")
         )));
     }
@@ -159,7 +161,7 @@ pub fn cmd_tls_init(store: &Keystore, force: bool) -> Result<()> {
     say(&format!("relay CA fp {ca_fp} until {not_after}: its key sealed in {CA_FILE}, its certificate in state/relay-ca.pem and state/relay-ca.der"));
     say(&format!("relay certificate fp {leaf_fp} (ai-env-relay, {RELAY_IP}) in {tls} v{version}: the relay serves it within a minute"));
     if sealed.backup.is_some() {
-        say("a new CA: every worker's relay_ca file must be replaced (ai-env relay ca prints it)");
+        say("a new CA: every worker's relay_ca file and client certificate must then be replaced (ai-env relay ca prints the CA, ai-env relay allow --tls-key issues a certificate)");
     }
     Ok(())
 }
@@ -168,21 +170,39 @@ pub fn cmd_tls_init(store: &Keystore, force: bool) -> Result<()> {
 pub fn cmd_tls_rotate(store: &Keystore) -> Result<()> {
     tls_gate("tls rotate", &[])?;
     let paths = Paths::resolve()?;
-    let cert = read_der(&ca_der_path(&paths)).map_err(|e| CliError::Msg(format!("relay tls rotate: {e}")))?;
-    let cert = cert.ok_or_else(|| CliError::AuthUnavailable("relay tls rotate: state/relay-ca.der does not exist: make the relay CA with ai-env relay tls init".into()))?;
+    let cert = ca_certificate(&paths, "tls rotate")?;
     let ctx = RelayCtx::load()?;
     let op = ctx.operator("relay tls rotate")?;
-    let key = unseal_ca(store, &paths)?;
-    let ca = certs::ca_from_parts(&cert, &key).map_err(|e| match e {
-        certs::CertError::Mismatch => CliError::Policy(format!("relay tls rotate: {CA_FILE} does not hold the key of state/relay-ca.der: make a new CA with ai-env relay tls init --force")),
-        other => CliError::Msg(format!("relay tls rotate: the relay CA: {other}")),
-    })?;
-    drop(key);
+    let ca = unsealed_ca(store, &paths, &cert, "tls rotate")?;
     let (value, leaf_fp) = tls_value(&ca, unix_now())?;
     let version = write_tls(&op, "tls rotate", &value)?;
     drop(value);
     say(&format!("relay certificate fp {leaf_fp} (ai-env-relay, {RELAY_IP}) under the relay CA fp {} in {} v{version}: the relay serves it to new connections within a minute", certs::fingerprint(&ca.cert_der), tls_param()));
     Ok(())
+}
+
+/// A worker's client certificate under the sealed CA, its DER (R-117, R-131, §RS.4.2): one Touch ID (the CA key's
+/// unseal, as `tls rotate`), a CA that does not match its key is exit 9 as `tls rotate` says, and `worker_id`'s
+/// certificate for `point` runs from an hour ago to `not_after_unix`, the entry's.
+pub(crate) fn client_certificate(store: &Keystore, paths: &Paths, worker_id: &str, point: &ClientPoint, not_after_unix: u64) -> Result<Vec<u8>> {
+    let cert = ca_certificate(paths, "allow")?;
+    let ca = unsealed_ca(store, paths, &cert, "allow")?;
+    certs::client_leaf(&ca, worker_id, point, unix_now(), not_after_unix).map_err(|e| CliError::Msg(format!("relay allow: worker {worker_id}'s client certificate: {e}")))
+}
+
+/// `state/relay-ca.der`, for `relay <what>`: exit 5 naming `tls init` when it is absent.
+fn ca_certificate(paths: &Paths, what: &str) -> Result<Vec<u8>> {
+    let cert = read_der(&ca_der_path(paths)).map_err(|e| CliError::Msg(format!("relay {what}: {e}")))?;
+    cert.ok_or_else(|| CliError::AuthUnavailable(format!("relay {what}: state/relay-ca.der does not exist: make the relay CA with ai-env relay tls init")))
+}
+
+/// The CA again, for `relay <what>`: one unseal (one Touch ID), its key and `cert` as one (a mismatch is exit 9).
+fn unsealed_ca(store: &Keystore, paths: &Paths, cert: &[u8], what: &str) -> Result<Issued> {
+    let key = unseal_ca(store, paths)?;
+    certs::ca_from_parts(cert, &key).map_err(|e| match e {
+        certs::CertError::Mismatch => CliError::Policy(format!("relay {what}: {CA_FILE} does not hold the key of state/relay-ca.der: make a new CA with ai-env relay tls init --force")),
+        other => CliError::Msg(format!("relay {what}: the relay CA: {other}")),
+    })
 }
 
 /// One unseal of `credentials/relay-ca.env` (one Touch ID): the PKCS#8 DER of the CA key, from a plaintext that

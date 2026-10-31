@@ -544,13 +544,13 @@ relay-logs-run:
 # shell line through $(SUBMAKE), so a dry make -n stays dry), without any key, marker or passphrase in its environment
 # (D18); then relay.json, which the program reads (relay.ts loadRelayJson: the binary hashed again, uploaded under
 # relay/ai-env-relay-<sha16> and pinned by the artifact parameter, whose SHA-256 the relay's reload unit checks).
-relay-artifact: ## S13: cross-build the relay (cargo-lambda --arm64, -p ai-env-relay) -> $(RELAY_OUT)/ai-env-relay; aarch64 ELF, glibc <= $(GLIBC_MAX); then $(RELAY_JSON) (sha256, S3 key, version)
+relay-artifact: ## S13: cross-build the relay (cargo-lambda --arm64, -p ai-env-relay, --locked: the reviewed Cargo.lock) -> $(RELAY_OUT)/ai-env-relay; aarch64 ELF, glibc <= $(GLIBC_MAX); then $(RELAY_JSON) (sha256, S3 key, version)
 	@set -eu; out=$$($(SUBMAKE) -s --no-print-directory vm-build-pick) || { echo "relay-artifact: $$out"; exit 1; }; cl=$${out% *}; \
 	  echo "relay-artifact: using $$out"; \
 	  rustup +$(TOOLCHAIN) target list --installed | grep -qx '$(TARGET)' || { echo "missing target: rustup target add $(TARGET) --toolchain $(TOOLCHAIN)"; exit 1; }; \
 	  test -x $(LLVM_BIN)/llvm-objdump || { echo "relay-artifact: $(LLVM_BIN)/llvm-objdump missing (brew install llvm, or set LLVM_BIN)"; exit 1; }; \
 	  rm -f target/lambda/ai-env-relay/bootstrap; \
-	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay
+	  ulimit -n 10240; $(NO_KEY) RUSTUP_TOOLCHAIN=$(TOOLCHAIN) "$$cl" lambda build --release --locked --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay
 	mkdir -p $(RELAY_OUT)
 	cp target/lambda/ai-env-relay/bootstrap $(RELAY_OUT)/ai-env-relay
 	@file $(RELAY_OUT)/ai-env-relay | grep -q 'ELF 64-bit.*aarch64' || { file $(RELAY_OUT)/ai-env-relay; echo "relay-artifact: not an aarch64 ELF"; exit 1; }
@@ -563,7 +563,7 @@ relay-artifact: ## S13: cross-build the relay (cargo-lambda --arm64, -p ai-env-r
 	  printf '{"binary":"%s","sha256":"%s","key":"relay/ai-env-relay-%s","version":"%s"}\n' "$(RELAY_OUT)/ai-env-relay" "$$sha" "$${sha:0:16}" "$$version" > "$(RELAY_JSON)"; \
 	  ls -l $(RELAY_OUT)/ai-env-relay; cat "$(RELAY_JSON)"
 
-relay-reload-gz: ## S13: regenerate infra/relay/reload.py.gz from infra/relay/reload.py (gzip -9 -n), the bytes the relay's user data embeds; commit both
+relay-reload-gz: ## S13: regenerate infra/relay/reload.py.gz from infra/relay/reload.py (gzip -9 -n), the bytes the relay's boot script embeds; commit both
 	gzip -9 -n -c infra/relay/reload.py > infra/relay/reload.py.gz
 
 # One ai-env command each: the binary resolves its identity itself (an ai-env as marker, else credentials/ops.env with

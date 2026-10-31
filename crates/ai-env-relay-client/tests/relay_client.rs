@@ -1,14 +1,58 @@
 //! The real `ai-env-relay-client` and `ai-env-relay-mcp` binaries (§V-vm.8.3) against a fake relay
 //! (`relay_server::RelayServer` over TLS 1.3 on 127.0.0.1, certificates from the OpenSSL 3 CLI at run time): the
 //! session on the client's fd 3, the test process the client's leader, the MCP server its child. The fake compares
-//! the session header itself and never prints it; no line of either binary may hold the token or the CA.
+//! the session header itself and never prints it; no line of either binary may hold the token or the CA. A tool's
+//! text is read after its first line, `RESULT_PREAMBLE`, and its object under `data` (R-113: [`tool_data`]).
 mod common;
 
+use ai_env_relay_client::mcp::RESULT_PREAMBLE;
 use common::*;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+/// A tool result's text after its first line, which is `RESULT_PREAMBLE` (R-113): one line of compact JSON whose one
+/// key, `data`, holds the result's object.
+fn after_preamble(reply: &Value) -> String {
+    let text = raw_text(reply);
+    let (first, rest) = text.split_once('\n').unwrap_or_else(|| panic!("a first line: {text:?}"));
+    assert_eq!(first, RESULT_PREAMBLE, "{text}");
+    assert!(!rest.contains('\n'), "one line after it: {text:?}");
+    rest.to_string()
+}
+
+/// `object`'s text under the one key `data`, as the line after the preamble writes it.
+fn under_data(object: &str) -> String {
+    format!("{{\"data\":{object}}}")
+}
+
+/// A tool result's object under `data` (parsed) and `isError`.
+fn data_of(reply: &Value) -> (Value, bool) {
+    let line: Value = serde_json::from_str(&after_preamble(reply)).unwrap();
+    let data = line.as_object().filter(|o| o.len() == 1).and_then(|o| o.get("data")).unwrap_or_else(|| panic!("one key, data: {line}"));
+    (data.clone(), reply["result"]["isError"].as_bool().unwrap())
+}
+
+/// `tools/call` of `name` with `args` on `m`: the tool's object under `data` and `isError`.
+async fn tool_data(m: &mut Mcp, id: u64, name: &str, args: Value) -> (Value, bool) {
+    m.send(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}})).await;
+    let reply = m.next().await;
+    assert_eq!(reply["id"], id, "{reply}");
+    data_of(&reply)
+}
+
+/// One request line to `socket` and its answer line, from a client that answers before it reads the request and then
+/// closes (a peer it refuses, a connection past its cap): the request's write may fail with a broken pipe, and on
+/// Linux the read may end in a reset after the answer, neither the test's fault (`common::ask_at` unwraps both).
+async fn ask_refused(socket: &std::path::Path, line: &str) -> Value {
+    let mut s = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let _ = s.write_all(format!("{line}\n").as_bytes()).await;
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(LIMIT, s.read_to_end(&mut out)).await.expect("an answer");
+    let out = String::from_utf8_lossy(&out);
+    serde_json::from_str(out.trim_end()).unwrap_or_else(|e| panic!("{e}: {out:?}"))
+}
 
 /// A fake relay of `sources`, a client with its session, and an MCP server finding it by ancestry.
 struct Rig {
@@ -51,11 +95,11 @@ async fn the_catalog_and_a_call_carry_the_session_header() {
     let mut m = r.mcp().await;
     m.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "relay_catalog", "arguments": {}}})).await;
     let reply = m.next().await;
-    assert_eq!(raw_text(&reply), ECHO_CATALOG_TEXT);
+    assert_eq!(after_preamble(&reply), under_data(ECHO_CATALOG_TEXT));
     assert_eq!(reply["result"]["isError"], false);
     m.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "relay_call", "arguments": {"source": "echo", "op": "echo", "params": {"x": 1}, "max_bytes": 1000, "deadline_ms": 30_000}}})).await;
     let reply = m.next().await;
-    assert_eq!(raw_text(&reply), format!(r#"{{"source":"echo","op":"echo","request_id":"{REQUEST_ID}","content_type":"application/json","truncated":false,"bytes":7,"limit":1000,"json":{{"x":1}}}}"#));
+    assert_eq!(after_preamble(&reply), under_data(&format!(r#"{{"source":"echo","op":"echo","request_id":"{REQUEST_ID}","content_type":"application/json","truncated":false,"bytes":7,"limit":1000,"json":{{"x":1}}}}"#)));
     assert_eq!(r.relay.seen.header_ok.load(Ordering::SeqCst), 2, "the token on both RPCs");
     assert_eq!(r.relay.requests(), 2);
     assert_eq!(*r.relay.seen.last_call.lock().unwrap(), Some((30_000, Some(1000))));
@@ -76,7 +120,7 @@ async fn a_relay_under_another_ca_is_refused_before_any_request() {
     let token = token();
     let relay = FakeRelay::start(&theirs, &token, echo_sources()).await;
     let (_client, mut m, _) = rig_for(&relay.addr.to_string(), "127.0.0.1", &ours.ca_b64()).await;
-    let (text, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(is_error, "{text}");
     assert_eq!(text["error"]["code"], "unavailable", "{text}");
     assert!(text["error"]["message"].as_str().unwrap().starts_with("tls: "), "{text}");
@@ -91,7 +135,7 @@ async fn a_certificate_for_another_name_is_refused() {
     let token = token();
     let relay = FakeRelay::start(&pki, &token, echo_sources()).await;
     let (_client, mut m, _) = rig_for(&relay.addr.to_string(), "127.0.0.2", &pki.ca_b64()).await;
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "echo", "op": "echo"})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "echo", "op": "echo"})).await;
     assert!(is_error, "{text}");
     assert_eq!((text["error"]["code"].as_str(), text["source"].as_str(), text["op"].as_str()), (Some("unavailable"), Some("echo"), Some("echo")), "{text}");
     assert!(text["error"]["message"].as_str().unwrap().starts_with("tls: "), "{text}");
@@ -154,7 +198,7 @@ async fn a_tls12_only_relay_is_refused_before_any_request() {
     let pki = Pki::new("IP:127.0.0.1");
     let server = Tls12::start(&pki);
     let (_client, mut m, _) = rig_for(&format!("127.0.0.1:{}", server.port), "127.0.0.1", &pki.ca_b64()).await;
-    let (text, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(is_error, "{text}");
     assert_eq!(text["error"]["code"], "unavailable", "{text}");
     let message = text["error"]["message"].as_str().unwrap();
@@ -167,7 +211,7 @@ async fn an_unreachable_relay_is_unavailable_fast() {
     let pki = Pki::new("IP:127.0.0.1");
     let (_client, mut m, _) = rig_for("127.0.0.1:1", "127.0.0.1", &pki.ca_b64()).await;
     let t = Instant::now();
-    let (text, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     assert!(is_error, "{text}");
     assert_eq!(text["error"]["code"], "unavailable", "{text}");
@@ -180,7 +224,7 @@ async fn an_unreachable_relay_is_unavailable_fast() {
 async fn a_stream_past_max_bytes_is_cut_truncated_and_cancelled() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "lines", "op": "tail", "max_bytes": 100_000})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "lines", "op": "tail", "max_bytes": 100_000})).await;
     assert!(!is_error, "{text}");
     assert_eq!((text["bytes"].as_u64(), text["limit"].as_u64(), text["truncated"].as_bool()), (Some(100_000), Some(100_000), Some(true)), "{}", &text.to_string()[..200]);
     let body = text["text"].as_str().expect("a text body");
@@ -196,7 +240,7 @@ async fn a_stream_past_max_bytes_is_cut_truncated_and_cancelled() {
 async fn a_chunk_marked_truncated_reaches_the_tool() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "lines", "op": "head"})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "lines", "op": "head"})).await;
     assert!(!is_error, "{text}");
     assert_eq!(text, json!({"source": "lines", "op": "head", "request_id": REQUEST_ID, "content_type": "text/plain", "truncated": true, "bytes": 4, "limit": 65_536, "text": "a\nb\n"}));
 }
@@ -208,14 +252,14 @@ async fn a_chunk_marked_truncated_reaches_the_tool() {
 async fn relay_errors_reach_the_tool_with_their_codes() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "fail", "op": "denied"})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "fail", "op": "denied"})).await;
     assert!(is_error);
     assert_eq!(text, json!({"source": "fail", "op": "denied", "error": {"code": "permission_denied", "message": "denied by grant"}}));
-    let (text, is_error) = m.tool(2, "relay_call", json!({"source": "fail", "op": "missing"})).await;
+    let (text, is_error) = tool_data(&mut m, 2, "relay_call", json!({"source": "fail", "op": "missing"})).await;
     assert!(is_error);
     assert_eq!((text["error"]["code"].as_str(), text["error"]["message"].as_str()), (Some("not_found"), Some("no such entry")), "{text}");
     for (id, op) in [(3, "cut"), (4, "gap")] {
-        let (text, is_error) = m.tool(id, "relay_call", json!({"source": "fail", "op": op})).await;
+        let (text, is_error) = tool_data(&mut m, id, "relay_call", json!({"source": "fail", "op": op})).await;
         assert!(is_error, "{op}: {text}");
         assert_eq!(text["error"]["code"], "internal", "{op}: {text}");
     }
@@ -237,7 +281,7 @@ async fn a_failed_call_line_names_the_relays_request_id() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
     for (id, op, code) in [(1, "denied", "permission_denied"), (2, "missing", "not_found"), (3, "abort", "aborted"), (4, "cut", "internal"), (5, "anonymous", "failed_precondition")] {
-        let (text, is_error) = m.tool(id, "relay_call", json!({"source": "fail", "op": op})).await;
+        let (text, is_error) = tool_data(&mut m, id, "relay_call", json!({"source": "fail", "op": op})).await;
         assert!(is_error, "{op}: {text}");
         assert_eq!(text["error"]["code"], code, "{op}: {text}");
         let line = format!("ai-env-relay-client: call {REQUEST_ID} outcome={code} bytes=0 truncated=false ms=");
@@ -246,28 +290,28 @@ async fn a_failed_call_line_names_the_relays_request_id() {
     assert!(!r.client.log().contains(" call - "), "{}", r.client.log());
     let pki = Pki::new("IP:127.0.0.1");
     let (client, mut m, _) = rig_for("127.0.0.1:1", "127.0.0.1", &pki.ca_b64()).await;
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "echo", "op": "echo"})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "echo", "op": "echo"})).await;
     assert!(is_error && text["error"]["code"] == "unavailable", "{text}");
     assert!(eventually(LIMIT, || client.log().contains("ai-env-relay-client: call - outcome=unavailable bytes=0")).await, "{}", client.log());
 }
 
-/// A fake of 300 sources with 2 KiB descriptions: `truncated` true, the text under 256 KiB, the sources kept a
-/// prefix of the fake's. Control.
+/// A fake of 300 sources with 2 KiB descriptions: `truncated` true, the text after its first line under 256 KiB, the
+/// sources kept a prefix of the fake's. Control.
 #[tokio::test]
 async fn a_catalog_over_its_cap_is_cut_and_marked() {
     let r = Rig::new(many_sources(300, 2048), &[]).await;
     let mut m = r.mcp().await;
     m.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "relay_catalog", "arguments": {}}})).await;
     let reply = m.next().await;
-    let raw = raw_text(&reply);
+    let raw = after_preamble(&reply);
     assert!(raw.len() < 262_144, "{}", raw.len());
-    let (text, is_error) = tool_text(&reply);
+    let (text, is_error) = data_of(&reply);
     assert!(!is_error);
     assert_eq!(text["truncated"], true);
     let names: Vec<&str> = text["sources"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
     assert!(names.len() > 100 && names.len() < 300, "{}", names.len());
     assert!(names.iter().enumerate().all(|(i, n)| *n == format!("test-{i}")), "a prefix of the fake's");
-    let (one, _) = m.tool(2, "relay_catalog", json!({"source": "test-7"})).await;
+    let (one, _) = tool_data(&mut m, 2, "relay_catalog", json!({"source": "test-7"})).await;
     assert_eq!(one["sources"].as_array().unwrap().len(), 1, "a source alone");
     assert_eq!((one["sources"][0]["name"].as_str(), one["truncated"].as_bool()), (Some("test-7"), Some(false)));
 }
@@ -319,7 +363,7 @@ async fn an_mcp_cancel_drops_the_relay_stream() {
     assert!(eventually(LIMIT, || r.relay.requests() == 1).await, "the call reached the relay");
     m.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 41, "reason": "test"}})).await;
     assert!(eventually(Duration::from_secs(2), || r.relay.seen.dropped.load(Ordering::SeqCst) == 1).await, "the relay stream was dropped");
-    let (text, is_error) = m.tool(42, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 42, "relay_catalog", json!({})).await;
     assert!(!is_error, "{text}");
     r.relay.release();
     assert_eq!(m.next_within(Duration::from_millis(500)).await, None, "no line for the cancelled call");
@@ -359,7 +403,7 @@ async fn a_process_outside_the_session_is_refused() {
     let client = spawn_client(Some(session.as_bytes()), leader.id().unwrap(), uid(), &[]);
     client.wait_ready().await;
     let mut m = Mcp::start(&["--socket", client.socket.to_str().unwrap()]).await;
-    let (text, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(is_error);
     assert_eq!(text, json!({"error": {"code": "forbidden_peer", "message": "not a process of this session"}}));
     let pid = m.child.id().unwrap();
@@ -376,7 +420,7 @@ async fn a_peer_of_another_uid_is_refused() {
     let session = session_json(&token, &relay.addr.to_string(), "127.0.0.1", &pki.ca_b64());
     let client = spawn_client(Some(session.as_bytes()), std::process::id(), uid() + 1, &[]);
     client.wait_ready().await;
-    let answer = client.ask(r#"{"kind":"catalog","v":1}"#).await;
+    let answer = ask_refused(&client.socket, r#"{"kind":"catalog","v":1}"#).await;
     assert_eq!(answer, json!({"kind": "error", "v": 1, "code": "forbidden_peer", "message": format!("uid {} is not the agent's", uid())}));
     let refused = format!("refused peer pid={} uid={} (uid)", std::process::id(), uid());
     assert!(eventually(LIMIT, || client.log().contains(&refused)).await, "{}", client.log());
@@ -395,7 +439,7 @@ async fn the_ninth_connection_is_busy() {
     }
     assert!(eventually(LIMIT, || r.relay.requests() == 8).await, "eight calls at the relay");
     let t = Instant::now();
-    let busy = r.client.ask(r#"{"kind":"catalog","v":1}"#).await;
+    let busy = ask_refused(&r.client.socket, r#"{"kind":"catalog","v":1}"#).await;
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
     assert_eq!(busy, json!({"kind": "error", "v": 1, "code": "busy", "message": "8 calls in flight"}));
     assert!(eventually(LIMIT, || r.client.log().contains("ai-env-relay-client: busy (8 connections)")).await, "{}", r.client.log());
@@ -496,10 +540,10 @@ async fn a_bad_session_on_fd_3_refuses_to_start() {
 async fn the_mcp_server_says_no_session_without_a_socket() {
     let empty = tempfile::tempdir().unwrap();
     let mut m = Mcp::start(&["--socket-dir", empty.path().to_str().unwrap()]).await;
-    let (text, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(is_error);
     assert_eq!(text, json!({"error": {"code": "no_session", "message": "this chat has no relay session (it was not started with one)"}}));
-    let (text, _) = m.tool(2, "relay_call", json!({"source": "echo", "op": "echo"})).await;
+    let (text, _) = tool_data(&mut m, 2, "relay_call", json!({"source": "echo", "op": "echo"})).await;
     assert_eq!(text["error"]["code"], "no_session", "{text}");
     m.close();
     let status = tokio::time::timeout(LIMIT, m.child.wait()).await.unwrap().unwrap();
@@ -515,7 +559,7 @@ async fn a_call_past_its_ceiling_is_deadline_exceeded() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
     let t = Instant::now();
-    let (text, is_error) = m.tool(1, "relay_call", json!({"source": "slow", "op": "wait", "deadline_ms": 100})).await;
+    let (text, is_error) = tool_data(&mut m, 1, "relay_call", json!({"source": "slow", "op": "wait", "deadline_ms": 100})).await;
     let took = t.elapsed();
     assert!(is_error, "{text}");
     assert_eq!(text["error"]["code"], "deadline_exceeded", "{text}");
@@ -537,7 +581,7 @@ async fn a_silent_peer_is_dropped_after_the_request_wait() {
     }
     // Each silent connection takes its slot once the client accepts it: until then a ninth is served (`bad_request`).
     let until = Instant::now() + LIMIT;
-    while r.client.ask("hello").await["code"] != "busy" {
+    while ask_refused(&r.client.socket, "hello").await["code"] != "busy" {
         assert!(Instant::now() < until, "the eight silent connections never filled the client");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -558,11 +602,11 @@ async fn a_silent_peer_is_dropped_after_the_request_wait() {
 async fn no_line_of_the_client_holds_the_token() {
     let r = Rig::new(echo_sources(), &[]).await;
     let mut m = r.mcp().await;
-    let (_, is_error) = m.tool(1, "relay_catalog", json!({})).await;
+    let (_, is_error) = tool_data(&mut m, 1, "relay_catalog", json!({})).await;
     assert!(!is_error);
-    let (_, is_error) = m.tool(2, "relay_call", json!({"source": "echo", "op": "echo", "params": {"x": 1}})).await;
+    let (_, is_error) = tool_data(&mut m, 2, "relay_call", json!({"source": "echo", "op": "echo", "params": {"x": 1}})).await;
     assert!(!is_error);
-    let (_, is_error) = m.tool(3, "relay_call", json!({"source": "fail", "op": "denied"})).await;
+    let (_, is_error) = tool_data(&mut m, 3, "relay_call", json!({"source": "fail", "op": "denied"})).await;
     assert!(is_error);
     m.close();
     let _ = tokio::time::timeout(LIMIT, m.child.wait()).await;

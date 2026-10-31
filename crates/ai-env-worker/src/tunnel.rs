@@ -17,7 +17,7 @@ use tonic::Streaming;
 
 use crate::backoff::Class;
 use crate::calls::{self, Calls};
-use crate::endpoint::Failure;
+use crate::endpoint::{Failure, RelayAlert};
 use crate::signer::AuthChallenge;
 use crate::worker::{CheckReport, Inner, WorkerError};
 
@@ -176,16 +176,28 @@ async fn until_stop<T>(stop: &Cancel, fut: impl std::future::Future<Output = Res
     }
 }
 
+/// R-121: an end before the tunnel ran, on a connection whose first read met the relay's alert of a client
+/// certificate (TLS 1.3 sends it after the worker's Finished, so HTTP/2 or gRPC reports it first), is that
+/// TLS failure: `tls: the relay requires a client certificate`, or the relay refused this worker's. Transient,
+/// as every TLS failure (R-101).
+fn tls_refusal(end: End, alert: &RelayAlert) -> End {
+    match alert.words() {
+        Some(words) if end.class != Class::Shutdown => End { authed_at: end.authed_at, at: end.at, ..End::transient(WorkerError::Tls(words)) },
+        _ => end,
+    }
+}
+
 /// A new connection and its own channel (WM-R12, WM-R13): the dial and TLS within `connect_timeout`, then
 /// HTTP/2 over that one connection. The channel's connector hands out this connection once: tonic never
 /// dials again behind the worker's back (A-M3).
-async fn connect(inner: &Inner) -> Result<Channel, End> {
+async fn connect(inner: &Inner) -> Result<(Channel, RelayAlert), End> {
     let t = &inner.tuning;
     let tls = inner.endpoint.connect(t.connect_timeout).await.map_err(|f| match f {
         Failure::Dial(e) => End::transient(WorkerError::Connect(e)),
         Failure::Tls(e) => End::transient(WorkerError::Tls(e)),
         Failure::Timeout => End::transient(WorkerError::Timeout("connect")),
     })?;
+    let alert = tls.alert();
     let slot = Arc::new(Mutex::new(Some(TokioIo::new(tls))));
     let connector = tower::service_fn(move |_: ai_env_relay_proto::tonic::codegen::http::Uri| {
         let io = slot.lock().ok().and_then(|mut s| s.take());
@@ -197,9 +209,9 @@ async fn connect(inner: &Inner) -> Result<Channel, End> {
         .keep_alive_timeout(t.keepalive_timeout)
         .keep_alive_while_idle(true);
     match tokio::time::timeout(t.connect_timeout, endpoint.connect_with_connector(connector)).await {
-        Ok(Ok(channel)) => Ok(channel),
-        Ok(Err(e)) => Err(End::transient(WorkerError::Connect(format!("HTTP/2: {e}")))),
-        Err(_) => Err(End::transient(WorkerError::Timeout("connect"))),
+        Ok(Ok(channel)) => Ok((channel, alert)),
+        Ok(Err(e)) => Err(tls_refusal(End::transient(WorkerError::Connect(format!("HTTP/2: {e}"))), &alert)),
+        Err(_) => Err(tls_refusal(End::transient(WorkerError::Timeout("connect")), &alert)),
     }
 }
 
@@ -232,10 +244,16 @@ async fn send(tx: &mpsc::Sender<WorkerFrame>, msg: worker_frame::Msg) -> Result<
     tx.send(WorkerFrame { msg: Some(msg) }).await.map_err(|_| End::transient(WorkerError::Connect("the stream closed during the handshake".into())))
 }
 
-/// WM-R13: Challenge, Hello, the signature, AuthProof, AuthOk, then the one Catalog.
+/// WM-R13: Challenge, Hello, the signature, AuthProof, AuthOk, then the one Catalog, on a new connection whose
+/// TLS failure on the relay's alert ends the tunnel as R-121 says.
 async fn establish(inner: &Inner, stop: &Cancel) -> Result<Established, End> {
+    let (channel, alert) = until_stop(stop, connect(inner)).await?;
+    authenticate(inner, stop, channel).await.map_err(|end| tls_refusal(end, &alert))
+}
+
+/// WM-R13 over `channel`.
+async fn authenticate(inner: &Inner, stop: &Cancel, channel: Channel) -> Result<Established, End> {
     let t = &inner.tuning;
-    let channel = until_stop(stop, connect(inner)).await?;
     let mut client = WorkerTunnelClient::new(channel.clone()).max_decoding_message_size(RELAY_FRAME_MAX).max_encoding_message_size(wire::FRAME_MAX);
     let (tx, rx) = mpsc::channel(OUTBOUND_FRAMES);
     let open = async {
@@ -356,6 +374,42 @@ async fn frame_loop(inner: &Inner, inbound: &mut Streaming<RelayFrame>, calls: &
                 }
             }
             () = tokio::time::sleep_until(queued_at), if queued.is_some() => calls.expire_queued(Instant::now()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::AlertDescription;
+
+    /// R-121's mapping of an end before the tunnel ran (beside WM-T56): on the relay's alert of a client
+    /// certificate it is that TLS failure, transient as every TLS failure is (R-101), at the end's own instants;
+    /// a shutdown stays a shutdown, and an end with no such alert stays as it was.
+    #[test]
+    fn an_end_on_the_relays_certificate_alert_is_a_transient_tls_failure() {
+        let (authed_at, at) = (Instant::now() + Duration::from_secs(60), Instant::now() + Duration::from_secs(120));
+        let required = RelayAlert::received(AlertDescription::CertificateRequired);
+        let ends = [
+            End::transient(WorkerError::Connect("HTTP/2: transport error".into())),
+            End::transient(WorkerError::Timeout("open")),
+            End::refused(WorkerError::Unauthenticated),
+        ];
+        for before in ends {
+            let end = tls_refusal(End { authed_at: Some(authed_at), at, ..before }, &required);
+            assert_eq!(end.class, Class::Transient, "{end:?}");
+            assert_eq!(end.error, Some(WorkerError::Tls("the relay requires a client certificate".into())));
+            assert_eq!(end.reason, "tls: the relay requires a client certificate");
+            assert_eq!((end.authed_at, end.at, end.sleep), (Some(authed_at), at, false));
+        }
+        let end = tls_refusal(End::refused(WorkerError::Unauthenticated), &RelayAlert::received(AlertDescription::UnknownCA));
+        assert_eq!((end.class, end.error), (Class::Transient, Some(WorkerError::Tls("the relay refused this worker's client certificate (UnknownCA)".into()))));
+
+        let stopped = tls_refusal(End { at, ..End::shutdown() }, &required);
+        assert_eq!((stopped.class, stopped.error, stopped.reason.as_str(), stopped.at), (Class::Shutdown, None, "shutdown", at));
+        for alert in [RelayAlert::default(), RelayAlert::received(AlertDescription::HandshakeFailure)] {
+            let end = tls_refusal(End { at, ..End::refused(WorkerError::Unauthenticated) }, &alert);
+            assert_eq!((end.class, end.error, end.at), (Class::Refused, Some(WorkerError::Unauthenticated), at));
         }
     }
 }

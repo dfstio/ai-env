@@ -3,15 +3,20 @@
 //! `status` shows this Mac's side first, with no AWS call and no Touch ID (the sealed keys' notes, the agent's
 //! `status` answer within a second); `--local` stops there. Then, as the operator (the `ai-env as` key, else
 //! `credentials/ops.env` and its one Touch ID): the instance (state, addresses), SSM's ping and a plain TCP
-//! connect to `<public ip>:443` when it runs (informational, LD-WM15: no TLS dial), the three lists in one
-//! `get-parameters`, and the newest `ev:"status"` line of the relay's request log in CloudWatch (B-12).
+//! connect to `<public ip>:443` when it runs (informational, LD-WM15: no TLS dial, and no byte sent, so no fault,
+//! R-102), the newest `ev:"status"` line of the relay's request log in CloudWatch (B-12), what the relay refused in
+//! the last hour and a root volume near full (§RS.3.2 row 4, never the exit code), the three lists in one
+//! `get-parameters`, and the peers list in one of its own (until RO-1's deploy the ops policy cannot read it, and IAM
+//! refuses a whole call for one such name).
 //! Findings are `[NO ]` and exit 1: this Mac's session key is not an in-force token signer under
-//! `[relay].worker_id`, a list does not parse, the instance is not running. A read that failed is `[?? ]` and
-//! exit 7 when nothing was found first. `start` and `stop` wait as `proxy start|stop` do, their polls scaled by
-//! the lab knob; a relay that stops answers VM relay tools `unavailable`, and workers keep dialing until it
+//! `[relay].worker_id`, a list does not parse, the instance is not running, the peers list is absent or holds no
+//! entry in force, a worker in force has no client certificate under a relay that requires one. A read that failed
+//! is `[?? ]` and exit 7 when nothing was found first. `start` and `stop` wait as `proxy start|stop` do, their polls
+//! scaled by the lab knob; a relay that stops answers VM relay tools `unavailable`, and workers keep dialing until it
 //! starts again.
-use super::cli::{audit, note, runtime, say, RelayCtx};
+use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
 use super::keys::{read_notes, MacKeyNotes};
+use super::params::{fp16, MAC_LABEL, WIDE_BELOW};
 use crate::bridge::audit::event::{RELAY_START, RELAY_STOP};
 use crate::bridge::awscli::aws_json;
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -21,8 +26,9 @@ use crate::errors::{CliError, Result};
 use crate::wire::time::{rfc3339_utc, unix_now, unix_now_ms};
 use ai_env_worker::agent::{request, AgentStatus, Request, Response};
 use ai_env_worker::keys::PublicKey;
-use ai_env_worker::policy::{self, GRANTS, TOKEN_SIGNERS, WORKERS};
+use ai_env_worker::policy::{self, GRANTS, PEERS, TOKEN_SIGNERS, WORKERS};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// `start`'s waits (WM-R48): `running` within 180 s, then SSM `Online` within 120 s, 5 s steps.
@@ -32,8 +38,20 @@ const START_ONLINE: Wait = Wait { step: Duration::from_secs(5), tries: 24 };
 const STOP_STOPPED: Wait = Wait { step: Duration::from_secs(5), tries: 60 };
 /// The TCP probe of the public face (LD-WM15).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a connected probe waits, sending nothing, for the relay to close it (§RS.3.2 row 2).
+const PROBE_CLOSE_WAIT: Duration = Duration::from_secs(1);
 /// How far back the status line is looked for (B-12; the relay writes one every 300 s).
 const STATUS_WINDOW_MS: u64 = 600_000;
+/// How far back the refusals are counted (§RS.3.2 row 4).
+const REFUSED_WINDOW_MS: u64 = 3_600_000;
+/// What is counted: every peer line, and the refused tunnel lines (R-66 bounds them to 14 400 lines an hour).
+const REFUSED_FILTER: &str = r#"{ ($.ev = "peer") || ($.ev = "tunnel" && $.outcome = "refused") }"#;
+/// How far back the reload's `why=disk` is looked for (§RS.3.2 row 4; it runs every minute).
+const DISK_WINDOW_MS: u64 = 600_000;
+/// The word of the reload's run line (R-95).
+const DISK_WORD: &str = "why=disk";
+/// The public face's allowlist refusals: the internet's noise, counted apart (R-66, §RS.3.2 row 4).
+const UNLISTED_REASONS: [&str; 2] = ["no_peers", "not_in_peers"];
 /// What the agent has to answer `status` in (WM-R47).
 const AGENT_WAIT: Duration = Duration::from_secs(1);
 
@@ -72,10 +90,10 @@ impl Mark {
     }
 }
 
-/// The rows of one `status` run, and its JSON (WM-R47): always the six keys `instance`, `workers`,
-/// `token_signers`, `grants`, `status` and `mac`, `null` for what was not read (`--local`, a failed read, a list
-/// that does not parse). `status` is the verdict and the rows; the relay's newest status line (B-12) rides in
-/// `instance.status_line`.
+/// The rows of one `status` run, and its JSON (WM-R47, §RS.3.2): always the seven keys `instance`, `workers`,
+/// `token_signers`, `grants`, `peers`, `status` and `mac`, `null` for what was not read (`--local`, a failed read, a
+/// list that does not parse). `status` is the verdict and the rows; the relay's newest status line (B-12) rides in
+/// `instance.status_line`, the refused hour in `instance.refused`, the disk in `instance.disk_full`.
 #[derive(Default)]
 struct Report {
     rows: Vec<(Mark, String)>,
@@ -83,7 +101,7 @@ struct Report {
 }
 
 /// The keys of `--json`'s object.
-const JSON_KEYS: [&str; 6] = ["instance", "workers", "token_signers", "grants", "status", "mac"];
+const JSON_KEYS: [&str; 7] = ["instance", "workers", "token_signers", "grants", "peers", "status", "mac"];
 
 impl Report {
     fn row(&mut self, mark: Mark, line: impl Into<String>) {
@@ -204,30 +222,54 @@ pub fn cmd_status(json: bool, local: bool) -> Result<()> {
             return Err(e);
         }
     };
-    instance_rows(&ctx, &instance, &mut report);
-    list_rows(&worker_id, notes.as_ref(), &mut report);
+    let stance = instance_rows(&ctx, &instance, &mut report);
+    list_rows(&worker_id, notes.as_ref(), stance, &mut report);
+    peer_rows(&mut report);
     report.finish(json)
 }
 
-/// The instance, and when it runs, SSM's ping, the TCP probe and the status line.
-fn instance_rows(ctx: &RelayCtx, instance: &str, report: &mut Report) {
+/// What the newest status line says of the workers' client certificates (R-132, RO-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertStance {
+    /// `client_certs: true`: the relay refuses a worker without one.
+    Required,
+    /// No `peers_version`: a relay from before the relay security plan, which refuses a list with `tls_fp` and unloads
+    /// its whole whitelist, so no certificate may be issued yet (RO-3).
+    TooEarly,
+    /// `client_certs: false`, a relay with no such key but a `peers_version`, or no line read.
+    Later,
+}
+
+impl CertStance {
+    fn of(line: Option<&Value>) -> CertStance {
+        match line {
+            Some(l) if l.get("client_certs").and_then(Value::as_bool) == Some(true) => CertStance::Required,
+            Some(l) if l.get("peers_version").is_none() => CertStance::TooEarly,
+            _ => CertStance::Later,
+        }
+    }
+}
+
+/// The instance, and when it runs, SSM's ping, the TCP probe, the status line, the refused hour and the disk: what
+/// the newest status line says of the workers' certificates.
+fn instance_rows(ctx: &RelayCtx, instance: &str, report: &mut Report) -> CertStance {
     let doc = match ops::instance(instance) {
         Ok(d) => d,
         Err(e) => {
             report.row(Mark::Unknown, format!("instance {instance}: {e}"));
-            report.doc.insert("instance".into(), json!({"id": instance}));
-            return;
+            report.doc.insert("instance".into(), json!({"id": instance, "refused": null, "disk_full": null}));
+            return CertStance::Later;
         }
     };
     let state = doc.get("State").map(|s| text(s, "Name").to_string()).unwrap_or_default();
     let private_ip = text(&doc, "PrivateIpAddress").to_string();
     let public_ip = Some(text(&doc, "PublicIpAddress")).filter(|ip| !ip.is_empty()).map(str::to_string).or_else(|| ctx.state.relay_public_ip.clone()).unwrap_or_default();
     let shown = |ip: &str| if ip.is_empty() { "-".to_string() } else { ip.to_string() };
-    let mut inst = json!({"id": instance, "state": state, "private_ip": private_ip, "public_ip": public_ip});
+    let mut inst = json!({"id": instance, "state": state, "private_ip": private_ip, "public_ip": public_ip, "refused": null, "disk_full": null});
     if state != "running" {
         report.row(Mark::No, format!("instance {instance}: {state} (private {}, public {}): ai-env relay start", shown(&private_ip), shown(&public_ip)));
         report.doc.insert("instance".into(), inst);
-        return;
+        return CertStance::Later;
     }
     report.row(Mark::Ok, format!("instance {instance}: running (private {}, public {})", shown(&private_ip), shown(&public_ip)));
     match ops::ssm_ping(instance) {
@@ -237,24 +279,61 @@ fn instance_rows(ctx: &RelayCtx, instance: &str, report: &mut Report) {
         Err(e) => report.row(Mark::Unknown, format!("ssm: {e}")),
     }
     inst["probe"] = json!(probe(&public_ip, report));
-    inst["status_line"] = status_line(instance, report).unwrap_or(Value::Null);
+    let line = status_line(instance, report);
+    let stance = CertStance::of(line.as_ref());
+    inst["status_line"] = line.unwrap_or(Value::Null);
+    inst["refused"] = refused_hour(instance, report).unwrap_or(Value::Null);
+    inst["disk_full"] = disk_full(instance, report);
     report.doc.insert("instance".into(), inst);
+    stance
 }
 
-/// A plain TCP connect to `<public ip>:443` within 3 s (LD-WM15): informational, never the exit code.
+/// A plain TCP probe of `<public ip>:443` (LD-WM15, §RS.3.2 row 2): informational, never the exit code.
 fn probe(public_ip: &str, report: &mut Report) -> &'static str {
     let Ok(ip) = public_ip.parse::<std::net::IpAddr>() else {
         report.row(Mark::Warn, "probe: no public address recorded (state/infra.toml relay_public_ip)".to_string());
         return "none";
     };
-    match std::net::TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, 443), PROBE_TIMEOUT) {
-        Ok(_) => {
-            report.row(Mark::Ok, format!("probe: {ip}:443 accepts a TCP connection"));
-            "open"
+    probe_at(std::net::SocketAddr::new(ip, 443), report)
+}
+
+/// [`probe`] of `at`: a connect within 3 s, then up to 1 s without sending a byte, so it is no fault (R-102). A relay
+/// that closes it within that second refuses this Mac's address before TLS; one that keeps it open would go on to TLS.
+fn probe_at(at: std::net::SocketAddr, report: &mut Report) -> &'static str {
+    match std::net::TcpStream::connect_timeout(&at, PROBE_TIMEOUT) {
+        Ok(stream) => {
+            if closed_within(&stream, PROBE_CLOSE_WAIT) {
+                report.row(Mark::Warn, format!("probe: {at} closed the connection before TLS: this Mac's address is not in {PEERS}, or is banned (ai-env relay allow-ip --mine)"));
+                "refused"
+            } else {
+                report.row(Mark::Ok, format!("probe: {at} accepts a TCP connection"));
+                "open"
+            }
         }
         Err(e) => {
-            report.row(Mark::Warn, format!("probe: {ip}:443 did not accept a TCP connection within 3 s ({e}); this Mac's network may block it"));
+            report.row(Mark::Warn, format!("probe: {at} did not accept a TCP connection within 3 s ({e}); this Mac's network may block it, or its address is not in {PEERS} (ai-env relay allow-ip --mine)"));
             "closed"
+        }
+    }
+}
+
+/// Whether the peer closes `stream` within `wait`, this end sending nothing: an end of stream or a reset. A byte from
+/// the peer, or the wait running out, says it stays open; dropping `stream` then closes it.
+fn closed_within(stream: &std::net::TcpStream, wait: Duration) -> bool {
+    use std::io::{ErrorKind, Read as _};
+    let deadline = Instant::now() + wait;
+    let mut reader = stream;
+    let mut byte = [0u8; 1];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return false;
+        }
+        match reader.read(&mut byte) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
         }
     }
 }
@@ -262,10 +341,7 @@ fn probe(public_ip: &str, report: &mut Report) -> &'static str {
 /// The newest `ev:"status"` line of the relay's request log in the last 10 minutes (B-12, R-67): its row, and
 /// the line itself for `--json` (ids, versions, counts and ages only).
 fn status_line(instance: &str, report: &mut Report) -> Option<Value> {
-    let start = unix_now_ms().saturating_sub(STATUS_WINDOW_MS).to_string();
-    let stream = format!("{instance}/requests");
-    let args = ["filter-log-events", "--log-group-name", RELAY_LOG_GROUP, "--log-stream-names", stream.as_str(), "--start-time", start.as_str(), "--filter-pattern", r#"{ $.ev = "status" }"#];
-    let doc = match aws_json("logs", &args) {
+    let doc = match log_events(instance, "requests", STATUS_WINDOW_MS, r#"{ $.ev = "status" }"#) {
         Ok(d) => d,
         Err(e) => {
             report.row(Mark::Unknown, format!("relay: the status line could not be read ({e})"));
@@ -282,10 +358,15 @@ fn status_line(instance: &str, report: &mut Report) -> Option<Value> {
         return None;
     };
     let field = |k: &str| line.get(k).map_or_else(|| "-".to_string(), |v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
+    // An older relay's line has no `peers_version`; one with no peers file loaded holds it empty (§RS.3.1).
+    let peers = match line.get("peers_version").and_then(Value::as_str) {
+        Some(version) if !version.is_empty() => format!("{version} ({} s old)", field("peers_age_s")),
+        _ => "-".to_string(),
+    };
     report.row(
         Mark::Ok,
         format!(
-            "relay {}: {} tunnel(s), {} source(s) live; workers {} ({} s old), token-signers {} ({} s old), grants {} ({} s old)",
+            "relay {}: {} tunnel(s), {} source(s) live; workers {} ({} s old), token-signers {} ({} s old), grants {} ({} s old), peers {peers}",
             field("relay_version"),
             field("tunnels"),
             field("sources_live"),
@@ -297,11 +378,130 @@ fn status_line(instance: &str, report: &mut Report) -> Option<Value> {
             field("grants_age_s")
         ),
     );
+    // Its version empty, not missing: every admission is `no_peers` and every tunnel closed (R-89, R-90), whatever row 8
+    // reads in SSM.
+    if line.get("peers_version").and_then(Value::as_str) == Some("") {
+        report.row(Mark::Warn, "relay: its peers list is not loaded: it admits no worker".to_string());
+    }
     Some(line)
 }
 
-/// The three lists in one `get-parameters`, each entry shown, and this Mac's session key judged.
-fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, report: &mut Report) {
+/// One `filter-log-events` of the relay's log group: `<instance>/<stream>`, the last `window_ms`, `pattern`.
+fn log_events(instance: &str, stream: &str, window_ms: u64, pattern: &str) -> std::result::Result<Value, String> {
+    let start = unix_now_ms().saturating_sub(window_ms).to_string();
+    let stream = format!("{instance}/{stream}");
+    aws_json("logs", &["filter-log-events", "--log-group-name", RELAY_LOG_GROUP, "--log-stream-names", stream.as_str(), "--start-time", start.as_str(), "--filter-pattern", pattern])
+}
+
+/// What the relay refused or cut in the last hour (§RS.3.2 row 4, R-139).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Refused {
+    /// `N`: the refused tunnel lines, plus their `suppressed`.
+    handshakes: u64,
+    /// `M`: distinct `peer` values among those tunnel lines.
+    addresses: usize,
+    /// `P`: the peer lines but the public face's allowlist refusals, plus their `suppressed`.
+    connections: u64,
+    /// `B`: distinct `peer` values of the peer lines whose reason is `banned`.
+    banned: usize,
+    /// `U`: the public face's `no_peers` and `not_in_peers` lines, plus their `suppressed`.
+    unlisted: u64,
+    /// The three most frequent reasons of the tunnel lines and of `P`'s lines, by line count, ties by name.
+    top: Vec<(String, u64)>,
+}
+
+impl Refused {
+    /// The counts of request-log lines. Any other line (the filter's to leave out) counts nothing.
+    fn of<'a>(lines: impl Iterator<Item = &'a Value>) -> Refused {
+        let word = |line: &'a Value, key: &str| line.get(key).and_then(Value::as_str).unwrap_or("");
+        let (mut out, mut addresses, mut banned) = (Refused::default(), BTreeSet::new(), BTreeSet::new());
+        let mut reasons: BTreeMap<&str, u64> = BTreeMap::new();
+        for line in lines {
+            let counted = 1 + line.get("suppressed").and_then(Value::as_u64).unwrap_or(0);
+            let (peer, reason) = (word(line, "peer"), word(line, "reason"));
+            match word(line, "ev") {
+                "tunnel" if word(line, "outcome") == "refused" => {
+                    out.handshakes += counted;
+                    addresses.insert(peer);
+                }
+                "peer" if word(line, "face") == "public" && UNLISTED_REASONS.contains(&reason) => {
+                    out.unlisted += counted;
+                    continue;
+                }
+                "peer" => {
+                    out.connections += counted;
+                    if reason == "banned" {
+                        banned.insert(peer);
+                    }
+                }
+                _ => continue,
+            }
+            *reasons.entry(reason).or_default() += 1;
+        }
+        addresses.remove("");
+        banned.remove("");
+        reasons.remove("");
+        (out.addresses, out.banned) = (addresses.len(), banned.len());
+        let mut top: Vec<(&str, u64)> = reasons.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        out.top = top.into_iter().take(3).map(|(reason, count)| (reason.to_string(), count)).collect();
+        out
+    }
+
+    /// Its row: `[warn]` with a refused handshake or a banned address, the allowlist's noise (`U`) never.
+    fn row(&self) -> (Mark, String) {
+        let top = if self.top.is_empty() { "none".to_string() } else { self.top.iter().map(|(reason, count)| format!("{reason} {count}")).collect::<Vec<_>>().join(", ") };
+        let mark = if self.handshakes > 0 || self.banned > 0 { Mark::Warn } else { Mark::Ok };
+        let text = format!(
+            "refused in the last hour: {} handshake(s) from {} address(es), {} connection(s) refused or cut, {} address(es) banned, {} connection(s) from unlisted addresses; top reasons: {top}",
+            self.handshakes, self.addresses, self.connections, self.banned, self.unlisted
+        );
+        (mark, text)
+    }
+
+    /// `instance.refused`.
+    fn doc(&self) -> Value {
+        let top: Vec<Value> = self.top.iter().map(|(reason, count)| json!({"reason": reason, "count": count})).collect();
+        json!({"handshakes": self.handshakes, "addresses": self.addresses, "connections": self.connections, "banned": self.banned, "unlisted": self.unlisted, "top": top})
+    }
+}
+
+/// The refused hour's row, never the exit code, and `instance.refused`; `None` when it could not be read.
+fn refused_hour(instance: &str, report: &mut Report) -> Option<Value> {
+    let doc = match log_events(instance, "requests", REFUSED_WINDOW_MS, REFUSED_FILTER) {
+        Ok(d) => d,
+        Err(e) => {
+            report.row(Mark::Warn, format!("relay: the refusals of the last hour could not be read ({e})"));
+            return None;
+        }
+    };
+    let lines: Vec<Value> = arr(&doc, "events").iter().filter_map(|e| serde_json::from_str(e.get("message")?.as_str()?).ok()).collect();
+    let refused = Refused::of(lines.iter());
+    let (mark, text) = refused.row();
+    report.row(mark, text);
+    Some(refused.doc())
+}
+
+/// R-95: the reload's `why=disk` in the last 10 minutes: its row, never the exit code, and `instance.disk_full`
+/// (`null` when it could not be read).
+fn disk_full(instance: &str, report: &mut Report) -> Value {
+    let doc = match log_events(instance, "reload", DISK_WINDOW_MS, &format!("\"{DISK_WORD}\"")) {
+        Ok(d) => d,
+        Err(e) => {
+            report.row(Mark::Warn, format!("relay: the reload's log could not be read ({e})"));
+            return Value::Null;
+        }
+    };
+    let newest = arr(&doc, "events").iter().filter(|e| text(e, "message").contains(DISK_WORD)).map(|e| e.get("timestamp").and_then(Value::as_u64).unwrap_or(0)).max();
+    if let Some(at) = newest {
+        report.row(Mark::Warn, format!("relay: the root volume is over 90 % full (the reload's {DISK_WORD} at {})", rfc3339_utc(at / 1000)));
+    }
+    json!(newest.is_some())
+}
+
+/// The three lists in one `get-parameters`, each entry shown, and this Mac's session key judged; `stance` is what the
+/// newest status line says of the workers' certificates.
+fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, stance: CertStance, report: &mut Report) {
     let names: Vec<String> = [WORKERS, TOKEN_SIGNERS, GRANTS].iter().map(|n| (*n).to_string()).collect();
     let (got, _) = match ops::get_parameters(&names) {
         Ok(g) => g,
@@ -324,9 +524,14 @@ fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, report: &mut Report) 
         Some((Ok(list), n)) => {
             report.row(Mark::Ok, format!("{WORKERS} v{n}: {} worker(s)", list.len()));
             for w in &list {
-                report.row(Mark::Note, format!("  worker {} (key fp {}) for sources {} until {}{}", w.worker_id, fp(&w.public_key), w.sources.join(","), w.not_after, expired(w.not_after_unix())));
+                let cert = w.tls_fp.as_deref().map_or_else(|| "no cert fp".to_string(), |t| format!("cert fp {}", fp16(t)));
+                report.row(Mark::Note, format!("  worker {} (key fp {}, {cert}) for sources {} until {}{}", w.worker_id, fp(&w.public_key), w.sources.join(","), w.not_after, expired(w.not_after_unix())));
+                if w.tls_fp.is_none() && now <= w.not_after_unix() {
+                    let (mark, text) = no_cert_row(w, stance);
+                    report.row(mark, text);
+                }
             }
-            let docs: Vec<Value> = list.iter().map(|w| json!({"id": w.worker_id, "fp": fp(&w.public_key), "sources": w.sources, "not_after": w.not_after, "expired": now > w.not_after_unix()})).collect();
+            let docs: Vec<Value> = list.iter().map(|w| json!({"id": w.worker_id, "fp": fp(&w.public_key), "cert_fp": w.tls_fp.as_deref().map(fp16), "sources": w.sources, "not_after": w.not_after, "expired": now > w.not_after_unix()})).collect();
             report.doc.insert("workers".into(), Value::Array(docs));
         }
     }
@@ -372,6 +577,65 @@ fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, report: &mut Report) 
             report.doc.insert("grants".into(), Value::Array(docs));
         }
     }
+}
+
+/// The row of an in-force worker with no `tls_fp` (§RS.3.2 row 5, R-132): `[NO ]` when the newest status line says the
+/// relay requires client certificates, `[warn]` when it says not, lacks the key or was not read. The command names the
+/// worker's key and globs from the list; its P-256 point only the worker holds. A relay from before the plan gets no
+/// command at all: running it now would unload that relay's whole whitelist (RO-3).
+fn no_cert_row(w: &policy::WorkerEntry, stance: CertStance) -> (Mark, String) {
+    let key = PublicKey::parse_b64(&w.public_key).map_or_else(|_| "<its key>".to_string(), |k| k.text());
+    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow {} --key {key} --sources {} --tls-key <its p256 text>", w.worker_id, shell_word(&w.sources.join(",")));
+    match stance {
+        CertStance::Required => (Mark::No, format!("worker {} has no client certificate: the relay refuses it ({command})", w.worker_id)),
+        CertStance::Later => (Mark::Warn, format!("worker {} has no client certificate yet: a relay that requires client certificates would refuse it ({command})", w.worker_id)),
+        CertStance::TooEarly => (Mark::Warn, format!("worker {} has no client certificate yet: a relay that requires client certificates would refuse it (not yet: this relay refuses a list with tls_fp and unloads its whole whitelist (RO-3))", w.worker_id)),
+    }
+}
+
+/// The peers list (§RS.3.2 row 8, R-97), in a `get-parameters` of its own: until RO-1's deploy the ops policy reads
+/// only S13's names, and IAM refuses a whole call for one name it does not allow, so a shared call would turn the other
+/// lists' rows into `[?? ]` too.
+fn peer_rows(report: &mut Report) {
+    let (got, _) = match ops::get_parameters(&[PEERS.to_string()]) {
+        Ok(g) => g,
+        Err(e) => {
+            report.row(Mark::Unknown, format!("{PEERS} could not be read ({e})"));
+            return;
+        }
+    };
+    let Some(param) = got.get(PEERS) else {
+        report.row(Mark::No, format!("{PEERS}: absent: the relay admits no worker (ai-env relay allow-ip creates it)"));
+        report.doc.insert("peers".into(), json!([]));
+        return;
+    };
+    let n = param.version;
+    let list = match policy::parse_peers(&param.value) {
+        Ok(list) => list,
+        Err(e) => {
+            report.row(Mark::No, format!("{PEERS} v{n} does not parse ({e})"));
+            return;
+        }
+    };
+    let now = unix_now();
+    let in_force = list.iter().filter(|p| now <= p.not_after_unix()).count();
+    if in_force == 0 {
+        report.row(Mark::No, format!("{PEERS} v{n}: {} peer(s), none in force: the relay admits no worker", list.len()));
+    } else {
+        report.row(Mark::Ok, format!("{PEERS} v{n}: {} peer(s), {in_force} in force", list.len()));
+    }
+    for p in &list {
+        let lapsed = now > p.not_after_unix();
+        report.row(Mark::Note, format!("  peer {} {} until {}{}", p.label, p.cidr, p.not_after, if lapsed { " EXPIRED" } else { "" }));
+        if lapsed && p.label == MAC_LABEL {
+            report.row(Mark::Warn, format!("peer {MAC_LABEL} lapsed at {}: this Mac's worker is refused (ai-env relay allow-ip --mine)", p.not_after));
+        }
+        if !lapsed && p.network().1 < WIDE_BELOW {
+            report.row(Mark::Warn, format!("peer {} {} is wider than /16: it admits much of the internet (ai-env relay revoke-ip --label {})", p.label, p.cidr, p.label));
+        }
+    }
+    let docs: Vec<Value> = list.iter().map(|p| json!({"label": p.label, "cidr": p.cidr, "not_after": p.not_after, "expired": now > p.not_after_unix()})).collect();
+    report.doc.insert("peers".into(), Value::Array(docs));
 }
 
 /// An aws failure of `what`: exit 7.
@@ -452,4 +716,110 @@ pub fn cmd_stop() -> Result<()> {
     audit(&ctx.paths, RELAY_STOP, &[("id", instance.clone()), ("outcome", "stopped".into()), ("ms", took.clone())]);
     say(&format!("relay {instance} stopped ({took} ms): VM relay tools answer unavailable and workers keep dialing until ai-env relay start"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+
+    fn rows(report: &Report) -> Vec<(Mark, &str)> {
+        report.rows.iter().map(|(m, l)| (*m, l.as_str())).collect()
+    }
+
+    /// WM-T60's probe (§RS.3.2 row 2): the real command only dials port 443, which a test cannot bind without root, so
+    /// `probe_at` meets three loopback servers: one that closes the connection at once (`refused`, within the second),
+    /// one that keeps it open and reads no byte from it, the probe having sent none (`open`, after the second), and
+    /// a port nothing listens on (`closed`). Each row's text and its JSON word.
+    #[test]
+    fn the_probe_tells_a_refusal_from_an_open_port_and_no_connect() {
+        // Closes at once.
+        let closer = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at = closer.local_addr().unwrap();
+        let t = std::thread::spawn(move || drop(closer.accept().unwrap()));
+        let mut report = Report::default();
+        assert_eq!(probe_at(at, &mut report), "refused");
+        t.join().unwrap();
+        assert_eq!(rows(&report), [(Mark::Warn, format!("probe: {at} closed the connection before TLS: this Mac's address is not in /ai-env/relay/peers, or is banned (ai-env relay allow-ip --mine)").as_str())]);
+        // Keeps it open; the probe sends nothing, and closes it itself.
+        let keeper = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at = keeper.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let (mut conn, _) = keeper.accept().unwrap();
+            let mut seen = Vec::new();
+            conn.read_to_end(&mut seen).unwrap();
+            seen
+        });
+        let mut report = Report::default();
+        let started = Instant::now();
+        assert_eq!(probe_at(at, &mut report), "open");
+        assert!(started.elapsed() >= PROBE_CLOSE_WAIT, "it waits out the second: {:?}", started.elapsed());
+        assert_eq!(t.join().unwrap(), Vec::<u8>::new(), "no byte sent, so no fault (R-102)");
+        assert_eq!(rows(&report), [(Mark::Ok, format!("probe: {at} accepts a TCP connection").as_str())]);
+        // Nothing listens.
+        let gone = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at = gone.local_addr().unwrap();
+        drop(gone);
+        let mut report = Report::default();
+        assert_eq!(probe_at(at, &mut report), "closed");
+        let (mark, text) = report.rows[0].clone();
+        assert_eq!(mark, Mark::Warn);
+        assert!(text.starts_with(&format!("probe: {at} did not accept a TCP connection within 3 s (")) && text.ends_with("); this Mac's network may block it, or its address is not in /ai-env/relay/peers (ai-env relay allow-ip --mine)"), "{text}");
+        // A server that writes first (no relay does) is open, and the wait for it ends the wait.
+        let talker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let at: SocketAddr = talker.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let (mut conn, _) = talker.accept().unwrap();
+            conn.write_all(b"x").unwrap();
+            conn
+        });
+        let stream = TcpStream::connect(at).unwrap();
+        assert!(!closed_within(&stream, Duration::from_secs(5)));
+        drop(t.join().unwrap());
+    }
+
+    /// §RS.3.2 row 4's counts over hand-made lines, each with what R-66 suppressed before it.
+    #[test]
+    fn the_refused_hour_counts_its_lines_and_their_suppressed() {
+        let tunnel = |peer: &str, reason: &str, suppressed: u64| json!({"ev": "tunnel", "phase": "auth", "outcome": "refused", "peer": peer, "reason": reason, "suppressed": suppressed});
+        let line = |face: &str, peer: &str, reason: &str, suppressed: u64| json!({"ev": "peer", "face": face, "peer": peer, "reason": reason, "suppressed": suppressed});
+        let lines = [
+            tunnel("198.51.100.1", "bad_signature", 2),
+            tunnel("198.51.100.1", "bad_signature", 0),
+            tunnel("198.51.100.2", "unknown_cert", 0),
+            // Neither refused nor a peer line: nothing (the filter's own, kept out here too).
+            json!({"ev": "tunnel", "phase": "auth", "outcome": "ok", "peer": "198.51.100.3", "reason": "", "suppressed": 9}),
+            json!({"ev": "status", "tunnels": 2}),
+            line("public", "203.0.113.1", "not_in_peers", 40),
+            line("public", "203.0.113.2", "no_peers", 1),
+            line("public", "198.51.100.4", "banned", 3),
+            line("public", "198.51.100.4", "banned", 0),
+            line("public", "198.51.100.5", "tls_failed", 0),
+            line("private", "192.0.2.9", "auth_timeout", 0),
+            // A private address outside private_peers is no scanner of the internet: `P`, not `U`.
+            line("private", "192.0.2.99", "not_in_peers", 0),
+        ];
+        let refused = Refused::of(lines.iter());
+        assert_eq!((refused.handshakes, refused.addresses, refused.connections, refused.banned, refused.unlisted), (5, 2, 8, 1, 43));
+        // Ties by name; by line count, whatever each line suppressed; the allowlist's lines never.
+        assert_eq!(refused.top, [("bad_signature".to_string(), 2), ("banned".to_string(), 2), ("auth_timeout".to_string(), 1)]);
+        let (mark, text) = refused.row();
+        assert_eq!(mark, Mark::Warn);
+        assert_eq!(text, "refused in the last hour: 5 handshake(s) from 2 address(es), 8 connection(s) refused or cut, 1 address(es) banned, 43 connection(s) from unlisted addresses; top reasons: bad_signature 2, banned 2, auth_timeout 1");
+        assert_eq!(refused.doc(), json!({"handshakes": 5, "addresses": 2, "connections": 8, "banned": 1, "unlisted": 43, "top": [{"reason": "bad_signature", "count": 2}, {"reason": "banned", "count": 2}, {"reason": "auth_timeout", "count": 1}]}));
+        // Nothing: no reason. Scanners alone: `[ok ]`, whatever their number. A cut alone: `[ok ]` too (`N` and `B` warn).
+        let (mark, text) = Refused::of([].iter()).row();
+        assert!(mark == Mark::Ok && text.ends_with("; top reasons: none"), "{text}");
+        let scanners = [line("public", "203.0.113.1", "not_in_peers", 1000)];
+        let (mark, text) = Refused::of(scanners.iter()).row();
+        assert!(mark == Mark::Ok && text.contains("1001 connection(s) from unlisted addresses; top reasons: none"), "{text}");
+        let cut = [line("private", "192.0.2.9", "idle", 0)];
+        assert_eq!(Refused::of(cut.iter()).row().0, Mark::Ok);
+        // One banned line warns; fewer reasons when fewer exist.
+        let ban = [line("public", "198.51.100.4", "banned", 0)];
+        let (mark, text) = Refused::of(ban.iter()).row();
+        assert!(mark == Mark::Warn && text.ends_with("; top reasons: banned 1"), "{text}");
+    }
 }

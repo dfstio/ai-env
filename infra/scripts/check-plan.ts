@@ -42,7 +42,9 @@
 // proxy subnet, its own group, address and profile, IMDSv2 hop limit 1, no key pair), its Elastic IP and the
 // association (that address, the relay instance, by URN and by value), its role, inline policy (relayRolePolicy) and SSM
 // attachment, its log group, its artifact object (the artifacts bucket, a hash-keyed key) and the artifact parameter
-// that pins it (that object's key, the bucket, and the uploaded file's hash when the plan carries it); its security
+// that pins it (that object's key, the bucket, and the uploaded file's hash when the plan carries it); LD-R56 the
+// twentieth, its boot object (the artifacts bucket, a key of its content's hash, its content and no other property),
+// and the user data that pins it (that key and hash, the instance depending on it); its security
 // group's rules by checkRule; the VM group's second rule and NACL entries by checkRule and checkNacl; ai-env-ops' policy
 // built from the relay instance too.
 //
@@ -63,7 +65,7 @@ import {
     proxyTrustPolicy, RELAY_INSTANCE_PROFILE_NAME, RELAY_ROLE_NAME, relayRolePolicy, relayTrustPolicy, roleArn, runtimePolicy, s3EndpointPolicy, transcriptsBucketName,
     transcriptsBucketPolicy,
 } from "../policies";
-import { RELAY_KEY_RE, parseRelayArtifactValue } from "../relay-spec";
+import { RELAY_BOOT_KEY_RE, RELAY_KEY_RE, parseRelayArtifactValue, relayBootPin, renderRelayUserData } from "../relay-spec";
 
 /**
  * S9: the transcripts bucket's lifecycle (contracts §7.2), written out again (not imported from transcripts.ts, a Pulumi
@@ -260,9 +262,10 @@ for (const t of types) {
 console.log(`  ${String(all.length).padStart(3)}  resources in total, the stack included (expected ${expectedTotal})`);
 if (all.length !== expectedTotal) bad(`${all.length} resources, expected ${expectedTotal}`);
 // The inventory's own size is pinned (contracts §7.1: S9 took it from 67 and 72 to 75 and 80; S13 took it from 75, 80
-// and 83 to 94, 99 and 102, the relay's nineteen): a resource added to the stack changes this pin too, where review sees it.
-const pinnedTotal = cfg.dnsMode === "firewall" ? (cfg.enableDnsQueryLog ? 102 : 99) : 94;
-if (expectedTotal !== pinnedTotal) bad(`the stack inventory holds ${expectedTotal} resources (the stack included) in dnsMode ${cfg.dnsMode}, the pin says ${pinnedTotal} (94 in none, 99 in firewall, 102 with the query log)`);
+// and 83 to 94, 99 and 102, the relay's nineteen; LD-R56 to 95, 100 and 103, its boot object): a resource added to the
+// stack changes this pin too, where review sees it.
+const pinnedTotal = cfg.dnsMode === "firewall" ? (cfg.enableDnsQueryLog ? 103 : 100) : 95;
+if (expectedTotal !== pinnedTotal) bad(`the stack inventory holds ${expectedTotal} resources (the stack included) in dnsMode ${cfg.dnsMode}, the pin says ${pinnedTotal} (95 in none, 100 in firewall, 103 with the query log)`);
 
 // ---- every resource: a child of the stack, the pinned provider of its package, unprotected, in the region ----
 const providerUrn = (name: string) => all.find((r) => r.type.startsWith("pulumi:providers:") && r.name === name)?.urn;
@@ -637,6 +640,42 @@ ref(relayEipAssoc, "instanceId", [relayInst]);
 absent(relayEipAssoc, ["networkInterfaceId", "privateIpAddress", "publicIp", "allowReassociation"]);
 const relayGroup = one(T.logGroup, NET.relayLogGroup);
 eq("relay log group", [relayGroup.i.name, relayGroup.i.retentionInDays], [cfg.relayLogGroup, cfg.relayLogRetentionDays]);
+// Its boot script (LD-R56): one object of the artifacts bucket, keyed by its content's hash, holding its content and no
+// other property of its type; and the instance that fetches it: depending on it, its user data the rendering of
+// user-data.sh next to --egress-config for that key and hash (a replaced object runs nothing). Unknown only while what
+// it is built from (the artifacts bucket) is created or replaced.
+const relayBoot = one(T.object, NET.relayBoot);
+if (relayBoot !== EMPTY) {
+    ref(relayBoot, "bucket", [bucketRes]);
+    const key = relayBoot.i.key, content = relayBoot.i.content;
+    if (!(typeof key === "string" && RELAY_BOOT_KEY_RE.test(key))) bad(`relay boot key: ${json(key)} is not relay/ai-env-relay-boot-<sha256[:16]>`);
+    eq("relay boot contentType", relayBoot.i.contentType, "text/x-shellscript");
+    absent(relayBoot, ["source", "contentBase64", "sourceHash", "etag", "acl", "bucketKeyEnabled", "cacheControl", "checksumAlgorithm", "contentDisposition", "contentEncoding", "contentLanguage",
+        "forceDestroy", "kmsKeyId", "metadata", "objectLockLegalHoldStatus", "objectLockMode", "objectLockRetainUntilDate", "overrideProvider", "serverSideEncryption", "storageClass", "websiteRedirect"]);
+    if (!known(content)) bad(`${relayBoot.type} ${relayBoot.name}: content is ${content === UNKNOWN ? "unknown" : "missing"}, not the rendered boot script`);
+    else {
+        const pin = relayBootPin(content);
+        if (key !== pin.bootKey) bad(`relay boot key: ${json(key)} is not its content's, ${pin.bootKey}`);
+        if (relayInst !== EMPTY && !relayInst.dependencies.includes(relayBoot.urn)) bad(`${relayInst.type} ${relayInst.name}: does not depend on ${relayBoot.urn.split("::").slice(-2).join("::")}, which its user data fetches`);
+        const userData = relayInst.i.userData;
+        if (known(userData)) {
+            if (!userData.includes(`'${pin.bootKey}'`) || !userData.includes(`'${pin.bootSha256}'`)) bad(`relay instance userData does not pin the boot object's key and SHA-256 (${pin.bootKey})`);
+            else if (typeof bucketName === "string") {
+                let want: string | undefined;
+                try {
+                    want = renderRelayUserData(bucketName, pin, REGION, path.join(path.dirname(egressConfigFile), "relay"));
+                } catch (e) {
+                    bad(`relay instance userData: ${(e as Error).message}`);
+                }
+                if (want !== undefined && userData !== want) bad("relay instance userData is not relay/user-data.sh rendered for the boot object");
+            }
+        } else if (relayInst !== EMPTY && userData !== UNKNOWN) {
+            bad(`${relayInst.type} ${relayInst.name}: userData is ${json(userData)}, neither text nor unknown: cannot prove it pins the boot object`);
+        } else if (relayInst !== EMPTY && !(relayInst.deps.userData ?? []).some((u) => CREATING.has(byUrn.get(u)?.op ?? ""))) {
+            bad(`${relayInst.type} ${relayInst.name}: userData is unknown on a ${relayInst.op} step whose inputs all exist: cannot prove it pins the boot object`);
+        }
+    }
+}
 // Its binary: a hash-keyed object of the artifacts bucket, and the parameter that pins it (the reload unit installs
 // exactly that object, by its SHA-256).
 const relayObject = one(T.object, NET.relayArtifact);

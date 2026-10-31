@@ -271,7 +271,7 @@ bridge = [
     "dep:ai-env-worker",
     "tokio-tungstenite/connect",
     # This feature is the only public way to obtain `Connector::Rustls`; it pulls
-    # webpki-roots 0.26 (a re-export of the pinned 1.0.9) which tls.rs never uses —
+    # webpki-roots 0.26 (a re-export of the pinned 1.0.11) which tls.rs never uses —
     # the WS client installs its own root store.
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]

@@ -3,6 +3,10 @@ worker_id = "example-worker"               # as the deployer allowed it: ai-env 
 relay = "203.0.113.10:443"                 # the relay's public address and port (documentation range)
 server_name = "ai-env-relay"               # the name in the relay's certificate
 relay_ca = "/etc/ai-env-worker/relay-ca.pem"   # the relay CA's certificate: the only trust anchor
+# The client certificate the relay asks for, and its key (both, or neither). On the Mac (signer = "agent"),
+# the bridge's state/relay-client.pem and state/relay-client.key, the key made by this binary's tls-keygen.
+# relay_client_cert = "/etc/ai-env-worker/relay-client.pem"  # what `ai-env relay allow ... --tls-key` printed (0640, root:ai-env-worker)
+# relay_client_key = "/etc/ai-env-worker/relay-client.key"   # 0600, owned by the worker's user; made by `my-worker tls-keygen`
 signer = "file"                            # "file" on a server; "agent" on the Mac (ai-env relay agent)
 key_file = "/etc/ai-env-worker/worker.key" # 0600, owned by the worker's user; made by `my-worker keygen`
 max_in_flight = 8

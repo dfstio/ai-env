@@ -2,7 +2,7 @@
 //! (plans/s13-contracts.md §R-relay.2.3).
 //!
 //! Exit codes: run 0 after a clean stop, 1 on a runtime failure (a bind, a server error), 2 when the config is
-//! refused; `check` 0 when the four live files are loaded and the three JSON lists fresh, 1 otherwise, 2 when the
+//! refused; `check` 0 when the five live files are loaded and the four JSON lists fresh, 1 otherwise, 2 when the
 //! config is refused. `check` binds nothing and writes nothing, and never prints a key, a glob or a source name.
 
 use std::path::{Path, PathBuf};
@@ -47,16 +47,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// Logging to stderr without ANSI: `RUST_LOG` (default `info`), the transport crates held at `warn` (§R-relay.2.3).
+/// Logging to stderr without ANSI (§R-relay.2.3, F23): `RUST_LOG` (default `info`), the transport crates held at
+/// `error`, and every target but the relay's own capped at `log_refusals_per_min` lines a minute (`reqlog::LogCap`;
+/// the limits are compiled in, D-3, so the default is production's).
 fn logging() {
-    use tracing_subscriber::EnvFilter;
-    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    for quiet in ["h2=warn", "hyper=warn", "rustls=warn", "tonic=warn", "tower=warn"] {
-        if let Ok(d) = quiet.parse() {
-            filter = filter.add_directive(d);
-        }
-    }
-    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::io::stderr).init();
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let spec = std::env::var("RUST_LOG").ok();
+    ai_env_relay::reqlog::log_subscriber(spec.as_deref(), ai_env_relay::Limits::default().log_refusals_per_min, std::io::stderr).init();
 }
 
 /// The `AI_ENV_RELAY_*` names of the process environment (the only ones `run` reads, with `RUST_LOG`,
@@ -198,6 +195,26 @@ fn check(env_file: &Path) -> ExitCode {
             println!("{TLS_FILE}: missing");
         }
     }
+    // R-91: the fifth line, the public face's allowlist, after tls.pem's (poll order); loaded and fresh, as the lists.
+    let peers_file = ai_env_relay::lists::PEERS_FILE;
+    match (&polls[4].1, entries_of(&live.peers.loaded())) {
+        (Poll::Refused(text), _) => {
+            ok = false;
+            println!("{peers_file}: refused ({text})");
+        }
+        (_, Some((version, entries, fresh_at))) => {
+            let age = fresh_at.and_then(|t| now.duration_since(t).ok());
+            if age.is_none_or(|a| a > max_stale) {
+                ok = false;
+            }
+            let age = age.map_or_else(|| "none".to_string(), |a| a.as_secs().to_string());
+            println!("{peers_file}: loaded version={version:016x} entries={entries} age_s={age}");
+        }
+        (_, None) => {
+            ok = false;
+            println!("{peers_file}: missing");
+        }
+    }
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -228,6 +245,12 @@ impl Counted for ai_env_relay::lists::Signers {
 }
 
 impl Counted for ai_env_relay::lists::Grants {
+    fn count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Counted for ai_env_relay::lists::Peers {
     fn count(&self) -> usize {
         self.entries.len()
     }

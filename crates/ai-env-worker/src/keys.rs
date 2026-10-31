@@ -237,15 +237,22 @@ pub(crate) fn pem_blocks(text: &[u8]) -> Result<Vec<PemBlock>, String> {
 
 /// Writes a 0600 key file: `O_CREAT|O_EXCL`, or with `force` a temp file renamed over the old one (WM-R4).
 pub fn write_key_file(path: &Path, key: &SigningKey, force: bool) -> Result<(), KeyFileError> {
+    let pem = key.to_pkcs8_pem().map_err(|e| KeyFileError(format!("{}: {e}", path.display())))?;
+    write_private_pem(path, pem.as_bytes(), force)
+}
+
+/// Writes a 0600 private key file of `pem` (WM-R4, R-119): `O_CREAT|O_EXCL`, or with `force` a temp file in the
+/// same directory renamed over the old one; fsynced either way. Both keys of a worker are written by it: its
+/// Ed25519 key (`write_key_file`) and its P-256 TLS key (the template's `tls-keygen`).
+pub fn write_private_pem(path: &Path, pem: &[u8], force: bool) -> Result<(), KeyFileError> {
     let shown = path.display();
-    let pem = key.to_pkcs8_pem().map_err(|e| KeyFileError(format!("{shown}: {e}")))?;
     let create = |p: &Path| OpenOptions::new().write(true).create_new(true).mode(0o600).open(p);
     if !force {
         let mut file = create(path).map_err(|e| match e.kind() {
             ErrorKind::AlreadyExists => KeyFileError(format!("{shown} already exists: --force replaces it")),
             _ => KeyFileError(format!("cannot create {shown}: {e}")),
         })?;
-        return write_synced(&mut file, pem.as_bytes()).map_err(|e| KeyFileError(format!("cannot write {shown}: {e}")));
+        return write_synced(&mut file, pem).map_err(|e| KeyFileError(format!("cannot write {shown}: {e}")));
     }
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
@@ -256,7 +263,7 @@ pub fn write_key_file(path: &Path, key: &SigningKey, force: bool) -> Result<(), 
     aws_lc_rs::rand::fill(&mut nonce).map_err(|_| KeyFileError(format!("{shown}: no random bytes for a temp name")))?;
     let tmp = dir.join(format!(".{}.tmp-{}-{}", name.to_string_lossy(), std::process::id(), u64::from_be_bytes(nonce)));
     let written = create(&tmp)
-        .and_then(|mut file| write_synced(&mut file, pem.as_bytes()))
+        .and_then(|mut file| write_synced(&mut file, pem))
         .and_then(|()| std::fs::rename(&tmp, path))
         .and_then(|()| File::open(dir).and_then(|d| d.sync_all()));
     written.map_err(|e| {
@@ -273,8 +280,17 @@ fn write_synced(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Reads a key file: a regular file of the effective uid, no group or other bits, at most 4096 bytes, one
-/// `PRIVATE KEY` block of an Ed25519 key (WM-R4).
+/// `PRIVATE KEY` block of an Ed25519 key (WM-R4): `read_private_pem`, then the Ed25519 parse.
 pub fn read_key_file(path: &Path) -> Result<SigningKey, KeyFileError> {
+    let pem = read_private_pem(path)?;
+    SigningKey::from_pkcs8_pem(&pem).map_err(|e| KeyFileError(format!("{}: {e}", path.display())))
+}
+
+/// Reads a private key file (WM-R4, R-119): a regular file (`lstat`, so never a symlink) of the effective uid,
+/// no group or other bits, at most `KEY_FILE_MAX` (4096) bytes, opened `O_NOFOLLOW | O_NONBLOCK`, holding one
+/// `PRIVATE KEY` block; its bytes back, in zeroizing memory. Both keys of a worker are read by it: its Ed25519
+/// key (`read_key_file`) and its P-256 TLS key (`RelayEndpoint::client_identity`'s `key_pem`).
+pub fn read_private_pem(path: &Path) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
     let shown = path.display();
     let refused = |why: String| KeyFileError(format!("{shown}: {why}"));
     let meta = std::fs::symlink_metadata(path).map_err(|e| KeyFileError(format!("cannot read {shown}: {e}")))?;
@@ -320,7 +336,14 @@ pub fn read_key_file(path: &Path) -> Result<SigningKey, KeyFileError> {
     if n > cap {
         return Err(refused(format!("is over {KEY_FILE_MAX} bytes")));
     }
-    SigningKey::from_pkcs8_pem(&buf[..n]).map_err(|e| refused(e.to_string()))
+    // The buffer keeps its allocation: the zeroizing drop clears all of it.
+    buf.truncate(n);
+    match pem_blocks(&buf).map_err(refused)?.as_slice() {
+        [(label, _)] if label == KEY_LABEL => Ok(buf),
+        [(label, _)] => Err(refused(format!("a {label} block, not a {KEY_LABEL} block"))),
+        [] => Err(refused(format!("no {KEY_LABEL} block"))),
+        more => Err(refused(format!("{} PEM blocks, not one {KEY_LABEL} block", more.len()))),
+    }
 }
 
 /// A key that cannot be used (WM-R3). Phase 0 freezes the name; W chooses its variants (its text names a
@@ -464,5 +487,89 @@ mod tests {
         assert!(read_key_file(&none).expect_err("no block").to_string().contains("no PRIVATE KEY block"));
         let missing = dir.path().join("missing.key");
         assert!(read_key_file(&missing).is_err());
+    }
+
+    /// WM-T55: a worker's two keys, its Ed25519 key and its P-256 TLS key, go through one writer and one reader,
+    /// whose refusals keep today's texts.
+    #[test]
+    fn private_key_files_share_one_reader() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let key = SigningKey::generate().expect("a key");
+        let ed25519 = dir.path().join("worker.key");
+        write_key_file(&ed25519, &key, false).expect("written");
+        let ed25519_pem = key.to_pkcs8_pem().expect("PEM").to_string();
+        let der = crate::certs::client_key().expect("a P-256 key");
+        let p256_pem = crate::certs::pem(KEY_LABEL, &der);
+        let p256 = dir.path().join("relay-client.key");
+        write_private_pem(&p256, p256_pem.as_bytes(), false).expect("written");
+        let e = write_private_pem(&p256, p256_pem.as_bytes(), false).expect_err("it exists");
+        assert_eq!(e.to_string(), format!("{} already exists: --force replaces it", p256.display()));
+        write_private_pem(&p256, p256_pem.as_bytes(), true).expect("replaced");
+
+        for path in [&ed25519, &p256] {
+            assert_eq!(std::fs::metadata(path).expect("meta").mode() & 0o777, 0o600, "{}", path.display());
+        }
+        assert_eq!(read_private_pem(&ed25519).expect("read").as_slice(), ed25519_pem.as_bytes());
+        assert_eq!(read_key_file(&ed25519).expect("read").public_key(), key.public_key());
+        let back = read_private_pem(&p256).expect("read");
+        assert_eq!(back.as_slice(), p256_pem.as_bytes());
+        let blocks = pem_blocks(&back).expect("PEM");
+        assert_eq!(crate::certs::client_point(&blocks[0].1), crate::certs::client_point(&der), "the P-256 key's own point");
+        let e = read_key_file(&p256).expect_err("not an Ed25519 key");
+        assert_eq!(e.to_string(), format!("{}: not a PKCS#8 Ed25519 private key", p256.display()));
+
+        let text = |p: &Path| read_private_pem(p).expect_err("refused").to_string();
+        let write = |p: &Path, bytes: &[u8]| {
+            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(p).expect("create");
+            f.write_all(bytes).expect("write");
+        };
+        for (path, pem) in [(&ed25519, &ed25519_pem), (&p256, &p256_pem)] {
+            let shown = path.display();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            assert_eq!(text(path), format!("{shown}: has mode 0644: a key file is 0600 (chmod 600)"));
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+            let link = path.with_extension("link");
+            std::os::unix::fs::symlink(path, &link).expect("symlink");
+            assert_eq!(text(&link), format!("{}: is a symlink: point the config at the key file itself", link.display()));
+
+            // The key, then explanatory text (RFC 7468) to 4097 bytes.
+            let big = path.with_extension("big");
+            let mut padded = pem.clone().into_bytes();
+            padded.resize(4097, b'\n');
+            write(&big, &padded);
+            assert_eq!(text(&big), format!("{}: is 4097 bytes, over 4096", big.display()));
+
+            let two = path.with_extension("two");
+            write(&two, format!("{pem}{pem}").as_bytes());
+            assert_eq!(text(&two), format!("{}: 2 PEM blocks, not one PRIVATE KEY block", two.display()));
+        }
+
+        // Another owner: as root, copies of both keys handed to uid 1; else a file root owns (the owner is
+        // checked before a byte is read).
+        let euid = nix::unistd::geteuid().as_raw();
+        let foreign: Vec<std::path::PathBuf> = if euid == 0 {
+            [&ed25519, &p256]
+                .into_iter()
+                .map(|p| {
+                    let theirs = p.with_extension("theirs");
+                    std::fs::copy(p, &theirs).expect("copy");
+                    std::os::unix::fs::chown(&theirs, Some(1), None).expect("chown");
+                    theirs
+                })
+                .collect()
+        } else {
+            ["/etc/passwd", "/etc/hosts", "/etc/group"]
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.uid() != euid))
+                .take(1)
+                .collect()
+        };
+        assert!(!foreign.is_empty(), "a regular file of another owner");
+        for path in foreign {
+            let uid = std::fs::symlink_metadata(&path).expect("meta").uid();
+            assert_eq!(text(&path), format!("{}: is owned by uid {uid}, not this process's uid {euid}", path.display()));
+        }
     }
 }

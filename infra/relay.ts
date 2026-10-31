@@ -1,14 +1,16 @@
 // The relay (S13, plans/s13-contracts.md §I-infra.4.3): a t4g.nano `ai-env-relay` in the proxy subnet at a fixed
 // private address, with an Elastic IP for the workers, its role (relayRolePolicy beside the AWS managed SSM agent
-// policy) and instance profile, its log group, its binary in the artifacts bucket and the `artifact` parameter that pins
-// it. Its other four parameters (workers, grants, token-signers, tls) are `ai-env relay`'s, written as the deployer at
+// policy) and instance profile, its log group, its boot script and its binary in the artifacts bucket and the `artifact`
+// parameter that pins the binary. Its other five parameters (workers, grants, token-signers, peers, tls) are `ai-env relay`'s, written as the deployer at
 // their first use: Pulumi never holds them (LD-I5: the grants name private sources; a SecureString in Pulumi's state
 // would hold the key).
 //
 // Why this shape: administration through SSM only (no key pair, no port 22), IMDSv2 with hop limit 1, the AMI pinned
-// by ignoreChanges as the proxy's; the user data (relay-spec.ts renderRelayFiles) carries no secret, and a change to
-// it replaces the instance (the Elastic IP moves to the new one). The scratch:relay-imds, scratch:relay-policy and
-// scratch:relay-eip markers are edited by `make preview-scratch NEGATIVE=relay-imds|relay-role-widen|relay-eip-elsewhere`.
+// by ignoreChanges as the proxy's; two boot scripts (relay-spec.ts, plans/relay-security-contracts.md LD-R56): the user
+// data makes the swap, then fetches the boot object and runs it only if its SHA-256 is the one the user data pins, so
+// the boot's size has no limit. Neither carries a secret, and a change to either, or to what the boot object embeds,
+// changes the user data, which replaces the instance (the Elastic IP moves to the new one). The scratch:relay-imds,
+// scratch:relay-policy and scratch:relay-eip markers are edited by `make preview-scratch NEGATIVE=relay-imds|relay-role-widen|relay-eip-elsewhere`.
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -18,7 +20,7 @@ import { Egress, EgressGuard, EgressProviders } from "./egress";
 import { AMI_PARAMETER, EgressSpec, NET } from "./egress-spec";
 import { Artifacts, uploadCopy } from "./image";
 import { Names, REGION, RELAY_INSTANCE_PROFILE_NAME, RELAY_KEY_PREFIX, RELAY_ROLE_NAME, SSM_INSTANCE_POLICY_ARN, relayRolePolicy, relayTrustPolicy } from "./policies";
-import { relayArtifactValue, renderRelayFiles } from "./relay-spec";
+import { relayArtifactValue, renderRelayFiles, renderRelayUserData } from "./relay-spec";
 
 /** What `make relay-artifact` wrote; `binaryPath` resolved, `uploadPath` the verified copy the upload reads. */
 export interface RelayJson {
@@ -69,6 +71,7 @@ export interface Relay {
     rolePolicy: aws.iam.RolePolicy;
     profile: aws.iam.InstanceProfile;
     logGroup: aws.cloudwatch.LogGroup;
+    boot: aws.s3.BucketObjectv2;
     artifact: aws.s3.BucketObjectv2;
     artifactParameter: aws.ssm.Parameter;
 }
@@ -84,6 +87,11 @@ export function createRelay(
     const files = renderRelayFiles(cfg, REGION);
 
     const logGroup = new aws.cloudwatch.LogGroup(NET.relayLogGroup, { name: cfg.relayLogGroup, retentionInDays: cfg.relayLogRetentionDays, tags }, opts);
+    // The boot script, the user data's second step (LD-R56). A changed text is a new key, hence a replacement: the new
+    // object exists before the instance that pins it boots, the old one is deleted after it.
+    const boot = new aws.s3.BucketObjectv2(NET.relayBoot, {
+        bucket: artifacts.bucket.id, key: files.bootKey, content: files.boot, contentType: "text/x-shellscript", tags,
+    }, { ...opts, dependsOn: [artifacts.publicAccess] });
     // A new binary is a new key, hence a replacement: the new object exists before the parameter names it.
     const artifact = new aws.s3.BucketObjectv2(NET.relayArtifact, {
         bucket: artifacts.bucket.id, key: relayJson.key, source: new pulumi.asset.FileAsset(relayJson.uploadPath), contentType: "application/octet-stream", tags,
@@ -116,7 +124,7 @@ export function createRelay(
         metadataOptions: { httpEndpoint: "enabled", httpTokens: "required", httpPutResponseHopLimit: 1, instanceMetadataTags: "disabled" }, // scratch:relay-imds
         rootBlockDevice: { volumeType: "gp3", volumeSize: 8, encrypted: true, deleteOnTermination: true },
         creditSpecification: { cpuCredits: "standard" },
-        userData: files.userData,
+        userData: artifacts.bucket.bucket.apply((bucket) => renderRelayUserData(bucket, files, REGION)),
         userDataReplaceOnChange: true,
         tags: named(NET.relayInstance),
         volumeTags: named(NET.relayInstance),
@@ -126,12 +134,12 @@ export function createRelay(
         ignoreChanges: ["ami"],
         // The fixed private IP cannot be held by two instances.
         deleteBeforeReplace: true,
-        // Its boot fetches packages (the route, DHCP, the S3 endpoint), its parameters and binary, and ships logs.
-        dependsOn: [net.proxyRouteAssociation, net.dhcpAssociation, net.s3Endpoint, ...net.relayRules, logGroup, artifact, artifactParameter, rolePolicy, ssmAttachment],
+        // Its boot fetches its boot script and packages (the route, DHCP, the S3 endpoint), its parameters and binary, and ships logs.
+        dependsOn: [net.proxyRouteAssociation, net.dhcpAssociation, net.s3Endpoint, ...net.relayRules, logGroup, boot, artifact, artifactParameter, rolePolicy, ssmAttachment],
     });
     guard.track("relay-instance", instance.id);
     const eip = new aws.ec2.Eip(NET.relayEip, { domain: "vpc", tags: named(NET.relayEip) }, opts);
     guard.track("relay-eip", eip.id);
     const eipAssociation = new aws.ec2.EipAssociation(NET.relayEip, { allocationId: eip.allocationId, instanceId: instance.id }, opts); // scratch:relay-eip
-    return { instance, eip, eipAssociation, role, rolePolicy, profile, logGroup, artifact, artifactParameter };
+    return { instance, eip, eipAssociation, role, rolePolicy, profile, logGroup, boot, artifact, artifactParameter };
 }

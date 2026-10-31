@@ -107,6 +107,8 @@ pub struct TunnelHandle {
     pub last_seen_ms: Arc<AtomicI64>,
     /// When it authenticated, unix seconds.
     pub since_unix: u64,
+    /// Its connection's peer, canonical (`PeerInfo.ip`): every poll judges it against the peers file (R-90).
+    pub peer_ip: std::net::IpAddr,
 }
 
 /// Why a catalog was refused (R-21, R-23).
@@ -345,7 +347,8 @@ impl Default for Registry {
     }
 }
 
-/// Names through `ai_env_worker::globs::valid_id`, the entry's globs through `WorkerEntry::allows_source` (R-21).
+/// Names through `ai_env_worker::globs::valid_id`, the entry's globs through `WorkerEntry::allows_source` (R-21);
+/// after each source's R-21 checks, its text's control and format characters ([`text_fault`], R-115).
 pub fn validate_catalog(entry: &WorkerEntry, catalog: &[SourceDescriptor]) -> Result<(), CatalogRefusal> {
     use ai_env_worker::globs::valid_id;
     if catalog.is_empty() {
@@ -397,8 +400,129 @@ pub fn validate_catalog(entry: &WorkerEntry, catalog: &[SourceDescriptor]) -> Re
                 return Err(shape(&d.name, format!("op {}: an example is not JSON of at most {EXAMPLE_MAX} bytes", op.name)));
             }
         }
+        if let Some(what) = text_fault(d) {
+            return Err(shape(&d.name, what));
+        }
     }
     Ok(())
+}
+
+/// Unicode 16.0's General_Category=Format (Cf) as inclusive ranges: 21 ranges, 170 code points (R-115). The bidi
+/// embeddings, overrides and isolates, the zero-width spaces and joiners, the soft hyphen and the tag characters
+/// among them: text a reader is not shown, or shown in another order.
+pub const FORMAT_CHARS: [(u32, u32); 21] = [
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
+/// Whether `c` is a Cf character ([`FORMAT_CHARS`]).
+fn is_format(c: char) -> bool {
+    let c = u32::from(c);
+    FORMAT_CHARS.iter().any(|&(first, last)| (first..=last).contains(&c))
+}
+
+/// R-115: what `version` and `env` refuse: any Cc character (U+0000 to U+001F, U+007F to U+009F: `char::is_control`)
+/// or any Cf character.
+fn refused_in_word(c: char) -> bool {
+    c.is_control() || is_format(c)
+}
+
+/// R-115: what the descriptions, the examples and the schema refuse: any Cc character but TAB, LF and CR (a
+/// description may run over lines; JSON's whitespace is theirs), or any Cf character.
+fn refused_in_text(c: char) -> bool {
+    (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || is_format(c)
+}
+
+/// R-115 (LD-R28): whether a JSON text R-21 took holds a refused character ([`refused_in_text`]), raw or in a string
+/// it decodes to, keys and values alike, so an escaped `\u202e` is refused as the raw one is. Every `\` of valid JSON
+/// opens an escape inside a string, so the escapes are decoded in order, each to its character (a surrogate pair's
+/// two escapes to their one); a lone surrogate decodes to no character and refuses nothing. Everything else is the
+/// raw text, already checked. An escape that is not JSON's is refused (R-21 took no such text).
+fn json_refused(text: &str) -> bool {
+    if text.chars().any(refused_in_text) {
+        return true;
+    }
+    let b = text.as_bytes();
+    // The UTF-16 unit of the four hex digits at `at` (a `\u` escape's).
+    let unit = |at: usize| {
+        let digits = b.get(at..at + 4).filter(|h| h.iter().all(u8::is_ascii_hexdigit))?;
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let (code, len) = match b.get(i + 1) {
+            Some(b'"') => (0x22, 2),
+            Some(b'\\') => (0x5c, 2),
+            Some(b'/') => (0x2f, 2),
+            Some(b'b') => (0x08, 2),
+            Some(b'f') => (0x0c, 2),
+            Some(b'n') => (0x0a, 2),
+            Some(b'r') => (0x0d, 2),
+            Some(b't') => (0x09, 2),
+            Some(b'u') => match (unit(i + 2), b.get(i + 6..i + 8), unit(i + 8)) {
+                (Some(high @ 0xd800..=0xdbff), Some(br"\u"), Some(low @ 0xdc00..=0xdfff)) => (0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00), 12),
+                (Some(one), _, _) => (one, 6),
+                (None, _, _) => return true,
+            },
+            _ => return true,
+        };
+        if char::from_u32(code).is_some_and(refused_in_text) {
+            return true;
+        }
+        i += len;
+    }
+    false
+}
+
+/// R-115: the first control or format character of a source, as its refusal's text after `source <name>: `, in this
+/// order: `version`, `env`, `description`, then each op's `description`, examples and `params_json_schema`. Run after
+/// the source's R-21 checks, so the JSON fields are JSON and the op names ids.
+fn text_fault(d: &SourceDescriptor) -> Option<String> {
+    const HOLDS: &str = "holds a control or format character";
+    if d.version.chars().any(refused_in_word) {
+        return Some(format!("version {HOLDS}"));
+    }
+    if d.env.chars().any(refused_in_word) {
+        return Some(format!("env {HOLDS}"));
+    }
+    if d.description.chars().any(refused_in_text) {
+        return Some(format!("description {HOLDS}"));
+    }
+    for op in &d.ops {
+        if op.description.chars().any(refused_in_text) {
+            return Some(format!("op {}: description {HOLDS}", op.name));
+        }
+        if op.examples.iter().any(|x| json_refused(x)) {
+            return Some(format!("op {}: an example {HOLDS}", op.name));
+        }
+        if json_refused(&op.params_json_schema) {
+            return Some(format!("op {}: params_json_schema {HOLDS}", op.name));
+        }
+    }
+    None
 }
 
 /// At most `max` bytes of `s`, cut at a character boundary.
@@ -422,6 +546,7 @@ pub(crate) mod tests {
             public_key: String::new(),
             sources: globs.iter().map(|g| g.to_string()).collect(),
             not_after: "2027-01-01T23:59:59Z".into(),
+            tls_fp: None,
         }
     }
 
@@ -508,6 +633,7 @@ pub(crate) mod tests {
             closer: Closer::new(),
             last_seen_ms: Arc::new(AtomicI64::new(0)),
             since_unix: 0,
+            peer_ip: std::net::IpAddr::from([198, 51, 100, 10]),
         }
     }
 
@@ -684,5 +810,121 @@ pub(crate) mod tests {
         let (swept, cut) = reg.sweep(&file(&[a_narrowed, b]), now());
         assert_eq!((swept, cut.len()), (0, 0), "nothing left to cut");
         assert_eq!(listed(&reg), ["example.alpha", "other.x"]);
+    }
+
+    /// Unit 44 (R-115, LD-R28): U+202E in each of R-115's fields is refused with that field's text; a description
+    /// with a tab, LF and CR passes, as do JSON's whitespace and escaped tabs in an example or a schema; `version`
+    /// and `env` refuse a tab or an LF; C0, DEL and C1 controls are refused; the escapes are refused as the raw
+    /// characters are (`{"a":"\u202e"}`, the six characters, in an example; in a schema's key; a tag character as its
+    /// surrogate pair; `\u0007` and `\b`), while an escaped backslash before `u202e` and a lone surrogate decode to no
+    /// refused character; the check follows the source's R-21 checks and names the first fault; `FORMAT_CHARS` holds
+    /// 21 ranges and 170 code points, R-115's list as the contract writes it, each refused, and ordinary text passes;
+    /// for every character the check refuses exactly what the client's `convert::strip_controls` (R-116) drops, TAB,
+    /// LF and CR aside in `version` and `env`, so the two tables cannot drift apart. Kills M-R152 (a range shifted
+    /// too), M-R153.
+    #[test]
+    fn catalog_text_holds_no_control_or_format_character() {
+        /// The refusal of a catalog of one source `a` (its op `get` with a schema and an example), edited.
+        fn check(edit: impl Fn(&mut SourceDescriptor)) -> Result<(), String> {
+            let mut d = source("a");
+            d.ops[0].params_json_schema = "{\"type\":\"object\"}".into();
+            d.ops[0].examples = vec!["{\"n\":1}".into()];
+            edit(&mut d);
+            validate_catalog(&entry(&["*"]), &[d]).map_err(|r| r.reason())
+        }
+        let holds = |what: &str| -> Result<(), String> { Err(format!("source a: {what} holds a control or format character")) };
+        let hex = |c: char| format!("U+{:04X}", u32::from(c));
+        assert_eq!(check(|_| ()), Ok(()));
+
+        // U+202E (RIGHT-TO-LEFT OVERRIDE), raw, in each field.
+        let rlo = '\u{202e}';
+        assert_eq!(check(|d| d.version = format!("1.0{rlo}")), holds("version"));
+        assert_eq!(check(|d| d.env = format!("te{rlo}st")), holds("env"));
+        assert_eq!(check(|d| d.description = format!("a {rlo}test source")), holds("description"));
+        assert_eq!(check(|d| d.ops[0].description = format!("get {rlo}it")), holds("op get: description"));
+        assert_eq!(check(|d| d.ops[0].examples.push(format!("{{\"a\":\"{rlo}\"}}"))), holds("op get: an example"));
+        assert_eq!(check(|d| d.ops[0].params_json_schema = format!("{{\"type\":\"object\",\"title\":\"{rlo}\"}}")), holds("op get: params_json_schema"));
+
+        // TAB, LF and CR: a description's line breaks and JSON's whitespace, never a version's or an env's.
+        let lines = "one\ttwo\nthree\r\nfour";
+        assert_eq!(check(|d| d.description = lines.into()), Ok(()));
+        assert_eq!(check(|d| d.ops[0].description = lines.into()), Ok(()));
+        assert_eq!(check(|d| d.ops[0].examples.push("{\n\t\"a\": \"x\\ty\\nz\\r\"\r\n}".into())), Ok(()), "JSON's whitespace; TAB, LF and CR escaped");
+        assert_eq!(check(|d| d.ops[0].params_json_schema = "{\n\t\"type\": \"object\",\r\n\t\"title\": \"a\\tb\"\n}".into()), Ok(()));
+        assert_eq!(check(|d| d.version = "1.0\t".into()), holds("version"));
+        assert_eq!(check(|d| d.env = "te\nst".into()), holds("env"));
+
+        // Cc: C0, DEL and C1.
+        for c in ['\u{0}', '\u{7}', '\u{1b}', '\u{7f}', '\u{85}', '\u{9f}'] {
+            assert_eq!(check(|d| d.version = format!("1{c}")), holds("version"), "{}", hex(c));
+            assert_eq!(check(|d| d.description = format!("a{c}b")), holds("description"), "{}", hex(c));
+            assert_eq!(check(|d| d.ops[0].description = format!("a{c}b")), holds("op get: description"), "{}", hex(c));
+        }
+
+        // The escapes, as JSON decodes them.
+        assert_eq!(r#"{"a":"\u202e"}"#.len(), 14, "the escape is six ASCII characters");
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"{"a":"\u202e"}"#.into())), holds("op get: an example"));
+        assert_eq!(check(|d| d.ops[0].params_json_schema = r#"{"type":"object","properties":{"\u202Ex":{}}}"#.into()), holds("op get: params_json_schema"), "a key");
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"["\udb40\udc01"]"#.into())), holds("op get: an example"), "U+E0001 as its surrogate pair");
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"{"a":"\u0007"}"#.into())), holds("op get: an example"));
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"{"a":"\b"}"#.into())), holds("op get: an example"));
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"{"a\"\\\/":"\u00e9\ud83d\ude00\\u202e"}"#.into())), Ok(()), "an escaped backslash, then the text u202e");
+        assert_eq!(check(|d| d.ops[0].examples.push(r#"["\ud800","\udc00x","\ud800\u0041"]"#.into())), Ok(()), "a lone surrogate decodes to no character");
+
+        // After the source's R-21 checks, the first fault named.
+        assert_eq!(check(|d| d.version = format!("{}{rlo}", "1".repeat(64))), Err("source a: version over 64 bytes".into()), "R-21's cap first");
+        let bad_op = |d: &mut SourceDescriptor| {
+            d.ops[0].description = format!("x{rlo}");
+            let op = OpDescriptor { name: "Bad".into(), ..d.ops[0].clone() };
+            d.ops.push(op);
+        };
+        assert_eq!(check(bad_op), Err("source a: \"Bad\" is not an op name".into()), "R-21's op checks first");
+        let env_and_op = |d: &mut SourceDescriptor| {
+            d.env = format!("t{rlo}");
+            d.ops[0].description = format!("x{rlo}");
+        };
+        assert_eq!(check(env_and_op), holds("env"));
+        let description_and_schema = |d: &mut SourceDescriptor| {
+            d.description = format!("x{rlo}");
+            d.ops[0].params_json_schema = format!("{{\"title\":\"{rlo}\"}}");
+        };
+        assert_eq!(check(description_and_schema), holds("description"));
+        let example_and_schema = |d: &mut SourceDescriptor| {
+            d.ops[0].examples[0] = format!("[\"{rlo}\"]");
+            d.ops[0].params_json_schema = format!("{{\"title\":\"{rlo}\"}}");
+        };
+        assert_eq!(check(example_and_schema), holds("op get: an example"));
+        let mut b = source("b");
+        b.description = format!("b{rlo}");
+        assert_eq!(validate_catalog(&entry(&["*"]), &[source("a"), b]).unwrap_err().reason(), "source b: description holds a control or format character");
+
+        // FORMAT_CHARS: Unicode 16.0's Cf, 21 ranges and 170 code points, sorted and apart, R-115's list as the
+        // contract writes it (a range moved, cut or widened fails here); each refused.
+        assert_eq!(FORMAT_CHARS.len(), 21);
+        assert_eq!(FORMAT_CHARS.iter().map(|&(first, last)| last - first + 1).sum::<u32>(), 170);
+        assert!(FORMAT_CHARS.iter().all(|&(first, last)| first <= last) && FORMAT_CHARS.windows(2).all(|w| w[0].1 + 1 < w[1].0), "sorted and apart");
+        let r115 = "U+00AD, U+0600..U+0605, U+061C, U+06DD, U+070F, U+0890..U+0891, U+08E2, U+180E, U+200B..U+200F, U+202A..U+202E, U+2060..U+2064, U+2066..U+206F, U+FEFF, U+FFF9..U+FFFB, U+110BD, U+110CD, U+13430..U+1343F, U+1BCA0..U+1BCA3, U+1D173..U+1D17A, U+E0001, U+E0020..U+E007F";
+        let code = |s: &str| u32::from_str_radix(s.strip_prefix("U+").unwrap(), 16).unwrap();
+        let listed: Vec<(u32, u32)> = r115.split(", ").map(|r| r.split_once("..").map_or_else(|| (code(r), code(r)), |(first, last)| (code(first), code(last)))).collect();
+        assert_eq!(FORMAT_CHARS.to_vec(), listed);
+        for &(first, last) in &FORMAT_CHARS {
+            for c in (first..=last).filter_map(char::from_u32) {
+                assert_eq!(check(|d| d.description = format!("a{c}b")), holds("description"), "{}", hex(c));
+                assert_eq!(check(|d| d.env = format!("t{c}")), holds("env"), "{}", hex(c));
+            }
+        }
+        // The client's copy: for every character, `strip_controls` drops what the descriptions refuse, and `version`
+        // and `env` refuse that and TAB, LF and CR.
+        for c in (0..=0x10_ffff).filter_map(char::from_u32) {
+            let dropped = ai_env_relay_client::convert::strip_controls(&c.to_string()).is_empty();
+            assert_eq!(refused_in_text(c), dropped, "{}", hex(c));
+            assert_eq!(refused_in_word(c), dropped || matches!(c, '\t' | '\n' | '\r'), "{}", hex(c));
+        }
+        // Ordinary text passes: a no-break space, accents, a dash, CJK, an emoji, and U+2065 (between two of the
+        // ranges, not Cf).
+        for c in ['\u{a0}', '\u{e9}', '\u{2013}', '\u{2065}', '\u{4e2d}', '\u{1f600}'] {
+            assert_eq!(check(|d| d.description = format!("a{c}b")), Ok(()), "{}", hex(c));
+            assert_eq!(check(|d| d.ops[0].examples.push(format!("[\"{c}\"]"))), Ok(()), "{}", hex(c));
+        }
     }
 }

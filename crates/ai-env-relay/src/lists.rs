@@ -1,4 +1,4 @@
-//! The three relay lists of WM-R7, parsed by ai-env-worker's `policy` (R never renders one). The writer (M's
+//! The four relay lists of WM-R7 and R-85, parsed by ai-env-worker's `policy` (R never renders one). The writer (M's
 //! `ai-env relay allow|revoke` and grant commands) and this reader share one implementation (LD-R5); the relay
 //! adds only the 65 536-byte pre-check (`files::Watched`) and the unload on refusal (§R-relay.3.5).
 
@@ -101,6 +101,50 @@ impl crate::files::Entries for Grants {
     }
 }
 
+/// The live directory's peers file: the public face's allowlist (R-87).
+pub const PEERS_FILE: &str = "peers.json";
+
+/// The public face's allowlist (R-87): its entries, each one's network and `not_after` built once at load.
+#[derive(Debug, Clone, Default)]
+pub struct Peers {
+    /// Its entries.
+    pub entries: Vec<policy::PeerEntry>,
+    /// Each entry's network (its `cidr` truncated, `PeerEntry::network`) and `not_after_unix()`.
+    networks: Vec<(ipnet::Ipv4Net, u64)>,
+}
+
+/// `policy::parse_peers` of the bytes as UTF-8; refused whole on any fault, the text `PolicyError`'s.
+pub fn parse_peers(bytes: &[u8]) -> Result<Peers, String> {
+    let entries = policy::parse_peers(text(bytes)?).map_err(|e| e.to_string())?;
+    let networks = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let (addr, prefix) = e.network();
+            let net = ipnet::Ipv4Net::new(addr, prefix).map_err(|_| format!("peers: entry {i}: cidr is not an IPv4 network (a.b.c.d/n, n 0 to 32)"))?;
+            Ok((net, e.not_after_unix()))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Peers { entries, networks })
+}
+
+impl Peers {
+    /// R-87: whether an entry in force at `now_unix` (`now <= not_after_unix()`) holds `ip`, an IPv4-mapped address
+    /// read as its IPv4 address (`to_canonical`); any other IPv6 address is never allowed.
+    pub fn allows(&self, ip: std::net::IpAddr, now_unix: u64) -> bool {
+        match ip.to_canonical() {
+            std::net::IpAddr::V4(v4) => self.networks.iter().any(|(net, not_after)| now_unix <= *not_after && net.contains(&v4)),
+            std::net::IpAddr::V6(_) => false,
+        }
+    }
+}
+
+impl crate::files::Entries for Peers {
+    fn entries(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +175,7 @@ mod tests {
             public_key: key_b64(seed),
             sources: globs.iter().map(|g| g.to_string()).collect(),
             not_after: not_after.into(),
+            tls_fp: None,
         }
     }
 
@@ -230,5 +275,45 @@ mod tests {
         assert!(!g.allows("example.alpha", "list"), "each half matches some rule, but no one rule matches both");
         assert!(!g.allows("other.x", "get"));
         assert!(grants.get("g-none").is_none());
+    }
+
+    /// Unit 38 (R-87): a `/32` and a `/24` allowed and an address beside them not; an IPv4-mapped address read as
+    /// its IPv4 address, any other IPv6 address never; an entry allowed through its `not_after` second and not one
+    /// second later; `[]` allows nobody. The bytes load as W/M's parser reads them, refused whole with its text.
+    #[test]
+    fn a_peers_file_allows_its_in_force_networks_only() {
+        use crate::files::Entries;
+        let entry = |cidr: &str, label: &str, not_after: &str| policy::PeerEntry { cidr: cidr.into(), label: label.into(), not_after: not_after.into() };
+        let text = policy::render_peers(&[entry("198.51.100.7/32", "mac", "2026-10-29T23:59:59Z"), entry("203.0.113.77/24", "office", "2027-01-01T23:59:59Z")]).unwrap();
+        let peers = parse_peers(text.as_bytes()).expect("W/M's rendering loads");
+        assert_eq!((peers.entries.len(), peers.entries()), (2, 2));
+        let at = policy::unix_of("2026-10-29T23:59:59Z").unwrap();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(peers.allows(ip("198.51.100.7"), at), "the /32");
+        for beside in ["198.51.100.6", "198.51.100.8", "192.0.2.7", "0.0.0.0"] {
+            assert!(!peers.allows(ip(beside), at), "{beside}");
+        }
+        for inside in ["203.0.113.0", "203.0.113.77", "203.0.113.255"] {
+            assert!(peers.allows(ip(inside), at), "the /24: {inside}");
+        }
+        assert!(peers.allows(ip("::ffff:198.51.100.7"), at), "an IPv4-mapped address is its IPv4 address");
+        assert!(!peers.allows(ip("::ffff:192.0.2.7"), at));
+        for v6 in ["2001:db8::7", "::198.51.100.7", "::1"] {
+            assert!(!peers.allows(ip(v6), at), "IPv6 is never allowed: {v6}");
+        }
+        assert!(peers.allows(ip("198.51.100.7"), at), "in force through its not_after second");
+        assert!(!peers.allows(ip("198.51.100.7"), at + 1), "lapsed one second later");
+        assert!(peers.allows(ip("203.0.113.9"), at + 1), "the other entry still in force");
+        let none = parse_peers(b"[]").expect("the empty list");
+        assert!(none.entries.is_empty() && !none.allows(ip("198.51.100.7"), at) && !none.allows(ip("203.0.113.9"), 0));
+        assert!(!Peers::default().allows(ip("198.51.100.7"), 0));
+
+        let unknown_field = text.replacen("\"cidr\"", "\"extra\":1,\"cidr\"", 1);
+        let repeated = text.replace("203.0.113.0/24", "198.51.100.7/32");
+        for bad in [unknown_field, repeated, "[".to_string()] {
+            let shared = policy::parse_peers(&bad).expect_err("the shared parser refuses it").to_string();
+            assert_eq!(parse_peers(bad.as_bytes()).unwrap_err(), shared, "PolicyError's text");
+        }
+        assert_eq!(parse_peers(&[0xff, 0xfe]).unwrap_err(), "not UTF-8");
     }
 }

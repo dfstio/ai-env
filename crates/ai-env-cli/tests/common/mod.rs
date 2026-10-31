@@ -99,7 +99,7 @@ pub const SESSION_ARGV: [&str; 16] = [
 /// every knob of the harness's fakes (`tests/fakes/claude-v2.sh`, `claude.sh`,
 /// `age.sh`, `git.sh`) but the four logs a spawn sets before this removal
 /// (`tests/infra/image.rs` checks both).
-pub const REMOVED_ENV: [&str; 119] = [
+pub const REMOVED_ENV: [&str; 120] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -132,6 +132,8 @@ pub const REMOVED_ENV: [&str; 119] = [
     "AI_ENV_BRIDGE_LAB_GPGV",
     "AI_ENV_BRIDGE_LAB_ADMIT_MAKE",
     "AI_ENV_BRIDGE_LAB_NOW",
+    // The relay security plan (§RS.4.2): `relay allow-ip --mine`'s loopback checkip (debug builds).
+    "AI_ENV_BRIDGE_LAB_CHECKIP",
     "AI_ENV_DIR",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",

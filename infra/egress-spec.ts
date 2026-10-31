@@ -23,8 +23,9 @@
 // S13 (plans/s13-contracts.md §I-infra.4.1): the relay, a third security group (SG_KEYS: TCP 443 in from anywhere for the
 // workers, TCP relayPort in from the VM group, HTTPS and DNS out), the VM group's second egress rule (TCP relayPort to
 // relayIp/32) and the VM subnet's second NACL entry in each direction (RELAY_NACL_RULE_NO), compared as a set; the
-// inventory gains the relay's nineteen resources (relay.ts); and the template renderer moves here from egress.ts
-// (renderTemplate, embedded: LD-I14), so relay-spec.ts, which renders the relay's boot, stays Pulumi-free.
+// inventory gains the relay's nineteen resources (relay.ts; LD-R56 adds the twentieth, its boot object); and the template
+// renderer moves here from egress.ts (renderTemplate, embedded: LD-I14), so relay-spec.ts, which renders the relay's
+// boot, stays Pulumi-free.
 import * as fs from "fs";
 import * as path from "path";
 import {
@@ -68,7 +69,7 @@ export interface EgressConfig {
     relayPort: number;
     relayInstanceType: string;
     relaySecurityGroupName: string;
-    /** S13: the relay's SSM parameters `<prefix>/{artifact,workers,grants,token-signers,tls}`. */
+    /** S13: the relay's SSM parameters `<prefix>/{artifact,workers,grants,token-signers,peers,tls}`. */
     relayParameterPrefix: string;
     relayLogGroup: string;
     relayLogRetentionDays: number;
@@ -238,10 +239,11 @@ export const NET = {
     /** Pulumi names outside the network (the inventory pins them too). */
     logGroup: "egress-log-group",
     dnsLogGroup: "egress-dns-log-group",
-    /** S13: the relay (relay.ts): its instance, its Elastic IP and the association (one name), log group, artifact object and parameter. */
+    /** S13: the relay (relay.ts): its instance, its Elastic IP and the association (one name), log group, boot object (LD-R56), artifact object and parameter. */
     relayInstance: "ai-env-relay",
     relayEip: "ai-env-relay",
     relayLogGroup: "relay-log-group",
+    relayBoot: "relay-boot",
     relayArtifact: "relay-artifact",
     relayArtifactParameter: "ai-env-relay-artifact",
 } as const;
@@ -778,13 +780,14 @@ export const PROVIDER_INPUTS = ["region", "version", "skipCredentialsValidation"
  * guard refuses any resource outside it (CloudFormation stacks, Cloud Control and other generic resources, SSM
  * associations, extra providers, components, and every IAM kind the operator identities must never have: an access
  * key, a login profile, a group or group membership, a PolicyAttachment or UserPolicyAttachmentsExclusive, an
- * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 94 in
- * dnsMode none, 99 in firewall, 102 with the query log, the stack included (S13 added nineteen: the relay instance, its
- * Elastic IP and association, role, inline policy, SSM attachment, instance profile, security group with seven rules,
- * the VM group's rule to it, its log group, artifact object and artifact parameter; before S13, 75, 80 and 83; S9 added
- * eight: transcripts.ts's bucket ai-env-transcripts with its versioning, encryption, ownership controls, public access
- * block, lifecycle and policy, and egress.ts's S3 gateway endpoint ai-env-s3; before S9, 67 and 72). A resource added
- * to the program must be added here, or the preview fails.
+ * attachment not in USER_POLICY_ATTACHMENTS); check-plan.ts counts the planned resources against it exactly: 95 in
+ * dnsMode none, 100 in firewall, 103 with the query log, the stack included (LD-R56 added the relay's boot object; S13
+ * added nineteen, to 94, 99 and 102: the relay instance, its Elastic IP and association, role, inline policy, SSM
+ * attachment, instance profile, security group with seven rules, the VM group's rule to it, its log group, artifact
+ * object and artifact parameter; before S13, 75, 80 and 83; S9 added eight: transcripts.ts's bucket ai-env-transcripts
+ * with its versioning, encryption, ownership controls, public access block, lifecycle and policy, and egress.ts's S3
+ * gateway endpoint ai-env-s3; before S9, 67 and 72). A resource added to the program must be added here, or the preview
+ * fails.
  */
 export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory {
     const firewall = cfg.dnsMode === "firewall";
@@ -803,8 +806,8 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         ["aws:s3/bucketOwnershipControls:BucketOwnershipControls", [TRANSCRIPTS_RESOURCE]],
         ["aws:s3/bucketLifecycleConfiguration:BucketLifecycleConfiguration", [TRANSCRIPTS_RESOURCE]],
         ["aws:s3/bucketPolicy:BucketPolicy", [TRANSCRIPTS_RESOURCE]],
-        // S13: the relay's binary beside the image zip, its log group, its role and inline policy (relay.ts).
-        ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip", NET.relayArtifact]],
+        // S13: the relay's binary and (LD-R56) boot script beside the image zip, its log group, its role and inline policy (relay.ts).
+        ["aws:s3/bucketObjectv2:BucketObjectv2", ["image-zip", NET.relayArtifact, NET.relayBoot]],
         ["aws:cloudwatch/logGroup:LogGroup", ["image-log-group", NET.logGroup, ...(queryLog ? [NET.dnsLogGroup] : []), NET.relayLogGroup]],
         ["aws:iam/role:Role", [BUILD_ROLE_NAME, EXECUTION_ROLE_NAME, cfg.proxyRoleName, cfg.operatorRoleName, RELAY_ROLE_NAME]],
         // The operator role's is its Deny (policies.ts operatorRolePolicy): an inline policy on the role itself is

@@ -1660,7 +1660,8 @@
       "optional": [
         "version",
         "sources",
-        "not_after"
+        "not_after",
+        "tls_fp"
       ],
       "required": [
         "kind",
@@ -1732,6 +1733,37 @@
         "hours",
         "signed",
         "minted"
+      ],
+      "required": [
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_allow_ip",
+      "optional": [
+        "not_after",
+        "version",
+        "mine"
+      ],
+      "required": [
+        "label",
+        "prefix",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_revoke_ip",
+      "optional": [
+        "label",
+        "prefix",
+        "not_after",
+        "version"
       ],
       "required": [
         "outcome"

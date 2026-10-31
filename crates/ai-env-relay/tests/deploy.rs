@@ -1,5 +1,5 @@
-//! The relay's units and config on the instance (§R-relay.3, `deploy/`): I's user data embeds these files
-//! verbatim (Q-R5), so their text is pinned here, line for line.
+//! The relay's units and config on the instance (§R-relay.3, `deploy/`): I's boot script embeds these files
+//! verbatim (Q-R5, LD-R56), so their text is pinned here, line for line.
 
 use std::path::{Path, PathBuf};
 
@@ -93,6 +93,11 @@ fn the_relay_unit_is_notify_with_watchdog_and_hardening() {
         ("SystemCallFilter", "~@privileged @resources"),
         ("SystemCallErrorNumber", "EPERM"),
         ("RestrictAddressFamilies", "AF_INET AF_INET6 AF_UNIX"),
+        // F29 (R-95): AF_UNIX stays for sd_notify (/run/systemd/notify), and no D-Bus system service is reachable;
+        // nor resolved's varlink socket (0666, ResolveHostname for any caller): the relay resolves no name, and its
+        // user's names would leave through resolved, past the guard's owner match. `-`: no error when resolved is off.
+        ("InaccessiblePaths", "/run/dbus"),
+        ("InaccessiblePaths", "-/run/systemd/resolve"),
         ("IPAddressDeny", "169.254.0.0/16 fd00:ec2::/32"),
         ("UMask", "0077"),
         ("LogsDirectory", "ai-env-relay/requests"),
@@ -100,6 +105,9 @@ fn the_relay_unit_is_notify_with_watchdog_and_hardening() {
         ("StandardOutput", "append:/var/log/ai-env-relay/relay.log"),
         ("StandardError", "append:/var/log/ai-env-relay/relay.log"),
         ("MemoryMax", "320M"),
+        // LD-R57: past MemoryMax the relay's pages go to the swapfile, and the OOM killer comes only when none is left:
+        // about twice LD-R50's worst overrun (125 MiB), the rest of the 512 MiB for dnf and the agents.
+        ("MemorySwapMax", "256M"),
         ("TasksMax", "256"),
         ("LimitNOFILE", "8192"),
         ("Restart", "always"),
@@ -119,6 +127,7 @@ fn the_relay_unit_is_notify_with_watchdog_and_hardening() {
         ("IPAddressDeny", "169.254.0.0/16 fd00:ec2::/32"),
         ("CapabilityBoundingSet", "CAP_NET_BIND_SERVICE"),
         ("ExecReload", "/bin/kill -HUP $MAINPID"),
+        ("MemorySwapMax", "256M"),
     ] {
         assert_eq!(value(&got, "Service", key), vec![v], "{key}");
     }

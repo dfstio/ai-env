@@ -1,7 +1,7 @@
 //! The relay's answers as the socket's (§V-vm.3.6): a `SourceStatus` with its descriptor becomes a [`SourceEntry`]
 //! (enums as words, an unknown number `unspecified`; absent limits zeros; a schema or an example parsed when it
-//! parses, else its text as a JSON string), a call's bytes a [`Body`] (V-R26), a status or an in-band error a
-//! [`Failure`] with its local code and a cleaned message (V-R25).
+//! parses, else its text as a JSON string; its text without control or format characters, R-116), a call's bytes a
+//! [`Body`] (V-R26), a status or an in-band error a [`Failure`] with its local code and a cleaned message (V-R25).
 use crate::dial::{Failure, REQUEST_ID_HEADER};
 use crate::local::{code_of_grpc, Body, LimitsEntry, OpEntry, SourceEntry};
 use ai_env_relay_proto::v1;
@@ -46,11 +46,68 @@ fn json_or_text(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
 }
 
+/// Unicode 16.0's General_Category=Format (Cf) as inclusive ranges, 21 ranges and 170 code points: the relay's
+/// `registry::FORMAT_CHARS` (R-115), which this crate cannot reach.
+const FORMAT_CHARS: [(u32, u32); 21] = [
+    (0x00ad, 0x00ad),
+    (0x0600, 0x0605),
+    (0x061c, 0x061c),
+    (0x06dd, 0x06dd),
+    (0x070f, 0x070f),
+    (0x0890, 0x0891),
+    (0x08e2, 0x08e2),
+    (0x180e, 0x180e),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x2064),
+    (0x2066, 0x206f),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x110bd, 0x110bd),
+    (0x110cd, 0x110cd),
+    (0x13430, 0x1343f),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+];
+
+/// Whether `c` is a Cf character ([`FORMAT_CHARS`]).
+pub(crate) fn is_format(c: char) -> bool {
+    let code = u32::from(c);
+    FORMAT_CHARS.iter().any(|&(first, last)| (first..=last).contains(&code))
+}
+
+/// Whether `c` stays in a catalog's text: TAB, LF and CR, or anything that is neither Cc (`char::is_control`: U+0000
+/// to U+001F, U+007F to U+009F) nor Cf ([`is_format`]).
+fn kept(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || !(c.is_control() || is_format(c))
+}
+
+/// R-116: `s` without the characters the relay's catalog check refuses in a description (R-115): every Cc character
+/// but TAB, LF and CR, and every Cf character (the bidi controls, the zero-width characters, the tag characters).
+#[must_use]
+pub fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| kept(*c)).collect()
+}
+
+/// `v` with every string of it, keys and values, through [`strip_controls`] (R-116).
+fn stripped(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => Value::String(strip_controls(&s)),
+        Value::Array(items) => Value::Array(items.into_iter().map(stripped).collect()),
+        Value::Object(map) => Value::Object(map.into_iter().map(|(k, v)| (strip_controls(&k), stripped(v))).collect()),
+        other => other,
+    }
+}
+
 fn limits(l: Option<&v1::Limits>) -> LimitsEntry {
     l.map_or(LimitsEntry { max_bytes: 0, max_rows: 0, max_chunks: 0 }, |l| LimitsEntry { max_bytes: l.max_bytes, max_rows: l.max_rows, max_chunks: l.max_chunks })
 }
 
-/// One source of `ListSources`, as the socket answers it; `None` without a descriptor.
+/// One source of `ListSources`, as the socket answers it; `None` without a descriptor. Its `version`, `env`,
+/// descriptions and every string of its schemas and examples through [`strip_controls`] (R-116).
 #[must_use]
 pub fn source_entry(s: &v1::SourceStatus) -> Option<SourceEntry> {
     let d = s.descriptor.as_ref()?;
@@ -59,21 +116,21 @@ pub fn source_entry(s: &v1::SourceStatus) -> Option<SourceEntry> {
         .iter()
         .map(|op| OpEntry {
             name: op.name.clone(),
-            description: op.description.clone(),
-            params_schema: json_or_text(&op.params_json_schema),
+            description: strip_controls(&op.description),
+            params_schema: stripped(json_or_text(&op.params_json_schema)),
             output: output_word(op.output).to_string(),
             read_only: op.read_only,
             default_limits: limits(op.default_limits.as_ref()),
             max_limits: limits(op.max_limits.as_ref()),
-            examples: op.examples.iter().map(|e| json_or_text(e)).collect(),
+            examples: op.examples.iter().map(|e| stripped(json_or_text(e))).collect(),
         })
         .collect();
     Some(SourceEntry {
         name: d.name.clone(),
-        version: d.version.clone(),
-        description: d.description.clone(),
+        version: strip_controls(&d.version),
+        description: strip_controls(&d.description),
         kind: kind_word(d.kind).to_string(),
-        env: d.env.clone(),
+        env: strip_controls(&d.env),
         sensitivity: sensitivity_word(d.sensitivity).to_string(),
         available: s.available,
         last_seen_unix_ms: s.last_seen_unix_ms,
@@ -290,6 +347,82 @@ mod tests {
         };
         assert_eq!((0..=4).map(sens).collect::<Vec<_>>(), ["unspecified", "public", "internal", "restricted", "unspecified"]);
         assert_eq!(source_entry(&v1::SourceStatus { descriptor: None, available: true, last_seen_unix_ms: 1 }), None);
+    }
+
+    /// R-116: a descriptor whose version, env, description and op description hold U+202E, U+200B, U+0007 and a tab,
+    /// as do its schema's and examples' strings, keys and values (escaped; raw where JSON takes them; in an example
+    /// that is no JSON): the entry keeps each tab and none of the others. `strip_controls` keeps TAB, LF and CR and
+    /// drops C0, DEL, C1 and each of the 170 Cf code points; other text passes whole. Kills M-V71.
+    #[test]
+    fn catalog_text_drops_control_and_format_characters() {
+        let dirty = "a\u{202e}b\u{200b}c\u{7}d\te";
+        let clean = "abcd\te";
+        // `s` as a JSON string, each character outside printable ASCII escaped (`\u` and four hex digits for each
+        // UTF-16 unit): JSON that holds none of them raw.
+        let escaped = |s: &str| {
+            let mut out = String::from("\"");
+            for c in s.chars() {
+                if (' '..='~').contains(&c) && !matches!(c, '"' | '\\') {
+                    out.push(c);
+                } else {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+            out.push('"');
+            out
+        };
+        let k = escaped(dirty);
+        assert!(k.is_ascii() && k.contains("202e") && serde_json::from_str::<String>(&k).unwrap() == dirty, "{k}");
+        let schema = format!(r#"{{"type":"object","properties":{{{k}:{{"description":{k}}}}}}}"#);
+        // JSON takes a Cf character raw in a string, never a C0 one: the third example is no JSON, kept as text.
+        let examples = vec![format!("{{{k}:[{k},1]}}"), "{\"q\":\"a\u{202e}b\u{200b}c\"}".to_string(), format!("not json {dirty}")];
+        let op = v1::OpDescriptor {
+            name: "echo".into(),
+            description: dirty.into(),
+            params_json_schema: schema,
+            output: v1::OutputKind::Json as i32,
+            read_only: true,
+            default_limits: None,
+            max_limits: None,
+            examples,
+        };
+        let status = v1::SourceStatus {
+            descriptor: Some(v1::SourceDescriptor { name: "echo".into(), version: format!("0.1.0{dirty}"), description: dirty.into(), kind: v1::SourceKind::Other as i32, env: format!("test{dirty}"), sensitivity: v1::Sensitivity::Internal as i32, ops: vec![op] }),
+            available: true,
+            last_seen_unix_ms: 1,
+        };
+        let e = source_entry(&status).unwrap();
+        assert_eq!((e.version.as_str(), e.env.as_str(), e.description.as_str()), ("0.1.0abcd\te", "testabcd\te", clean));
+        assert_eq!(e.ops[0].description, clean);
+        assert_eq!(e.ops[0].params_schema, serde_json::json!({"type": "object", "properties": {clean: {"description": clean}}}));
+        assert_eq!(e.ops[0].examples, [serde_json::json!({clean: [clean, 1]}), serde_json::json!({"q": "abc"}), serde_json::Value::String(format!("not json {clean}"))]);
+        assert_eq!((e.name.as_str(), e.ops[0].name.as_str()), ("echo", "echo"));
+
+        assert_eq!(strip_controls("tab\tlf\ncr\r"), "tab\tlf\ncr\r");
+        assert_eq!(strip_controls("a\u{0}b\u{1b}c\u{7f}d\u{85}e\u{9f}f"), "abcdef", "C0, DEL and C1");
+        // The table is R-115's list as the contract writes it (a range moved, cut or widened fails here), and every
+        // character is dropped exactly when it is Cc but TAB, LF and CR, or in that list.
+        assert_eq!(FORMAT_CHARS.len(), 21);
+        assert_eq!(FORMAT_CHARS.iter().map(|&(first, last)| last - first + 1).sum::<u32>(), 170);
+        let listed = r115_format_chars();
+        assert_eq!(FORMAT_CHARS.to_vec(), listed);
+        for c in (0..=0x10_ffff).filter_map(char::from_u32) {
+            let format = listed.iter().any(|&(first, last)| (first..=last).contains(&u32::from(c)));
+            let refused = (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || format;
+            assert_eq!(strip_controls(&format!("a{c}b")), if refused { "ab".to_string() } else { format!("a{c}b") }, "U+{:04X}", u32::from(c));
+        }
+        let plain = "caf\u{e9} \u{2013} \u{4e2d} \u{1f600}\u{a0}\u{2065}";
+        assert_eq!(strip_controls(plain), plain, "ordinary text, and U+2065 (between two of the ranges, not Cf)");
+    }
+
+    /// R-115's Cf list, parsed from the contract's own words (`U+XXXX` or `U+XXXX..U+YYYY`, comma-separated).
+    fn r115_format_chars() -> Vec<(u32, u32)> {
+        const R115: &str = "U+00AD, U+0600..U+0605, U+061C, U+06DD, U+070F, U+0890..U+0891, U+08E2, U+180E, U+200B..U+200F, U+202A..U+202E, U+2060..U+2064, U+2066..U+206F, U+FEFF, U+FFF9..U+FFFB, U+110BD, U+110CD, U+13430..U+1343F, U+1BCA0..U+1BCA3, U+1D173..U+1D17A, U+E0001, U+E0020..U+E007F";
+        let code = |s: &str| u32::from_str_radix(s.strip_prefix("U+").unwrap(), 16).unwrap();
+        R115.split(", ").map(|r| r.split_once("..").map_or_else(|| (code(r), code(r)), |(first, last)| (code(first), code(last)))).collect()
     }
 
     /// Statuses and in-band errors keep their code's word and a clean message: control characters dropped, 300

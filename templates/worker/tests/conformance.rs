@@ -1,5 +1,6 @@
 //! The template's sources against ai-env-source's conformance checks (P-R85): offline, so the
-//! `HttpJsonSource` below never reaches its address.
+//! `HttpJsonSource` below never reaches its address. And its binary's `tls-keygen` and client certificate
+//! config (WM-T57), offline too.
 
 #[allow(dead_code)]
 #[path = "../src/config.rs"]
@@ -8,12 +9,21 @@ mod config;
 #[path = "../src/sources.rs"]
 mod sources;
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_env_source::testkit::{assert_conforms, context};
 use ai_env_source::{CallRequest, DataSource, Limits, SourceError};
+use ai_env_worker::certs::{self, ClientPoint};
+use ai_env_worker::keys;
+use ai_env_worker::RelayEndpoint;
 use serde_json::json;
+
+/// This package's binary, as cargo built it for its tests (its name follows the package's).
+const BIN: &str = env!(concat!("CARGO_BIN_EXE_", env!("CARGO_PKG_NAME")));
 
 #[tokio::test]
 async fn the_example_sources_conform() {
@@ -55,4 +65,115 @@ async fn the_http_source_refuses_paths_outside_its_prefixes() {
     for path in ["/v1/status", "/v1/status/", "/v1/status/x.json"] {
         assert!(!matches!(get(path).await, Err(SourceError::InvalidArgument(_))), "{path:?} is allowed");
     }
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(BIN).args(args).output().expect("the binary runs")
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8(out.stdout.clone()).expect("UTF-8")
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// WM-T57: `tls-keygen` writes the worker's 0600 P-256 key and prints its point and the next command; a config
+/// takes the client certificate and its key together or not at all, the key read as the worker key is (R-119),
+/// and `check` presents the pair.
+#[test]
+fn tls_keygen_writes_its_key_and_the_config_takes_both_files() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tls-keygen");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let path = |name: &str| dir.join(name).display().to_string();
+
+    let key = path("relay-client.key");
+    let out = run(&["tls-keygen", "--out", &key]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = stdout(&out);
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(lines.len(), 2, "two lines: {printed:?}");
+    assert!(lines[0].len() == 93 && lines[0].starts_with("p256:"), "{}", lines[0]);
+    let first_point = ClientPoint::parse_text(lines[0]).expect("a P-256 point's text");
+    let next = format!(
+        "next, on the Mac: ai-env as deployer -- ai-env relay allow <worker-id> --key <its ed25519 key> --sources <its globs> --tls-key {}; the certificate it prints goes to relay_client_cert",
+        lines[0]
+    );
+    assert_eq!(lines[1], next);
+    assert_eq!(std::fs::metadata(&key).expect("the key").permissions().mode() & 0o777, 0o600);
+    let first = keys::read_private_pem(Path::new(&key)).expect("the one reader of key files");
+
+    // Again: refused without --force, the key unchanged; replaced with it.
+    let again = run(&["tls-keygen", "--out", &key]);
+    assert!(!again.status.success() && stderr(&again).contains("already exists: --force replaces it"), "{}", stderr(&again));
+    assert!(keys::read_private_pem(Path::new(&key)).expect("read") == first, "the key unchanged");
+    let forced = run(&["tls-keygen", "--out", &key, "--force"]);
+    assert!(forced.status.success(), "{}", stderr(&forced));
+    let point = ClientPoint::parse_text(stdout(&forced).lines().next().unwrap_or_default()).expect("a point");
+    assert_ne!(point, first_point, "a new key, a new point");
+    assert!(keys::read_private_pem(Path::new(&key)).expect("read") != first, "the key replaced");
+
+    // The certificate the deployer would issue for the printed point (here under a CA of the test's).
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("after 1970").as_secs();
+    let ca = certs::relay_ca(now).expect("a CA");
+    std::fs::write(path("relay-ca.pem"), certs::pem("CERTIFICATE", &ca.cert_der)).expect("the CA");
+    let cert_der = certs::client_leaf(&ca, "example-worker", &point, now, now + 86_400).expect("a client certificate");
+    let cert_pem = certs::pem("CERTIFICATE", &cert_der);
+    std::fs::write(path("relay-client.pem"), &cert_pem).expect("the certificate");
+    let key_pem = keys::read_private_pem(Path::new(&key)).expect("the key");
+    assert!(RelayEndpoint::new("203.0.113.10:443").expect("an address").client_identity(cert_pem.as_bytes(), &key_pem).is_ok(), "the key of the printed point");
+    let worker_key = path("worker.key");
+    assert!(run(&["keygen", "--out", &worker_key]).status.success());
+
+    let config = |name: &str, extra: &str| {
+        let text = format!(
+            "worker_id = \"example-worker\"\nrelay = \"203.0.113.10:443\"\nserver_name = \"ai-env-relay\"\nrelay_ca = {:?}\n{extra}signer = \"file\"\nkey_file = {worker_key:?}\n\n[[source]]\nkind = \"echo\"\nname = \"example-echo\"\n",
+            path("relay-ca.pem"),
+        );
+        let p = path(name);
+        std::fs::write(&p, text).expect("a config");
+        p
+    };
+    let cert_line = format!("relay_client_cert = {:?}\n", path("relay-client.pem"));
+    let key_line = format!("relay_client_key = {key:?}\n");
+    for (name, extra) in [("cert-alone.toml", cert_line.clone()), ("key-alone.toml", key_line.clone())] {
+        let p = config(name, &extra);
+        let e = config::Config::load(Path::new(&p)).expect_err("one of the two");
+        assert_eq!(format!("{e:#}"), format!("{p}: relay_client_cert and relay_client_key go together"));
+        let out = run(&["check", "--config", &p, "--offline"]);
+        assert!(!out.status.success() && stderr(&out).contains("relay_client_cert and relay_client_key go together"), "{}", stderr(&out));
+    }
+    let both = config("both.toml", &format!("{cert_line}{key_line}"));
+    let loaded = config::Config::load(Path::new(&both)).expect("both");
+    assert!(loaded.relay_client_cert.is_some() && loaded.relay_client_key.is_some());
+    let out = run(&["check", "--config", &both, "--offline"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).starts_with("config ok: worker example-worker, 1 source(s), key fp "), "{}", stdout(&out));
+    let neither = config("neither.toml", "");
+    assert!(run(&["check", "--config", &neither, "--offline"]).status.success());
+
+    // The binary reads relay_client_key as it reads the worker key (R-119's one reader): a key file with group or
+    // other bits, or a symlink to the key, is refused at build.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let out = run(&["check", "--config", &both, "--offline"]);
+    let refused = format!("my-worker: {key}: has mode 0644: a key file is 0600 (chmod 600)");
+    assert!(!out.status.success() && stderr(&out).contains(&refused), "{}", stderr(&out));
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    let link = path("relay-client-link.key");
+    std::os::unix::fs::symlink(&key, &link).expect("a symlink");
+    let linked = config("linked.toml", &format!("{cert_line}relay_client_key = {link:?}\n"));
+    let out = run(&["check", "--config", &linked, "--offline"]);
+    let refused = format!("my-worker: {link}: is a symlink: point the config at the key file itself");
+    assert!(!out.status.success() && stderr(&out).contains(&refused), "{}", stderr(&out));
+    assert!(run(&["check", "--config", &both, "--offline"]).status.success(), "the key file itself, 0600");
+
+    // A certificate of another key is refused at build.
+    let other_key = certs::client_key().expect("another key");
+    let other = certs::client_leaf(&ca, "example-worker", &certs::client_point(&other_key).expect("its point"), now, now + 86_400).expect("a certificate");
+    std::fs::write(path("relay-client.pem"), certs::pem("CERTIFICATE", &other)).expect("another certificate");
+    let out = run(&["check", "--config", &both, "--offline"]);
+    assert!(!out.status.success() && stderr(&out).contains("the client key does not match the client certificate"), "{}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&dir);
 }

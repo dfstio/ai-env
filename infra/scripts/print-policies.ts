@@ -11,7 +11,8 @@
 //             dns-log-group|runtime-user|ops-user|deployer-user|proxy-role|operator-role|ssm-instance-policy|operator-policy|deploy-policy|
 //             deploy-egress-policy|deploy-dns-policy|deployer-policy|ops-policy|transcripts-bucket|transcripts-vm-object|transcripts-mac-object|
 //             transcripts-egress-check|transcripts-outside-prefix|transcripts-claude-object|other-bucket-object|al2023-object|s3-endpoint|
-//             relay-role|relay-instance-profile|relay-parameter|relay-tls|relay-artifact-parameter|relay-log-group|relay-artifact-object
+//             relay-role|relay-instance-profile|relay-parameter|relay-tls|relay-artifact-parameter|relay-log-group|relay-artifact-object|
+//             relay-boot-object
 //       an ARN the checks simulate against (or fetch: the two AWS managed policies the egress roles attach); `s3-endpoint`
 //       prints the endpoint id the bucket policy names (an id, the simulations' aws:SourceVpce)
 //
@@ -39,7 +40,7 @@
 // S13: the relay's role (`relay-trust`, `relay`); the ops policy names the relay instance, whose id exists only in a
 // stack: --relay-instance-id, else a placeholder of the real shape (not the proxy's). The relay's ARNs the simulations
 // ask are printed (--arn relay-*): its role and profile, a list parameter (`workers`), the TLS pair, the artifact
-// parameter, its log group and an artifact object.
+// parameter, its log group, an artifact object and (LD-R56) a boot object.
 //
 // The account id is passed in by the caller (from `aws sts get-caller-identity`) and only ever printed to stdout.
 import * as fs from "fs";
@@ -141,8 +142,8 @@ if (name !== undefined) {
         ["other-bucket-object", "arn:aws:s3:::not-ai-env-transcripts/v1/x"],
         ["al2023-object", `arn:aws:s3:::${AL2023_REPO_BUCKET}/core/mirrors/latest/aarch64/mirror.list`],
         ["s3-endpoint", names.s3EndpointId as string],
-        // S13: the relay's role, instance profile, a list parameter, the TLS pair, the artifact parameter, its log group
-        // and an artifact object of the bucket.
+        // S13: the relay's role, instance profile, a list parameter, the TLS pair, the artifact parameter, its log group,
+        // an artifact object of the bucket and (LD-R56) a boot object.
         ["relay-role", roleArn(names, RELAY_ROLE_NAME)],
         ["relay-instance-profile", instanceProfileArn(names, RELAY_INSTANCE_PROFILE_NAME)],
         ["relay-parameter", relayParameterArn(names, "workers")],
@@ -150,6 +151,7 @@ if (name !== undefined) {
         ["relay-artifact-parameter", relayParameterArn(names, "artifact")],
         ["relay-log-group", relayLogGroupArns(names)[0]],
         ["relay-artifact-object", `arn:aws:s3:::${names.bucket}/${RELAY_KEY_PREFIX}0123456789abcdef`],
+        ["relay-boot-object", `arn:aws:s3:::${names.bucket}/${RELAY_KEY_PREFIX}boot-0123456789abcdef`],
     ]);
     process.stdout.write(`${arns.get(arn) ?? usage(`no ARN kind ${arn}`)}\n`);
 } else {

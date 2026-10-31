@@ -3,6 +3,7 @@
 # value. Exit 0 ok, 1 a failure, 2 a bad environment. Test knobs only with AI_ENV_RELAY_ROOT (a prefix of every path).
 import grp
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -13,12 +14,27 @@ import time
 
 SELF = "ai-env-relay-reload"
 # In this order (infra/policies.ts RELAY_PARAMETERS, bridge::egress::RELAY_PARAMETERS); `tls` alone is a SecureString.
-PARAMETERS = ["artifact", "workers", "grants", "token-signers", "tls"]
-LISTS = ["workers", "grants", "token-signers"]
+PARAMETERS = ["artifact", "workers", "grants", "token-signers", "peers", "tls"]
+LISTS = ["workers", "grants", "token-signers", "peers"]
 BINARY_RE = re.compile(r"ai-env-relay-([0-9a-f]{16})")
 BINARY_MAX = 64 << 20
 # PEM markers built from parts: no key block in this file (I-R78).
 D5 = "-" * 5
+# R-94: a peer's cidr and not_after as R-86 holds them (ASCII digits: json.loads turns \u escapes into any digit), and
+# the kernel's table, replaced whole by each load.
+CIDR_RE = re.compile(r"(?:(?:0|[1-9][0-9]{0,2})\.){3}(?:0|[1-9][0-9]{0,2})/(?:0|[1-9][0-9]?)")
+UTC = "%Y-%m-%dT%H:%M:%SZ"
+UTC_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+NFT = """table inet ai_env_relay_peers
+delete table inet ai_env_relay_peers
+table inet ai_env_relay_peers {
+    set allowed { type ipv4_addr; flags interval;%s }
+    chain input {
+        type filter hook input priority filter; policy accept;
+        tcp dport 443 tcp flags & (syn | ack) == syn ip saddr != @allowed counter drop
+    }
+}
+"""
 
 
 def block(label):
@@ -34,6 +50,7 @@ class Run:
         knob = lambda k, d: env.get(k, d) if test else d
         root = knob("AI_ENV_RELAY_ROOT", "")
         self.aws, self.systemctl = knob("AI_ENV_RELAY_AWS", "aws"), knob("AI_ENV_RELAY_SYSTEMCTL", "systemctl")
+        self.nft, self.swapon = knob("AI_ENV_RELAY_NFT", "/usr/sbin/nft"), knob("AI_ENV_RELAY_SWAPON", "swapon")
         wait = knob("AI_ENV_RELAY_WAIT_S", "60")
         self.wait_s = int(wait) if wait.isdigit() else 60
         self.libexec = root + "/usr/local/libexec/ai-env-relay"
@@ -42,25 +59,41 @@ class Run:
         self.previous, self.stage, self.live = self.state + "/previous", self.state + "/stage", self.state + "/live"
         self.trying, self.refused = self.state + "/trying", self.state + "/refused"
         self.log = root + "/var/log/ai-env-relay/reload.log"
+        self.peers_nft = root + "/etc/ai-env-relay/peers.nft"
+        self.proc_swaps, self.swapfile = root + "/proc/swaps", root + "/swapfile"
         self.root = os.geteuid() == 0
         self.why, self.changed, self.absent = [], [], []
         self.fetched, self.artifact, self.relay, self.rollback = "none", "none", "unknown", None
+        self.swap_off = False
 
     def line(self):
+        # R-95: `disk` leads the list, and fails nothing; LD-R57: `swap` after it, likewise.
+        why = (["disk"] if full("/") else []) + (["swap"] if self.swap_off else []) + self.why
         text = "%s: %s fetched=%s changed=%s absent=%s artifact=%s tls=%s relay=%s" % (
             SELF, "FAILED" if self.why else "ok", self.fetched, ",".join(self.changed) or "none", ",".join(self.absent) or "none",
             self.artifact, "present" if os.path.lexists(self.live + "/tls.pem") else "absent", self.relay)
-        text += (" rollback=" + self.rollback if self.rollback else "") + (" why=" + "; ".join(self.why) if self.why else "")
+        text += (" rollback=" + self.rollback if self.rollback else "") + (" why=" + "; ".join(why) if why else "")
         print(text, file=sys.stderr, flush=True)
         try:
             with os.fdopen(os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644), "a") as f:
+                # R-96: 0644 whatever the umask, for the CloudWatch agent (cwagent).
+                os.fchmod(f.fileno(), 0o644)
                 f.write(text + "\n")
         except OSError:
             pass
 
 
-def call(argv, timeout, fsize=0):
-    """(exit code, stdout, the last stderr line); -1 when it did not run."""
+def full(path):
+    """R-95: the volume of `path` over 90 % used, as df counts it (used of used and available)."""
+    try:
+        s = os.statvfs(path)
+    except OSError:
+        return False
+    return s.f_bavail * 10 < s.f_blocks - s.f_bfree + s.f_bavail
+
+
+def call(argv, timeout, fsize=0, keep=""):
+    """(exit code, stdout, the last stderr line holding `keep`); -1 when it did not run."""
     cap = (lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))) if fsize else None
     try:
         r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, preexec_fn=cap)
@@ -69,7 +102,7 @@ def call(argv, timeout, fsize=0):
     except OSError as e:
         return -1, b"", "cannot run %s: %s" % (argv[0], e.strerror)
     lines = r.stderr.decode("utf-8", "replace").split("\n")
-    last = ([l.strip() for l in lines if l.strip()] or ["exit %d" % r.returncode])[-1]
+    last = ([l.strip() for l in lines if l.strip() and keep in l] or ["exit %d" % r.returncode])[-1]
     return r.returncode, r.stdout, re.sub(r"[^ -~]", "?", last)[:200]
 
 
@@ -94,11 +127,16 @@ def no_constant(name):
     raise ValueError(name)
 
 
+# What json.loads raises of a value: 4096 bytes hold a list nested past its limit (RecursionError, no ValueError), which
+# would otherwise end the run with no line, no `fetched` and the kernel's table as it was.
+NOT_JSON = (ValueError, RecursionError)
+
+
 def artifact_of(value):
     """(the artifact, None) or (None, why): infra/relay-spec.ts parseRelayArtifactValue's rules."""
     try:
         a = json.loads(value, parse_constant=no_constant)
-    except ValueError:
+    except NOT_JSON:
         return None, "not JSON"
     if not isinstance(a, dict) or sorted(a) != ["bucket", "key", "sha256", "version"] or not all(isinstance(v, str) for v in a.values()):
         return None, "not bucket, key, sha256, version"
@@ -124,7 +162,7 @@ def invalid(param, value):
         return None if TLS_RE.fullmatch(value) else "not certificates then one PKCS#8 key block"
     try:
         json.loads(value, parse_constant=no_constant)
-    except ValueError:
+    except NOT_JSON:
         return "not JSON"
     return None
 
@@ -184,6 +222,55 @@ def publish(run, values):
     now = int(time.time())
     write(run, run.live + "/fetched", b"%d\n" % now, 0o640, True)
     run.fetched = str(now)
+
+
+def networks(value):
+    """R-94: the in-force peers' networks, sorted, none inside another; none at all if R-86 refuses a cidr or a not_after."""
+    nets, now = {}, time.strftime(UTC, time.gmtime())
+    try:
+        for p in json.loads(value):
+            cidr, t = p["cidr"], p["not_after"]
+            if not CIDR_RE.fullmatch(cidr) or not UTC_RE.fullmatch(t) or time.strptime(t, UTC).tm_sec > 59 or t < "1970":
+                return []
+            n = ipaddress.IPv4Network(cidr, strict=False)
+            if n in nets:
+                return []
+            nets[n] = t >= now
+    except (TypeError, KeyError) + NOT_JSON:
+        return []
+    live = [n for n in nets if nets[n]]
+    return sorted(n for n in live if not any(n != m and n.subnet_of(m) for m in live))
+
+
+def load_set(run):
+    """`nft -f` of peers.nft. After a failure the kernel keeps the table it had, and the relay's own check (R-89) is
+    untouched: the run goes on. Of a failure, nft's last Error line: the lines after it quote the file and point at it."""
+    code, _, why = call([run.nft, "-f", run.peers_nft], 60, keep="Error")
+    if code != 0:
+        run.why.append("peers.nft: " + why)
+
+
+def kernel_set(run, value):
+    """R-94: peers.nft rendered and loaded on every run (a reboot empties the kernel's tables, not the file)."""
+    nets = [] if value is None or invalid("peers", value) else networks(value)
+    text = NFT % (" elements = { %s }" % ", ".join(map(str, nets)) if nets else "")
+    try:
+        write(run, run.peers_nft, text.encode(), 0o644, False)
+    except OSError as e:
+        run.why.append("peers.nft: %s" % e.strerror)
+        return
+    load_set(run)
+
+
+def swap_on(run):
+    """LD-R57: whether the swapfile is on (/proc/swaps), after one swapon when it is not."""
+    def listed():
+        swaps = (read(run.proc_swaps) or b"").decode("utf-8", "replace")
+        return any(line.split()[:1] == [run.swapfile] for line in swaps.split("\n"))
+    if listed():
+        return True
+    call([run.swapon, run.swapfile], 60)
+    return listed()
 
 
 def sha256(path):
@@ -317,6 +404,8 @@ def main():
         return 2
     os.umask(0o077)
     run = Run(os.environ)
+    # LD-R57: every run, whatever stops it later.
+    run.swap_off = not swap_on(run)
     try:
         # Made again in §3.3's modes when gone (the umask is 077).
         for d, mode, group in ((run.libexec, 0o755, False), (run.state, 0o750, True), (run.live, 0o750, True), (run.stage, 0o700, False)):
@@ -327,10 +416,14 @@ def main():
                     os.chown(d, 0, grp.getgrnam("ai-env-relay").gr_gid if group else 0)
         values = fetch(run, prefix, region)
         if values is None:
+            # Nothing to render: the file a reboot left is what the kernel held (R-94). An SSM outage is no absent value.
+            if os.path.exists(run.peers_nft):
+                load_set(run)
             run.line()
             return 1
         run.absent = [p for p in PARAMETERS if values[p] is None]
         publish(run, values)
+        kernel_set(run, values["peers"])
         switched = False
         why = "absent" if values["artifact"] is None else invalid("artifact", values["artifact"])
         if why:

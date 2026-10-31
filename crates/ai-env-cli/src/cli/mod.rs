@@ -268,7 +268,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ProxyCmd,
     },
-    /// The S13 relay: this Mac's keys and signing agent (keygen, pubkey, agent), the whitelist, grants and TLS (allow, revoke, grant, tls: as ai-env-deployer), the relay CA's certificate (ca), the relay instance (status, start, stop: as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
+    /// The S13 relay: this Mac's keys and signing agent (keygen, pubkey, agent), the whitelist, the public face's allowlist, grants and TLS (allow, revoke, allow-ip, revoke-ip, grant, tls: as ai-env-deployer), the relay CA's certificate (ca), the relay instance (status, start, stop: as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
     #[cfg(feature = "bridge")]
     Relay {
         #[command(subcommand)]
@@ -845,6 +845,9 @@ pub enum RelayCmd {
         /// The last valid day, UTC (default: a year from today; at most two years ahead)
         #[arg(long, value_name = "YYYY-MM-DD")]
         not_after: Option<String>,
+        /// Issue the worker a client certificate for this P-256 point, p256:<base64>, as tls-keygen printed it (one Touch ID: the relay CA)
+        #[arg(long, value_name = "P256", conflicts_with = "token_signer")]
+        tls_key: Option<String>,
     },
     /// Remove a worker (or with --token-signer a token signer) from the relay's lists (as ai-env-deployer)
     Revoke {
@@ -864,6 +867,37 @@ pub enum RelayCmd {
         /// Delete the grant
         #[arg(long)]
         remove: bool,
+    },
+    /// Allow a network on the relay's public face (as ai-env-deployer); --mine allows this Mac's current address
+    AllowIp {
+        /// The network, a.b.c.d (read as /32) or a.b.c.d/n, n 0 to 32
+        #[arg(value_name = "CIDR", required_unless_present = "mine", conflicts_with = "mine")]
+        cidr: Option<String>,
+        /// The entry's id: what the network is (an entry with this label is replaced)
+        #[arg(long, value_name = "ID", required_unless_present = "mine", conflicts_with = "mine")]
+        label: Option<String>,
+        /// The last valid day, UTC (default: a year from today; at most two years ahead)
+        #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "mine")]
+        not_after: Option<String>,
+        /// A network wider than /16 (a prefix 0 to 15) is meant: it admits much of the internet
+        #[arg(long, conflicts_with = "mine")]
+        wide: bool,
+        /// This Mac's current address, as checkip.amazonaws.com answers it, as a /32 labelled mac (again: refreshed)
+        #[arg(long)]
+        mine: bool,
+        /// How long --mine's entry lasts, 1 to 168 (default 24)
+        // clap lets `requires` go when a present argument conflicts with what it requires, so the two are named too.
+        #[arg(long, value_name = "N", requires = "mine", conflicts_with_all = ["cidr", "label"])]
+        hours: Option<u32>,
+    },
+    /// Remove a network from the relay's public face (as ai-env-deployer)
+    RevokeIp {
+        /// The network, a.b.c.d (read as /32) or a.b.c.d/n
+        #[arg(value_name = "CIDR", required_unless_present = "label", conflicts_with = "label")]
+        cidr: Option<String>,
+        /// The entry's label, in place of its network
+        #[arg(long, value_name = "ID")]
+        label: Option<String>,
     },
     /// The relay instance, its lists, and this Mac's keys and agent (AWS reads as ai-env-ops)
     Status {
@@ -903,7 +937,7 @@ pub enum RelayCmd {
 pub enum RelayTlsCmd {
     /// Make the relay CA (its key sealed into credentials/relay-ca.env) and the relay's certificate, written to /ai-env/relay/tls
     Init {
-        /// Replace an existing CA: every worker's relay_ca file must then be replaced
+        /// Replace an existing CA: every worker's relay_ca file and client certificate must then be replaced
         #[arg(long)]
         force: bool,
     },
@@ -2101,7 +2135,10 @@ mod tests {
     /// S13 (WM-T42): each `relay` command parses with its flags: `--sources a,b --sources c` is three globs;
     /// `allow` takes exactly one of `--sources` and `--token-signer` (both, or neither, is a usage error, exit 2),
     /// `grant` its rules or `--remove`, `pubkey` at most one of `--worker` and `--session`; `agent --hours 0`
-    /// parses (the range is the command's: exit 2 there). `relay` comes right after `proxy`.
+    /// parses (the range is the command's: exit 2 there). `relay` comes right after `proxy`. §RS.4.1: `allow
+    /// --tls-key` conflicts with `--token-signer`; `allow-ip` takes a network and `--label`, or `--mine` (`--hours`
+    /// with it alone, `--not-after` and `--wide` with the network alone); `revoke-ip` exactly one of a network and
+    /// `--label`.
     #[test]
     fn relay_commands_parse() {
         let relay = |args: &[&str]| -> RelayCmd {
@@ -2116,13 +2153,26 @@ mod tests {
         let RelayCmd::Pubkey { worker: false, session: false, verify: false } = relay(&["pubkey"]) else { panic!("pubkey") };
         let RelayCmd::Pubkey { worker: true, session: false, verify: true } = relay(&["pubkey", "--worker", "--verify"]) else { panic!("pubkey --worker --verify") };
         let RelayCmd::Pubkey { worker: false, session: true, verify: false } = relay(&["pubkey", "--session"]) else { panic!("pubkey --session") };
-        let RelayCmd::Allow { id, key, sources, token_signer: false, not_after } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
+        let RelayCmd::Allow { id, key, sources, token_signer: false, not_after, tls_key: None, .. } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
             panic!("allow --sources")
         };
         assert_eq!((id.as_str(), key.as_str(), not_after.as_deref()), ("worker-a", "ed25519:K", Some("2027-10-29")));
         assert_eq!(sources, ["a", "b", "c"], "comma-separated and repeated: three globs");
-        let RelayCmd::Allow { id, sources, token_signer: true, not_after: None, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K"]) else { panic!("allow --token-signer") };
+        let RelayCmd::Allow { id, sources, token_signer: true, not_after: None, tls_key: None, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K"]) else { panic!("allow --token-signer") };
         assert!(id == "mac" && sources.is_empty());
+        let RelayCmd::Allow { tls_key: Some(point), .. } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a", "--tls-key", "p256:P"]) else { panic!("allow --tls-key") };
+        assert_eq!(point, "p256:P", "the text's check is the command's");
+        // §RS.4.1: allow-ip and revoke-ip.
+        let RelayCmd::AllowIp { cidr: Some(cidr), label: Some(label), not_after: None, wide: false, mine: false, hours: None } = relay(&["allow-ip", "198.51.100.7/24", "--label", "office"]) else { panic!("allow-ip") };
+        assert_eq!((cidr.as_str(), label.as_str()), ("198.51.100.7/24", "office"));
+        let RelayCmd::AllowIp { not_after: Some(day), wide: true, mine: false, .. } = relay(&["allow-ip", "198.51.100.0/8", "--label", "wide", "--wide", "--not-after", "2027-10-29"]) else { panic!("allow-ip --wide") };
+        assert_eq!(day, "2027-10-29");
+        let RelayCmd::AllowIp { cidr: None, label: None, not_after: None, wide: false, mine: true, hours: None } = relay(&["allow-ip", "--mine"]) else { panic!("allow-ip --mine") };
+        let RelayCmd::AllowIp { mine: true, hours: Some(0), .. } = relay(&["allow-ip", "--mine", "--hours", "0"]) else { panic!("--hours 0 parses: the range is the command's") };
+        let RelayCmd::RevokeIp { cidr: Some(cidr), label: None } = relay(&["revoke-ip", "198.51.100.0/24"]) else { panic!("revoke-ip") };
+        assert_eq!(cidr, "198.51.100.0/24");
+        let RelayCmd::RevokeIp { cidr: None, label: Some(label) } = relay(&["revoke-ip", "--label", "office"]) else { panic!("revoke-ip --label") };
+        assert_eq!(label, "office");
         let RelayCmd::Revoke { id, token_signer: false } = relay(&["revoke", "worker-a"]) else { panic!("revoke") };
         assert_eq!(id, "worker-a");
         let RelayCmd::Revoke { token_signer: true, .. } = relay(&["revoke", "mac", "--token-signer"]) else { panic!("revoke --token-signer") };
@@ -2145,6 +2195,21 @@ mod tests {
             &["relay", "allow", "w", "--key", "ed25519:K", "--sources", "a", "--token-signer"][..],
             &["relay", "allow", "w", "--key", "ed25519:K"],
             &["relay", "allow", "w", "--sources", "a"],
+            &["relay", "allow", "w", "--key", "ed25519:K", "--token-signer", "--tls-key", "p256:P"],
+            &["relay", "allow-ip"],
+            &["relay", "allow-ip", "198.51.100.0/24"],
+            &["relay", "allow-ip", "--label", "office"],
+            &["relay", "allow-ip", "198.51.100.0/24", "--label", "office", "--mine"],
+            &["relay", "allow-ip", "198.51.100.0/24", "--mine"],
+            &["relay", "allow-ip", "--label", "office", "--mine"],
+            &["relay", "allow-ip", "--mine", "--not-after", "2027-10-29"],
+            &["relay", "allow-ip", "--mine", "--wide"],
+            &["relay", "allow-ip", "198.51.100.0/24", "--label", "office", "--hours", "1"],
+            &["relay", "allow-ip", "--hours", "1"],
+            &["relay", "allow-ip", "--label", "office", "--hours", "1"],
+            &["relay", "allow-ip", "--mine", "--hours", "x"],
+            &["relay", "revoke-ip"],
+            &["relay", "revoke-ip", "198.51.100.0/24", "--label", "office"],
             &["relay", "grant", "g"],
             &["relay", "grant", "g", "a/b", "--remove"],
             &["relay", "pubkey", "--worker", "--session"],

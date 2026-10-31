@@ -33,7 +33,7 @@ fn wrapper() -> &'static str {
 /// or the fake (`tests/fakes/claude.sh`'s knobs
 /// but the argv log `command` sets). Every `AI_ENV_BRIDGE_*` knob the code
 /// reads is here but the bridge root (`tests/infra/image.rs` checks it).
-const WRAPPER_ENV: [&str; 33] = [
+const WRAPPER_ENV: [&str; 34] = [
     "AI_ENV_BRIDGE_LOCAL",
     "AI_ENV_BRIDGE_LAB_EXIT",
     "AI_ENV_BRIDGE_CONFIG",
@@ -62,6 +62,7 @@ const WRAPPER_ENV: [&str; 33] = [
     "AI_ENV_BRIDGE_LAB_GPGV",
     "AI_ENV_BRIDGE_LAB_ADMIT_MAKE",
     "AI_ENV_BRIDGE_LAB_NOW",
+    "AI_ENV_BRIDGE_LAB_CHECKIP",
     "AI_ENV_DIR",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "FAKE_STDOUT",

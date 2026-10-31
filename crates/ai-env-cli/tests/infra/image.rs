@@ -431,10 +431,10 @@ fn the_make_child_carries_no_outer_make_or_operator_state() {
 
 const MUST_NOT_RUN: &[&str] = &["aws", "pulumi", "docker", "curl", "gpg", "cargo", "npm", "node", "zip", "shasum", "rustup", "sleep"];
 
-/// `$(LAB_UNSET)` as the live recipes run it: the twenty-one lab knobs
+/// `$(LAB_UNSET)` as the live recipes run it: the twenty-two lab knobs
 /// (`the_scrub_lists_hold_every_knob_the_code_and_the_fakes_read` holds the
 /// Makefile's list to every one the code and ops.sh read).
-const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES -u AI_ENV_BRIDGE_LAB_PARK_AFTER_MS -u AI_ENV_BRIDGE_LAB_RELEASE_CURL -u AI_ENV_BRIDGE_LAB_GPGV -u AI_ENV_BRIDGE_LAB_ADMIT_MAKE -u AI_ENV_BRIDGE_LAB_NOW";
+const LAB_UNSET: &str = "env -u AI_ENV_BRIDGE_LAB_FAKE_API -u AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL -u AI_ENV_BRIDGE_LAB_BACKOFF_MS -u AI_ENV_BRIDGE_LAB_FAKE_SHELL -u AI_ENV_BRIDGE_LAB_AGENT_ADDR -u AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS -u AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS -u AI_ENV_BRIDGE_LAB_TRANSCRIPT -u AI_ENV_BRIDGE_LAB_EXIT -u AI_ENV_BRIDGE_LAB_IGNORE_EOF -u AI_ENV_BRIDGE_LAB_STDOUT_NOISE -u AI_ENV_BRIDGE_LAB_DELAY_INIT_MS -u AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS -u AI_ENV_BRIDGE_LAB_OSASCRIPT -u AI_ENV_BRIDGE_LAB_S3_ADDR -u AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES -u AI_ENV_BRIDGE_LAB_PARK_AFTER_MS -u AI_ENV_BRIDGE_LAB_RELEASE_CURL -u AI_ENV_BRIDGE_LAB_GPGV -u AI_ENV_BRIDGE_LAB_ADMIT_MAKE -u AI_ENV_BRIDGE_LAB_NOW -u AI_ENV_BRIDGE_LAB_CHECKIP";
 
 /// The stand-in's log line of the operator CLI's keyless build (D18: infra.mk's `$(AI_ENV_BUILD)`, TIER's first
 /// step, and ops.sh's need_ai_env): `--version`, with no marker and no lab knob in its environment.
@@ -2115,7 +2115,7 @@ fn relay_artifact_cross_builds_the_relay_and_writes_relay_json() {
     let text = all(&out);
     assert!(out.status.success(), "{text}");
     let builds: Vec<String> = lines_of(&t.path().join("cl.log")).into_iter().filter(|l| l.contains(" build ")).collect();
-    assert_eq!(builds, ["lambda build --release --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay"], "one build, without a key, marker or passphrase: {text}");
+    assert_eq!(builds, ["lambda build --release --locked --arm64 --lambda-dir target/lambda -p ai-env-relay --bin ai-env-relay"], "one build of the reviewed lock (F18), without a key, marker or passphrase: {text}");
     assert_eq!(std::fs::read(w.join("target/relay/ai-env-relay")).unwrap(), fresh, "this build's binary: {text}");
     let sha = hex::encode(Sha256::digest(&fresh));
     let cargo = read(&w.join("Cargo.toml"));
@@ -3211,11 +3211,12 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
         "\n     cd infra && pulumi stack rm dev\n",
         "the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README \"Break-glass\"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)",
         // S13 (I-T53): the relay instance and its Elastic IP (billed while allocated), its log group, its artifact
-        // parameter and the four writes of ai-env relay Pulumi never held (deleted by hand), its role and profile.
+        // parameter and the five writes of ai-env relay Pulumi never held (deleted by hand; `peers` since R-93), its
+        // role and profile.
         " 12. the relay instance, terminated only, and no Elastic IP of the stack left (one still allocated is billed):\n     aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-relay --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n     aws ec2 describe-addresses --filters Name=tag:Name,Values=ai-env-relay --query 'Addresses[].[AllocationId,PublicIp]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n",
-        " 13. no relay log group; the relay's artifact parameter listed as invalid; the four ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/relay --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
-        "\n     aws ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/tls --query InvalidParameters --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
-        "\n     aws ssm delete-parameters --names /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/tls --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        " 13. no relay log group; the relay's artifact parameter listed as invalid; the five ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/relay --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --query InvalidParameters --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm delete-parameters --names /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
         " 14. NoSuchEntity for each:\n",
         "\n     aws iam get-role --role-name ai-env-relay --region eu-central-1; aws iam get-instance-profile --instance-profile-name ai-env-relay --region eu-central-1\n",
         " 17. the account root ran this destroy (BREAKGLASS=1)",

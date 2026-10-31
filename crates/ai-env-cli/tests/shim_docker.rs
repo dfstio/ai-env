@@ -3318,12 +3318,14 @@ fn l2_relay_client_serves_the_session_to_its_claude_alone() {
     assert_eq!((replies[&1]["result"]["protocolVersion"].as_str(), replies[&1]["result"]["serverInfo"].clone()), (Some("2025-06-18"), serde_json::json!({"name": "ai-env-relay", "version": env!("CARGO_PKG_VERSION")})));
     let names: Vec<&str> = replies[&2]["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
     assert_eq!(names, ["relay_catalog", "relay_call"]);
+    // R-113: a tool's text is one line saying it is data, then the object under `data`.
+    let second_line = |id: u64| replies[&id]["result"]["content"][0]["text"].as_str().unwrap().lines().nth(1).unwrap_or_default().to_string();
     for id in [3, 4] {
         let r = &replies[&id]["result"];
-        let tool: serde_json::Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        let tool = serde_json::from_str::<serde_json::Value>(&second_line(id)).unwrap()["data"].clone();
         assert!(r["isError"] == true && tool["error"]["code"] == "unavailable" && tool["error"]["message"].as_str().is_some_and(|m| m.starts_with("connect 127.0.0.1:1:")), "{id}: {tool}");
     }
-    assert!(replies[&4]["result"]["content"][0]["text"].as_str().unwrap().starts_with(r#"{"source":"echo","op":"echo","error":"#), "{}", replies[&4]);
+    assert!(second_line(4).starts_with(r#"{"data":{"source":"echo","op":"echo","error":"#), "{}", replies[&4]);
     assert_eq!(text.lines().last(), Some("mcp_exit=0"), "{text}");
     // 9. The client ends with its leader.
     let deadline = Instant::now() + Duration::from_secs(3);

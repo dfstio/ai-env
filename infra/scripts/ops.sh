@@ -382,10 +382,10 @@ operator users are gone): paste each command line on its own; its step's numbere
  12. the relay instance, terminated only, and no Elastic IP of the stack left (one still allocated is billed):
      aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-relay --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region $region --endpoint-url $ec2_url
      aws ec2 describe-addresses --filters Name=tag:Name,Values=ai-env-relay --query 'Addresses[].[AllocationId,PublicIp]' --output text --region $region --endpoint-url $ec2_url
- 13. no relay log group; the relay's artifact parameter listed as invalid; the four ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):
+ 13. no relay log group; the relay's artifact parameter listed as invalid; the five ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):
      aws logs describe-log-groups --log-group-name-prefix $relay_group --region $region --endpoint-url https://logs.$region.amazonaws.com
-     aws ssm get-parameters --names $relay_prefix/artifact $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/tls --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com
-     aws ssm delete-parameters --names $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/tls --region $region --endpoint-url https://ssm.$region.amazonaws.com
+     aws ssm get-parameters --names $relay_prefix/artifact $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/peers $relay_prefix/tls --query InvalidParameters --region $region --endpoint-url https://ssm.$region.amazonaws.com
+     aws ssm delete-parameters --names $relay_prefix/workers $relay_prefix/grants $relay_prefix/token-signers $relay_prefix/peers $relay_prefix/tls --region $region --endpoint-url https://ssm.$region.amazonaws.com
  14. NoSuchEntity for each:
      aws iam get-role --role-name $(econf operatorRoleName) --region $region; aws iam get-role --role-name $(econf proxyRoleName) --region $region; aws iam get-instance-profile --instance-profile-name $(econf proxyInstanceProfileName) --region $region
      aws iam get-role --role-name ai-env-relay --region $region; aws iam get-instance-profile --instance-profile-name ai-env-relay --region $region
@@ -736,7 +736,7 @@ cmd_connector_delete() {
 # allowed and named: any change to a file embedded in its user-data replaces it by design. The same rule holds for a
 # VPC step turning enableDnsSupport or enableDnsHostnames from off (or unknown) to on (dnsMode none -> firewall): the
 # VPC's Amazon DNS answers the VMs before the DNS Firewall exists, so not while a connector exists. S13: a replaced
-# relay instance is allowed and named (its user data, as the proxy's); a replaced Elastic IP is refused whatever the
+# relay instance is allowed and named (its user data, which pins its boot object, LD-R56); a replaced Elastic IP is refused whatever the
 # connectors (every worker's relay URL names its address; the program can no longer plan one, so only drift could).
 cmd_replace_guard() {
     local plan verdict guarded proxies relays eips dns list

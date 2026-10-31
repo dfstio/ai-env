@@ -1,4 +1,4 @@
-//! The three relay lists (WM-R7): `workers`, `token-signers` and `grants`, each a compact JSON array in one
+//! The four relay lists (WM-R7, R-85): `workers`, `token-signers`, `grants` and `peers`, each a compact JSON array in one
 //! SSM String parameter.
 
 use std::collections::HashMap;
@@ -40,6 +40,10 @@ pub struct WorkerEntry {
     pub sources: Vec<String>,
     /// `YYYY-MM-DDTHH:MM:SSZ`.
     pub not_after: String,
+    /// The SHA-256 of its client certificate's DER, 64 lowercase hex (R-123; `certs::tls_fp`), unique across
+    /// entries. Absent parses, and renders without the key, so a list without certificates is today's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_fp: Option<String>,
 }
 
 /// One token signer (a Mac's session key).
@@ -112,6 +116,272 @@ pub fn render_grants(list: &[Grant]) -> Result<String, PolicyError> {
         grant.allow.sort();
     }
     render("grants", &sorted)
+}
+
+/// The peers list (R-85): the networks the relay's public face admits a connection from, a fourth list of WM-R7's
+/// grammar. The relay refuses every other address before any TLS byte (R-89).
+pub const PEERS: &str = "/ai-env/relay/peers";
+
+/// One network the relay's public face admits (R-85, R-86).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEntry {
+    /// `a.b.c.d/n`, an IPv4 network (n 0 to 32), never a host name; `render_peers` writes it as its network.
+    pub cidr: String,
+    /// The entry's id: what the network is (`allow-ip --mine` labels this Mac's address `mac`).
+    pub label: String,
+    /// `YYYY-MM-DDTHH:MM:SSZ`.
+    pub not_after: String,
+}
+
+impl PeerEntry {
+    /// `not_after` in unix seconds (0, never in force, if it does not parse).
+    pub fn not_after_unix(&self) -> u64 {
+        unix_of(&self.not_after).unwrap_or(0)
+    }
+
+    /// Its network: `cidr` truncated to its prefix (host bits cleared: `198.51.100.7/24` is `198.51.100.0/24`), the
+    /// entry's identity (R-86, LD-R40). An entry `parse_peers` would refuse has `0.0.0.0/32`, no peer's network.
+    pub fn network(&self) -> (std::net::Ipv4Addr, u8) {
+        cidr_of(&self.cidr).map_or((std::net::Ipv4Addr::UNSPECIFIED, 32), |(addr, prefix)| (truncated(addr, prefix), prefix))
+    }
+
+    /// Whether its network holds `ip`, in force or not (`not_after_unix` is the caller's).
+    pub fn contains(&self, ip: std::net::Ipv4Addr) -> bool {
+        cidr_of(&self.cidr).is_some_and(|(addr, prefix)| truncated(ip, prefix) == truncated(addr, prefix))
+    }
+}
+
+/// The peers list.
+pub fn parse_peers(json: &str) -> Result<Vec<PeerEntry>, PolicyError> {
+    let list = parse_list("peers", json)?;
+    check_peers(&list)?;
+    Ok(list)
+}
+
+/// Sorted by label, each `cidr` written as its network, compact: a rendered list parses back to itself.
+pub fn render_peers(list: &[PeerEntry]) -> Result<String, PolicyError> {
+    check_peers(list)?;
+    let mut sorted: Vec<PeerEntry> = list
+        .iter()
+        .map(|p| {
+            let (addr, prefix) = p.network();
+            PeerEntry { cidr: format!("{addr}/{prefix}"), ..p.clone() }
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.label.cmp(&b.label));
+    render("peers", &sorted)
+}
+
+/// R-86, each entry in turn: its `cidr` an IPv4 network whose network no earlier entry holds, its `label` an id no
+/// earlier entry holds, its `not_after` a UTC time; then at most 64 entries. A text names the entry and the field,
+/// never a value.
+fn check_peers(list: &[PeerEntry]) -> Result<(), PolicyError> {
+    let (mut networks, mut labels) = (HashMap::new(), HashMap::new());
+    for (i, p) in list.iter().enumerate() {
+        let bad = |why: String| PolicyError(format!("peers: entry {i}: {why}"));
+        let Some((addr, prefix)) = cidr_of(&p.cidr) else {
+            return Err(bad("cidr is not an IPv4 network (a.b.c.d/n, n 0 to 32)".to_string()));
+        };
+        if let Some(first) = networks.insert((truncated(addr, prefix), prefix), i) {
+            return Err(bad(format!("cidr repeats entry {first}'s (one network, one label)")));
+        }
+        if !valid_id(&p.label) {
+            return Err(bad(format!("label is not an id ({})", ai_env_source::names::NAME_RULE)));
+        }
+        if let Some(first) = labels.insert(p.label.as_str(), i) {
+            return Err(bad(format!("label repeats entry {first}'s")));
+        }
+        unix_of(&p.not_after).map_err(|e| bad(format!("not_after: {e}")))?;
+    }
+    if list.len() > ENTRIES_MAX {
+        return Err(PolicyError(format!("peers: {} entries, over {ENTRIES_MAX}", list.len())));
+    }
+    Ok(())
+}
+
+/// R-86's `a.b.c.d/n`: four decimal octets as `Ipv4Addr`'s parser takes them (no leading zero, no IPv6), `/`, then a
+/// prefix of 0 to 32 in decimal with no leading zero (`0` itself allowed); the address and the prefix.
+fn cidr_of(cidr: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr.split_once('/')?;
+    let decimal = !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_digit()) && (prefix == "0" || !prefix.starts_with('0'));
+    let prefix: u8 = if decimal { prefix.parse().ok()? } else { return None };
+    if prefix > 32 {
+        return None;
+    }
+    Some((addr.parse().ok()?, prefix))
+}
+
+/// `ip` with the bits after its first `prefix` cleared.
+fn truncated(ip: std::net::Ipv4Addr, prefix: u8) -> std::net::Ipv4Addr {
+    let mask = u32::MAX.checked_shl(32u32.saturating_sub(u32::from(prefix))).unwrap_or(0);
+    std::net::Ipv4Addr::from(u32::from(ip) & mask)
+}
+
+/// WM-T51 (R-85, R-86): the peers list's grammar, as WM-T8 holds the other three's.
+#[cfg(test)]
+mod peers_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn peer(cidr: &str, label: &str) -> PeerEntry {
+        PeerEntry { cidr: cidr.into(), label: label.into(), not_after: "2027-10-29T23:59:59Z".into() }
+    }
+
+    /// WM-T51.
+    #[test]
+    fn peers_render_sorted_and_parse_back() {
+        // Sorted by label, each cidr written as its network (host bits cleared), compact; the text parses back to
+        // exactly the entries it holds, and renders again to itself.
+        let list = vec![peer("203.0.113.77/24", "office"), peer("198.51.100.7/32", "mac"), peer("192.0.2.200/25", "lab")];
+        let text = render_peers(&list).expect("renders");
+        assert_eq!(
+            text,
+            r#"[{"cidr":"192.0.2.128/25","label":"lab","not_after":"2027-10-29T23:59:59Z"},{"cidr":"198.51.100.7/32","label":"mac","not_after":"2027-10-29T23:59:59Z"},{"cidr":"203.0.113.0/24","label":"office","not_after":"2027-10-29T23:59:59Z"}]"#
+        );
+        let back = parse_peers(&text).expect("parses");
+        assert_eq!(back, [peer("192.0.2.128/25", "lab"), peer("198.51.100.7/32", "mac"), peer("203.0.113.0/24", "office")]);
+        assert_eq!(render_peers(&back).expect("renders"), text, "a rendered list parses back to itself");
+        assert_eq!(parse_peers("[]").expect("empty"), vec![]);
+        assert_eq!(render_peers(&[]).expect("empty"), "[]");
+        // A cidr with host bits parses (LD-R40); its identity is its network.
+        assert_eq!(parse_peers(r#"[{"cidr":"198.51.100.7/24","label":"office","not_after":"2027-10-29T23:59:59Z"}]"#).expect("host bits").len(), 1);
+        let lapsed = PeerEntry { not_after: "2026-01-01T00:00:00Z".into(), ..peer("198.51.100.0/24", "old") };
+        assert_eq!(parse_peers(&render_peers(std::slice::from_ref(&lapsed)).expect("renders")).expect("a lapsed entry still parses"), std::slice::from_ref(&lapsed));
+        assert_eq!(lapsed.not_after_unix(), 1_767_225_600);
+        assert_eq!(PeerEntry { not_after: "never".into(), ..lapsed }.not_after_unix(), 0, "never in force");
+
+        // One network, one label: two cidrs of one network repeat each other, whatever their host bits.
+        let refused = |list: Vec<PeerEntry>| {
+            let rendered = render_peers(&list).expect_err("render refuses").to_string();
+            let parsed = parse_peers(&serde_json::to_string(&list).expect("json")).expect_err("parse refuses").to_string();
+            assert_eq!(rendered, parsed, "one check on both sides");
+            parsed
+        };
+        assert_eq!(refused(vec![peer("198.51.100.7/24", "office"), peer("198.51.100.9/24", "lab")]), "peers: entry 1: cidr repeats entry 0's (one network, one label)");
+        assert_eq!(refused(vec![peer("198.51.100.0/24", "a"), peer("192.0.2.0/24", "b"), peer("198.51.100.255/24", "c")]), "peers: entry 2: cidr repeats entry 0's (one network, one label)");
+        let mut nested = vec![peer("198.51.100.0/24", "office"), peer("198.51.100.7/32", "mac"), peer("198.51.100.0/25", "half")];
+        assert_eq!(parse_peers(&render_peers(&nested).expect("a /32 and a /25 inside a /24 are other networks")).expect("parses").len(), 3);
+        nested.push(peer("198.51.100.7/32", "again"));
+        assert_eq!(refused(nested), "peers: entry 3: cidr repeats entry 1's (one network, one label)");
+        assert_eq!(refused(vec![peer("198.51.100.0/24", "office"), peer("203.0.113.0/24", "office")]), "peers: entry 1: label repeats entry 0's");
+
+        // R-86's grammar: each refusal names the entry and the field, never a value.
+        let not_a_network = "peers: entry 0: cidr is not an IPv4 network (a.b.c.d/n, n 0 to 32)";
+        for cidr in [
+            "198.51.100.0/33",
+            "198.51.100.0",
+            "198.051.100.0/24",
+            "2001:db8::/32",
+            "198.51.100.0/08",
+            "198.51.100.0/00",
+            "198.51.100.0/",
+            "198.51.100.0/+8",
+            "198.51.100.0/24/8",
+            " 198.51.100.0/24",
+            "198.51.100/24",
+            "example.invalid/24",
+            "",
+        ] {
+            assert_eq!(refused(vec![peer(cidr, "office")]), not_a_network, "{cidr:?}");
+        }
+        for cidr in ["198.51.100.0/0", "0.0.0.0/0", "203.0.113.9/32", "192.0.2.1/9"] {
+            assert!(render_peers(&[peer(cidr, "office")]).is_ok(), "{cidr}");
+        }
+        let planted = "zz-planted";
+        let not_an_id = format!("peers: entry 0: label is not an id ({})", ai_env_source::names::NAME_RULE);
+        assert_eq!(refused(vec![peer("198.51.100.0/24", &planted.to_uppercase())]), not_an_id);
+        assert_eq!(refused(vec![peer("198.51.100.0/24", "")]), not_an_id);
+        let bad_time = PeerEntry { not_after: planted.into(), ..peer("198.51.100.0/24", "office") };
+        assert_eq!(refused(vec![bad_time]), "peers: entry 0: not_after: not a UTC time (YYYY-MM-DDTHH:MM:SSZ)");
+        let good = serde_json::to_value(peer("198.51.100.0/24", "office")).expect("json");
+        let with = |field: &str, value: serde_json::Value| {
+            let mut entry = good.clone();
+            entry[field] = value;
+            serde_json::to_string(&[entry]).expect("json")
+        };
+        let mut no_label = good.clone();
+        no_label.as_object_mut().expect("an object").remove("label");
+        let texts = [
+            (with("cidr", serde_json::json!(format!("{planted}/24"))), not_a_network.to_string()),
+            (with("cidr", serde_json::json!(24)), "peers: entry 0: a field of another type".to_string()),
+            (with(planted, serde_json::json!(1)), "peers: entry 0: an unknown field".to_string()),
+            (format!("[{no_label}]"), "peers: entry 0: no label".to_string()),
+            (format!("[{planted}]"), "peers: not a JSON array (line 1, column 2)".to_string()),
+            ("[1]".to_string(), "peers: entry 0: not a JSON object".to_string()),
+            (format!("[]{}", " ".repeat(4095)), "peers: 4097 bytes, over 4096".to_string()),
+            (format!("[{}]", vec!["{}"; 65].join(",")), "peers: 65 entries, over 64".to_string()),
+        ];
+        for (list, want) in texts {
+            let got = parse_peers(&list).expect_err("refused").to_string();
+            assert_eq!(got, want, "{list}");
+            assert!(!got.to_lowercase().contains(planted), "a value in {got}");
+        }
+        let many: Vec<PeerEntry> = (0..65).map(|i| peer(&format!("198.51.100.{i}/32"), &format!("p{i:02}"))).collect();
+        assert_eq!(render_peers(&many).expect_err("65 entries").to_string(), "peers: 65 entries, over 64");
+        let wide: Vec<PeerEntry> = (0..64).map(|i| peer(&format!("198.51.100.{i}/32"), &format!("label-{i:02}"))).collect();
+        assert!(render_peers(&wide).expect_err("over 4096 bytes").to_string().starts_with("peers: would be "), "64 entries of about 75 bytes");
+
+        // `network` and `contains` against a table worked by hand: a cidr, its network, and addresses it holds or not,
+        // every one from the documentation ranges (§RS.0), so a network's edges are probed on the prefixes inside them.
+        type Case<'a> = (&'a str, (Ipv4Addr, u8), &'a [(Ipv4Addr, bool)]);
+        let table: [Case<'_>; 6] = [
+            (
+                "198.51.100.7/24",
+                (Ipv4Addr::new(198, 51, 100, 0), 24),
+                &[(Ipv4Addr::new(198, 51, 100, 0), true), (Ipv4Addr::new(198, 51, 100, 255), true), (Ipv4Addr::new(203, 0, 113, 0), false), (Ipv4Addr::new(192, 0, 2, 255), false)],
+            ),
+            (
+                "203.0.113.7/32",
+                (Ipv4Addr::new(203, 0, 113, 7), 32),
+                &[(Ipv4Addr::new(203, 0, 113, 6), false), (Ipv4Addr::new(203, 0, 113, 7), true), (Ipv4Addr::new(203, 0, 113, 8), false)],
+            ),
+            (
+                "192.0.2.200/25",
+                (Ipv4Addr::new(192, 0, 2, 128), 25),
+                &[(Ipv4Addr::new(192, 0, 2, 127), false), (Ipv4Addr::new(192, 0, 2, 128), true), (Ipv4Addr::new(192, 0, 2, 255), true)],
+            ),
+            (
+                "198.51.100.6/30",
+                (Ipv4Addr::new(198, 51, 100, 4), 30),
+                &[(Ipv4Addr::new(198, 51, 100, 3), false), (Ipv4Addr::new(198, 51, 100, 4), true), (Ipv4Addr::new(198, 51, 100, 7), true), (Ipv4Addr::new(198, 51, 100, 8), false)],
+            ),
+            (
+                "203.0.113.201/31",
+                (Ipv4Addr::new(203, 0, 113, 200), 31),
+                &[(Ipv4Addr::new(203, 0, 113, 199), false), (Ipv4Addr::new(203, 0, 113, 200), true), (Ipv4Addr::new(203, 0, 113, 201), true), (Ipv4Addr::new(203, 0, 113, 202), false)],
+            ),
+            (
+                "0.0.0.0/0",
+                (Ipv4Addr::UNSPECIFIED, 0),
+                &[(Ipv4Addr::new(192, 0, 2, 0), true), (Ipv4Addr::new(198, 51, 100, 255), true), (Ipv4Addr::new(203, 0, 113, 9), true)],
+            ),
+        ];
+        for (cidr, network, cases) in table {
+            let p = peer(cidr, "office");
+            assert_eq!(p.network(), network, "{cidr}");
+            for (ip, inside) in cases {
+                assert_eq!(p.contains(*ip), *inside, "{cidr} holds {ip}");
+            }
+        }
+        // Wider prefixes, written and probed with documentation addresses alone: a /9 and a /16 hold their own range and
+        // neither other one, and each network is its address masked to the prefix (the mask computed another way here).
+        let masked = |ip: Ipv4Addr, prefix: u8| Ipv4Addr::from(u32::from(ip) & !(u32::MAX >> u32::from(prefix)));
+        let wider = [
+            ("192.0.2.1/9", Ipv4Addr::new(192, 0, 2, 1), 9, Ipv4Addr::new(192, 0, 2, 255), [Ipv4Addr::new(198, 51, 100, 7), Ipv4Addr::new(203, 0, 113, 9)]),
+            ("198.51.100.77/16", Ipv4Addr::new(198, 51, 100, 77), 16, Ipv4Addr::new(198, 51, 100, 0), [Ipv4Addr::new(192, 0, 2, 7), Ipv4Addr::new(203, 0, 113, 9)]),
+        ];
+        for (cidr, ip, prefix, inside, outside) in wider {
+            let p = peer(cidr, "office");
+            assert_eq!(p.network(), (masked(ip, prefix), prefix), "{cidr}");
+            assert!(p.contains(ip) && p.contains(inside), "{cidr}");
+            assert!(outside.iter().all(|o| !p.contains(*o)), "{cidr}");
+        }
+        let unparsed = peer("198.51.100.0", "office");
+        assert_eq!(unparsed.network(), (Ipv4Addr::UNSPECIFIED, 32), "an entry that does not parse holds no peer's network");
+        assert!(!unparsed.contains(Ipv4Addr::new(198, 51, 100, 0)) && !unparsed.contains(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(PEERS, format!("{PARAMETER_PREFIX}/peers"));
+    }
 }
 
 impl WorkerEntry {
@@ -301,6 +571,7 @@ fn unique<'a>(name: &str, id_field: &str, entries: impl Iterator<Item = (&'a str
 
 fn check_workers(list: &[WorkerEntry]) -> Result<(), PolicyError> {
     let mut checked = Vec::with_capacity(list.len());
+    let mut certificates = HashMap::new();
     for (i, w) in list.iter().enumerate() {
         let key = check_key_entry("workers", i, "worker_id", &w.worker_id, &w.alg, &w.public_key, &w.not_after)?;
         if w.sources.is_empty() || w.sources.len() > SOURCES_MAX {
@@ -308,6 +579,14 @@ fn check_workers(list: &[WorkerEntry]) -> Result<(), PolicyError> {
         }
         if let Some(j) = w.sources.iter().position(|g| !valid_glob(g)) {
             return Err(PolicyError(format!("workers: entry {i}: sources[{j}] is not a source glob")));
+        }
+        if let Some(fp) = &w.tls_fp {
+            if fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                return Err(PolicyError(format!("workers: entry {i}: tls_fp is not 64 lowercase hex characters")));
+            }
+            if let Some(first) = certificates.insert(fp.as_str(), i) {
+                return Err(PolicyError(format!("workers: entry {i}: tls_fp repeats entry {first}'s (one certificate, one worker)")));
+            }
         }
         checked.push((w.worker_id.as_str(), Some(key)));
     }
@@ -367,6 +646,7 @@ mod tests {
             public_key: key_b64(seed),
             sources: vec!["example-*".into()],
             not_after: "2027-10-29T23:59:59Z".into(),
+            tls_fp: None,
         }
     }
 
@@ -495,5 +775,44 @@ mod tests {
             assert_eq!(civil_from_days(days), date);
             assert_eq!(days_from_civil(date.0, date.1, date.2), days);
         }
+    }
+
+    /// WM-T52. The relay parses the workers list with this module's `parse_workers` (LD-R5).
+    #[test]
+    fn a_worker_entry_carries_an_optional_tls_fp() {
+        // Fingerprints of one-byte stand-ins for certificates, made at run time.
+        let fp = |seed: u8| crate::certs::tls_fp(&[seed]);
+        let plain = worker("worker-a", 1);
+        let text = render_workers(std::slice::from_ref(&plain)).expect("renders");
+        assert!(!text.contains("tls_fp"), "absent renders without the key: {text}");
+        assert_eq!(parse_workers(&text).expect("parses"), vec![plain]);
+
+        let with = WorkerEntry { tls_fp: Some(fp(1)), ..worker("worker-a", 1) };
+        let text = render_workers(std::slice::from_ref(&with)).expect("renders");
+        assert!(text.ends_with(&format!(r#","not_after":"2027-10-29T23:59:59Z","tls_fp":"{}"}}]"#, fp(1))), "after not_after: {text}");
+        assert_eq!(parse_workers(&text).expect("parses"), vec![with.clone()]);
+        let mixed = vec![WorkerEntry { tls_fp: Some(fp(2)), ..worker("worker-b", 2) }, worker("worker-c", 3), with.clone()];
+        let text = render_workers(&mixed).expect("renders");
+        assert_eq!(parse_workers(&text).expect("parses").iter().map(|w| w.tls_fp.clone()).collect::<Vec<_>>(), [Some(fp(1)), Some(fp(2)), None]);
+
+        let upper = fp(1).to_uppercase();
+        assert_ne!(upper, fp(1), "a fingerprint with letters");
+        let refused = |list: &[WorkerEntry]| {
+            let rendered = render_workers(list).expect_err("render refuses").to_string();
+            let parsed = parse_workers(&serde_json::to_string(list).expect("json")).expect_err("parse refuses").to_string();
+            assert_eq!(rendered, parsed);
+            rendered
+        };
+        for bad in [fp(1)[..63].to_string(), format!("{}0", fp(1)), upper, format!("{}g", &fp(1)[..63]), String::new()] {
+            let text = refused(&[WorkerEntry { tls_fp: Some(bad.clone()), ..worker("worker-a", 1) }]);
+            assert_eq!(text, "workers: entry 0: tls_fp is not 64 lowercase hex characters", "{bad:?}");
+            assert!(bad.is_empty() || !text.to_lowercase().contains(&bad[..16].to_lowercase()), "no value in {text}");
+        }
+        let twice = [WorkerEntry { tls_fp: Some(fp(1)), ..worker("worker-a", 1) }, WorkerEntry { tls_fp: Some(fp(1)), ..worker("worker-b", 2) }];
+        assert_eq!(refused(&twice), "workers: entry 1: tls_fp repeats entry 0's (one certificate, one worker)");
+        let unknown = render_workers(std::slice::from_ref(&with)).expect("renders").replacen(r#""tls_fp""#, r#""tls_fp2""#, 1);
+        assert_eq!(parse_workers(&unknown).expect_err("an unknown field").to_string(), "workers: entry 0: an unknown field");
+        let typed = render_workers(std::slice::from_ref(&with)).expect("renders").replacen(&format!(r#""{}""#, fp(1)), "1", 1);
+        assert_eq!(parse_workers(&typed).expect_err("a number").to_string(), "workers: entry 0: a field of another type");
     }
 }

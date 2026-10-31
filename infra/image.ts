@@ -165,7 +165,7 @@ export function loadImageJson(): ImageJson {
 
 export interface Artifacts {
     bucket: aws.s3.Bucket;
-    /** S13: the relay's artifact object is created after it too (relay.ts). */
+    /** S13: the relay's artifact and (LD-R56) boot objects are created after it too (relay.ts). */
     publicAccess: aws.s3.BucketPublicAccessBlock;
     zip: aws.s3.BucketObjectv2;
     logGroup: aws.cloudwatch.LogGroup;

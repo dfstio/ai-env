@@ -2,7 +2,7 @@
 # Style: DFST/monitoring/Makefile (`make help` lists targets from `## comments`).
 .PHONY: help build check-bins test test-aws test-aws-readonly test-claude s4-smoke s5-smoke s6-smoke s7-smoke s8-smoke test-cursor doc-test test-egress test-egress-run test-proxy perf-wrapper install vm-build vm-run check-features check-deps check-msrv coverage fmt fmt-diff clippy lint lint-negative gates acceptance acceptance-run clean \
         claude-pin claude-admit-docker image-stage-scan image-zip image-build-local image-run-local test-docker check-base-image s3-preflight argv-fixtures \
-        relay-proto relay-proto-check
+        relay-proto relay-proto-check check-advisories
 
 SHELL        := /bin/bash
 # The switches that delete, rotate, write, pick a version, skip a gate, widen a live run or pick an identity (YES, KEEP,
@@ -158,7 +158,7 @@ LAB_KNOBS    := AI_ENV_BRIDGE_LAB_FAKE_API AI_ENV_BRIDGE_LAB_FAKE_API_UNSEAL AI_
                 AI_ENV_BRIDGE_LAB_AGENT_ADDR AI_ENV_BRIDGE_LAB_SYNTHETIC_OAUTH_MS AI_ENV_BRIDGE_LAB_UNSEAL_TIMEOUT_MS AI_ENV_BRIDGE_LAB_TRANSCRIPT AI_ENV_BRIDGE_LAB_EXIT \
                 AI_ENV_BRIDGE_LAB_IGNORE_EOF AI_ENV_BRIDGE_LAB_STDOUT_NOISE AI_ENV_BRIDGE_LAB_DELAY_INIT_MS AI_ENV_BRIDGE_LAB_REPLAY_DEADLINE_MS AI_ENV_BRIDGE_LAB_OSASCRIPT \
                 AI_ENV_BRIDGE_LAB_S3_ADDR AI_ENV_BRIDGE_LAB_CODE_TOKEN_MINUTES AI_ENV_BRIDGE_LAB_PARK_AFTER_MS \
-                AI_ENV_BRIDGE_LAB_RELEASE_CURL AI_ENV_BRIDGE_LAB_GPGV AI_ENV_BRIDGE_LAB_ADMIT_MAKE AI_ENV_BRIDGE_LAB_NOW
+                AI_ENV_BRIDGE_LAB_RELEASE_CURL AI_ENV_BRIDGE_LAB_GPGV AI_ENV_BRIDGE_LAB_ADMIT_MAKE AI_ENV_BRIDGE_LAB_NOW AI_ENV_BRIDGE_LAB_CHECKIP
 LAB_UNSET    := env $(addprefix -u ,$(LAB_KNOBS))
 
 # S10 (F12): `make test-aws S3=1 CHAT=dev` runs the S3 store's gib test alone (live_s3_gib_round_trip_timing) on a
@@ -397,6 +397,12 @@ check-deps: ## Unused-dependency scan (cargo machete) of ai-env-cli and the rela
 	@command -v cargo-machete >/dev/null || { echo "cargo install cargo-machete --locked"; exit 1; }
 	cargo machete crates/$(PKG) $(addprefix crates/,$(RELAY_CRATES))
 	cargo machete crates/$(RELAY_PKG)
+
+check-advisories: ## E.2: RustSec advisories over the workspace's lock (cargo deny, deny.toml); an unreachable database falls back to the cached copy, else the check is skipped with a note
+	@command -v cargo-deny >/dev/null || { echo "cargo install cargo-deny --locked"; exit 1; }
+	@if cargo deny fetch db >/dev/null 2>&1; then cargo deny --workspace check advisories; \
+	elif ls -d "$$HOME"/.cargo/advisory-dbs/advisory-db-* >/dev/null 2>&1; then echo "check-advisories: the RustSec database could not be fetched: checking against the cached copy"; cargo deny --offline --workspace check advisories; \
+	else echo "check-advisories: skipped: the RustSec database could not be fetched and none is cached"; fi
 
 check-msrv: ## T0.2: ai-env-age builds on $(MSRV_OLD); ai-env-cli refuses (requires rustc 1.94.1); everything builds on $(TOOLCHAIN); S13: the relay crates and the relay client build on $(MSRV_OLD) too
 	@rustup run $(MSRV_OLD) rustc --version >/dev/null 2>&1 || { echo "toolchain $(MSRV_OLD) not installed: rustup toolchain install $(MSRV_OLD)"; exit 1; }

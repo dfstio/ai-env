@@ -3,6 +3,10 @@
 //! Every request carries a session token that W/M's verifier checks first (R-51 to R-53); the caller is the token's,
 //! never the request's (R-54). A refusal before the stream is a gRPC status (R-31, LD-R14); once the stream starts,
 //! the call ends with exactly one final chunk (R-42). Each call gets one call line (R-61), each list one list line.
+//!
+//! Each request is one of its connection's (R-103): pending from its handler's start to its answer or its call's
+//! conclusion, so the connection's watch knows when it is idle; its refused tokens count against the connection,
+//! and at `private_faults_max` every later request is refused before any token is verified (R-105).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,8 +25,8 @@ use crate::lists::Grant;
 use crate::registry::Route;
 use crate::reqlog::{CallFields, CallLog, ListFields};
 use crate::serve::RelayState;
-use crate::session::{self, SessionClaims};
-use crate::tls::PeerInfo;
+use crate::session::{self, SessionClaims, SessionFault};
+use crate::tls::{PeerInfo, PrivateConn};
 
 /// The response metadata key of the relay's id of a call (one definition in ai-env-source's `wire`, review A-L11).
 pub const REQUEST_ID_HEADER: &str = ai_env_source::wire::REQUEST_ID_HEADER;
@@ -81,23 +85,46 @@ fn session_refusal(r: Refusal) -> Box<Refused> {
     match r {
         Refusal::RateLimited => Refused::new(tonic::Code::ResourceExhausted, "rate limited", "rate_limited"),
         Refusal::TooManySessions => Refused::new(tonic::Code::ResourceExhausted, "too many sessions", "too_many"),
-        Refusal::TooManyInFlight | Refusal::TooManyConnections => Refused::new(tonic::Code::ResourceExhausted, "too many calls in flight", "too_many"),
+        // Never a session's: a ban is the public face's (R-98).
+        Refusal::TooManyInFlight | Refusal::TooManyConnections | Refusal::Banned => {
+            Refused::new(tonic::Code::ResourceExhausted, "too many calls in flight", "too_many")
+        }
     }
 }
 
 impl RelayState {
-    /// R-51 to R-53 on a request's metadata: exactly one token, the signers fresh, W/M's verifier.
-    fn caller_of(&self, metadata: &MetadataMap) -> Result<SessionClaims, Box<Refused>> {
+    /// R-51 to R-53 on a request's metadata: exactly one token, the signers fresh, W/M's verifier. R-105: a faulted
+    /// connection's request is refused before anything is verified; a refused token (`Missing` or `Token`, never
+    /// `NotLoaded`, the relay's own) counts against the connection; a verified one meets its deadline (R-103).
+    fn caller_of(&self, metadata: &MetadataMap, conn: &PrivateConn) -> Result<SessionClaims, Box<Refused>> {
+        if conn.faulted() {
+            return Err(unauthenticated());
+        }
         // A value that is not visible ASCII is still a value: it fails the verifier as malformed.
         let values: Vec<&str> = metadata.get_all(session::SESSION_HEADER).iter().map(|v| v.to_str().unwrap_or("")).collect();
         let signers = self.live.signers.fresh(self.now(), self.max_stale());
-        session::verify_request(&values, signers.as_deref(), self.now_unix()).map_err(|fault| {
-            // R-53: the variant to relay.log (the caller and the request log see only `unauthenticated`).
-            if self.fault_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(Instant::now()) {
-                tracing::info!(fault = fault.word(), "private face: a session token was refused");
+        match session::verify_request(&values, signers.as_deref(), self.now_unix()) {
+            Ok(claims) => {
+                conn.verified();
+                Ok(claims)
             }
-            unauthenticated()
-        })
+            Err(fault) => {
+                // R-53: the variant to relay.log (the caller and the request log see only `unauthenticated`).
+                if self.fault_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(Instant::now()) {
+                    tracing::info!(fault = fault.word(), "private face: a session token was refused");
+                }
+                if fault != SessionFault::NotLoaded {
+                    conn.refused(self.cfg.limits.private_faults_max, Instant::now());
+                }
+                Err(unauthenticated())
+            }
+        }
+    }
+
+    /// The request's connection (R-103): its watch registered it before tonic saw it. None only for a request that
+    /// reached its handler after its connection's watch ended (the connection is cut or gone).
+    fn connection_of<T>(&self, request: &tonic::Request<T>) -> Option<Arc<PrivateConn>> {
+        request.extensions().get::<PeerInfo>().and_then(|p| self.private_conns.get(p.conn_seq))
     }
 }
 
@@ -108,7 +135,10 @@ impl relay_server::Relay for PrivateSvc {
         let started = Instant::now();
         let request_id = uuid::Uuid::now_v7().to_string();
         let mut line = ListFields { request_id: request_id.clone(), ..ListFields::default() };
-        let answer = list(st, &request, &mut line);
+        // R-103: pending from here to the answer.
+        let conn = st.connection_of(&request);
+        let _pending = conn.as_ref().map(|c| c.request(started));
+        let answer = list(st, &request, conn.as_deref(), &mut line);
         let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match answer {
             Ok(response) => {
@@ -132,7 +162,10 @@ impl relay_server::Relay for PrivateSvc {
         let started = Instant::now();
         let request_id = uuid::Uuid::now_v7().to_string();
         let mut fields = CallFields { request_id: request_id.clone(), ..CallFields::default() };
-        match call(st, request, &mut fields, started).await {
+        // R-103: pending from here to the refusal, or to the call's conclusion (its permits, R-106).
+        let conn = st.connection_of(&request);
+        let pending = conn.as_ref().map(|c| c.request(started));
+        match call(st, request, conn, pending, &mut fields, started).await {
             Ok(stream) => {
                 let mut r = tonic::Response::new(stream);
                 tag(r.metadata_mut(), &request_id);
@@ -150,11 +183,12 @@ impl relay_server::Relay for PrivateSvc {
 }
 
 /// R-32: the token, the session's bucket, the grants, then R-49.
-fn list(st: &RelayState, request: &tonic::Request<ListSourcesRequest>, line: &mut ListFields) -> Result<ListSourcesResponse, Box<Refused>> {
+fn list(st: &RelayState, request: &tonic::Request<ListSourcesRequest>, conn: Option<&PrivateConn>, line: &mut ListFields) -> Result<ListSourcesResponse, Box<Refused>> {
     if request.extensions().get::<PeerInfo>().is_none() {
         return Err(Refused::new(tonic::Code::Internal, "no peer", "invalid"));
     }
-    let claims = st.caller_of(request.metadata())?;
+    // A request whose connection is no longer watched is cut with it: refused unverified.
+    let claims = st.caller_of(request.metadata(), conn.ok_or_else(unauthenticated)?)?;
     line.caller = claims.caller_id.clone();
     line.session = claims.session_id.clone();
     line.vm = claims.vm_id.clone();
@@ -169,13 +203,23 @@ fn list(st: &RelayState, request: &tonic::Request<ListSourcesRequest>, line: &mu
     Ok(response)
 }
 
-/// R-30 to R-46, in R-31's order; the stream when every step passes.
-async fn call(st: &Arc<RelayState>, request: tonic::Request<CallRequest>, fields: &mut CallFields, started: Instant) -> Result<CallStream, Box<Refused>> {
+/// R-30 to R-46, in R-31's order; the stream when every step passes. `pending` is the request's on its connection
+/// (R-103): the call holds it until it concludes (R-106).
+async fn call(
+    st: &Arc<RelayState>,
+    request: tonic::Request<CallRequest>,
+    conn: Option<Arc<PrivateConn>>,
+    pending: Option<crate::tls::Pending>,
+    fields: &mut CallFields,
+    started: Instant,
+) -> Result<CallStream, Box<Refused>> {
     let l = &st.cfg.limits;
     if request.extensions().get::<PeerInfo>().is_none() {
         return Err(Refused::new(tonic::Code::Internal, "no peer", "invalid"));
     }
-    let claims = st.caller_of(request.metadata())?;
+    // A request whose connection is no longer watched is cut with it: refused unverified.
+    let Some(conn) = conn else { return Err(unauthenticated()) };
+    let claims = st.caller_of(request.metadata(), &conn)?;
     let req = request.into_inner();
     let valid = |s: &str| ai_env_worker::globs::valid_id(s);
     // R-62: names reach the log only when they are ids.
@@ -226,7 +270,7 @@ async fn call(st: &Arc<RelayState>, request: tonic::Request<CallRequest>, fields
     let deadline_ms = effective_deadline_ms(req.deadline_ms, l);
     let deadline = started + Duration::from_millis(u64::from(deadline_ms));
     let log = CallLog { log: Arc::clone(&st.log), clock: Arc::clone(&st.clock), fields: fields.clone() };
-    let state = Arc::new(CallState::new(fields.request_id.clone(), Some(log)));
+    let state = Arc::new(CallState::new(fields.request_id.clone(), claims.session_id.clone(), Some(log)));
     let caps = Caps { max_bytes: limits.max_bytes, max_chunks: limits.max_chunks };
     let rx = handle.calls.insert(Arc::clone(&state), caps, l.call_buffer_chunks as usize).map_err(|_| {
         if handle.calls.is_closed() {
@@ -263,8 +307,11 @@ async fn call(st: &Arc<RelayState>, request: tonic::Request<CallRequest>, fields
         });
     }
     arm_deadline(&handle.calls, &handle.tx, &state, deadline, config::ms(l.enqueue_timeout_ms));
-    let permits = Permits { _session: session_pass, _relay: Some(relay_permit) };
-    Ok(CallStream::new(rx, state, Arc::downgrade(&handle.calls), handle.tx.clone(), permits, config::ms(l.enqueue_timeout_ms)))
+    // R-106: the session's pass and the connection's pending request end with the call; the relay's permit and the
+    // stream's mark on the connection's watch stay with the stream until hyper drops it.
+    let mark = Arc::new(conn.stream());
+    state.hold(Permits { _session: session_pass, _request: pending, stream: Some(Arc::clone(&mark)) });
+    Ok(CallStream::new(rx, state, Arc::downgrade(&handle.calls), handle.tx.clone(), Some(relay_permit), Some(mark), config::ms(l.enqueue_timeout_ms)))
 }
 
 /// A call in its tunnel's table whose Invoke is not queued yet (R-38). hyper drops the handler at the enqueue's

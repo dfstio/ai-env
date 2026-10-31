@@ -6,9 +6,13 @@
 //! the lead's integration test serve in-process streams through `serve_public` and `serve_private` instead.
 //!
 //! Every public connection is watched from its accept to its close (R-2a): no `Open` within
-//! `handshake_timeout_ms`, or its tunnel's end and a second's grace, and the watch cuts it, so it holds no
-//! admission slot. The cut never reaches a live tunnel: it waits for the tunnel's end. A second `Open` on the
-//! connection, which the face's one stream lets start only after the first stream's end, cuts it at once (R-6).
+//! `handshake_timeout_ms` of its TLS accept, or its tunnel's end and a second's grace, and the watch cuts it, so it
+//! holds no admission slot. The same budget from the same accept bounds its handshake (R-9, F24): an unauthenticated
+//! connection lives at most `tls_handshake_timeout_ms` + `handshake_timeout_ms` + the grace (3 + 5 + 1 s), and reads
+//! no more than its read budget meanwhile: two windows of decrypted bytes and their refill, about 9 KiB a second, until
+//! the budget first runs short (LD-R60). The cut never reaches a live tunnel: it waits for the tunnel's end. A second
+//! `Open` on the connection, which the face's one stream lets start only after the first stream's end, cuts it at once
+//! (R-6).
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,7 +33,7 @@ use crate::lists::{WorkerEntry, Workers};
 use crate::private::PrivateSvc;
 use crate::registry::{holds_key, Registry, TunnelHandle};
 use crate::reqlog::{RequestLog, StatusLine};
-use crate::tls::{ConnUse, Conns, Face, PeerInfo, Peered};
+use crate::tls::{meter_unauthenticated, unmeter, ConnUse, Conns, Face, PeerInfo, Peered, PrivateBudget, PrivateConn, PrivateConns};
 use crate::tunnel::{close, TunnelSvc};
 use crate::{files, notify, reqlog};
 
@@ -45,7 +49,10 @@ pub(crate) const PUBLIC_HEADER_LIST: u32 = 16_384;
 /// a started response stream is never cut). `enqueue_timeout_ms`, the handler's one wait, stays within half of it.
 pub(crate) const PRIVATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// R-2a: after a tunnel's end, its connection's last frames have this long to leave before the cut.
-const TUNNEL_END_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const TUNNEL_END_GRACE: Duration = Duration::from_secs(1);
+/// R-103: a concluded call's stream that hyper has not dropped this long after cuts its connection (the stream holds
+/// the relay's permit until then, R-106).
+pub(crate) const UNDRAINED_GRACE: Duration = Duration::from_secs(10);
 /// How long a stop waits for both servers (R-71).
 const DRAIN: Duration = Duration::from_secs(5);
 /// The session sweep's period (R-58).
@@ -124,6 +131,10 @@ pub(crate) struct RelayState {
     pub(crate) dropped_chunks: AtomicU64,
     /// Token faults to `relay.log`, at the request log's refusal rate (R-53, R-66).
     pub(crate) fault_log: Mutex<TokenBucket>,
+    /// The private face's connections, each watched from its accept to its close (R-103, R-105).
+    pub(crate) private_conns: PrivateConns,
+    /// Calls to `Registry::install` (R-110; `RelayApp::catalog_installs`, for the tests).
+    pub(crate) catalog_installs: AtomicU64,
     started: Instant,
     bound: Mutex<Option<(SocketAddr, SocketAddr)>>,
     housekeeping: AtomicBool,
@@ -162,6 +173,8 @@ impl RelayApp {
     /// A relay of `cfg` and `deps`; it serves nothing yet.
     pub fn new(cfg: Config, deps: Deps) -> Result<RelayApp, RelayError> {
         cfg.validate().map_err(RelayError::Config)?;
+        // F5: the throw-away key made now, so the first refused handshake pays no more than the next.
+        let _ = crate::handshake::throwaway_key();
         let l = &cfg.limits;
         let state = RelayState {
             log: Arc::new(RequestLog::new(deps.sink, deps.params_key, l.log_refusals_per_min)),
@@ -177,6 +190,8 @@ impl RelayApp {
             unknown_frames: AtomicU64::new(0),
             dropped_chunks: AtomicU64::new(0),
             fault_log: Mutex::new(TokenBucket::new(l.log_refusals_per_min, l.log_refusals_per_min, Instant::now())),
+            private_conns: PrivateConns::default(),
+            catalog_installs: AtomicU64::new(0),
             started: Instant::now(),
             bound: Mutex::new(None),
             housekeeping: AtomicBool::new(false),
@@ -185,9 +200,9 @@ impl RelayApp {
         Ok(RelayApp { state: Arc::new(state) })
     }
 
-    /// One poll of the live directory, with R-18's revocations and R-26's sweep; tests call it instead of waiting for
-    /// the tick.
-    pub fn poll_files(&self) -> [(&'static str, files::Poll); 4] {
+    /// One poll of the live directory, with R-18's revocations and R-26's sweep, then R-90's judgement of every live
+    /// tunnel's peer; tests call it instead of waiting for the tick.
+    pub fn poll_files(&self) -> [(&'static str, files::Poll); 5] {
         let st = &self.state;
         let now = st.now();
         let outcomes = st.live.poll(now, st.max_stale());
@@ -201,13 +216,40 @@ impl RelayApp {
                 "workers" => described(st, &st.live.workers.loaded()),
                 "token-signers" => described(st, &st.live.signers.loaded()),
                 "grants" => described(st, &st.live.grants.loaded()),
+                "peers" => described(st, &st.live.peers.loaded()),
                 _ => described(st, &st.live.tls.loaded()),
             };
             let version = if matches!(outcome, Poll::Missing) { String::new() } else { version };
             st.log.reload(now, file, word, &version, entries, age);
         }
         self.apply_whitelist(now);
+        self.apply_peers(now);
         outcomes
+    }
+
+    /// R-90, after R-17, R-18 and R-26 (whose early returns it never shares): every live tunnel against the peers file
+    /// as it is now. Not loaded, `Close{STALE, "the peers list is not loaded"}`; loaded and not fresh, `Close{STALE,
+    /// "the peers list is stale"}`; fresh, and no entry in force holds the tunnel's peer, `Close{REVOKED, "peer
+    /// revoked"}`. A tunnel keeps its first Close (R-27), so a whitelist's verdict of the same poll stands.
+    fn apply_peers(&self, now: SystemTime) {
+        let st = &self.state;
+        let tunnels = st.registry.live();
+        let Some(loaded) = st.live.peers.loaded() else {
+            for t in &tunnels {
+                t.closer.close(close::STALE, "the peers list is not loaded");
+            }
+            return;
+        };
+        if !files::is_fresh(loaded.fresh_at, now, st.max_stale()) {
+            for t in &tunnels {
+                t.closer.close(close::STALE, "the peers list is stale");
+            }
+            return;
+        }
+        let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for t in tunnels.iter().filter(|t| !loaded.value.allows(t.peer_ip, now_unix)) {
+            t.closer.close(close::REVOKED, "peer revoked");
+        }
     }
 
     /// R-17 for every live tunnel against the workers file as it is now; then, the file loaded and fresh, R-18 and
@@ -248,46 +290,68 @@ impl RelayApp {
         if st.shutdown.is_cancelled() {
             return refuse("shutting_down");
         }
+        // R-89: the public face admits the peers file's networks alone, checked before any per-IP state (no bucket
+        // token, no entry) and any TLS byte; with no fresh file nobody (`no_peers`). The private face never reads it.
+        if face == Face::Public {
+            let Some(peers) = st.live.peers.fresh(st.now(), st.max_stale()) else {
+                return refuse("no_peers");
+            };
+            if !peers.allows(ip, st.now_unix()) {
+                return refuse("not_in_peers");
+            }
+        }
+        // R-104 (LD-R42): an address outside `private_peers` takes no token of the private face's one bucket.
+        if face == Face::Private && !st.cfg.private_peers.iter().any(|n| n.contains(&ip)) {
+            return refuse("not_in_peers");
+        }
         // Before any TLS byte: a refusal drops `io`, closing the connection without writing (R-2).
         let slot = match st.slots.admit(face, ip, Instant::now()) {
             Ok(slot) => slot,
             Err(r) => return refuse(r.word()),
         };
-        if face == Face::Private && !st.cfg.private_peers.iter().any(|n| n.contains(&ip)) {
-            return refuse("not_in_peers");
-        }
         let Some(tls) = st.live.tls.loaded() else {
             return refuse("no_tls");
         };
         match crate::tls::accept(tls.value, io, ip, slot, ms(st.cfg.limits.tls_handshake_timeout_ms)).await {
             Ok(peered) => Some(peered),
-            Err(reason) => refuse(reason),
+            Err(refused) => {
+                // R-102: on the public face a TLS timeout is a fault, and a failed handshake once the client sent a
+                // byte; a client that closed before sending any (a bare TCP probe) is none.
+                if face == Face::Public && refused.fault {
+                    st.slots.fault(ip, Instant::now());
+                }
+                refuse(refused.reason)
+            }
         }
     }
 
-    /// R-5's HTTP/2 settings both faces share.
-    fn h2(&self) -> tonic::transport::Server {
+    /// R-5's HTTP/2 settings both faces share, with the face's flow-control `window` for each connection and each
+    /// stream (F28): the most DATA a peer parks unread, inside unit 28's budget.
+    fn h2(&self, window: u32) -> tonic::transport::Server {
         let l = &self.state.cfg.limits;
         let keepalive = (l.h2_keepalive_s > 0).then(|| Duration::from_secs(u64::from(l.h2_keepalive_s)));
         tonic::transport::Server::builder()
             .http2_keepalive_interval(keepalive)
             .http2_keepalive_timeout(Some(H2_KEEPALIVE_TIMEOUT))
-            .initial_connection_window_size(Some(1 << 20))
-            .initial_stream_window_size(Some(1 << 20))
+            .initial_connection_window_size(Some(window))
+            .initial_stream_window_size(Some(window))
             .http2_max_pending_accept_reset_streams(Some(16))
             .http2_max_local_error_reset_streams(Some(64))
     }
 
-    /// R-5's public face: one stream at a time (R-6), a 16 KiB header list.
+    /// R-5's public face: one stream at a time (R-6), a 16 KiB header list, windows of its largest message (F28).
     fn public_server(&self) -> tonic::transport::Server {
-        self.h2().max_concurrent_streams(Some(1)).http2_max_header_list_size(Some(PUBLIC_HEADER_LIST))
+        self.h2(self.state.cfg.limits.public_window()).max_concurrent_streams(Some(1)).http2_max_header_list_size(Some(PUBLIC_HEADER_LIST))
     }
 
     /// R-5's private face, its own builder: 16 streams a connection, a 4 KiB header list, and every request decoded
     /// and answered (its response head, or its status) within 10 s, so what a caller with no token pins is bounded
     /// (§R-relay.4's budget, unit 28) and held at most 10 s.
     fn private_server(&self) -> tonic::transport::Server {
-        self.h2().max_concurrent_streams(Some(PRIVATE_STREAMS)).http2_max_header_list_size(Some(PRIVATE_HEADER_LIST)).timeout(PRIVATE_REQUEST_TIMEOUT)
+        self.h2(self.state.cfg.limits.private_window())
+            .max_concurrent_streams(Some(PRIVATE_STREAMS))
+            .http2_max_header_list_size(Some(PRIVATE_HEADER_LIST))
+            .timeout(PRIVATE_REQUEST_TIMEOUT)
     }
 
     /// Serves `WorkerTunnel` (R-5's settings) on `incoming` until `shutdown`, each connection watched (R-2a).
@@ -321,9 +385,18 @@ impl RelayApp {
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        use tokio_stream::StreamExt as _;
         self.start_housekeeping();
-        let max = self.state.cfg.limits.params_max_bytes as usize + 16_384;
+        let max = self.state.cfg.limits.private_message_max() as usize;
         let svc = RelayServer::new(PrivateSvc::new(Arc::clone(&self.state))).max_decoding_message_size(max);
+        let state = Arc::clone(&self.state);
+        // R-103: the watch starts before tonic sees the connection, so each request finds it.
+        let incoming = incoming.map(move |c| {
+            c.map(|mut peered| {
+                watch_private(&state, &mut peered);
+                peered
+            })
+        });
         self.private_server()
             .serve_with_incoming_shutdown(svc, incoming, self.state.shutdown.clone().cancelled_owned())
             .await
@@ -468,6 +541,18 @@ impl RelayApp {
         self.state.conns.len()
     }
 
+    /// The calls to `Registry::install` so far (R-110: an identical catalog installs nothing); for the tests.
+    #[doc(hidden)]
+    pub fn catalog_installs(&self) -> u64 {
+        self.state.catalog_installs.load(Ordering::SeqCst)
+    }
+
+    /// The chunks dropped so far, `Late` or `Unknown` (R-37, R-109); for the tests.
+    #[doc(hidden)]
+    pub fn dropped_chunks(&self) -> u64 {
+        self.state.dropped_chunks.load(Ordering::Relaxed)
+    }
+
     /// Stops both servers (R-71): `STOPPING=1`, no more admissions, `Close{NORMAL}` to every tunnel, every pending
     /// call ended `Shutdown`; `run` then waits at most 5 s for the servers.
     pub fn shutdown(&self) {
@@ -491,6 +576,7 @@ impl RelayApp {
         let (workers_version, _, workers_age_s) = described(st, &st.live.workers.loaded());
         let (signers_version, _, signers_age_s) = described(st, &st.live.signers.loaded());
         let (grants_version, _, grants_age_s) = described(st, &st.live.grants.loaded());
+        let (peers_version, _, peers_age_s) = described(st, &st.live.peers.loaded());
         StatusLine {
             relay_version: crate::RELAY_VERSION.to_string(),
             protocol: ai_env_relay_proto::PROTOCOL,
@@ -498,7 +584,8 @@ impl RelayApp {
             tunnels: live.len() as u64,
             sources_live: sources_live as u64,
             sources_offline: sources_offline as u64,
-            calls_in_flight: live.iter().map(|t| t.calls.len() as u64).sum(),
+            // R-106: the relay permits held, each until hyper drops its call's stream.
+            calls_in_flight: u64::from(st.cfg.limits.calls_in_flight_max).saturating_sub(st.in_flight.available_permits() as u64),
             sessions: st.sessions.len() as u64,
             workers_version,
             workers_age_s,
@@ -506,25 +593,32 @@ impl RelayApp {
             signers_age_s,
             grants_version,
             grants_age_s,
+            peers_version,
+            peers_age_s,
             tls_loaded: st.live.tls.loaded().is_some(),
             unknown_frames: st.unknown_frames.load(Ordering::SeqCst),
             log_dropped: reqlog::dropped(),
+            log_suppressed: reqlog::log_suppressed(),
         }
     }
 }
 
-/// R-2a: registers a public connection and starts its watch, its `Open` deadline counted from its accept.
+/// R-2a: registers a public connection and starts its watch, its `Open` deadline counted from its TLS accept, which
+/// the connection's use keeps for the handshake's budget (F24). Its reads are budgeted from here (LD-R60): two windows,
+/// a handshake's two largest frames and their framing, until its `AuthOk`.
 fn watch_public<IO>(st: &Arc<RelayState>, peered: &mut Peered<IO>) {
     let info = peered.info();
-    let conn = st.conns.insert(info.conn_seq);
+    meter_unauthenticated(info.conn_seq, 2 * st.cfg.limits.public_window(), Instant::now());
+    let conn = st.conns.insert(info.conn_seq, peered.accepted());
     peered.watch(&conn);
-    let deadline = peered.accepted() + ms(st.cfg.limits.handshake_timeout_ms);
+    let deadline = conn.accepted() + ms(st.cfg.limits.handshake_timeout_ms);
     tokio::spawn(watch(Arc::clone(st), conn, info, deadline));
 }
 
 /// R-2a: one public connection from its accept to its close. No `Open` by `deadline` (or the relay stops first):
 /// the cut, and a peer line `open_timeout`. Else its tunnel's end (its task or its response stream, whichever goes
-/// first), `TUNNEL_END_GRACE` for the last frames, then the cut. The connection's own end stops the watch.
+/// first), `TUNNEL_END_GRACE` for the last frames, then the cut. The connection's own end stops the watch. Whatever
+/// ended it, its read budget goes with it (LD-R60), so no entry outlives its connection.
 async fn watch(st: Arc<RelayState>, conn: Arc<ConnUse>, info: PeerInfo, deadline: Instant) {
     let (gone, ended) = (conn.gone(), conn.ended());
     let expired = tokio::select! {
@@ -537,6 +631,8 @@ async fn watch(st: Arc<RelayState>, conn: Arc<ConnUse>, info: PeerInfo, deadline
     if expired && conn.expire() {
         if !st.shutdown.is_cancelled() {
             st.log.peer(st.now(), Face::Public.word(), &info.ip.to_string(), "open_timeout");
+            // R-102: an `open_timeout` is a fault of the peer's.
+            st.slots.fault(info.ip, Instant::now());
         }
     } else {
         tokio::select! {
@@ -548,6 +644,69 @@ async fn watch(st: Arc<RelayState>, conn: Arc<ConnUse>, info: PeerInfo, deadline
         }
     }
     st.conns.remove(info.conn_seq);
+    unmeter(info.conn_seq);
+}
+
+/// R-103: registers a private connection and starts its watch, its token deadline counted from its TLS accept.
+fn watch_private<IO>(st: &Arc<RelayState>, peered: &mut Peered<IO>) {
+    let info = peered.info();
+    let conn = st.private_conns.insert(info.conn_seq, peered.accepted());
+    peered.watch_private(&conn);
+    tokio::spawn(private_watch(Arc::clone(st), conn, info));
+}
+
+/// R-103, R-105: one private connection from its accept to its close, watched as R-2a watches a public one: no
+/// request whose token verified within `handshake_timeout_ms` of its TLS accept (`auth_timeout`), no request pending
+/// `private_idle_s` after its last one started or ended (`idle`), a concluded call's stream left undrained
+/// `UNDRAINED_GRACE` (`undrained`), or its refused tokens at `private_faults_max` and a second's grace for the last
+/// status (`bad_tokens`). The next cut `PrivateConn::next_cut` names, re-read at each change, cuts it with one peer
+/// line of its reason. A connection its client closes ends the watch with no line; the relay's stop cuts it with
+/// none, a second after the stop so the calls' last chunks can leave. Biased, the connection's end and then the stop
+/// first: a stop already seen beats a cut due in the same poll, for the line and the grace both.
+async fn private_watch(st: Arc<RelayState>, conn: Arc<PrivateConn>, info: PeerInfo) {
+    let l = &st.cfg.limits;
+    let budget = PrivateBudget {
+        token: ms(l.handshake_timeout_ms),
+        idle: Duration::from_secs(u64::from(l.private_idle_s)),
+        undrained: UNDRAINED_GRACE,
+        faulted: TUNNEL_END_GRACE,
+    };
+    let gone = conn.gone();
+    loop {
+        // Made before the state is read, so a change after the read still wakes the watch.
+        let changed = conn.changed();
+        let next = conn.next_cut(&budget);
+        let due = async {
+            match next {
+                Some((at, _)) => tokio::time::sleep_until(at).await,
+                // Nothing due until the next change.
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = gone.cancelled() => break,
+            () = st.shutdown.cancelled() => {
+                tokio::select! {
+                    () = tokio::time::sleep(TUNNEL_END_GRACE) => conn.cut(),
+                    () = gone.cancelled() => {}
+                }
+                break;
+            }
+            () = due => {
+                // Read again: a change at the deadline itself (a request's start) may have moved it.
+                if let Some((at, reason)) = conn.next_cut(&budget) {
+                    if at <= Instant::now() {
+                        conn.cut();
+                        st.log.peer(st.now(), Face::Private.word(), &info.ip.to_string(), reason);
+                        break;
+                    }
+                }
+            }
+            () = changed => {}
+        }
+    }
+    st.private_conns.remove(info.conn_seq);
 }
 
 /// A loaded file's version (16 hex), entries and age, or `""`, 0, 0.

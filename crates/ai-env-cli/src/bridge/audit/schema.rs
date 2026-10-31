@@ -135,7 +135,8 @@ pub mod event {
     /// (`replaced` when a container was there).
     pub const RELAY_KEYGEN: &str = "relay_keygen";
     /// S13 (WM-R43): `relay allow` (the deployer): `kind` (`worker`, `token_signer`), `id`, `fp`, `outcome`
-    /// (`added`, `replaced`, `unchanged`); `version`, `sources` (a count), `not_after`.
+    /// (`added`, `replaced`, `unchanged`); `version`, `sources` (a count), `not_after`; `tls_fp` (§RS.4.3: the
+    /// 16-hex fingerprint of the client certificate `--tls-key` issued).
     pub const RELAY_ALLOW: &str = "relay_allow";
     /// S13 (WM-R44): `relay revoke`: `kind`, `id`, `outcome` (`revoked`, `absent`); `version`.
     pub const RELAY_REVOKE: &str = "relay_revoke";
@@ -147,8 +148,14 @@ pub mod event {
     pub const RELAY_STOP: &str = "relay_stop";
     /// S13 (WM-R38, WM-R40): `relay agent` started, stopped or expired: `outcome`; `hours`, `signed`, `minted`.
     pub const RELAY_AGENT: &str = "relay_agent";
+    /// §RS.4.3: `relay allow-ip` (the deployer): `label`, `prefix` (the prefix length), `outcome` (`added`,
+    /// `replaced`, `unchanged`); `not_after`, `version`, `mine` (`yes` under `--mine`). The address is never a value.
+    pub const RELAY_ALLOW_IP: &str = "relay_allow_ip";
+    /// §RS.4.3: `relay revoke-ip`: `outcome` (`revoked`, `absent`); the removed entry's `label`, `prefix` and
+    /// `not_after`, and `version`. The address is never a value.
+    pub const RELAY_REVOKE_IP: &str = "relay_revoke_ip";
     /// Every event above, in the registry's order.
-    pub const ALL: [&str; 51] = [
+    pub const ALL: [&str; 53] = [
         VM_RUN,
         VM_REUSE,
         VM_ADOPT,
@@ -200,6 +207,8 @@ pub mod event {
         RELAY_START,
         RELAY_STOP,
         RELAY_AGENT,
+        RELAY_ALLOW_IP,
+        RELAY_REVOKE_IP,
     ];
 }
 
@@ -233,7 +242,7 @@ const fn ev(name: &'static str, required: &'static [&'static str], optional: &'s
 
 use SessionFrom::{Detail, Envelope, None as NoSession};
 
-/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (51).
+/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (53).
 pub static EVENTS: &[EventSpec] = &[
     // ---- remote::audit_event (S8 to S10, A1; then S11 part A's six) ----
     // S13 (WM-R53): `relay`, the spawn's session-token word (`minted`, `no_agent`, …), unless it is `off`.
@@ -338,12 +347,15 @@ pub static EVENTS: &[EventSpec] = &[
     ev("panel_serve", &["port", "outcome"], NO, NO, NoSession, NONE),
     // S13 (§WM-worker-mac.6.7): ids, words, numbers and 16-hex fingerprints only (WM-R57); no VM key, no cost effect.
     ev("relay_keygen", &["worker_id", "worker_fp", "session_fp"], &["replaced"], NO, NoSession, NONE),
-    ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after"], NO, NoSession, NONE),
+    ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after", "tls_fp"], NO, NoSession, NONE),
     ev("relay_revoke", &["kind", "id", "outcome"], &["version"], NO, NoSession, NONE),
     ev("relay_grant", &["id", "outcome"], &["rules", "version"], NO, NoSession, NONE),
     ev("relay_start", &["id", "outcome"], &["ms"], NO, NoSession, NONE),
     ev("relay_stop", &["id", "outcome"], &["ms"], NO, NoSession, NONE),
     ev("relay_agent", &["outcome"], &["hours", "signed", "minted"], NO, NoSession, NONE),
+    // §RS.4.3: ids, words and numbers only; the address is never a value (the relay's own peer lines carry addresses).
+    ev("relay_allow_ip", &["label", "prefix", "outcome"], &["not_after", "version", "mine"], NO, NoSession, NONE),
+    ev("relay_revoke_ip", &["outcome"], &["label", "prefix", "not_after", "version"], NO, NoSession, NONE),
 ];
 
 /// The registered event `name`.
@@ -441,7 +453,7 @@ mod tests {
         let modules: Vec<&str> = crate::bridge::remote::audit_event::ALL.iter().chain(crate::bridge::accounts::audit_event::ALL.iter()).chain(event::ALL.iter()).copied().collect();
         let names: Vec<&str> = EVENTS.iter().map(|s| s.name).collect();
         assert_eq!(names, modules, "EVENTS is remote::audit_event::ALL, then accounts::audit_event::ALL, then event::ALL");
-        assert_eq!(EVENTS.len(), 94);
+        assert_eq!(EVENTS.len(), 96);
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "unique names");
         for s in EVENTS {

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The template's two ai-env dependencies, as it pins them.
-const PINNED: &str = r#"git = "https://github.com/dfstio/ai-env", tag = "relay-v0.1.0""#;
+const PINNED: &str = r#"git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0""#;
 
 fn tree() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("the tree")
@@ -170,7 +170,7 @@ fn the_template_builds_against_this_tree() {
     assert_eq!(checked.trim(), format!("config ok: worker example-worker, 1 source(s), key fp {fp}"));
 
     let tested = run_ok(&mut cargo(&["test", "--offline"]));
-    for test in ["the_example_sources_conform", "the_http_source_refuses_paths_outside_its_prefixes"] {
+    for test in ["the_example_sources_conform", "the_http_source_refuses_paths_outside_its_prefixes", "tls_keygen_writes_its_key_and_the_config_takes_both_files"] {
         assert!(tested.contains(&format!("{test} ... ok")), "{tested}");
     }
 }
