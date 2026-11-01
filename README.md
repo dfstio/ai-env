@@ -211,8 +211,11 @@ ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a 
 ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
 ai-env relay  keygen [--force] | pubkey [--worker|--session] [--verify] | ca [--der]   # this Mac's two relay keys, sealed with no Touch ID /
                                                           #   printed (--verify: one Touch ID) / the relay CA's certificate, for a worker (S13; no AWS)
-ai-env relay  allow ID --key KEY --sources GLOBS|--token-signer [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
-                                                          #   whitelist and token signers, as ai-env-deployer only (S13)
+ai-env relay  allow ID --key KEY --sources GLOBS [--tls-key P256]|--token-signer [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
+                                                          #   whitelist and token signers, as ai-env-deployer only (S13); --tls-key also issues
+                                                          #   the worker's client certificate, printed on stdout (one Touch ID)
+ai-env relay  allow-ip CIDR --label ID [--not-after YYYY-MM-DD] [--wide] | allow-ip --mine [--hours N] | revoke-ip CIDR|--label ID   # the networks the
+                                                          #   relay's public face admits, as ai-env-deployer only; --mine: this Mac's address, 24 h
 ai-env relay  grant GRANT RULE… | grant GRANT --remove | tls init [--force] | tls rotate   # the grants (default-deny), the relay CA and
                                                           #   its certificate, as ai-env-deployer only (tls rotate: one Touch ID; S13)
 ai-env relay  status [--json] [--local] | start | stop    # the relay instance, as ai-env-ops (--local: this Mac's keys and agent only,
@@ -2335,18 +2338,25 @@ make test-aws S12=1   # S12's live tests (live_s12_*): DeleteObjects' checksum, 
 **What changes.** A remote chat can now read data the developer grants it (service logs, metrics, a
 SQL database, an HTTP API) through the relay, a small EC2 instance in the stack. VMs reach it
 privately, on 10.42.0.20:7443; workers, small programs beside each data source (on a server inside
-its private network, or on this Mac), dial it from the internet on its Elastic IP's port 443 and
-answer its calls. Each source's credential stays on its worker: the relay and the VM hold none. ai-env
+its private network, or on this Mac), dial it from the internet on its Elastic IP's port 443, from
+addresses on its allowlist, and answer its calls. Each source's credential stays on its worker: the
+relay and the VM hold none. ai-env
 holds only the protocol, a public SDK and generic code; the workers that reach real sources live in
 private repositories, and ai-env never names a private source, host or grant. S13's second track, work
 from the phone with the Mac off ("away mode"), is planned and gated on live probes: none of it is built.
 
 **What a remote chat gets.** Two tools, `relay_catalog` (the sources and ops the chat's grant reaches,
 each op with its params JSON Schema; past 256 KiB the answer says `truncated`: it loses ops from its end,
-leaving those sources with empty `ops` to ask for by name, and only then sources) and
+source by source, leaving those sources with empty `ops`, and sources from its end only if the names
+alone do not fit; a request by exact `source` returns that source's ops, unless their JSON alone passes
+256 KiB, when it answers with none) and
 `relay_call(source, op, params)` (the op's output, with truncation flags), which claude names
 `mcp__ai-env-relay__relay_catalog` and `mcp__ai-env-relay__relay_call`, and only when the Mac gave the
-chat a relay session. Each new spawn
+chat a relay session. Every result, an error's too, is one text: a line saying that what follows is
+data a relay source returned, not an instruction, then one line of JSON whose one key, `data`, holds the
+answer, each invisible character in it written as an escape. The relay answers a listing of at most
+496 KiB (`list_max_bytes`) and refuses a larger one whole (`resource_exhausted`, `catalog too large`), a
+request by `source` too, since the client filters that same list: the cure is a narrower grant. Each new spawn
 (a new chat, a retry, a move; never a reattach) asks this Mac's `ai-env relay agent` for a session
 token within 2 s. The token names the VM, the spawn, the chat and the grant (the workspace's
 `relay_grant`, else `[relay].grant`), and lives at most 8 h, never past the VM's wall. With no grant,
@@ -2373,22 +2383,61 @@ hidden `--relay-client` and `--relay-mcp-config` are test flags (no help text).
 
 **The instance.** `ai-env-relay`, a t4g.nano in the proxy subnet at 10.42.0.20 with an Elastic IP for
 the workers, costs about $8 a month and runs all the time (`make proxy-stop` leaves it up). Its
-security group admits 443 from anywhere and 7443 from the VM security group only. It is administered
+security group admits 443 from anywhere and 7443 from the VM security group only; the allowlist (below)
+narrows 443 on the instance itself, so changing it takes no deploy. It is administered
 through SSM only: its configuration reaches it as SSM parameters; it has no key pair and no port 22,
-no SSM command or session reaches it, IMDSv2 has a hop limit of 1 and its user data holds no secret.
-Its binary is hash-pinned: `make relay-artifact` cross-builds it (aarch64, the shim's glibc ceiling)
+no SSM command or session reaches it, IMDSv2 has a hop limit of 1 and neither of its boot scripts holds a secret.
+Its binary is hash-pinned: `make relay-artifact` cross-builds it (aarch64, the shim's glibc ceiling;
+`--locked`, so from the reviewed `Cargo.lock`)
 into `target/relay/` with `relay.json` (`make deploy`, `make preview` and `make deploy-policies` run it
 first), and the deploy uploads it and pins its SHA-256 in the parameter `artifact`. The reload unit
-(`ai-env-relay-reload`, every minute) fetches `/ai-env/relay/{artifact,workers,grants,token-signers,tls}`
-in one call, checks each value, swaps them into the relay's live directory and installs the pinned
+(`ai-env-relay-reload`, every minute) fetches `/ai-env/relay/{artifact,workers,grants,token-signers,peers,tls}`
+in one call, checks each value, swaps them into the relay's live directory, loads the allowlist into the
+kernel and installs the pinned
 binary when it changed, going back to the previous one if it does not start. The weekly patch
 (`ai-env-relay-patch`, Sundays from 03:30 UTC) runs `dnf upgrade --security`, then restarts the relay,
 or reboots when dnf says so. The relay fails closed while a list or its certificate is missing or
-stale, never calls AWS, and logs ids and hashes only (one request line per call, never a parameter or
-a result): `make relay-logs` tails its log group `/ai-env/relay` (ops: one Touch ID; `SINCE=1h`,
-`FOLLOW=1`). Doctor's relay row, under `ai-env as ops -- ai-env doctor`, says
+stale, never calls AWS, and logs ids and hashes (one request line per call, never a parameter or
+a result), with the peer's address on its peer and tunnel lines alone: `make relay-logs` tails its log
+group `/ai-env/relay` (ops: one Touch ID; `SINCE=1h`, `FOLLOW=1`), whose streams are `reload`, `relay`
+and `requests`, and `patch` after its first weekly run. The CloudWatch agent runs as `cwagent`, never
+root, and logrotate every 5 minutes, so a log past its 20 MB waits at most that long. The reload's line
+ends `why=…` for anything it found: `disk` with the root volume over 90 % full and `swap` (below) fail
+nothing; any other item, such as `peers.nft: …` (the allowlist, below), makes the run `FAILED`.
+Doctor's relay row, under `ai-env as ops -- ai-env doctor`, says
 `[ok ] relay i-… running (10.42.0.20, 203.0.113.20)`, `[!! ]` when it is stopped (workers cannot
 connect and VM relay calls fail), `[-  ]` before S13's deploy, never `[NO ]`.
+
+**Two boot scripts.** The user data is small (about 1.3 KB of EC2's 16 384 bytes). It makes the swapfile,
+fetches the boot object from the artifacts bucket (`relay/ai-env-relay-boot-…`, named for the first 16 hex
+digits of its SHA-256; the deploy puts it there), compares the file's SHA-256 with the hash rendered into the
+user data, and runs it only if they match. The boot object, `infra/relay/boot.sh` rendered, does everything else:
+the relay's user and directories, the reload and the weekly patch, the units and timers, the IMDS guard,
+the packages and the CloudWatch agent, so the boot's size has no limit. Only the deployer can write the
+object, and a replaced one runs nothing. A change to either script, or to anything the boot object embeds,
+changes the user data, so the next `make deploy` replaces the instance: its ten minutes or so are an outage, the
+Elastic IP moves to the new instance and workers dial again by themselves. Neither script runs again on a
+stop, a start or a reboot.
+
+The fetch retries for about 5 minutes (the S3 endpoint and the role's first credentials), each try cut at
+60 s. After that, or on another hash, the bootstrap stops with nothing fetched run, and it stays stopped:
+the instance runs with its swap and nothing else, no units, no timers, no relay and no CloudWatch agent,
+and `make deploy` sees no diff. A stopped bootstrap looks like this: doctor still says `running`,
+`ai-env relay status` shows the instance running, its probe not accepted and no status line, and 15 minutes
+after the deploy `make relay-logs` holds no `ai-env-relay-reload:` line from it. The reason is on the
+script's stderr, which only the instance's system log holds, and reading that needs the account root, at
+EC2's console: no policy of the stack grants `ec2:GetConsoleOutput`, and no ai-env identity may open a session
+on the instance. With the cause fixed, a new instance brings it back: a change to `boot.sh` and `make deploy`,
+or `pulumi up --replace` of the instance as the deployer. A console session as the account root may also run
+the user data again, since both scripts are safe to run twice.
+
+**The swap is for good.** The user data's first step makes the 512 MiB `/swapfile`, turns it on and adds it
+to `/etc/fstab`, and nothing removes it; the root volume is encrypted, so swapped pages are too. The unit
+states `MemoryMax=320M` and `MemorySwapMax=256M` (about twice the worst overrun; the rest stays for dnf and
+the agents): at the limit the kernel moves the relay's pages to swap and OOM-kills only when none is left,
+so the worst a VM holding a token can do to the relay's memory, about 443 MiB against the 318 MiB it budgets,
+is a slowdown for those seconds and no restart. Every reload run reads `/proc/swaps` and turns the swapfile
+on again if it is off; if it stays off, `swap` joins the line's `why=`.
 
 **Egress.** The VM security group and the VM subnet's network ACL gain TCP 7443 to 10.42.0.20/32 (and
 its replies), and nothing else of the relay. `egress status` checks them and adds the rows `relay-sg`
@@ -2403,17 +2452,20 @@ the check fails, and a failed check revokes the connector's records. `make deplo
 `ai-env egress check` (`new image version: …`) before its `make infra-status WRITE=1` hint: keep the
 order below.
 
-**Who may use it.** Three SSM String parameters under `/ai-env/relay`, each a JSON list that only the
-deployer writes (`ai-env relay allow`, `revoke` and `grant`: as ai-env-ops, or with no runner, they are
+**Who may use it.** Four SSM String parameters under `/ai-env/relay`, each a JSON list that only the
+deployer writes (`ai-env relay allow`, `revoke`, `grant`, `allow-ip` and `revoke-ip`: as ai-env-ops, or
+with no runner, they are
 refused before any Touch ID or AWS call, exit 9), created at the first write and never by Pulumi
 (grants name private sources, which stay out of the repository and of Pulumi's state):
 
 - `workers`, the whitelist: each worker's id, its Ed25519 public key, the source names it may register
-  (globs) and its last valid day (`--not-after`: a year by default, at most two);
+  (globs), its last valid day (`--not-after`: a year by default, at most two) and, once it has a client
+  certificate, that certificate's SHA-256 (`tls_fp`, below);
 - `token-signers`: the keys whose VM session tokens the relay takes, each Mac's session key
   (`--token-signer`); a key has one id and one role, so a worker's key never mints tokens;
 - `grants`, default-deny: each grant is a list of `SOURCE-GLOB/OP-GLOB` rules, and a chat lists and
-  calls only what its token's grant reaches (`*/*` reaches everything, which the command notes).
+  calls only what its token's grant reaches (`*/*` reaches everything, which the command notes);
+- `peers`, the public face's allowlist: each entry a network, a label and the moment it lapses (below).
 
 The relay applies a change within 60 s (`revoke` closes the worker's tunnel by then). A list holds at
 most 64 entries and 4096 bytes. A list that does not parse is never overwritten (exit 1). Writers on
@@ -2421,25 +2473,94 @@ this Mac take turns (`state/relay.lock`). A write that raced another writer (the
 changed meanwhile) exits 7, and by then a changed list has been overwritten: run the command again to
 see what it holds.
 
+**The allowlist.** The relay's public face admits only the IPv4 networks of `/ai-env/relay/peers`.
+`ai-env as deployer -- ai-env relay allow-ip 198.51.100.7 --label example-server` lists a server's outgoing
+address (a bare address is a /32; `a.b.c.d/n` is a network, written with its host bits cleared) to the end
+of its `--not-after` day, a year by default and at most two; the label says what the network is, and a
+second `allow-ip` with that label replaces the entry. One network has one label, though a /32 may sit inside
+another label's /24. `ai-env relay allow-ip --mine` lists this Mac's current address, as
+checkip.amazonaws.com answers it, as a /32 labelled `mac` for `--hours` (24 by default, at most 168): a
+worker on this Mac needs it, and on another network, or when it lapsed, the same command replaces the address
+and the time. A network wider than /16 is exit 2 without `--wide`, so a typo such as `/0` cannot lift the
+list, and `relay status` warns of such an entry while it is in force. `ai-env relay revoke-ip 198.51.100.7`
+or `revoke-ip --label example-server` removes an entry, and notes any other entry that still admits the
+address. Each needs the deployer (one paste), and each change applies within 60 s: a revoked network's
+tunnels close by then.
+
+An unlisted host's connection times out: on every run the reload renders the entries in force into a kernel
+set, and the kernel drops any other address's SYN to 443, so the relay never sees it and its log holds no
+line for it. That reads like a network failure, by design. The relay checks again before any TLS byte
+(`not_in_peers`, which covers the minute a change takes to reach the kernel) and closes a tunnel whose
+address is no longer in force (`peer revoked`), within seconds when an entry lapses: a `--mine` entry's end
+closes this Mac's worker's tunnel. The list fails closed. No entry in force, or a value absent, not JSON or
+holding a malformed network or time, empties the kernel's set, so every SYN to 443 drops. A file missing,
+refused or older than 15 minutes (the reload's last fetch) makes the relay refuse every connection
+(`no_peers`) and close every tunnel. A load the kernel refuses keeps the table it had and adds
+`peers.nft: …` to the reload's `why=`, and
+a run whose fetch failed loads the file already there, since a reboot empties the kernel and the file
+survives. VMs are never in this: the private face does not read the list.
+
+**Bans.** A listed address with 20 faults within 10 minutes is banned for 15: its connections are closed
+before any TLS byte, each with a peer line `banned`. The ban lives in the relay's memory, so a restart ends
+it. A fault is a refused handshake (`malformed`, `bad_protocol`, `bad_alg`, `unknown_worker`, `expired`,
+`bad_signature`, `out_of_order`, `timeout`; a connection dropped in mid-handshake reads `malformed`), no
+`Open` within 5 s of the TLS accept (`open_timeout`), a TLS handshake past its 3 s (`tls_timeout`), or one
+that fails once the client sent a byte (`tls_failed`). Nothing else counts: not a connection closed before
+its first byte (`relay status`'s probe is one), the client's own end of its stream (`eof`), the relay's own
+state (`not_loaded`, `stale`, `no_tls`, `shutting_down`), `too_many_tunnels`, the allowlist's refusals, the
+accept bucket and the connection caps, or anything on the private face. An address that holds a live tunnel,
+or ended one less than 10 minutes ago, counts no fault at all, so a stranger behind a worker's shared
+address (a hotspot's, an office's NAT) cannot get it banned; it still meets that address's 20 connections a
+minute and 8 at once. One SDK worker per address never bans itself: a wrong key makes about 12 attempts in
+10 minutes, a TLS failure about 14 and up to 18 with jitter. Two workers behind one address, restarts or
+`check` runs from it can pass 20, and so can any client that retries faster than the SDK does.
+
 **This Mac's keys and the agent.** `ai-env relay keygen` seals this Mac's two Ed25519 keys into
 `credentials/relay-worker.env` with no Touch ID: its worker key (for a worker on this Mac) and its
 session key (which signs the VM session tokens); it prints the public keys and the commands that allow
 them. `ai-env relay agent` unseals them once (one Touch ID) and, like ssh-agent, answers this user only,
 on the 0600 socket `state/relay-agent.sock`: it signs the handshakes of a worker on this Mac, and mints
 tokens only for this Mac's live vpc VMs whose egress gate passed and for grants bridge.toml names,
-until Ctrl-C or `--hours` (12 by default, at most 24), then drops the keys. `ai-env relay status`
-shows this Mac's side first (no AWS, no Touch ID; `--local` stops there), then, as ai-env-ops, the
-instance, the three lists and the relay's newest status line: `[NO ]` and exit 1 when this Mac's
-session key is no token signer in force, a list does not parse or the instance is not running.
+until Ctrl-C or `--hours` (12 by default, at most 24), then drops the keys.
 `ai-env relay stop` stops the instance: VM relay calls then answer `unavailable`, and workers keep
 dialing until `ai-env relay start`.
+
+**What `ai-env relay status` says.** This Mac's side first (no AWS, no Touch ID; `--local` stops there),
+then, as ai-env-ops, the instance, SSM's ping, a TCP probe of port 443, the relay's newest status line, what
+it refused in the last hour, the workers, the token signers, the grants and the peers list. `[NO ]` is exit
+1: this Mac's session key is no token signer in force, a list does not parse, the instance is not running,
+or the peers list is absent or holds no entry in force. `[?? ]` is a read that failed, exit 7 unless a finding
+came first. `[warn]` and `[-  ]` never change the exit. `--json` holds the same under `instance` (with its
+`refused` and `disk_full`), `workers`, `token_signers`, `grants`, `peers`, `status` and `mac`. The rows that
+speak of the allowlist, the bans and the certificates:
+
+- The probe connects within 3 s and waits a second, sending nothing, so it is no fault.
+  `[ok ] probe: …:443 accepts a TCP connection`; `[warn] probe: …:443 closed the connection before TLS: …`, the
+  relay itself refused this Mac (a ban, or no fresh list); `[warn] probe: …:443 did not accept a TCP connection
+  within 3 s (…); …`, this Mac's address is off the list, or its network blocks it.
+- The status line's row ends `peers … (… s old)`, or `peers -` when the relay is older than the list or holds
+  none. `[warn] relay: its peers list is not loaded: it admits no worker` says so whatever SSM holds.
+- The refused hour counts the request log's last hour: `refused in the last hour: N handshake(s) from M
+  address(es), P connection(s) refused or cut, B address(es) banned, U connection(s) from unlisted addresses;
+  top reasons: r1 n1, r2 n2, r3 n3`. `N` is refused handshakes, `P` the peer lines but the allowlist's refusals,
+  `U` those refusals. It is `[warn]` when `N` or `B` is above zero, else `[ok ]`, and never the exit. `U` never
+  warns, and with the kernel dropping unlisted SYNs it stays near zero. Beside it,
+  `[warn] relay: the root volume is over 90 % full (the reload's why=disk at …)`.
+- Each worker's row shows `cert fp …` or `no cert fp`. `[warn] worker … has no client certificate yet: a relay
+  that requires client certificates would refuse it (…)` is the row to expect while this relay asks for none.
+- The peers list is read in a call of its own: `[ok ] /ai-env/relay/peers v2: 3 peer(s), 2 in force`, then one
+  `[-  ]   peer … until …` per entry, a lapsed one's ending `EXPIRED`. It is `[NO ]` when absent or with none in
+  force (`the relay admits no worker`) or when it does not parse, and `[?? ] /ai-env/relay/peers could not be
+  read (…)` alone when that call fails. `[warn] peer mac lapsed at …: this Mac's worker is refused (ai-env relay
+  allow-ip --mine)`, and `[warn] peer … is wider than /16: it admits much of the internet (…)`.
 
 **The relay's TLS.** `ai-env as deployer -- ai-env relay tls init` makes the relay CA (ECDSA P-256),
 seals its key into `credentials/relay-ca.env` (no Touch ID), writes its certificate to
 `state/relay-ca.pem` and `state/relay-ca.der`, and issues the relay's certificate (397 days, for
 `ai-env-relay` and 10.42.0.20) into the SecureString `/ai-env/relay/tls`, which the relay serves
 within a minute and ops never reads. `--force` makes a new CA, which strands every worker's pinned
-`relay_ca` file; `ai-env relay tls rotate` issues a new certificate under the sealed CA (one paste, one
+`relay_ca` file and client certificate; `ai-env relay tls rotate` issues a new certificate under the
+sealed CA (one paste, one
 Touch ID). Both run only as ai-env-deployer, and hand the value to aws on its stdin, never in a file: under
 `ai-env as root` or `ambient` they are refused (exit 9), since that aws CLI reads your own aws config, whose
 `cli_history` would record the relay's private key. `ai-env relay ca` prints the CA's certificate for a worker
@@ -2477,26 +2598,89 @@ ai-env as deployer -- ai-env relay allow mac --token-signer --key 'ed25519:…' 
 ai-env as deployer -- ai-env relay grant default 'example-*/*'                  # (one paste) every op of the sources example-*
 ai-env relay agent                              # one Touch ID; leave it running, and name the grant in bridge.toml (above)
 ai-env as deployer -- ai-env relay allow example-worker --key 'ed25519:…' --sources 'example-*'   # (one paste) a server's worker
+ai-env as deployer -- ai-env relay allow-ip 198.51.100.7 --label example-server                   # (one paste) that server's address
+ai-env as deployer -- ai-env relay allow-ip --mine                                                # (one paste) this Mac's, for 24 h, for a worker here
 ai-env relay ca                                 # the relay CA's certificate, for that worker's relay_ca file
 ```
 
+Until the first `allow-ip` the relay admits no worker, and `relay status` says `[NO ]`.
+
+**From a relay older than the allowlist.** The list goes first, since the new relay admits nobody without
+one. The old relay's reload fetches its five names and ignores a sixth; until the deploy the ops policy cannot
+read the new parameter, so `relay status`'s peers row reads `[?? ]` (exit 7) and its status row `peers -`. The
+deploy replaces the instance under the same Elastic IP: only its minutes are an outage, and workers dial
+again at their next backoff. No `--tls-key` before it: the older relay refuses a workers list that carries
+`tls_fp` and unloads its whole whitelist, and `relay status` says so in the worker's row (`not yet: this relay
+refuses a list with tls_fp and unloads its whole whitelist (RO-3)`).
+
+```sh
+make install                                                                      # the CLI with allow-ip
+ai-env as deployer -- ai-env relay allow-ip 198.51.100.7 --label example-server   # (one paste) every server's address
+ai-env as deployer -- ai-env relay allow-ip --mine                                # (one paste) this Mac's: the deploy comes within its 24 h
+make test-docker                                                                  # the image's Docker tests (no key), which the deploy requires
+make deploy                                                                       # (deployer: one paste; the stack's passphrase: one Touch ID unless set)
+make infra-status WRITE=1                                                         # (ops: one Touch ID)
+ai-env relay status                                                               # (ops: one Touch ID) some 5 minutes on: /ai-env/relay/peers [ok ], the probe [ok ]
+make relay-logs SINCE=20m                                                         # (ops: one Touch ID) reload, relay and requests; no peers.nft: or swap in why=
+ai-env egress check                                                               # (two Touch IDs) before any remote chat: the image version is new
+```
+
 **Writing a worker.** Start from `templates/worker/`: its README is the guide (a private repository,
-the release tag to pin, the key, the config, the systemd unit). A source implements `DataSource` from
+the release tag to pin, the keys, the address to list, the config, the systemd unit). A source implements
+`DataSource` from
 `crates/ai-env-source`: a descriptor naming its ops, each with a params JSON Schema, and `call`, which
 answers JSON, text or a stream; the crate's `testkit` brings `EchoSource` and the conformance checks.
+The relay refuses a catalog whose `version`, `env`, descriptions, examples or params schema hold a control or
+format character (a soft hyphen, a zero-width joiner, a byte-order mark, a bidi override; TAB, LF and CR pass
+outside `version` and `env`), and the worker's log then names the source and the field: the SDK's own
+descriptor checks and the conformance checks do not catch these.
 `crates/ai-env-worker` is the runtime (`Worker::builder()…run_until(…)`); it signs with a `FileSigner`
 (a 0600 key file of the worker's own user, on a server) or an `AgentSigner` (`signer = "agent"`, on
 this Mac, through `ai-env relay agent`). Workers for your own databases, APIs and logs live in private
-repositories that pin an ai-env release tag (`relay-v…`); ai-env names none of them.
+repositories that pin an ai-env release tag (`relay-v…`; the template names `relay-v0.2.0`, which comes with
+the client certificates' roll-out); ai-env names none of them.
 
-**The security model.** A worker proves a whitelisted Ed25519 key by challenge-response: it signs a
+**A worker's client certificate.** This relay asks for none yet, so a worker runs with or without one, and
+rustls presents a certificate only when a relay asks, so one installed now changes nothing. A relay that
+requires them refuses any worker without a certificate under the relay CA whose SHA-256 its whitelist entry
+holds. The order is certificates first, then the relay that requires them. On each worker,
+`my-worker tls-keygen --out …` makes a P-256 key (0600, the worker's own user; apart from its Ed25519 key,
+which goes on proving who it is) and prints its point, `p256:…`, and the next command. On the Mac,
+`ai-env as deployer -- ai-env relay allow ID --key 'ed25519:…' --sources 'GLOBS' --tls-key 'p256:…'` costs one
+paste and one Touch ID, the sealed relay CA's key (the deployer alone: `ai-env as root` or `ambient` is exit 9).
+It issues a certificate that ends with the entry's last day, prints it alone on stdout (it is public; the
+lines go to stderr) and writes its SHA-256 as the entry's `tls_fp`, which this relay parses and ignores. The
+certificate goes on the worker as a 0640 file of the worker's group, `relay_client_cert` and `relay_client_key`
+in `worker.toml` name the two files (both or neither), and after a restart the tunnel is back at once.
+`relay status` then shows `cert fp …` beside the worker. With a `cert fp` for every worker in force, the
+relay that requires them deploys with no window; in the other order each worker is refused at TLS until its
+certificate arrives (`check` says `tls: the relay requires a client certificate`), and those retries count as
+faults. `allow` without `--tls-key` moves the entry's end, never the certificate's; a key rotation past the
+certificate's end needs `--tls-key`, or the relay refuses the worker at TLS on that day. A worker on this Mac
+keeps the same two files in the bridge's `state/` (`relay-client.key`, `relay-client.pem`), and a worker not
+built from the template passes both to `RelayEndpoint::client_identity`. `templates/worker/README.md` has the
+steps.
+
+**The security model.** The public face admits only listed addresses: the instance's kernel drops any
+other address's SYN, the relay refuses it again before any TLS byte or per-address state, and 20 faults in 10
+minutes ban a listed address for 15. A worker proves a whitelisted Ed25519 key by challenge-response: it signs a
 domain-separated transcript of the relay's fresh nonce, the relay's id, its own id and its key; every
-failure gets one generic `unauthenticated`, and the relay rate-limits by IP. Both faces speak TLS 1.3
+failure gets one generic `unauthenticated`, after one signature check on every well-shaped proof, known id or
+not. A connection has one budget from its TLS accept: 3 s for TLS, 5 s for its `Open`, `Hello` and
+`AuthProof`, and about 557 KB of reads a minute until its `AuthOk`. A tunnel then has a budget for what the
+worker sends unasked (600 frames and 32 MiB a minute, six catalogs a minute, 16 chunks of no call a minute),
+past which it closes and the worker dials again; a caller that stops reading has its call evicted at once and
+never stalls the tunnel, and three such evictions in 10 minutes refuse its session new calls. The private face
+takes the VM subnet alone, through one accept bucket for the whole face: a connection needs a verified token
+within 5 s of its accept, and is cut at 8 refused tokens on it and after 10 minutes idle. One VM process can
+still deny the other VMs their relay, which stays accepted, the VMs being the developer's own. Both faces
+speak TLS 1.3
 only, under the relay CA, which workers and VM clients pin as their one trust anchor (beside the
 MicroVM endpoint's Amazon roots, ai-env's second sanctioned TLS setup). No source credential is on the
 relay or in a VM, and a VM holds only its chat's session token (one VM, one grant, at most 8 h), out
-of the agent's reach. A worker sends up only descriptors and redacted output, and the logs hold ids
-and hashes only.
+of the agent's reach. A worker sends up only descriptors and redacted output. The logs hold ids and hashes,
+with an address only on the peer and tunnel lines; the transport crates log at `error` alone, and any crate
+but the relay's own at most 60 lines a minute (`log_suppressed` in the status line counts the rest).
 
 **Also in S13.**
 
@@ -2508,6 +2692,16 @@ and hashes only.
 - the replacement guard refuses a plan that replaces the Elastic IP (every worker names it), and
   `make destroy`'s checklist names the relay's instance, Elastic IP and parameters;
 - the library crates build on Rust 1.88, for the private repositories (`make check-msrv`).
+
+**Also in the relay security plan.**
+
+- two audit events, `relay_allow_ip` and `relay_revoke_ip` (the label and the prefix length, never the
+  address), and `relay_allow` gains `tls_fp` (stage S11's audit);
+- `make check-advisories` checks the workspace's lock against the RustSec advisories (`cargo deny`,
+  `deny.toml`). An unreachable database falls back to the cached copy, else the check is skipped with a note.
+  It needs `cargo install cargo-deny --locked`, and neither `make test`, `make gates` nor `make deploy` runs it;
+- the relay's unit closes `/run/dbus` and systemd-resolved's socket to it, so its user resolves no name past
+  the guard.
 
 ### Identities: the deployer, ops and the runtime key
 
@@ -2932,6 +3126,9 @@ the diffs annoy you.
 - A relay session token reaches only its own VM, behind the credential gate, and there only the relay
   client (uid 999), on fd 3; a relay private key stays in its sealed container on this Mac, the `tls`
   SecureString or a worker's own 0600 key file. Workers and VM relay clients trust the relay CA alone (S13).
+- The relay's public face refuses an address outside its in-force `/ai-env/relay/peers` before any TLS byte
+  and any per-address state, and with no fresh list it admits nobody; an address's 20th fault in 10 minutes
+  bans it for 15, unless it holds a tunnel or ended one in those 10 minutes (the relay security plan).
 
 ## Workspace
 
@@ -2958,6 +3155,7 @@ make build test                                   # all four feature sets
 make doc-test                                     # the README's and SKILL.md's sh doc-test blocks, dry, in a planted HOME (also in make test)
 make clippy lint                                  # -D warnings in every cfg world + TLS/WS grep guards
 make check-bins check-features check-msrv         # packaging invariants
+make check-advisories                             # RustSec advisories over the workspace's lock (cargo deny, deny.toml)
 make vm-build                                     # cargo lambda build --arm64 (shim only) → image/ai-env, and (S13) the
                                                   #   relay client and MCP server → image/ai-env-relay-client, image/ai-env-relay-mcp
 make image-zip test-docker                        # the S3 image: stage + scan + zip, then the opt-in Docker tests

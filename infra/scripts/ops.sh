@@ -780,7 +780,7 @@ for (const s of plan.steps) {
     fi
     if [ -n "$relays" ]; then
         while IFS=$'\t' read -r p why; do
-            echo "replacement guard: $p will be replaced (${why:-the plan names no reason}): the relay is down until the new instance boots and its reload unit installs the binary (a few minutes): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"
+            echo "replacement guard: $p will be replaced (${why:-the plan names no reason}): the relay is down until the new instance boots and its reload unit installs the binary (about 10 minutes, the boot's dnf on a t4g.nano): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"
         done <<<"$relays"
     fi
     if [ -n "$eips" ]; then

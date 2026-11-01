@@ -843,7 +843,7 @@ export function stackInventory(cfg: EgressConfig, image: ImageNames): Inventory 
         // S13: the relay's Elastic IP and its association (one name: the address is the relay's).
         ["aws:ec2/eip:Eip", [NET.relayEip]],
         ["aws:ec2/eipAssociation:EipAssociation", [NET.relayEip]],
-        // S13: the relay's artifact parameter (its other four are ai-env relay's, never Pulumi's: LD-I5).
+        // S13: the relay's artifact parameter (its other five are ai-env relay's, never Pulumi's: LD-I5).
         ["aws:ssm/parameter:Parameter", [...PROXY_PARAMETERS.map((p) => `ai-env-proxy-${p}`), NET.relayArtifactParameter]],
         // S8 operators: the proxy's documents, the only ones ai-env-ops may send.
         ["aws:ssm/document:Document", DOCUMENT_ROLES.map((r) => documentNames(cfg)[r])],

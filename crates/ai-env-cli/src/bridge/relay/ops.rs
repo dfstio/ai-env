@@ -267,7 +267,7 @@ fn instance_rows(ctx: &RelayCtx, instance: &str, report: &mut Report) -> CertSta
     let shown = |ip: &str| if ip.is_empty() { "-".to_string() } else { ip.to_string() };
     let mut inst = json!({"id": instance, "state": state, "private_ip": private_ip, "public_ip": public_ip, "refused": null, "disk_full": null});
     if state != "running" {
-        report.row(Mark::No, format!("instance {instance}: {state} (private {}, public {}): ai-env relay start", shown(&private_ip), shown(&public_ip)));
+        report.row(Mark::No, format!("instance {instance}: {state} (private {}, public {}): {}", shown(&private_ip), shown(&public_ip), not_running_cure(&state)));
         report.doc.insert("instance".into(), inst);
         return CertStance::Later;
     }
@@ -310,10 +310,28 @@ fn probe_at(at: std::net::SocketAddr, report: &mut Report) -> &'static str {
                 "open"
             }
         }
-        Err(e) => {
-            report.row(Mark::Warn, format!("probe: {at} did not accept a TCP connection within 3 s ({e}); this Mac's network may block it, or its address is not in {PEERS} (ai-env relay allow-ip --mine)"));
-            "closed"
-        }
+        Err(e) => probe_failed(at, &e, report),
+    }
+}
+
+/// A connect that failed. The security group admits 443 and R-94 drops an unlisted SYN, so a reset comes from the instance
+/// itself, with nothing listening: a relay stopped, failed or still booting, never this Mac's address (LD-R66).
+fn probe_failed(at: std::net::SocketAddr, e: &std::io::Error, report: &mut Report) -> &'static str {
+    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+        report.row(Mark::Warn, format!("probe: {at} refused the connection: nothing listens there, so the relay is not running or is still booting (make relay-logs)"));
+        return "not_listening";
+    }
+    report.row(Mark::Warn, format!("probe: {at} did not accept a TCP connection within 3 s ({e}); this Mac's network may block it, or its address is not in {PEERS} (ai-env relay allow-ip --mine)"));
+    "closed"
+}
+
+/// What a state other than `running` asks for: a terminated instance cannot start, and state/infra.toml names the old
+/// one after a deploy replaced it (LD-R66).
+fn not_running_cure(state: &str) -> &'static str {
+    if matches!(state, "terminated" | "shutting-down") {
+        "state/infra.toml names an instance a deploy replaced: make infra-status WRITE=1"
+    } else {
+        "ai-env relay start"
     }
 }
 
@@ -762,10 +780,19 @@ mod tests {
         let at = gone.local_addr().unwrap();
         drop(gone);
         let mut report = Report::default();
-        assert_eq!(probe_at(at, &mut report), "closed");
+        assert_eq!(probe_at(at, &mut report), "not_listening");
+        assert_eq!(rows(&report), [(Mark::Warn, format!("probe: {at} refused the connection: nothing listens there, so the relay is not running or is still booting (make relay-logs)").as_str())]);
+        // Every other failure: a dropped SYN times out.
+        let mut report = Report::default();
+        let late = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert_eq!(probe_failed(at, &late, &mut report), "closed");
         let (mark, text) = report.rows[0].clone();
         assert_eq!(mark, Mark::Warn);
         assert!(text.starts_with(&format!("probe: {at} did not accept a TCP connection within 3 s (")) && text.ends_with("); this Mac's network may block it, or its address is not in /ai-env/relay/peers (ai-env relay allow-ip --mine)"), "{text}");
+        // A state other than running: a stopped instance starts; a replaced one cannot.
+        assert_eq!(not_running_cure("stopped"), "ai-env relay start");
+        assert_eq!(not_running_cure("terminated"), "state/infra.toml names an instance a deploy replaced: make infra-status WRITE=1");
+        assert_eq!(not_running_cure("shutting-down"), not_running_cure("terminated"));
         // A server that writes first (no relay does) is open, and the wait for it ends the wait.
         let talker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let at: SocketAddr = talker.local_addr().unwrap();

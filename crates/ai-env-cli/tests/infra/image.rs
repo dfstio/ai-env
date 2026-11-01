@@ -2048,7 +2048,7 @@ fn the_replacement_guard_names_a_new_relay_and_refuses_a_new_relay_address() {
     let text = all(&out);
     assert!(out.status.success(), "{text}");
     assert!(
-        text.contains("replacement guard: aws:ec2/instance:Instance ai-env-relay will be replaced (userData): the relay is down until the new instance boots and its reload unit installs the binary (a few minutes): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"),
+        text.contains("replacement guard: aws:ec2/instance:Instance ai-env-relay will be replaced (userData): the relay is down until the new instance boots and its reload unit installs the binary (about 10 minutes, the boot's dnf on a t4g.nano): workers reconnect, VM relay calls fail meanwhile; the Elastic IP moves to it"),
         "{text}"
     );
     assert!(!text.contains("vpc VMs have no egress") && text.contains("nothing the connector's ENIs pin is replaced"), "{text}");

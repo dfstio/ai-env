@@ -1674,6 +1674,7 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
         "refused" => "[warn] probe: 127.0.0.1:443 closed the connection before TLS: this Mac's address is not in /ai-env/relay/peers, or is banned (ai-env relay allow-ip --mine)",
         "open" => "[ok ] probe: 127.0.0.1:443 accepts a TCP connection",
         "closed" => "[warn] probe: 127.0.0.1:443 did not accept a TCP connection within 3 s (",
+        "not_listening" => "[warn] probe: 127.0.0.1:443 refused the connection: nothing listens there, so the relay is not running or is still booting (make relay-logs)",
         other => panic!("{other}"),
     };
     let (_, out) = s.status();
