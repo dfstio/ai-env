@@ -82,8 +82,8 @@ pub struct EventSpec {
 
 /// The constants of the 42 events written as string literals before S11, then
 /// part B's two (`vm_observed`, `panel_serve`), then S13's seven (`relay_*`,
-/// plans/s13-contracts.md §WM-worker-mac.6.7). `remote::audit_event` and
-/// `accounts::audit_event` keep theirs.
+/// plans/s13-contracts.md §WM-worker-mac.6.7), the relay security plan's two and
+/// its `relay_access`. `remote::audit_event` and `accounts::audit_event` keep theirs.
 pub mod event {
     pub const VM_RUN: &str = "vm_run";
     pub const VM_REUSE: &str = "vm_reuse";
@@ -154,8 +154,12 @@ pub mod event {
     /// §RS.4.3: `relay revoke-ip`: `outcome` (`revoked`, `absent`); the removed entry's `label`, `prefix` and
     /// `not_after`, and `version`. The address is never a value.
     pub const RELAY_REVOKE_IP: &str = "relay_revoke_ip";
+    /// §RS.13, R-152: `relay access`, which ops may run: `op` (`allow`, `remove`), `outcome` (`added`, `extended`,
+    /// `unchanged`, `removed`, `absent`); `grant`, `access` (the chat's access id), `not_after` (an allow's), `version`,
+    /// `pruned` (a write's count of the lapsed entries it took).
+    pub const RELAY_ACCESS: &str = "relay_access";
     /// Every event above, in the registry's order.
-    pub const ALL: [&str; 53] = [
+    pub const ALL: [&str; 54] = [
         VM_RUN,
         VM_REUSE,
         VM_ADOPT,
@@ -209,6 +213,7 @@ pub mod event {
         RELAY_AGENT,
         RELAY_ALLOW_IP,
         RELAY_REVOKE_IP,
+        RELAY_ACCESS,
     ];
 }
 
@@ -242,7 +247,7 @@ const fn ev(name: &'static str, required: &'static [&'static str], optional: &'s
 
 use SessionFrom::{Detail, Envelope, None as NoSession};
 
-/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (53).
+/// Every event, in this order: `remote::audit_event::ALL` (37), `accounts::audit_event::ALL` (6), [`event::ALL`] (54).
 pub static EVENTS: &[EventSpec] = &[
     // ---- remote::audit_event (S8 to S10, A1; then S11 part A's six) ----
     // S13 (WM-R53): `relay`, the spawn's session-token word (`minted`, `no_agent`, …), unless it is `off`.
@@ -356,6 +361,8 @@ pub static EVENTS: &[EventSpec] = &[
     // §RS.4.3: ids, words and numbers only; the address is never a value (the relay's own peer lines carry addresses).
     ev("relay_allow_ip", &["label", "prefix", "outcome"], &["not_after", "version", "mine"], NO, NoSession, NONE),
     ev("relay_revoke_ip", &["outcome"], &["label", "prefix", "not_after", "version"], NO, NoSession, NONE),
+    // §RS.13, R-152: the chat's access id is `access`; it is on this Mac alone, and the relay never logs it (R-145).
+    ev("relay_access", &["op", "outcome"], &["grant", "access", "not_after", "version", "pruned"], NO, NoSession, NONE),
 ];
 
 /// The registered event `name`.
@@ -453,7 +460,7 @@ mod tests {
         let modules: Vec<&str> = crate::bridge::remote::audit_event::ALL.iter().chain(crate::bridge::accounts::audit_event::ALL.iter()).chain(event::ALL.iter()).copied().collect();
         let names: Vec<&str> = EVENTS.iter().map(|s| s.name).collect();
         assert_eq!(names, modules, "EVENTS is remote::audit_event::ALL, then accounts::audit_event::ALL, then event::ALL");
-        assert_eq!(EVENTS.len(), 96);
+        assert_eq!(EVENTS.len(), 97);
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "unique names");
         for s in EVENTS {

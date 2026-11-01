@@ -268,7 +268,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: ProxyCmd,
     },
-    /// The S13 relay: this Mac's keys and signing agent (keygen, pubkey, agent), the whitelist, the public face's allowlist, grants and TLS (allow, revoke, allow-ip, revoke-ip, grant, tls: as ai-env-deployer), the relay CA's certificate (ca), the relay instance (status, start, stop: as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
+    /// The S13 relay: this Mac's keys and signing agent (keygen, pubkey, agent), the whitelist, the public face's allowlist, grants and TLS (allow, revoke, allow-ip, revoke-ip, grant, tls: as ai-env-deployer), the relay CA's certificate (ca), the relay instance and each chat's access (status, start, stop, access: as ai-env-ops: the key of ai-env as …, else credentials/ops.env)
     #[cfg(feature = "bridge")]
     Relay {
         #[command(subcommand)]
@@ -898,6 +898,31 @@ pub enum RelayCmd {
         /// The entry's label, in place of its network
         #[arg(long, value_name = "ID")]
         label: Option<String>,
+    },
+    /// Approve a remote chat for a grant, or take it back, in /ai-env/relay/access (as ai-env-ops): the relay applies it within about 70 s, with no restart
+    Access {
+        /// The chat's session id, as ai-env session list shows it
+        #[arg(value_name = "SESSION", required_unless_present = "list", conflicts_with = "list")]
+        session: Option<String>,
+        /// The grant to allow this chat, one of [relay].offer
+        #[arg(long, value_name = "G", required_unless_present_any = ["remove", "list"], conflicts_with_all = ["remove", "list"])]
+        allow: Option<String>,
+        /// The grant to take from this chat
+        #[arg(long, value_name = "G", conflicts_with = "list")]
+        remove: Option<String>,
+        /// The entry's last valid day, this many days from today, UTC, 1 to 90 (default 30); one end covers all its grants, the later of the old and the new
+        // clap lets `requires` go when a present argument conflicts with what it requires, so the two are named too.
+        #[arg(long, value_name = "N", requires = "allow", conflicts_with_all = ["remove", "list"])]
+        days: Option<u32>,
+        /// Show the list, each chat with the sessions on this Mac that hold it
+        #[arg(long)]
+        list: bool,
+        /// One JSON object: the list's version and its entries (with --list)
+        #[arg(long, requires = "list", conflicts_with_all = ["session", "allow", "remove"])]
+        json: bool,
+        /// The panel's child: its audit rows say `panel`
+        #[arg(long, hide = true)]
+        from_panel: bool,
     },
     /// The relay instance, its lists, and this Mac's keys and agent (AWS reads as ai-env-ops)
     Status {
@@ -2180,6 +2205,14 @@ mod tests {
         assert_eq!((grant_id.as_str(), rules), ("default", vec!["example-*/get".to_string(), "example-*/list".to_string()]));
         let RelayCmd::Grant { rules, remove: true, .. } = relay(&["grant", "default", "--remove"]) else { panic!("grant --remove") };
         assert!(rules.is_empty());
+        // R-150: a session and one of --allow or --remove, or --list; --days with --allow alone, --json with --list alone.
+        let RelayCmd::Access { session: Some(session), allow: Some(allow), remove: None, days: None, list: false, json: false, from_panel: false } = relay(&["access", "0199a1b2-0000-7000-8000-0000000012a1", "--allow", "g-a"]) else { panic!("access --allow") };
+        assert_eq!((session.as_str(), allow.as_str()), ("0199a1b2-0000-7000-8000-0000000012a1", "g-a"));
+        let RelayCmd::Access { days: Some(0), .. } = relay(&["access", "0199a1b2-0000-7000-8000-0000000012a1", "--allow", "g-a", "--days", "0"]) else { panic!("--days 0 parses: the range is the command's") };
+        let RelayCmd::Access { remove: Some(remove), allow: None, from_panel: true, .. } = relay(&["access", "0199a1b2-0000-7000-8000-0000000012a1", "--remove", "g-a", "--from-panel"]) else { panic!("access --remove --from-panel") };
+        assert_eq!(remove, "g-a");
+        let RelayCmd::Access { session: None, list: true, json: false, .. } = relay(&["access", "--list"]) else { panic!("access --list") };
+        let RelayCmd::Access { list: true, json: true, .. } = relay(&["access", "--list", "--json"]) else { panic!("access --list --json") };
         let RelayCmd::Status { json: false, local: false } = relay(&["status"]) else { panic!("status") };
         let RelayCmd::Status { json: true, local: true } = relay(&["status", "--json", "--local"]) else { panic!("status --json --local") };
         let RelayCmd::Start = relay(&["start"]) else { panic!("start") };
@@ -2210,6 +2243,15 @@ mod tests {
             &["relay", "allow-ip", "--mine", "--hours", "x"],
             &["relay", "revoke-ip"],
             &["relay", "revoke-ip", "198.51.100.0/24", "--label", "office"],
+            &["relay", "access"],
+            &["relay", "access", "0199a1b2-0000-7000-8000-0000000012a1"],
+            &["relay", "access", "--allow", "g-a"],
+            &["relay", "access", "0199a1b2-0000-7000-8000-0000000012a1", "--allow", "g-a", "--remove", "g-a"],
+            &["relay", "access", "0199a1b2-0000-7000-8000-0000000012a1", "--remove", "g-a", "--days", "1"],
+            &["relay", "access", "0199a1b2-0000-7000-8000-0000000012a1", "--list"],
+            &["relay", "access", "--list", "--allow", "g-a"],
+            &["relay", "access", "--list", "--days", "1"],
+            &["relay", "access", "0199a1b2-0000-7000-8000-0000000012a1", "--allow", "g-a", "--json"],
             &["relay", "grant", "g"],
             &["relay", "grant", "g", "a/b", "--remove"],
             &["relay", "pubkey", "--worker", "--session"],

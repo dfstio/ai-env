@@ -1,5 +1,6 @@
 //! The request log: its lines, sinks, digest and refusal limiter (R-60 to R-68). Ids and hashes only: never a
-//! param, a chunk's data, a token or a key. And relay.log's own bounds (F23): its level filter and its cap.
+//! param, a chunk's data, a token, a key or a chat's id (R-145). And relay.log's own bounds (F23): its level filter and
+//! its cap.
 //!
 //! One JSON object per line, each kind with exactly its key set (`CALL_KEYS` … `STATUS_KEYS`), every key on every
 //! line (an empty string or 0 when unknown). Values are ids, words and numbers (R-62): source and op names only when
@@ -92,11 +93,12 @@ pub const TUNNEL_KEYS: [&str; 12] = ["ts", "ev", "tunnel", "worker", "peer", "sd
 pub const RELOAD_KEYS: [&str; 7] = ["ts", "ev", "file", "outcome", "version", "entries", "age_s"];
 /// A peer line's keys.
 pub const PEER_KEYS: [&str; 6] = ["ts", "ev", "face", "peer", "reason", "suppressed"];
-/// The status line's keys (R-67; `log_suppressed`, F23; `peers_version` and `peers_age_s`, §RS.3.1).
-pub const STATUS_KEYS: [&str; 22] = [
+/// The status line's keys (R-67; `log_suppressed`, F23; `peers_version` and `peers_age_s`, §RS.3.1; `access_version` and
+/// `access_age_s`, R-146).
+pub const STATUS_KEYS: [&str; 24] = [
     "ts", "ev", "relay_version", "protocol", "uptime_s", "tunnels", "sources_live", "sources_offline", "calls_in_flight", "sessions", "workers_version",
-    "workers_age_s", "signers_version", "signers_age_s", "grants_version", "grants_age_s", "peers_version", "peers_age_s", "tls_loaded", "unknown_frames",
-    "log_dropped", "log_suppressed",
+    "workers_age_s", "signers_version", "signers_age_s", "grants_version", "grants_age_s", "peers_version", "peers_age_s", "access_version", "access_age_s",
+    "tls_loaded", "unknown_frames", "log_dropped", "log_suppressed",
 ];
 
 /// R-63: the first 16 hex characters of HMAC-SHA256(key, params).
@@ -141,6 +143,10 @@ pub struct StatusLine {
     pub peers_version: String,
     /// Seconds since its last confirmed fetch.
     pub peers_age_s: u64,
+    /// `access.json`'s version, or "" when not loaded (R-146).
+    pub access_version: String,
+    /// Seconds since its last confirmed fetch.
+    pub access_age_s: u64,
     /// Whether a TLS config is loaded.
     pub tls_loaded: bool,
     /// WorkerFrames with no known variant (P-R17).
@@ -465,6 +471,8 @@ impl RequestLog {
             .num("grants_age_s", s.grants_age_s)
             .str("peers_version", &s.peers_version)
             .num("peers_age_s", s.peers_age_s)
+            .str("access_version", &s.access_version)
+            .num("access_age_s", s.access_age_s)
             .bool("tls_loaded", s.tls_loaded)
             .num("unknown_frames", s.unknown_frames)
             .num("log_dropped", s.log_dropped)
@@ -666,6 +674,8 @@ mod tests {
             grants_age_s: 0,
             peers_version: "0123456789abcdef".into(),
             peers_age_s: 7,
+            access_version: "fedcba9876543210".into(),
+            access_age_s: 9,
             tls_loaded: false,
             unknown_frames: 0,
             log_dropped: 0,
@@ -673,9 +683,14 @@ mod tests {
         });
         let lines = sink.lines();
         assert_eq!(lines.len(), 6);
-        assert_eq!(STATUS_KEYS.len(), 22, "§RS.3.1: F's log_suppressed, L's peers_version and peers_age_s");
-        // The peers keys in their place, each with its own value.
-        assert!(lines[5].contains(r#""grants_age_s":0,"peers_version":"0123456789abcdef","peers_age_s":7,"tls_loaded":false"#), "{}", lines[5]);
+        assert_eq!(STATUS_KEYS.len(), 24, "§RS.3.1: F's log_suppressed, L's peers_version and peers_age_s; R-146: access_version and access_age_s");
+        assert_eq!(STATUS_KEYS[16..20], ["peers_version", "peers_age_s", "access_version", "access_age_s"], "R-146: right after peers_age_s");
+        // The peers and access keys in their place, each with its own value.
+        assert!(
+            lines[5].contains(r#""grants_age_s":0,"peers_version":"0123456789abcdef","peers_age_s":7,"access_version":"fedcba9876543210","access_age_s":9,"tls_loaded":false"#),
+            "{}",
+            lines[5]
+        );
         let sets: [&[&str]; 6] = [&CALL_KEYS, &LIST_KEYS, &TUNNEL_KEYS, &RELOAD_KEYS, &PEER_KEYS, &STATUS_KEYS];
         for (line, set) in lines.iter().zip(sets) {
             assert_eq!(keys(line), sorted(set), "{line}");

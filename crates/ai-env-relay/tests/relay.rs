@@ -1,4 +1,4 @@
-//! The relay in-process (§R-relay.7, relay 1 to 44 and 49 to 51): tonic over `tokio::io::duplex` with the rig of
+//! The relay in-process (§R-relay.7, relay 1 to 44 and 49 to 54): tonic over `tokio::io::duplex` with the rig of
 //! `tests/common`. Tests marked "paused" run on tokio's paused clock and assert virtual time.
 
 mod common;
@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use ai_env_relay::files::{content_version, Poll, FETCHED_FILE};
-use ai_env_relay::lists::{GRANTS_FILE, SIGNERS_FILE, WORKERS_FILE};
+use ai_env_relay::lists::{ACCESS_FILE, GRANTS_FILE, SIGNERS_FILE, WORKERS_FILE};
 use ai_env_relay::reqlog::{CALL_KEYS, STATUS_KEYS};
 use ai_env_relay::Limits;
 use ai_env_relay_proto::v1::{relay_frame, worker_frame, CallChunk, CallRequest, Catalog, Chunk, Limits as WireLimits, WorkerFrame};
@@ -1250,6 +1250,9 @@ async fn params_are_bounded_json_objects() {
 async fn the_request_log_carries_ids_and_hashes_only() {
     let l = Limits { calls_per_session: 3, calls_per_tunnel: 2, session_burst: 20, ..limits() };
     let rig = Rig::start_with(l).await;
+    // R-146: an access list loaded; the tokens of the outcomes below that go through it are `token`'s, of its chat.
+    rig.write_access(&[access_entry(CHAT, &["g-example"])]);
+    rig.poll();
     // A answers by its params: echo, an error, a cut, a slow stream or a gap; B and C stay silent.
     let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::with(|inv, out| {
         let params: serde_json::Value = serde_json::from_slice(&inv.params_json).unwrap_or_default();
@@ -1292,7 +1295,7 @@ async fn the_request_log_carries_ids_and_hashes_only() {
     let _c = TestWorker::connect(&rig, "worker-c", 5, catalog_c()).await.serve(Script::silent());
     let mut client = rig.client().await;
     let mut driven: Vec<(String, &str, i64)> = Vec::new();
-    let token = rig.token("g-all");
+    let token = rig.chat_token("no-grant", CHAT);
     let req = |source: &str, mode: &str| request(source, "get", format!("{{\"mode\":\"{mode}\",\"q\":\"ZZ-SENTINEL-PARAM\"}}").as_bytes());
 
     // ok, source_error, truncated, violation: each answered by A.
@@ -1404,11 +1407,14 @@ async fn the_request_log_carries_ids_and_hashes_only() {
         assert!(key_texts.iter().all(|k| !line.contains(k.as_str())), "a key in {line}");
         assert!(!line.contains('*'), "a glob in {line}");
         assert!(PEER_NETS.iter().all(|net| !line.contains(net)), "a peers network in {line}");
+        assert!(!line.contains(CHAT), "a chat's id in {line}");
     }
-    // The status line's values (§RS.3.1): every key of STATUS_KEYS but `ts` and `ev`, the peers file's among them.
+    // The status line's values (§RS.3.1, R-146): every key of STATUS_KEYS but `ts` and `ev`, the peers file's and the
+    // access file's among them.
     let status = serde_json::to_value(rig.app.snapshot()).unwrap();
     assert_eq!(keys_of(&status), sorted(&STATUS_KEYS[2..]));
     assert_eq!(status["peers_version"], format!("{:016x}", content_version(&rig.read(ai_env_relay::lists::PEERS_FILE))));
+    assert_eq!(status["access_version"], format!("{:016x}", content_version(&rig.read(ACCESS_FILE))));
 }
 
 /// Relay 26 (paused).
@@ -1781,6 +1787,10 @@ async fn shutdown_closes_tunnels_and_ends_calls() {
 #[tokio::test(start_paused = true)]
 async fn the_status_line_counts_and_names_nothing_secret() {
     let rig = Rig::start().await;
+    // R-146: the access list loaded from a fetch 8 s before the rig's, so its age is its own (the rest keep T0, R-16).
+    rig.write_fetched(T0 - 8);
+    rig.write_access(&[access_entry(CHAT, &["g-example"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
     let _a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
     let mut client = rig.client().await;
     let token = rig.token("g-all");
@@ -1798,7 +1808,11 @@ async fn the_status_line_counts_and_names_nothing_secret() {
     // §RS.3.1: the peers file's version and age, never its networks or labels.
     assert_eq!(line["peers_version"], format!("{:016x}", content_version(&rig.read(ai_env_relay::lists::PEERS_FILE))));
     assert_eq!(line["peers_age_s"].as_u64(), Some(42), "fetched at the rig's T0, the wall clock at T0 + 42");
+    // R-146: the access file's version and age, never a chat or a grant of it.
+    assert_eq!(line["access_version"], format!("{:016x}", content_version(&rig.read(ACCESS_FILE))));
+    assert_eq!(line["access_age_s"].as_u64(), Some(50), "fetched at T0 - 8, the wall clock at T0 + 42");
     let text = line.to_string();
+    assert!(!text.contains(CHAT) && !text.contains("g-example"), "an access entry in {text}");
     assert!(PEER_NETS.iter().all(|net| !text.contains(net)) && !text.contains("test-net-2"), "a peers entry in {text}");
     assert!(!text.contains('*') && !text.contains("ZZ-SENTINEL") && !text.contains(&token[3..40]));
     let key = ai_env_worker::keys::SigningKey::from_seed(&[1; 32]).unwrap().public_key().b64();
@@ -3012,4 +3026,325 @@ async fn a_stop_beats_a_cut_due_at_the_same_instant() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(rig.lines("peer").is_empty(), "{:?}", rig.lines("peer"));
     drop(idle);
+}
+
+/// The relay with the access tests' limits (a session's rate never in the way) and everything it logs through relay.log's
+/// own subscriber, at every level of the relay's targets, for the rest of the test's thread.
+async fn access_rig() -> (Rig, Written, tracing::subscriber::DefaultGuard) {
+    let written = Written::default();
+    let w = written.clone();
+    let guard = tracing::subscriber::set_default(ai_env_relay::reqlog::log_subscriber(Some("trace"), 60_000, move || w.clone()));
+    hear_the_relay();
+    let rig = Rig::start_with(Limits { session_burst: 10_000, session_per_min: 60_000, ..limits() }).await;
+    (rig, written, guard)
+}
+
+/// Every log callsite hit so far speaks to this thread's subscriber. Tests run side by side, and with one subscriber
+/// registered `tracing` caches a callsite off when its first hit comes on a thread with none: a line of that callsite
+/// would then not be seen here until the cache is rebuilt, its absence proving nothing.
+fn hear_the_relay() {
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// A source's name and its ops, as `ListSources` shows them.
+fn listed_ops(r: &ai_env_relay_proto::v1::ListSourcesResponse) -> Vec<(String, Vec<String>)> {
+    r.sources.iter().map(|s| s.descriptor.as_ref().unwrap()).map(|d| (d.name.clone(), d.ops.iter().map(|o| o.name.clone()).collect())).collect()
+}
+
+/// One row of `listed_ops`.
+fn ops_row(name: &str, ops: &[&str]) -> (String, Vec<String>) {
+    (name.to_string(), ops.iter().map(|o| o.to_string()).collect())
+}
+
+/// A refused call's (code, message).
+fn refusal(r: Result<tonic::Streaming<CallChunk>, tonic::Status>) -> (Code, String) {
+    let s = r.expect_err("refused");
+    (s.code(), s.message().to_string())
+}
+
+/// The call answered: its chunks' one final and no error. `Script::echo`'s answer, or a held call's.
+async fn answered(r: Result<tonic::Streaming<CallChunk>, tonic::Status>) {
+    let (chunks, end) = drain(r.expect("granted")).await;
+    assert!(end.is_ok(), "{end:?}");
+    assert!(chunks.last().is_some_and(|c| c.r#final && c.error.is_none()), "{chunks:?}");
+}
+
+/// Relay 52 (R-145): a running token, minted once with a grant in no list. No entry: an empty catalog and 7 `not
+/// granted`. An entry for its chat, polled: the same token lists that grant's ops and its calls reach the worker, and
+/// the worker's `Caller.grant_id` and the call line's `grant` name the grant that allowed the call, while the list line and
+/// a denied call's line keep the token's. Two grants: `ListSources` unions them, a call goes through the first that
+/// allows it, a token's own grant before any of the entry's. Its removal, polled: the same token is back to nothing,
+/// with no tunnel closed, while a call in flight finishes (its line naming its grant). No line of the request log or
+/// relay.log holds the chat's id, and no `Invoke` carries it.
+#[tokio::test]
+async fn an_access_entry_opens_a_running_token_and_its_removal_closes_it() {
+    let (rig, written, _guard) = access_rig().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let b = TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(Script::echo("worker-b"));
+    let c = TestWorker::connect(&rig, "worker-c", 5, catalog_c()).await.serve(Script::silent());
+    let mut client = rig.client().await;
+    let token = rig.chat_token("no-grant", CHAT);
+    let denied = (Code::PermissionDenied, "not granted".to_string());
+
+    assert!(list(&mut client, &token).await.unwrap().sources.is_empty(), "no entry: nothing");
+    assert_eq!(refusal(call(&mut client, &token, "example.alpha", "get", b"{}").await), denied, "no entry: not granted");
+    assert_eq!(a.invokes().len(), 0);
+
+    rig.write_access(&[access_entry(CHAT, &["g-alpha-get"]), access_entry(OTHER_CHAT, &["g-all"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    let line = reloads(&rig, "access").pop().expect("a reload line of access");
+    assert_eq!((line["outcome"].as_str(), line["entries"].as_u64()), (Some("loaded"), Some(2)));
+    assert_eq!(line["version"], format!("{:016x}", content_version(&rig.read(ACCESS_FILE))));
+    assert_eq!(listed_ops(&list(&mut client, &token).await.unwrap()), [ops_row("example.alpha", &["get"])], "the same token, its grant's one op");
+    assert_eq!(rig.lines("list").pop().unwrap()["grant"], "no-grant", "the list line keeps the token's grant");
+    answered(call(&mut client, &token, "example.alpha", "get", b"{}").await).await;
+    let invoke = a.invoke(0).await;
+    let caller = invoke.caller.as_ref().unwrap();
+    assert_eq!(caller.grant_id, "g-alpha-get", "the worker hears the grant that allowed the call");
+    assert_eq!((caller.caller_id.as_str(), caller.vm_id.as_str()), ("mac", VM_ID));
+    let call_line = |r: &Rig, rid: &str| r.lines("call").into_iter().find(|l| l["request_id"] == rid).unwrap_or_else(|| panic!("the call line of {rid}"));
+    rig.until(Duration::from_secs(10), "its call line", |r| r.lines("call").iter().any(|l| l["request_id"] == invoke.request_id.as_str())).await;
+    assert_eq!(call_line(&rig, &invoke.request_id)["grant"], "g-alpha-get", "so does its line");
+    for (source, op) in [("example.alpha", "list"), ("example.beta", "get"), ("example.zzz", "get")] {
+        assert_eq!(refusal(call(&mut client, &token, source, op, b"{}").await), denied, "{source}/{op}: still before the source lookup");
+        assert_eq!(rig.lines("call").pop().unwrap()["grant"], "no-grant", "{source}/{op}: a denied call's line keeps the token's grant");
+    }
+
+    // Two grants, sorted on render: the union of their ops, and a call through the first that allows it.
+    hear_the_relay();
+    rig.write_access(&[access_entry(CHAT, &["g-example", "g-alpha-get"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    let every = [ops_row("example.alpha", &["get", "list"]), ops_row("example.alpha.logs", &["get", "list"]), ops_row("example.beta", &["get", "list"]), ops_row("example.gamma", &["get"])];
+    assert_eq!(listed_ops(&list(&mut client, &token).await.unwrap()), every);
+    answered(call(&mut client, &token, "example.alpha", "get", b"{}").await).await;
+    answered(call(&mut client, &token, "example.alpha", "list", b"{}").await).await;
+    answered(call(&mut client, &token, "example.beta", "get", b"{}").await).await;
+    let mine = [a.invoke(1).await, a.invoke(2).await, b.invoke(0).await];
+    assert_eq!(mine.each_ref().map(|i| i.caller.as_ref().unwrap().grant_id.as_str()), ["g-alpha-get", "g-example", "g-example"], "the first that allows each");
+    assert_eq!(refusal(call(&mut client, &token, "other.x", "get", b"{}").await), denied, "neither grant allows it");
+    let own = rig.chat_token("g-example", CHAT);
+    answered(call(&mut client, &own, "example.alpha", "get", b"{}").await).await;
+    assert_eq!(a.invoke(3).await.caller.unwrap().grant_id, "g-example", "a token's own grant first");
+
+    // A call in flight through the entry; the entry removed, the other chat's staying: the token is back to nothing at
+    // its next request, the call finishes, and no tunnel hears of it.
+    let held = call(&mut client, &token, "example.gamma", "get", b"{}").await;
+    let invoke = c.invoke(0).await;
+    assert_eq!(invoke.caller.as_ref().unwrap().grant_id, "g-example");
+    rig.write_access(&[access_entry(OTHER_CHAT, &["g-all"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    assert!(list(&mut client, &token).await.unwrap().sources.is_empty(), "removed: nothing");
+    assert_eq!(refusal(call(&mut client, &token, "example.alpha", "get", b"{}").await), denied, "removed: not granted");
+    c.send(worker_frame::Msg::Chunk(data(&invoke.request_id, 0, b"{}".to_vec(), true))).await;
+    answered(held).await;
+    rig.until(Duration::from_secs(10), "the held call's line", |r| r.lines("call").iter().any(|l| l["request_id"] == invoke.request_id.as_str())).await;
+    let line = call_line(&rig, &invoke.request_id);
+    assert_eq!((line["outcome"].as_str(), line["grant"].as_str()), (Some("ok"), Some("g-example")), "a call in flight finishes");
+    assert!(a.closes().is_empty() && b.closes().is_empty() && c.closes().is_empty(), "no tunnel is closed by this list");
+    assert_eq!(rig.app.snapshot().tunnels, 3);
+
+    // Allowed again, the same token once more: both ways.
+    rig.write_access(&[access_entry(CHAT, &["g-alpha-get"])]);
+    rig.poll();
+    answered(call(&mut client, &token, "example.alpha", "get", b"{}").await).await;
+
+    let served = [a.invokes(), b.invokes(), c.invokes()].concat();
+    assert!(served.iter().all(|i| !format!("{i:?}").contains(CHAT)), "R-54: no Invoke carries the chat's id");
+    // A refused token writes relay.log's line (R-53): the subscriber hears the relay's tasks.
+    for _ in 0..2 {
+        assert_eq!(list(&mut client, "not-a-token").await.expect_err("refused").code(), Code::Unauthenticated);
+        hear_the_relay();
+    }
+    assert_eq!(list(&mut client, "not-a-token").await.expect_err("refused").code(), Code::Unauthenticated);
+    let (requests, log) = (rig.sink.lines(), written.lines());
+    assert!(log.iter().any(|l| l.contains("a session token was refused")), "{log:?}");
+    assert!(requests.iter().any(|l| l.contains("\"ev\":\"call\"")) && requests.iter().any(|l| l.contains("\"ev\":\"reload\"")));
+    for line in requests.iter().chain(&log) {
+        assert!(!line.contains(CHAT) && !line.contains(OTHER_CHAT), "a chat's id in {line}");
+    }
+}
+
+/// Relay 53's two tokens of one chat, one with a grant in no list and one with `g-alpha-get`, on one live tunnel and one
+/// client, and what every other file's status keys said before any step.
+struct OneChat<'a> {
+    rig: &'a Rig,
+    worker: Served,
+    client: ai_env_relay_proto::v1::relay_client::RelayClient<tonic::transport::Channel>,
+    link: Link,
+    bare: String,
+    own: String,
+    others: (String, String, String, String, bool),
+}
+
+impl OneChat<'_> {
+    fn others_now(&self) -> (String, String, String, String, bool) {
+        let s = self.rig.app.snapshot();
+        (s.workers_version, s.signers_version, s.grants_version, s.peers_version, s.tls_loaded)
+    }
+
+    /// What holds whatever the list's state: every other file loaded at its version, no tunnel, connection or session lost.
+    fn alone(&self, what: &str) {
+        let s = self.rig.app.snapshot();
+        assert_eq!(self.others_now(), self.others, "{what}: every other file stays loaded");
+        assert!(self.worker.closes().is_empty() && s.tunnels == 1 && s.sources_live == 2, "{what}: no tunnel is closed: {:?}", self.worker.closes());
+        assert!(self.link.peer_closed_at().is_none(), "{what}: no client's connection");
+        assert_eq!(s.sessions, 2, "{what}: no session");
+    }
+
+    /// The entry adds nothing, and the token with a grant of its own keeps it.
+    async fn closed(&mut self, what: &str) {
+        let denied = (Code::PermissionDenied, "not granted".to_string());
+        assert!(list(&mut self.client, &self.bare).await.unwrap().sources.is_empty(), "{what}: the entry adds nothing to a list");
+        assert_eq!(refusal(call(&mut self.client, &self.bare, "example.alpha", "get", b"{}").await), denied, "{what}: nor to a call");
+        assert_eq!(listed_ops(&list(&mut self.client, &self.own).await.unwrap()), [ops_row("example.alpha", &["get"])], "{what}: the token's own grant stands");
+        answered(call(&mut self.client, &self.own, "example.alpha", "get", b"{}").await).await;
+        assert_eq!(refusal(call(&mut self.client, &self.own, "example.alpha", "list", b"{}").await), denied, "{what}: and nothing more");
+        self.alone(what);
+    }
+
+    /// The entry adds its grant, to either token.
+    async fn open(&mut self, what: &str) {
+        let every = [ops_row("example.alpha", &["get", "list"]), ops_row("example.alpha.logs", &["get", "list"])];
+        assert_eq!(listed_ops(&list(&mut self.client, &self.bare).await.unwrap()), every, "{what}: the entry adds to a list");
+        answered(call(&mut self.client, &self.bare, "example.alpha", "list", b"{}").await).await;
+        assert_eq!(listed_ops(&list(&mut self.client, &self.own).await.unwrap()), every, "{what}: the union with the token's own");
+        answered(call(&mut self.client, &self.own, "example.alpha", "list", b"{}").await).await;
+        self.alone(what);
+    }
+}
+
+/// Relay 53 (R-144, R-145): the list fails closed, and alone. Never written (`missing`, once), refused by the shared parser
+/// or as bytes, removed, its entry lapsed, or loaded from a fetch 901 s old while every other list is fresh: the entry adds
+/// nothing, and a token keeps its own grant (`OneChat::closed`). Each time no tunnel is closed, no client's connection and
+/// no session is lost, every other file stays loaded at its own version (`OneChat::alone`), and a good list applies again
+/// at once (`OneChat::open`).
+#[tokio::test]
+async fn the_access_list_fails_closed_and_alone() {
+    let (rig, written, _guard) = access_rig().await;
+    let worker = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let (channel, link) = rig.private_channel().await;
+    let client = ai_env_relay_proto::v1::relay_client::RelayClient::new(channel);
+    let (bare, own) = (rig.chat_token("no-grant", CHAT), rig.chat_token("g-alpha-get", CHAT));
+    let mut chat = OneChat { rig: &rig, worker, client, link, bare, own, others: Default::default() };
+    chat.others = chat.others_now();
+    assert!(!chat.others.0.is_empty() && !chat.others.1.is_empty() && !chat.others.2.is_empty() && !chat.others.3.is_empty() && chat.others.4);
+    let last_reload = |r: &Rig| {
+        let line = reloads(r, "access").pop().expect("a reload line of access");
+        (line["outcome"].as_str().unwrap().to_string(), line["version"].as_str().unwrap().to_string(), line["entries"].as_u64().unwrap())
+    };
+
+    // Never written: reported once, as the rig's first poll found it.
+    assert_eq!(reloads(&rig, "access").len(), 1);
+    assert_eq!(last_reload(&rig), ("missing".to_string(), String::new(), 0));
+    assert_eq!(rig.poll()[5], ("access", Poll::Unchanged));
+    assert_eq!(reloads(&rig, "access").len(), 1, "an absent list is reported once");
+    assert_eq!(rig.app.snapshot().access_version, "");
+    chat.closed("never written").await;
+
+    rig.write_access(&[access_entry(CHAT, &["g-example"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    chat.open("loaded").await;
+
+    // Refused, whatever refuses it: unloaded, its version gone, and its text no value.
+    let good = rig.read(ACCESS_FILE);
+    let not_uuid = String::from_utf8(good.clone()).unwrap().replace(CHAT, "not-a-uuid");
+    let unknown = String::from_utf8(good.clone()).unwrap().replacen("\"chat\"", "\"extra\":1,\"chat\"", 1);
+    let cases: [(&[u8], &str); 4] = [
+        (not_uuid.as_bytes(), "access: entry 0: chat is not a uuid (lowercase 8-4-4-4-12 hex)"),
+        (unknown.as_bytes(), "access: entry 0: an unknown field"),
+        (b"[", "access: not a JSON array (line 1, column 1)"),
+        (&[0xff, 0xfe], "not UTF-8"),
+    ];
+    for (bytes, text) in cases {
+        hear_the_relay();
+        rig.write(ACCESS_FILE, bytes);
+        assert_eq!(rig.poll()[5], ("access", Poll::Refused(text.to_string())));
+        assert_eq!(last_reload(&rig), ("refused".to_string(), String::new(), 0));
+        assert_eq!(rig.app.snapshot().access_version, "", "{text}");
+        chat.closed(text).await;
+        rig.write(ACCESS_FILE, &good);
+        assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })), "{text}");
+        assert_eq!(rig.app.snapshot().access_version, format!("{:016x}", content_version(&good)));
+        chat.open("restored").await;
+    }
+
+    // Removed.
+    rig.remove(ACCESS_FILE);
+    assert_eq!(rig.poll()[5], ("access", Poll::Missing));
+    assert_eq!(last_reload(&rig), ("missing".to_string(), String::new(), 0));
+    chat.closed("removed").await;
+    rig.write(ACCESS_FILE, &good);
+    rig.poll();
+    chat.open("written again").await;
+
+    // Lapsed, the file as it was and fresh: in force through its not_after second, nothing one second later.
+    const LAPSES: &str = "2027-01-15T08:00:05Z";
+    let lapses = ai_env_worker::policy::unix_of(LAPSES).unwrap();
+    assert_eq!(lapses, T0 + 5);
+    let until = |not_after: &str| ai_env_worker::policy::AccessEntry { not_after: not_after.into(), ..access_entry(CHAT, &["g-example"]) };
+    rig.write_access(&[until(LAPSES)]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    rig.clock.set(lapses);
+    rig.write_fetched(lapses);
+    assert_eq!(rig.poll()[5], ("access", Poll::Unchanged));
+    chat.open("through its not_after second").await;
+    rig.clock.set(lapses + 1);
+    rig.write_fetched(lapses + 1);
+    let polled = rig.poll();
+    assert!(polled.iter().all(|(_, p)| *p == Poll::Unchanged), "every file as it was, and fresh: {polled:?}");
+    chat.closed("lapsed").await;
+
+    // Stale alone: the clock and every list at T0 + 1000, then a new list loaded from a `fetched` of T0 + 99, 901 s
+    // before the clock (a fetch time only ever moves a file's freshness forward, R-16: the rest keep T0 + 1000). `loaded`
+    // would serve it; `fresh` serves nothing.
+    rig.clock.set(T0 + 1000);
+    rig.write_fetched(T0 + 1000);
+    assert_eq!(rig.poll()[5], ("access", Poll::Unchanged));
+    rig.write_fetched(T0 + 99);
+    rig.write_access(&[access_entry(CHAT, &["g-example"])]);
+    let polled = rig.poll();
+    assert!(polled[..5].iter().all(|(_, p)| *p == Poll::Unchanged) && matches!(polled[5], ("access", Poll::Loaded { .. })), "{polled:?}");
+    assert_eq!(rig.app.snapshot().access_age_s, 901);
+    chat.closed("stale").await;
+    assert_eq!(rig.poll()[5], ("access", Poll::Unchanged));
+    chat.closed("stale, a poll later").await;
+    rig.write_fetched(T0 + 1000);
+    assert_eq!(rig.poll()[5], ("access", Poll::Unchanged));
+    assert_eq!(rig.app.snapshot().access_age_s, 0);
+    chat.open("fresh again").await;
+
+    // A refused list's text and every reload line hold no value of it; a call line names the grant it went through.
+    let log = written.lines();
+    assert!(log.iter().any(|l| l.contains("a live file was refused: access: ")), "{log:?}");
+    for line in rig.sink.lines().iter().chain(&log) {
+        assert!(!line.contains(CHAT) && !line.contains("not-a-uuid"), "a chat in {line}");
+    }
+    let reload_lines = rig.lines("reload");
+    assert!(reload_lines.iter().map(ToString::to_string).chain(log).all(|l| !l.contains("g-example")), "a grant of the list in {reload_lines:?}");
+}
+
+/// Relay 54 (R-145): the list's key is the token's `chat_id` and nothing else. A token with no `chat_id` whose
+/// `session_id` is the entry's chat matches no entry, nor does one naming another chat with that `session_id`; each lists
+/// and calls under its own grant alone. A token of that chat, with any session, matches.
+#[tokio::test]
+async fn a_token_without_a_chat_matches_no_entry() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let mut client = rig.client().await;
+    rig.write_access(&[access_entry(CHAT, &["g-all"])]);
+    assert!(matches!(rig.poll()[5], ("access", Poll::Loaded { .. })));
+    let denied = (Code::PermissionDenied, "not granted".to_string());
+    let with = |chat: Option<&str>, grant: &str| mint(7, &SessionClaims { session_id: CHAT.into(), chat_id: chat.map(str::to_string), ..rig.claims(grant) });
+    for (token, what) in [(with(None, "no-grant"), "no chat"), (with(Some(OTHER_CHAT), "no-grant"), "another chat")] {
+        assert!(list(&mut client, &token).await.unwrap().sources.is_empty(), "{what}");
+        assert_eq!(refusal(call(&mut client, &token, "example.alpha", "get", b"{}").await), denied, "{what}");
+    }
+    for (token, what) in [(with(None, "g-alpha-get"), "no chat"), (with(Some(OTHER_CHAT), "g-alpha-get"), "another chat")] {
+        assert_eq!(listed_ops(&list(&mut client, &token).await.unwrap()), [ops_row("example.alpha", &["get"])], "{what}: its own grant alone");
+        assert_eq!(refusal(call(&mut client, &token, "example.alpha", "list", b"{}").await), denied, "{what}");
+    }
+    assert_eq!(a.invokes().len(), 0, "nothing reached the worker");
+    let chat = rig.chat_token("no-grant", CHAT);
+    answered(call(&mut client, &chat, "example.alpha", "list", b"{}").await).await;
+    assert_eq!(a.invoke(0).await.caller.unwrap().grant_id, "g-all", "the entry's chat, with any session");
 }

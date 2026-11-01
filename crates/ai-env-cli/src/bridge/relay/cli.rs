@@ -30,6 +30,9 @@ pub fn main(store: &Keystore, cmd: RelayCmd) -> Result<()> {
         RelayCmd::Grant { grant_id, rules, remove } => super::params::cmd_grant(&grant_id, &rules, remove),
         RelayCmd::AllowIp { cidr, label, not_after, wide, mine, hours } => super::params::cmd_allow_ip(&super::params::AllowIpArgs { cidr: cidr.as_deref(), label: label.as_deref(), not_after: not_after.as_deref(), wide, mine, hours }),
         RelayCmd::RevokeIp { cidr, label } => super::params::cmd_revoke_ip(cidr.as_deref(), label.as_deref()),
+        RelayCmd::Access { session, allow, remove, days, list, json, from_panel } => {
+            super::params::cmd_access(&super::params::AccessArgs { session: session.as_deref(), allow: allow.as_deref(), remove: remove.as_deref(), days, list, json, from_panel })
+        }
         RelayCmd::Status { json, local } => super::ops::cmd_status(json, local),
         RelayCmd::Start => super::ops::cmd_start(),
         RelayCmd::Stop => super::ops::cmd_stop(),

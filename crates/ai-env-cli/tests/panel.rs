@@ -12,10 +12,15 @@
 //! show` documents) are written here and go green at I1, once B2 is merged:
 //! `pages_render_escaped`'s last pages, `sse_streams_appended_rows`,
 //! `models_equal_cli_json`'s last documents. The panel's migrate on the S10
-//! rig is `panel/migrate.rs` (feature `shim`).
+//! rig is `panel/migrate.rs` (feature `shim`), a chat's relay access (§RS.13)
+//! `panel/access.rs`.
 #![allow(dead_code)]
 
 mod common;
+#[path = "panel/access.rs"]
+mod access;
+#[path = "common/aws_keys.rs"]
+mod aws_keys;
 #[cfg(feature = "shim")]
 #[path = "panel/migrate.rs"]
 mod migrate;
@@ -506,6 +511,15 @@ impl World {
         row.title = Some(title.to_string());
         row.title_source = Some(source.to_string());
         registry::write(&self.paths(), &row).expect("the titled row");
+    }
+
+    /// R-148: session `sid`'s row names its chat's access id and its latest spawn's mint word, as a pump writes them.
+    pub fn set_access(&self, sid: &str, access: &str, relay: &str) {
+        use ai_env_cli::bridge::registry;
+        let mut row = registry::read(&self.paths(), sid).expect("the session row").expect("a session row");
+        row.access_id = Some(access.to_string());
+        row.relay = Some(relay.to_string());
+        registry::write(&self.paths(), &row).expect("the row with its access id");
     }
 
     /// Every file under the world, concatenated (lossy).
@@ -1060,16 +1074,20 @@ fn nonce_single_use() {
 /// Each action's confirm page and status page name its CLI twin.
 #[test]
 fn every_action_names_its_cli_twin() {
-    let w = World::new();
+    let w = World::with_toml("[panel]\nenabled = true\n\n[relay]\noffer = [\"g-a\"]\n");
     let vm = w.vm(&[]);
     w.session(SID, "remote", Some(&vm), "remote", "/w/remote");
+    w.set_access(SID, "0199a1b2-0000-7000-8000-0000000012a1", "minted");
     let p = w.serve(&[]);
+    let relay_target = format!("{SID}_g-a");
     for (action, target, twin) in [
         ("vm-suspend", vm.as_str(), format!("ai-env vm suspend {vm}")),
         ("vm-resume", vm.as_str(), format!("ai-env vm resume {vm}")),
         ("vm-terminate", vm.as_str(), format!("ai-env vm terminate {vm}")),
         ("vm-refresh", "-", "ai-env vm list".to_string()),
         ("session-migrate", SID, format!("ai-env session migrate {SID}")),
+        ("relay-allow", relay_target.as_str(), format!("ai-env relay access {SID} --allow g-a")),
+        ("relay-remove", relay_target.as_str(), format!("ai-env relay access {SID} --remove g-a")),
     ] {
         let doc = p.get(&format!("confirm?action={action}&target={target}&json=1")).json();
         assert_eq!((doc["action"].as_str(), doc["target"].as_str(), doc["twin"].as_str()), (Some(action), Some(target), Some(twin.as_str())), "{doc}");
@@ -1094,6 +1112,7 @@ fn models_equal_cli_json() {
     let w = World::new();
     let vm = w.vm(&[]);
     w.session(SID, "remote", Some(&vm), "remote", "/w/remote");
+    w.set_access(SID, "0199a1b2-0000-7000-8000-0000000012a1", "minted");
     w.session(SID_LOCAL, "local-child", None, "local", "/w/local");
     plant_captures(&w, SID, "Bash(git status)");
     // P-1: a detail value holding a raw C1 (U+009B, a terminal's CSI) and a DEL, which a JSON line may hold raw.

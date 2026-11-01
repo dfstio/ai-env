@@ -220,6 +220,8 @@ ai-env relay  grant GRANT RULE… | grant GRANT --remove | tls init [--force] | 
                                                           #   its certificate, as ai-env-deployer only (tls rotate: one Touch ID; S13)
 ai-env relay  status [--json] [--local] | start | stop    # the relay instance, as ai-env-ops (--local: this Mac's keys and agent only,
                                                           #   no AWS, no Touch ID; S13)
+ai-env relay  access SESSION --allow G [--days N] | access SESSION --remove G | access --list [--json]   # a chat's grants in the relay, as
+                                                          #   ai-env-ops: applied within about 70 s, with no restart (S13)
 ai-env relay  agent [--hours N]                           # one Touch ID, then it signs worker handshakes and mints VM session tokens
                                                           #   until Ctrl-C or N hours (default 12, at most 24; S13)
 ai-env as     deployer|ops|root|ambient [--account ACCOUNT] -- CMD ARGS...   # run CMD as one AWS identity, the marker AI_ENV_BRIDGE_AS set (Identities)
@@ -2068,20 +2070,24 @@ exactly `127.0.0.1:PORT` (else 403: no DNS rebinding); only GET, HEAD and POST p
 own and its `Sec-Fetch-Site` `same-origin` (else 403), its body a small form (else 413 or 415). Every
 answer carries a strict Content-Security-Policy, `no-referrer`, `X-Frame-Options: DENY`, `nosniff` and
 `no-store`, and never a cookie or a CORS header. The pages, rendered on the Mac with every value
-escaped (each also as JSON with `?json=1`): Sessions (name, VM, moves, cost; a search over names and
-ids), a session (its name, generations, moves, timeline and cost), VMs (with RUN and COST), Audit
+escaped (each also as JSON with `?json=1`): Sessions (name, VM, moves, cost, each remote chat's relay
+token and grants; a search over names and
+ids), a session (its name, relay token and grants, generations, moves, timeline and cost), VMs (with RUN and COST), Audit
 (live, at most 8 streams), a session's settings diff (read-only) and Cost. The actions: suspend,
-resume and terminate a VM, refresh the list, and migrate a chat. Each goes through a confirm page
+resume and terminate a VM, refresh the list, migrate a chat, and allow or remove a chat's relay grant
+(stage S13). Each goes through a confirm page
 that names its CLI twin (`ai-env vm suspend ID`, …) and issues a nonce bound to it, single use for 5
 minutes; one action runs at a time (another gets 409), each asks its own Touch ID from the panel's
 process, and its rows say `actor=panel`. A live chat's migrate is its wrapper's move, with that move's
-Touch ID. The Run button posts through the page's script (a plain form post under `no-referrer` would
+Touch ID. A chat's relay grant runs its CLI twin (`ai-env relay access SESSION --allow G`) as a child, without the panel's
+own credentials: one Touch ID of the ops key per action, which the panel never holds, and its row says `actor=panel`
+too. The Run button posts through the page's script (a plain form post under `no-referrer` would
 carry no usable `Origin`, and gets 403).
 The panel's start and stop are audited (`panel_serve`).
 
 **The audit.** `audit.jsonl` is at schema v2: every row's `detail.actor` says who wrote it (`cli`,
 `wrapper` or `panel`; the wrapper's detached `vm warm` says `wrapper`, `claude admit --auto` `cli`), and
-a registry of every event (96, S13's seven `relay_*` and the relay security plan's two included, with their keys, the key that names a
+a registry of every event (97, S13's seven `relay_*`, the relay security plan's two and `relay_access` included, with their keys, the key that names a
 VM, where the session comes from and what each means for the cost) is frozen in
 `tests/fixtures/audit/schema-v2.json`: names and keys
 are never renamed. S11's events: `claude_admit`, `claude_stage`, `claude_fetch`, `claude_object_bad`,
@@ -2367,6 +2373,41 @@ its 2 s); `session_remote_start` records the outcome (`relay=WORD`: `minted`, `n
 (`relay: no relay agent answers on this Mac …`). The wrapper asks no Touch ID for it: the agent holds
 the keys.
 
+**A chat's access: none until you approve it.** With `[relay] grant = "no-grant"`, a name in no grant
+list, every remote chat holds a token and the two tools, and a chat with no approval sees an empty catalog:
+`relay_catalog` lists no source and `relay_call` answers `not granted`. On the panel's Sessions or session
+page (or with `ai-env relay access SESSION --allow G`) you approve one chat for a grant `[relay].offer` names.
+That rewrites `/ai-env/relay/access` and nothing else: within about 70 s the chat's running token reaches
+the grant too, with no change in the chat or its VM and no restart. `--remove G` takes it back in the same
+time, and calls in flight finish. The relay reads the list on each request and judges it alone: a list absent,
+refused or lapsed adds nothing, unloads nothing else and closes nothing.
+If the reload cannot fetch or write, the old list stays in force until it goes stale, at most 900 s after its
+last good fetch, and then every list fails closed; `ai-env relay stop` is the immediate cut.
+
+Each chat has one access id, a uuid this Mac chooses at its first start and keeps in its registry row
+(`access_id`), which every token of the chat names as its `chat_id`. So approval survives a respawn, a move,
+a wall's migration and `/clear`, whose new row holds the same id; a later `--resume` takes it from the row; a
+fork started with `--fork-session`, or an argv with two `--resume` flags, gets its own and inherits nothing; and no
+init from a VM chooses it. A process's token cannot change, so a session switch inside one, as `/clear` or an
+in-process `/branch`, stays the same chat and keeps its access. A `--no-session-persistence` spawn has
+no row to approve, so it gets no token. An approval lasts `--days` (1 to 90, 30 by default, the entry's last
+valid day, UTC). An entry has one end for all its grants, the later of the old and the new, so an approval can stretch the
+chat's other grants, or outlast its own `--days`: the confirm page says so, and a `note:` beside the result. `G` must be in
+`[relay].offer` and in `/ai-env/relay/grants` (exit 9 otherwise), which `--remove` does not ask, so a grant dropped from both
+can still leave a chat. So can a chat back on this Mac, which takes no new grant but keeps its id for a later remote `--resume`.
+Each write prunes what lapsed; a list still full (about 36 chats, in 4096 bytes) is exit 1 with nothing written.
+`--list` shows the entries with the sessions that hold them. `ai-env relay access` finds a chat through its row, so
+`session forget` of its last row leaves its entry until it lapses, and says so: its tokens end within 8 hours, and a write
+after its end prunes it. Each approval costs one Touch ID of the ops key, which of the relay's lists may write this one
+alone (`WriteRelayAccess`).
+
+Three things stay true. A chat with no token (agent off at its spawn: `no_agent`) gets nothing from an approval
+until its next spawn, so keep `ai-env relay agent` running; its page says so, and its Migrate makes one. Chats in
+a workspace share a VM by default (`reuse_per_workspace`), and a process there could use another chat's access:
+each confirm page names those chats, and for a grant that matters set `reuse_per_workspace = false`. A stolen ops key
+can widen a chat already listed, though it reads nothing without a process inside that chat. Edit `bridge.toml`
+only after `make install`: an older binary refuses the `offer` key.
+
 **What the VM holds.** The session (the token, the relay's address and name, and the relay CA) rides
 the spawn's credential delivery to its own VM only, behind the credential gate. The shim hands it on
 fd 3 to `ai-env-relay-client`, started as ai-env-net (uid 999), one per spawn: it serves
@@ -2391,7 +2432,7 @@ Its binary is hash-pinned: `make relay-artifact` cross-builds it (aarch64, the s
 `--locked`, so from the reviewed `Cargo.lock`)
 into `target/relay/` with `relay.json` (`make deploy`, `make preview` and `make deploy-policies` run it
 first), and the deploy uploads it and pins its SHA-256 in the parameter `artifact`. The reload unit
-(`ai-env-relay-reload`, every minute) fetches `/ai-env/relay/{artifact,workers,grants,token-signers,peers,tls}`
+(`ai-env-relay-reload`, every minute) fetches `/ai-env/relay/{artifact,workers,grants,token-signers,peers,access,tls}`
 in one call, checks each value, swaps them into the relay's live directory, loads the allowlist into the
 kernel and installs the pinned
 binary when it changed, going back to the previous one if it does not start. The weekly patch
@@ -2452,11 +2493,11 @@ the check fails, and a failed check revokes the connector's records. `make deplo
 `ai-env egress check` (`new image version: …`) before its `make infra-status WRITE=1` hint: keep the
 order below.
 
-**Who may use it.** Four SSM String parameters under `/ai-env/relay`, each a JSON list that only the
-deployer writes (`ai-env relay allow`, `revoke`, `grant`, `allow-ip` and `revoke-ip`: as ai-env-ops, or
-with no runner, they are
-refused before any Touch ID or AWS call, exit 9), created at the first write and never by Pulumi
-(grants name private sources, which stay out of the repository and of Pulumi's state):
+**Who may use it.** Five SSM String parameters under `/ai-env/relay`, each a JSON list, created at the
+first write and never by Pulumi (grants name private sources, which stay out of the repository and of
+Pulumi's state). The first four only the deployer writes (`ai-env relay allow`, `revoke`, `grant`,
+`allow-ip` and `revoke-ip`: as ai-env-ops, or with no runner, they are refused before any Touch ID or AWS
+call, exit 9), and ai-env-ops also writes the fifth (`ai-env relay access`, which has no such refusal: IAM decides):
 
 - `workers`, the whitelist: each worker's id, its Ed25519 public key, the source names it may register
   (globs), its last valid day (`--not-after`: a year by default, at most two) and, once it has a client
@@ -2465,7 +2506,9 @@ refused before any Touch ID or AWS call, exit 9), created at the first write and
   (`--token-signer`); a key has one id and one role, so a worker's key never mints tokens;
 - `grants`, default-deny: each grant is a list of `SOURCE-GLOB/OP-GLOB` rules, and a chat lists and
   calls only what its token's grant reaches (`*/*` reaches everything, which the command notes);
-- `peers`, the public face's allowlist: each entry a network, a label and the moment it lapses (below).
+- `peers`, the public face's allowlist: each entry a network, a label and the moment it lapses (below);
+- `access`: each entry a chat's access id, the grants it holds beyond its token's own and the moment it lapses
+  (above).
 
 The relay applies a change within 60 s (`revoke` closes the worker's tunnel by then). A list holds at
 most 64 entries and 4096 bytes. A list that does not parse is never overwritten (exit 1). Writers on
@@ -2527,12 +2570,12 @@ dialing until `ai-env relay start`.
 
 **What `ai-env relay status` says.** This Mac's side first (no AWS, no Touch ID; `--local` stops there),
 then, as ai-env-ops, the instance, SSM's ping, a TCP probe of port 443, the relay's newest status line, what
-it refused in the last hour, the workers, the token signers, the grants and the peers list. `[NO ]` is exit
+it refused in the last hour, the workers, the token signers, the grants, the peers list and the access list. `[NO ]` is exit
 1: this Mac's session key is no token signer in force, a list does not parse, the instance is not running,
 or the peers list is absent or holds no entry in force. `[?? ]` is a read that failed, exit 7 unless a finding
 came first. `[warn]` and `[-  ]` never change the exit. `--json` holds the same under `instance` (with its
-`refused` and `disk_full`), `workers`, `token_signers`, `grants`, `peers`, `status` and `mac`. The rows that
-speak of the allowlist, the bans and the certificates:
+`refused` and `disk_full`), `workers`, `token_signers`, `grants`, `peers`, `access`, `status` and `mac`. The rows that
+speak of the allowlist, the bans, the certificates and the chats:
 
 - The probe connects within 3 s and waits a second, sending nothing, so it is no fault.
   `[ok ] probe: …:443 accepts a TCP connection`; `[warn] probe: …:443 closed the connection before TLS: …`, the
@@ -2553,6 +2596,14 @@ speak of the allowlist, the bans and the certificates:
   force (`the relay admits no worker`) or when it does not parse, and `[?? ] /ai-env/relay/peers could not be
   read (…)` alone when that call fails. `[warn] peer mac lapsed at …: this Mac's worker is refused (ai-env relay
   allow-ip --mine)`, and `[warn] peer … is wider than /16: it admits much of the internet (…)`.
+- The access list too: `[ok ] /ai-env/relay/access v3: 2 chat(s), 1 in force`, then one `[-  ]   chat … grants …
+  until …` per entry, a lapsed one's ending `EXPIRED`. Absent is `[-  ] /ai-env/relay/access: absent: no chat has more
+  than its token's grant`, never a finding; it is `[NO ]` when it does not parse, and `[?? ] /ai-env/relay/access could
+  not be read (…)` alone when that call fails. A `relay status` that reads and parses the list, and a `relay access` that
+  ends with exit 0, leave what they read in `state/relay-access.json` (0600), which the panel shows as `as of v3, TIME`, for
+  display only: the relay remains the gate. A `relay access` that ends otherwise leaves it as it was, unless its write
+  reported failure or the panel killed its child: that write may have landed (its answer lost, another writer's version in
+  it), so its `relay_access` row says `outcome=unknown`, the file goes, and the panel says `not read yet` until the next read.
 
 **The relay's TLS.** `ai-env as deployer -- ai-env relay tls init` makes the relay CA (ECDSA P-256),
 seals its key into `credentials/relay-ca.env` (no Touch ID), writes its certificate to
@@ -2569,8 +2620,10 @@ Touch ID). Both run only as ai-env-deployer, and hand the value to aws on its st
 ```toml
 [relay]                 # bridge.toml
 worker_id = "mac"       # this Mac's id: its worker's, its token signer's and its tokens' caller
-grant = "default"       # the grant a remote chat's token names; "" (the default): no token, no tools
+grant = "default"       # the grant a remote chat's token names; "" (the default): no token, no tools;
+                        #   a name in no grant list ("no-grant"): a token and the tools, an empty catalog until approved
 agent_hours = 12        # ai-env relay agent's life, 1 to 24
+offer = ["example-a"]   # what the panel offers each chat and relay access --allow takes: at most 16 ids with no `.`; none by default
 
 [[workspace]]
 path = "/path/to/a/repo"
@@ -2696,7 +2749,8 @@ but the relay's own at most 60 lines a minute (`log_suppressed` in the status li
 **Also in the relay security plan.**
 
 - two audit events, `relay_allow_ip` and `relay_revoke_ip` (the label and the prefix length, never the
-  address), and `relay_allow` gains `tls_fp` (stage S11's audit);
+  address), and `relay_allow` gains `tls_fp` (stage S11's audit); then `relay_access` (`op`, `outcome`; the grant, the
+  chat's access id, the entry's end, the version, how many lapsed entries a write pruned), on this Mac alone;
 - `make check-advisories` checks the workspace's lock against the RustSec advisories (`cargo deny`,
   `deny.toml`). An unreachable database falls back to the cached copy, else the check is skipped with a note.
   It needs `cargo install cargo-deny --locked`, and neither `make test`, `make gates` nor `make deploy` runs it;

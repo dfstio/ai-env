@@ -215,6 +215,14 @@ pub struct SessionPlan {
     pub t0: Instant,
     /// `--resume`'s session id, when it is a uuid (the transcript's restore, the VM preferred).
     pub resume: Option<String>,
+    /// R-148: the chat's access id, set once here at P0 ([`access_id_of`]), the `chat` every generation's token names:
+    /// so it survives a respawn, a move, a wall's migration and `/clear`, whatever session id the VM's init says.
+    /// `None`: a `--no-session-persistence` spawn, which no row keeps, so none could be approved: it mints nothing.
+    pub access_id: Option<String>,
+    /// R-148: the `--resume` whose chat this process is not ([`keeps_chat`]: a fork's parent, or one of two `--resume`s):
+    /// a hostile init may name it and adopt its row, and a row with no id must not take [`SessionPlan::access_id`] then,
+    /// or approving that chat, and any later `--resume` of it, would reach this process.
+    pub access_foreign: Option<String>,
     /// The code-out trigger captures the VM's settings into the session's
     /// quarantine (T8.7): never for `--no-session-persistence` (Cursor's
     /// prompt-suggestion queries), which no registry row keeps, so nothing
@@ -626,6 +634,8 @@ impl SessionPlan {
             ws,
             t0: Instant::now(),
             resume: None,
+            access_id: Some(uuid::Uuid::now_v7().to_string()),
+            access_foreign: None,
             capture_settings: true,
             knobs: VmKnobs::default(),
             run,
@@ -728,6 +738,9 @@ pub struct PipelineEnd {
     /// S11 (A.4): V's fetch after the CLI's first output ([`AfterOutput`]); `None`: nothing (V not nameable, or
     /// the VM's image lacks `claude_stage_v1`).
     pub after_output: Option<AfterOutput>,
+    /// R-148: the word of this spawn's session token (`mint::MintOutcome::word`), which the link copies into
+    /// `RemoteSnapshot.relay` for the row; `None` from a test's pipeline.
+    pub relay: Option<&'static str>,
 }
 
 /// What the moved CLI resumes (S10 L2).
@@ -862,11 +875,26 @@ pub fn move_argv(argv: &[String], session_id: Option<&str>, cut: &Cut) -> Vec<St
 }
 
 /// Whether `argv` (P0's, before a bare `--`) forks `sid`: `--fork-session`,
-/// and its own `--resume` or `-r` (the last one) names `sid`, each read as
-/// [`move_argv`]'s loop reads them (`--resume X`, `--resume=X`, `-r X`,
-/// `-r=X`; another flag's value is no flag, whatever it reads).
+/// and its own `--resume` or `-r` (the last one) names `sid` ([`resume_flags`]).
 fn forks_session(argv: &[String], sid: &str) -> bool {
-    let (mut fork, mut resumed) = (false, None);
+    let (resumed, fork) = resume_flags(argv);
+    fork && resumed.last().copied().flatten() == Some(sid)
+}
+
+/// R-148: whether P0's `argv` goes on in the one chat its `--resume` names: exactly one `--resume` or `-r` and no
+/// `--fork-session`, before a bare `--`. A fork is another chat. Two flags name two chats: P0 reads the first
+/// (`wire::argv::value_of`) and the CLI may take the last, so neither row speaks for this process.
+fn keeps_chat(argv: &[String]) -> bool {
+    let end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let (resumed, fork) = resume_flags(&argv[..end]);
+    resumed.len() == 1 && !fork
+}
+
+/// The `--resume` and `-r` flags of `argv` (P0's, before a bare `--`), in order, each with its value when it has one, and
+/// whether `--fork-session` is there; each read as [`move_argv`]'s loop reads them (`--resume X`, `--resume=X`, `-r X`,
+/// `-r=X`; another flag's value is no flag, whatever it reads).
+fn resume_flags(argv: &[String]) -> (Vec<Option<&str>>, bool) {
+    let (mut fork, mut resumed) = (false, Vec::new());
     let mut i = 0;
     while i < argv.len() {
         let a = &argv[i];
@@ -877,7 +905,7 @@ fn forks_session(argv: &[String], sid: &str) -> bool {
         if RESUME_VALUE_FLAGS.contains(&flag) {
             let next = if inline.is_none() { argv.get(i + 1).filter(|v| !v.starts_with('-')) } else { None };
             if matches!(flag, "--resume" | "-r") {
-                resumed = inline.or(next.map(String::as_str));
+                resumed.push(inline.or(next.map(String::as_str)));
             }
             i += if next.is_some() { 2 } else { 1 };
             continue;
@@ -889,7 +917,20 @@ fn forks_session(argv: &[String], sid: &str) -> bool {
         }
         i += 1;
     }
-    fork && resumed == Some(sid)
+    (resumed, fork)
+}
+
+/// R-148: the access id of the chat P0 starts: the row's for a `--resume` that goes on in its chat ([`keeps_chat`]; a row
+/// with none, or with one that is no canonical uuid, gets a new one, as a chat begun before this), a new uuid for anything
+/// else (a new chat, a `--continue`, a fork, which inherits nothing); none for a `--no-session-persistence` spawn. Read from
+/// this Mac's row and never from the VM, so no init can choose it.
+fn access_id_of(paths: &Paths, resume: Option<&str>, argv: &[String], no_session_persistence: bool) -> Option<String> {
+    if no_session_persistence {
+        return None;
+    }
+    let row = resume.filter(|_| keeps_chat(argv)).and_then(|sid| crate::bridge::registry::read(paths, sid).ok().flatten());
+    let kept = row.as_ref().and_then(|r| r.access()).map(str::to_string);
+    Some(kept.unwrap_or_else(|| uuid::Uuid::now_v7().to_string()))
 }
 
 /// How a workspace is resolved (`workspace::resolve`; tests inject theirs).
@@ -993,6 +1034,8 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     provisional_gate(&ctx, &run).map_err(|e| precheck(BridgeError::Cli(e)))?;
     let store = Keystore::resolve(env("AI_ENV_DIR").filter(|d| !d.is_empty()).map(PathBuf::from)).map_err(|e| precheck(BridgeError::Cli(e)))?;
     let argv = vm_argv(cfg, &sess.args)?;
+    let access_id = access_id_of(&sess.paths, resume.as_deref(), &argv, sess.session.no_session_persistence);
+    let access_foreign = resume.clone().filter(|_| !keeps_chat(&argv));
     let session_env = crate::bridge::remote::env::session_env(cfg, env).map_err(|what| Failure::Refused { what })?;
     spawn_frame_fits(&ctx, &argv, &ws, &session_env)?;
     // One try: P0 runs before the pump reads the host or listens for a stop, so a closing session's exclusive
@@ -1028,6 +1071,8 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
         ws,
         t0: Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now),
         resume,
+        access_id,
+        access_foreign,
         capture_settings: !sess.session.no_session_persistence,
         knobs: ctx.knobs,
         run,
@@ -1886,6 +1931,7 @@ async fn onwards<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
         seal: Some(seal),
         claude: Some(end.claude),
         after_output: end.after_output,
+        relay: Some(end.relay),
     })
 }
 
@@ -1953,6 +1999,7 @@ async fn same_vm<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoin
         seal: Some(seal),
         claude: Some(end.claude),
         after_output: end.after_output,
+        relay: Some(end.relay),
     })
 }
 
@@ -2059,6 +2106,8 @@ struct Spawned {
     /// S11 (A.4): what P4 asked of the VM, and V's fetch after the first output.
     claude: ClaudeAsk,
     after_output: Option<AfterOutput>,
+    /// R-148: the word of this spawn's session token.
+    relay: &'static str,
 }
 
 /// What a generation spawns (S10: its argv is its own): the CLI's argv,
@@ -2100,10 +2149,14 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     agent_env(ctx, &*api, &*ep, &row, Some(&vm)).map_err(|e| failed_cli(StartStep::Spawn, e, at))?;
     let spawn_id = SpawnId::new_v7();
     let Spawning { argv, session: session_id, why, account } = spawning;
-    // S13 (WM-R50 to WM-R53): this spawn's relay session token, asked of this Mac's relay agent within 2 s (a
-    // resumed or moved chat's id as `chat_id`); it rides the delivery to this VM only, and the word goes in
-    // `session_remote_start` (`for_spawn` says WM-R53's note itself: the agent's refusal code is known there).
-    let relay = crate::bridge::relay::mint::for_spawn(&plan.cfg, &plan.paths, &plan.ws, &row, &spawn_id, session_id.as_deref(), crate::wire::time::unix_now()).await;
+    // S13 (WM-R50 to WM-R53): this spawn's relay session token, asked of this Mac's relay agent within 2 s, the chat's
+    // access id its `chat_id` (R-148: P0's, never the id the VM's init said); it rides the delivery to this VM only, and
+    // the word goes in `session_remote_start` (`for_spawn` says WM-R53's note itself: the agent's refusal code is known
+    // there). A `--no-session-persistence` spawn has no row to approve, so it mints nothing and says `off`.
+    let relay = match plan.access_id.as_deref() {
+        Some(chat) => crate::bridge::relay::mint::for_spawn(&plan.cfg, &plan.paths, &plan.ws, &row, &spawn_id, Some(chat), crate::wire::time::unix_now()).await,
+        None => crate::bridge::relay::mint::MintOutcome::Skipped("off"),
+    };
     let relay_word = relay.word();
     let delivery = delivery.with_relay(relay.into_spawn());
     // S11 (A.4): the staged claudes this spawn may name ([`claude_ask`]), and V's fetch into the VM after the CLI's
@@ -2137,7 +2190,7 @@ async fn spawn<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: EndpointC
     }
     audit_event(&plan.paths, event::SESSION_REMOTE_START, &pairs);
     tracing::info!(gen, vm = %id, spawn = %spawn_id, "the remote spawn went to its session");
-    Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report, claude, after_output })
+    Ok(Spawned { vm: id, spawn_id, trigger, session, delivery: report, claude, after_output, relay: relay_word })
 }
 
 /// What the code-out trigger syncs the session's transcript with (S9):
@@ -2340,6 +2393,7 @@ async fn move_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endpoi
         seal: Some(seal),
         claude: Some(end.claude),
         after_output: end.after_output,
+        relay: Some(end.relay),
     })
 }
 
@@ -4259,6 +4313,7 @@ async fn switch_gen<A: MicrovmApi + crate::bridge::s3::S3Sign + 'static, E: Endp
         seal: Some(seal),
         claude: Some(end.claude),
         after_output: end.after_output,
+        relay: Some(end.relay),
     })
 }
 
@@ -5528,6 +5583,79 @@ mod tests {
 
     /// The documentation account's made-up egress connector.
     const CONNECTOR: &str = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+
+    /// R-148: a row's id goes only to a process that goes on in that one chat: exactly one `--resume` or `-r` and no
+    /// `--fork-session`, before a bare `--`, another flag's value being no flag. Anything else is a fresh uuid, and it is
+    /// `access_foreign`'s to keep off that row. A `--no-session-persistence` spawn has none, and a row with none, or with a
+    /// text that is no uuid, gives none.
+    #[test]
+    fn a_chat_takes_its_rows_access_id_only_from_one_resume_that_does_not_fork() {
+        const A: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        const B: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+        const NONE: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+        const HAND_EDITED: &str = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e";
+        const CHAT_A: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+        const CHAT_B: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().join("bridge"), None);
+        for (sid, access) in [(A, Some(CHAT_A)), (B, Some(CHAT_B)), (NONE, None), (HAND_EDITED, Some("not a uuid"))] {
+            crate::bridge::registry::write(&paths, &crate::bridge::registry::SessionRow { session_id: sid.into(), mode: "remote".into(), access_id: access.map(str::to_string), ..crate::bridge::registry::SessionRow::default() }).unwrap();
+        }
+        let argv = |args: &[String]| -> Vec<String> { ["--output-format", "stream-json"].iter().map(|a| (*a).to_string()).chain(args.iter().cloned()).collect() };
+        let words = |args: &[&str]| -> Vec<String> { args.iter().map(|a| (*a).to_string()).collect() };
+        let eq = |flag: &str, sid: &str| format!("{flag}={sid}");
+        // The one chat.
+        for (i, args) in [
+            vec![eq("--resume", A)],
+            words(&["--resume", A]),
+            vec![eq("--resume", A), "--".into(), "--fork-session".into()],
+            vec![eq("--resume", A), "--".into(), eq("--resume", B)],
+            vec!["--model".into(), "--fork-session".into(), eq("--resume", A)],
+            vec!["--model".into(), eq("--resume", B), eq("--resume", A)],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let args = argv(args);
+            assert!(keeps_chat(&args), "{i}: {args:?}");
+            assert_eq!(access_id_of(&paths, Some(A), &args, false).as_deref(), Some(CHAT_A), "{i}: {args:?}");
+        }
+        // Not that chat: a fresh uuid each time, and never either row's.
+        for (i, args) in [
+            vec![eq("--resume", A), "--fork-session".into()],
+            vec!["--fork-session".into(), "--resume".into(), A.into()],
+            vec![eq("--resume", A), eq("--resume", B)],
+            vec![eq("--resume", A), "--resume".into(), B.into()],
+            vec![eq("--resume", A), "-r".into(), B.into()],
+            vec![eq("--resume", A), eq("-r", B)],
+            vec![eq("--resume", A), "--resume".into()],
+            vec![eq("--resume", A), eq("--resume", B), "--fork-session".into()],
+            vec![eq("--resume", A), eq("--resume", A)],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let args = argv(args);
+            assert!(!keeps_chat(&args), "{i}: {args:?}");
+            let id = access_id_of(&paths, Some(A), &args, false).expect("a chat has an id");
+            assert!(ai_env_worker::globs::valid_uuid(&id) && id != CHAT_A && id != CHAT_B, "{i}: {args:?}: {id}");
+            assert_ne!(access_id_of(&paths, Some(A), &args, false).as_deref(), Some(id.as_str()), "{i}: fresh each time");
+        }
+        // A new chat, a row with none, a text that is no uuid, a row that is not there: fresh.
+        let plain = argv(&[]);
+        assert!(access_id_of(&paths, None, &plain, false).is_some_and(|id| ai_env_worker::globs::valid_uuid(&id)));
+        for sid in [NONE, HAND_EDITED, "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4aff"] {
+            let args = argv(&[eq("--resume", sid)]);
+            assert!(access_id_of(&paths, Some(sid), &args, false).is_some_and(|id| ai_env_worker::globs::valid_uuid(&id)), "{sid}");
+        }
+        // No persistence, no id, whatever it resumes.
+        assert_eq!(access_id_of(&paths, Some(A), &argv(&[eq("--resume", A)]), true), None);
+        assert_eq!(access_id_of(&paths, None, &plain, true), None);
+        // `forks_session` keeps its own rule: the last flag's value, which a move's argv follows.
+        assert!(forks_session(&argv(&[eq("--resume", A), eq("--resume", B), "--fork-session".into()]), B));
+        assert!(!forks_session(&argv(&[eq("--resume", A), eq("--resume", B), "--fork-session".into()]), A));
+        assert!(!forks_session(&argv(&[eq("--resume", B)]), B));
+    }
 
     /// The chat's argv (extension 2.1.282), plus an `--add-dir`.
     const ARGS: [&str; 18] = [

@@ -1,6 +1,6 @@
 //! The VM session token of a remote spawn (S13, WM-R50 to WM-R53, WM-R62; LD-WM2 to LD-WM5). Each new spawn (a
 //! new chat, a retry, a move; never a reattach) asks this Mac's `ai-env relay agent` for a token naming its VM,
-//! its spawn id, the chat it resumes or moves, and the workspace's grant, within 2 s; a minted token becomes the
+//! its spawn id, its chat's access id (R-148), and the workspace's grant, within 2 s; a minted token becomes the
 //! spawn's relay session (`wire::relay::RelaySpawn`: the token, the relay's private face from the constants
 //! `RELAY_IP` and `RELAY_PORT`, `RELAY_IP` as the name its certificate carries, and `state/relay-ca.der`), which
 //! rides the spawn's credential delivery to its own VM only (`agent::Delivery::with_relay`).

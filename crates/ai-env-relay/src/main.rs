@@ -2,8 +2,10 @@
 //! (plans/s13-contracts.md §R-relay.2.3).
 //!
 //! Exit codes: run 0 after a clean stop, 1 on a runtime failure (a bind, a server error), 2 when the config is
-//! refused; `check` 0 when the five live files are loaded and the four JSON lists fresh, 1 otherwise, 2 when the
-//! config is refused. `check` binds nothing and writes nothing, and never prints a key, a glob or a source name.
+//! refused; `check` 0 when the five files the relay needs are loaded, their four JSON lists fresh, and the access list
+//! missing or loaded and fresh (R-144: no chat holds more than its token until the first approval), 1 otherwise, 2 when
+//! the config is refused. `check` binds nothing and writes nothing, and never prints a key, a glob, a source name or a
+//! chat.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -215,6 +217,24 @@ fn check(env_file: &Path) -> ExitCode {
             println!("{peers_file}: missing");
         }
     }
+    // R-144: the sixth line. Refused or stale exits 1, as the lists; missing exits 0, the list's state until the first
+    // approval.
+    let access_file = ai_env_relay::lists::ACCESS_FILE;
+    match (&polls[5].1, entries_of(&live.access.loaded())) {
+        (Poll::Refused(text), _) => {
+            ok = false;
+            println!("{access_file}: refused ({text})");
+        }
+        (_, Some((version, entries, fresh_at))) => {
+            let age = fresh_at.and_then(|t| now.duration_since(t).ok());
+            if age.is_none_or(|a| a > max_stale) {
+                ok = false;
+            }
+            let age = age.map_or_else(|| "none".to_string(), |a| a.as_secs().to_string());
+            println!("{access_file}: loaded version={version:016x} entries={entries} age_s={age}");
+        }
+        (_, None) => println!("{access_file}: missing"),
+    }
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -251,6 +271,12 @@ impl Counted for ai_env_relay::lists::Grants {
 }
 
 impl Counted for ai_env_relay::lists::Peers {
+    fn count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl Counted for ai_env_relay::lists::Access {
     fn count(&self) -> usize {
         self.entries.len()
     }

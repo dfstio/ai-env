@@ -1,9 +1,10 @@
-//! The relay's four lists (S13, WM-R41 to WM-R45, WM-R7; the relay security plan, §RS.4): `/ai-env/relay/workers`
+//! The relay's five lists (S13, WM-R41 to WM-R45, WM-R7; the relay security plan, §RS.4, §RS.13): `/ai-env/relay/workers`
 //! (the whitelist of worker keys and the source names each may register), `/ai-env/relay/token-signers` (the keys
 //! whose VM session tokens the relay takes: each Mac's session key), `/ai-env/relay/grants` (the source and op rules
-//! a token's grant reaches) and `/ai-env/relay/peers` (the networks the public face admits). Each is one SSM String
-//! parameter holding a compact JSON array, rendered and parsed by `ai_env_worker::policy` (the relay reads them with
-//! the same code), and written only by ai-env-deployer.
+//! a token's grant reaches), `/ai-env/relay/peers` (the networks the public face admits) and `/ai-env/relay/access`
+//! (the grants each chat holds beyond its token's own). Each is one SSM String parameter holding a compact JSON array,
+//! rendered and parsed by `ai_env_worker::policy` (the relay reads them with the same code), the first four written
+//! only by ai-env-deployer and the access list by ai-env-ops too.
 //!
 //! - The identity gate (WM-R41): no marker (the resolver would pick `credentials/ops.env`) and an ops marker are
 //!   refused, exit 9, before any unseal or AWS call: the lists decide who reaches private data. A deployer,
@@ -25,13 +26,19 @@
 //! - One network, one label (§RS.4.2, R-86): `allow-ip` is an upsert by label, `revoke-ip` a removal by network or
 //!   by label. A prefix under 16 needs `--wide`: a typo such as `/0` must not lift the allowlist (Q-R22). `--mine`
 //!   asks checkip.amazonaws.com for this Mac's address and writes it as the `/32` of the label `mac`.
+//! - One chat's access (§RS.13, R-150): `access` names no marker of its own, so no gate: IAM decides, and of the relay's
+//!   lists ops writes this one alone (`WriteRelayAccess`). A Touch ID approves a chat the row of a session on this Mac names, for
+//!   a grant `[relay].offer` names and `/ai-env/relay/grants` holds; every write prunes the lapsed entries. `state/relay-access.json`
+//!   keeps what was last read for the panel to show (R-152): the relay alone is the gate, and a write that reports failure,
+//!   which may have landed, leaves no cache.
 use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
-use crate::bridge::audit::event::{RELAY_ALLOW, RELAY_ALLOW_IP, RELAY_GRANT, RELAY_REVOKE, RELAY_REVOKE_IP};
+use crate::bridge::audit::event::{RELAY_ACCESS, RELAY_ALLOW, RELAY_ALLOW_IP, RELAY_GRANT, RELAY_REVOKE, RELAY_REVOKE_IP};
 use crate::bridge::awscli::{aws_cmd_as, CALL_TIMEOUT};
+use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::doctor::run_capture_cmd;
 use crate::bridge::egress::ops;
 use crate::bridge::identity::{self, Operator, Role};
-use crate::bridge::registry::ensure_private_dir;
+use crate::bridge::registry::{self, ensure_private_dir};
 use crate::bridge::vm::lock::lock_exclusive;
 use crate::errors::{CliError, Result};
 use crate::store::Keystore;
@@ -39,7 +46,7 @@ use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc, unix_now};
 use ai_env_worker::certs::{self, ClientPoint};
 use ai_env_worker::globs::{valid_glob, valid_id, valid_rule};
 use ai_env_worker::keys::PublicKey;
-use ai_env_worker::policy::{self, Grant, PeerEntry, SignerEntry, WorkerEntry, ENTRIES_MAX, GRANTS, PARAMETER_MAX, PEERS, RULES_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
+use ai_env_worker::policy::{self, AccessEntry, Grant, PeerEntry, SignerEntry, WorkerEntry, ACCESS, ENTRIES_MAX, GRANTS, PARAMETER_MAX, PEERS, RULES_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
 use serde_json::Value;
 use std::io::Write as _;
 use std::net::Ipv4Addr;
@@ -64,6 +71,9 @@ const MINE_HOURS_MAX: u32 = 168;
 const CHECKIP_HOST: &str = "checkip.amazonaws.com";
 const CHECKIP_TIMEOUT: Duration = Duration::from_secs(10);
 const CHECKIP_BODY_MAX: usize = 64;
+/// `relay access --days`: how many days past today an entry's last day lies, by default and at most (R-150).
+pub(crate) const ACCESS_DAYS_DEFAULT: u32 = 30;
+const ACCESS_DAYS_MAX: u32 = 90;
 
 /// The type `put-parameter` creates a parameter with: the lists are Strings (a second SecureString would fail the
 /// relay's whole fetch on `NoOtherDecrypt`, I §5.2); `tls` alone is a SecureString under `alias/aws/ssm`.
@@ -368,6 +378,76 @@ pub(crate) fn remove_peer(list: &mut Vec<PeerEntry>, named: &PeerNamed) -> Optio
         PeerNamed::Label(label) => p.label == *label,
     })?;
     Some(list.remove(at))
+}
+
+/// What an edit did to one chat's entry of the access list (R-150): the audit's `outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessEdit {
+    /// The grant joined the chat's entry, or an entry was made.
+    Added,
+    /// The chat held the grant, and its entry's end moved later.
+    Extended,
+    /// The chat held the grant until that end or later.
+    Unchanged,
+    Removed,
+    /// The chat did not hold the grant.
+    Absent,
+}
+
+impl AccessEdit {
+    fn word(self) -> &'static str {
+        match self {
+            AccessEdit::Added => "added",
+            AccessEdit::Extended => "extended",
+            AccessEdit::Unchanged => "unchanged",
+            AccessEdit::Removed => "removed",
+            AccessEdit::Absent => "absent",
+        }
+    }
+}
+
+/// The entries lapsed at `now` out of `list`: how many there were (R-150). What the reader holds in force is `now <=
+/// not_after`, so an entry whose last second is `now` stays.
+pub(crate) fn prune_access(list: &mut Vec<AccessEntry>, now: u64) -> usize {
+    let before = list.len();
+    list.retain(|a| now <= a.not_after_unix());
+    before - list.len()
+}
+
+/// The last valid day of an approval of `days` at `now`, `YYYY-MM-DD`, UTC (R-150).
+pub(crate) fn access_day(now: u64, days: u32) -> String {
+    rfc3339_utc(now - now % DAY_S + u64::from(days) * DAY_S)[..10].to_string()
+}
+
+/// `grant` in `chat`'s entry until `not_after`, or later if the entry ends later (R-150); an entry made when it has none.
+/// An entry has one end, so this also moves the end of what it holds already: [`cmd_access`] and the confirm page say so.
+pub(crate) fn allow_access(list: &mut Vec<AccessEntry>, chat: &str, grant: &str, not_after: &str) -> AccessEdit {
+    let Some(entry) = list.iter_mut().find(|a| a.chat == chat) else {
+        list.push(AccessEntry { chat: chat.to_string(), grants: vec![grant.to_string()], not_after: not_after.to_string() });
+        return AccessEdit::Added;
+    };
+    let later = policy::unix_of(not_after).is_ok_and(|t| t > entry.not_after_unix());
+    if later {
+        entry.not_after = not_after.to_string();
+    }
+    if entry.grants.iter().any(|g| g == grant) {
+        return if later { AccessEdit::Extended } else { AccessEdit::Unchanged };
+    }
+    entry.grants.push(grant.to_string());
+    entry.grants.sort();
+    AccessEdit::Added
+}
+
+/// `grant` out of `chat`'s entry; an entry left empty is removed (R-150).
+pub(crate) fn remove_access(list: &mut Vec<AccessEntry>, chat: &str, grant: &str) -> AccessEdit {
+    let Some(at) = list.iter().position(|a| a.chat == chat && a.grants.iter().any(|g| g == grant)) else {
+        return AccessEdit::Absent;
+    };
+    list[at].grants.retain(|g| g != grant);
+    if list[at].grants.is_empty() {
+        list.remove(at);
+    }
+    AccessEdit::Removed
 }
 
 // ---- the lists in SSM -------------------------------------------------------------------------
@@ -1093,6 +1173,222 @@ pub fn cmd_grant(grant_id: &str, rules: &[String], remove: bool) -> Result<()> {
     })
 }
 
+// ---- the access list ----------------------------------------------------------------------------
+
+/// `relay access`'s arguments, as clap parsed them.
+pub struct AccessArgs<'a> {
+    pub session: Option<&'a str>,
+    pub allow: Option<&'a str>,
+    pub remove: Option<&'a str>,
+    pub days: Option<u32>,
+    pub list: bool,
+    pub json: bool,
+    pub from_panel: bool,
+}
+
+/// `state/relay-access.json` (R-152): the access list as a command last read it, for the panel alone to show.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccessCache {
+    /// The parameter's version (0: absent).
+    pub version: u64,
+    /// When it was read, RFC 3339 UTC.
+    pub at: String,
+    pub entries: Vec<AccessEntry>,
+}
+
+/// The cache, as `list` at `version` was read just now (0600): a failure is a warning, since it is for display only and
+/// the relay remains the gate.
+pub(crate) fn write_access_cache(paths: &Paths, version: u64, list: &[AccessEntry]) {
+    let cache = AccessCache { version, at: rfc3339_utc(unix_now()), entries: list.to_vec() };
+    let target = paths.relay_access_cache();
+    let written = serde_json::to_vec_pretty(&cache).map_err(|e| e.to_string()).and_then(|text| {
+        let dir = super::cli::state_dir(paths);
+        ensure_private_dir(&dir).map_err(|e| format!("cannot prepare {}: {e}", dir.display()))?;
+        crate::bridge::infra::write_atomic_mode(&target, &text, 0o600).map_err(|e| e.to_string())
+    });
+    if let Err(e) = written {
+        note(&format!("warning: {} not written: {e}", target.display()));
+    }
+}
+
+/// The cache, if a command wrote one this build can read.
+#[must_use]
+pub fn read_access_cache(paths: &Paths) -> Option<AccessCache> {
+    serde_json::from_slice(&std::fs::read(paths.relay_access_cache()).ok()?).ok()
+}
+
+/// A run that may have changed the list and cannot say (R-152): its write reported failure (its answer lost at the timeout,
+/// another writer's version in it) or the panel killed its child, whose `aws` runs on. `pairs` is the audit row, its `outcome`
+/// `unknown`; the cache goes, so the panel says `not read yet` until a command reads the list again.
+pub(crate) fn access_outcome_unknown(paths: &Paths, pairs: &[(&str, String)]) {
+    audit(paths, RELAY_ACCESS, pairs);
+    let target = paths.relay_access_cache();
+    if let Err(e) = std::fs::remove_file(&target) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            note(&format!("warning: {} not removed: {e}", target.display()));
+        }
+    }
+}
+
+/// The access id of session `sid`'s row (R-150): no row is exit 1, a chat on this Mac with nothing to take back or asked for
+/// more exit 9, a row with no id (its last start came before this build) exit 1. A row now on this Mac that holds an id can
+/// still `--remove`: a later remote `--resume` takes that id. Its `relay` word too.
+fn access_target(paths: &Paths, sid: &str, allowing: bool) -> Result<(String, Option<String>)> {
+    let Some(row) = registry::read(paths, sid)? else {
+        return Err(CliError::Msg(format!("no session {sid}")));
+    };
+    let id = row.access().map(str::to_string);
+    if row.mode != "remote" && (allowing || id.is_none()) {
+        return Err(CliError::Policy(format!("relay access: session {sid} runs on this Mac: only a chat on a VM holds a relay session")));
+    }
+    match id {
+        Some(id) => Ok((id, row.relay)),
+        None => Err(CliError::Msg(format!("relay access: session {sid} has no access id: it last ran before this ai-env, so reopen the chat first"))),
+    }
+}
+
+/// `ai-env relay access <SESSION> (--allow G [--days N] | --remove G)`, `ai-env relay access --list [--json]` (R-150). No
+/// gate: IAM decides. In this order: the arguments (exit 2); `G` in `[relay].offer`, for `--allow` only (exit 9); the
+/// row; the context and the operator, then the lock; one read of `access` and `grants`, `G` in `grants` for `--allow`
+/// (exit 9); the lapsed entries pruned; the edit, `render_access`, the write with its version check; audit; cache. An edit
+/// that changes nothing writes nothing; a write that fails is [`access_outcome_unknown`].
+pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
+    if args.from_panel {
+        crate::bridge::audit::set_actor(crate::bridge::audit::Actor::Panel);
+    }
+    if args.list {
+        return access_list(args.json);
+    }
+    let usage = |why: String| CliError::Usage(format!("relay access: {why}"));
+    let Some(sid) = args.session else {
+        return Err(usage("a session and --allow or --remove, or --list".to_string()));
+    };
+    if !registry::is_uuid(sid) {
+        return Err(usage(format!("not a session id: {sid}")));
+    }
+    let (allowing, grant) = match (args.allow, args.remove) {
+        (Some(grant), None) => (true, grant),
+        (None, Some(grant)) => (false, grant),
+        _ => return Err(usage("--allow or --remove, exactly one".to_string())),
+    };
+    if !valid_id(grant) {
+        return Err(usage(format!("{grant:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
+    }
+    let days = args.days.unwrap_or(ACCESS_DAYS_DEFAULT);
+    if !(1..=ACCESS_DAYS_MAX).contains(&days) {
+        return Err(usage(format!("--days {days}: 1 to {ACCESS_DAYS_MAX}")));
+    }
+    let paths = Paths::resolve()?;
+    if allowing {
+        let relay = BridgeConfig::load(&paths)?.unwrap_or_default().relay;
+        relay.validate()?;
+        if !relay.offer.iter().any(|g| g == grant) {
+            return Err(CliError::Policy(format!("relay access: grant {grant} is not in [relay].offer of {}: the chats' approvals name only what it offers", paths.config.display())));
+        }
+    }
+    let (access, relay_word) = access_target(&paths, sid, allowing)?;
+    let ctx = RelayCtx::load()?;
+    let op = ctx.operator("relay access")?;
+    locked(&ctx, || {
+        let mut lists = read("access", &[ACCESS, GRANTS])?;
+        let grants = lists.remove(1);
+        let held = lists.remove(0);
+        let mut list = policy::parse_access(&held.value).map_err(|e| unparsed("access", held.name, &e))?;
+        if allowing {
+            let known = policy::parse_grants(&grants.value).map_err(|e| unparsed("access", grants.name, &e))?;
+            if !known.iter().any(|g| g.grant_id == grant) {
+                return Err(CliError::Policy(format!("relay access: grant {grant} is not in {} v{}, so this chat would reach nothing through it: ai-env as deployer -- ai-env relay grant {grant} '<source-glob>/<op-glob>'", grants.name, grants.version)));
+            }
+        }
+        let now = unix_now();
+        let pruned = prune_access(&mut list, now);
+        let edit = if allowing {
+            let until = policy::not_after_of_day(&access_day(now, days)).map_err(|e| usage(format!("--days {days}: {e}")))?;
+            allow_access(&mut list, &access, grant, &until)
+        } else {
+            remove_access(&mut list, &access, grant)
+        };
+        let chat = format!("chat {access} (session {sid})");
+        let op_word = if allowing { "allow" } else { "remove" };
+        let mut pairs = vec![("op", op_word.to_string()), ("outcome", edit.word().to_string()), ("grant", grant.to_string()), ("access", access.clone())];
+        let until = list.iter().find(|a| a.chat == access).map(|a| a.not_after.clone());
+        if let Some(until) = until.as_ref().filter(|_| allowing) {
+            pairs.push(("not_after", until.clone()));
+        }
+        if matches!(edit, AccessEdit::Unchanged | AccessEdit::Absent) {
+            pairs.push(("version", held.version.to_string()));
+            audit(&ctx.paths, RELAY_ACCESS, &pairs);
+            write_access_cache(&ctx.paths, held.version, &list);
+            match until.filter(|_| edit == AccessEdit::Unchanged) {
+                Some(until) => say(&format!("{chat} holds grant {grant} until {until} ({} v{}); nothing written", held.name, held.version)),
+                None => say(&format!("{chat} does not hold grant {grant} ({} v{}); nothing written", held.name, held.version)),
+            }
+            return Ok(());
+        }
+        let value = rendered("access", held.name, &list, policy::render_access)?;
+        let version = match write(&ctx, &op, "access", &held, &value) {
+            Ok(version) => version,
+            Err(e) => {
+                pairs[1].1 = "unknown".to_string();
+                access_outcome_unknown(&ctx.paths, &pairs);
+                return Err(e);
+            }
+        };
+        pairs.extend([("version", version.to_string()), ("pruned", pruned.to_string())]);
+        audit(&ctx.paths, RELAY_ACCESS, &pairs);
+        write_access_cache(&ctx.paths, version, &list);
+        let swept = if pruned == 0 { String::new() } else { format!("; {pruned} lapsed chat(s) pruned") };
+        match until.filter(|_| allowing) {
+            Some(until) => {
+                say(&format!("allowed {chat} grant {grant} until {until} ({} v{version}, {} chat(s)){swept}; the relay applies it within about 70 s, with no restart", held.name, list.len()));
+                let others: Vec<&str> = list.iter().find(|a| a.chat == access).map_or_else(Vec::new, |a| a.grants.iter().map(String::as_str).filter(|g| *g != grant).collect());
+                if !others.is_empty() {
+                    side_note(&format!("chat {access}'s entry holds {} too: one end, {until}, covers them all", others.join(",")));
+                }
+                match relay_word.as_deref() {
+                    None | Some("minted") => {}
+                    Some("off") => side_note(&format!("session {sid}'s latest spawn holds no session token (relay=off): [relay].grant or its workspace's relay_grant names none, so the chat reaches this grant from the first spawn after one does")),
+                    Some(word) => side_note(&format!("session {sid}'s latest spawn holds no session token (relay={word}): the chat reaches this grant from its next spawn (ai-env session migrate {sid})")),
+                }
+            }
+            None => say(&format!("removed grant {grant} from {chat} ({} v{version}, {} chat(s)){swept}; the relay refuses it within about 70 s, and calls in flight finish", held.name, list.len())),
+        }
+        Ok(())
+    })
+}
+
+/// `relay access --list [--json]`: the list as one read finds it, each chat with the sessions on this Mac whose row
+/// holds it (a `/clear`'s rows share an id); the cache written.
+fn access_list(json: bool) -> Result<()> {
+    let ctx = RelayCtx::load()?;
+    ctx.operator("relay access")?;
+    let held = read("access", &[ACCESS])?.remove(0);
+    let list = policy::parse_access(&held.value).map_err(|e| unparsed("access", held.name, &e))?;
+    write_access_cache(&ctx.paths, held.version, &list);
+    let rows = registry::list(&ctx.paths).unwrap_or_default();
+    let sessions = |chat: &str| -> Vec<String> { rows.iter().filter(|r| r.access_id.as_deref() == Some(chat)).map(|r| r.session_id.clone()).collect() };
+    let now = unix_now();
+    if json {
+        let entries: Vec<Value> = list.iter().map(|a| serde_json::json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix(), "sessions": sessions(&a.chat)})).collect();
+        let doc = serde_json::json!({"version": held.version, "entries": entries});
+        say(&serde_json::to_string_pretty(&doc).unwrap_or_default());
+        return Ok(());
+    }
+    if !held.exists {
+        say(&format!("{ACCESS}: absent: no chat has more than its token's grant"));
+        return Ok(());
+    }
+    let in_force = list.iter().filter(|a| now <= a.not_after_unix()).count();
+    say(&format!("{ACCESS} v{}: {} chat(s), {in_force} in force", held.version, list.len()));
+    for a in &list {
+        let lapsed = if now > a.not_after_unix() { " EXPIRED" } else { "" };
+        let shown = sessions(&a.chat);
+        let on = if shown.is_empty() { "no session on this Mac".to_string() } else { format!("session {}", shown.join(",")) };
+        say(&format!("  chat {} grants {} until {}{lapsed}: {on}", a.chat, a.grants.join(","), a.not_after));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,6 +1500,38 @@ mod tests {
         assert_eq!(remove_peer(&mut list, &PeerNamed::Label("nobody".to_string())), None);
         assert_eq!(remove_peer(&mut list, &PeerNamed::Network(net("203.0.113.9", 32))), Some(peer("203.0.113.9/32", "lab", T1)));
         assert_eq!(remove_peer(&mut list, &PeerNamed::Label("office".to_string())), Some(peer("203.0.113.0/24", "office", T2)));
+        assert!(list.is_empty());
+    }
+
+    /// R-150's pure edits of the access list. An allow makes an entry, or joins one, its grants sorted, and its end is the
+    /// later of the old and the new; the same grant to the same end changes nothing. A removal takes one grant, and an entry
+    /// left empty goes. A prune takes what lapsed before `now` and leaves an entry whose last second it is.
+    #[test]
+    fn access_edits_allow_remove_and_prune() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+        const OTHER: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+        const T1: &str = "2027-10-29T23:59:59Z";
+        const T2: &str = "2027-11-29T23:59:59Z";
+        let entry = |chat: &str, grants: &[&str], not_after: &str| AccessEntry { chat: chat.into(), grants: s(grants), not_after: not_after.into() };
+        let mut list = Vec::new();
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Added);
+        assert_eq!(list, [entry(CHAT, &["g-b"], T1)]);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Unchanged);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T2), AccessEdit::Extended);
+        assert_eq!(list, [entry(CHAT, &["g-b"], T2)], "the later end");
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Unchanged, "never earlier");
+        assert_eq!(allow_access(&mut list, CHAT, "g-a", T1), AccessEdit::Added);
+        assert_eq!(list, [entry(CHAT, &["g-a", "g-b"], T2)], "joined, sorted, and an entry's end stays the later");
+        assert_eq!(allow_access(&mut list, OTHER, "g-a", T1), AccessEdit::Added);
+        assert_eq!(remove_access(&mut list, OTHER, "g-b"), AccessEdit::Absent, "another chat's grant");
+        assert_eq!(remove_access(&mut list, CHAT, "g-c"), AccessEdit::Absent);
+        assert_eq!(remove_access(&mut list, CHAT, "g-b"), AccessEdit::Removed);
+        assert_eq!(list, [entry(CHAT, &["g-a"], T2), entry(OTHER, &["g-a"], T1)]);
+        assert_eq!(remove_access(&mut list, CHAT, "g-a"), AccessEdit::Removed);
+        assert_eq!(list, [entry(OTHER, &["g-a"], T1)], "an entry left empty goes");
+        let t1 = policy::unix_of(T1).unwrap();
+        assert_eq!(prune_access(&mut list, t1), 0, "its last second");
+        assert_eq!(prune_access(&mut list, t1 + 1), 1);
         assert!(list.is_empty());
     }
 

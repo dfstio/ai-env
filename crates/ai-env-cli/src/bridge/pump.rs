@@ -2722,7 +2722,10 @@ impl Pump {
             None => carried,
             Some(mine) => title::merge(carried.as_ref(), &mine).or(carried),
         };
-        self.vms_prefix = earlier.map(|r| r.vms).unwrap_or_default();
+        // R-148: so does its access id: a fork's init naming its parent adopts the parent's row (`may_adopt`), which keeps
+        // the id that row's chat holds, and the fork's token never names it; a parent's row with none stays so (`fill_remote`).
+        let access_id = earlier.as_ref().and_then(SessionRow::access).map(str::to_string);
+        self.vms_prefix = earlier.map_or_else(Default::default, |r| r.vms);
         let now = registry::now_rfc3339();
         let mut row = SessionRow {
             v: registry::REGISTRY_SCHEMA_V,
@@ -2745,6 +2748,7 @@ impl Pump {
             mirror_root: std::env::var_os(MIRROR_ROOT_ENV).filter(|v| !v.is_empty()).map(|v| v.to_string_lossy().into_owned()),
             scratch_dir: self.plan.scratch.as_ref().map(|p| p.display().to_string()),
             host_state: self.state.snapshot(),
+            access_id,
             ..SessionRow::default()
         };
         title::set_row(&mut row, self.title.as_ref());
@@ -2797,9 +2801,15 @@ impl Pump {
     /// one (that one's view write is still on its way); the caller writes it.
     /// Never while this process's tripwires do not load (C5: no title here,
     /// the view's neither; loaded at the first title, this one if it is).
+    /// R-148: the plan's access id unless the row holds one (a row's id never changes) or is the session this process is
+    /// not (`SessionPlan.access_foreign`, which an init can name), and the latest mint word.
     fn fill_remote(&mut self) {
         let Some(row) = self.row.as_mut() else { return };
         let Some(s) = self.links.snapshot() else { return };
+        if row.access_id.is_none() && s.access_foreign.as_deref() != Some(row.session_id.as_str()) {
+            row.access_id = s.access_id;
+        }
+        row.relay = s.relay.map(str::to_string);
         row.microvm_id = s.vm;
         row.spawn_id = s.spawn.as_ref().map(ToString::to_string);
         row.last_acked_seq = s.spawn.is_some().then_some(s.last_acked_seq);

@@ -1,12 +1,12 @@
-//! The four relay lists (WM-R7, R-85): `workers`, `token-signers`, `grants` and `peers`, each a compact JSON array in one
-//! SSM String parameter.
+//! The five relay lists (WM-R7, R-85, R-143): `workers`, `token-signers`, `grants`, `peers` and `access`, each a compact
+//! JSON array in one SSM String parameter.
 
 use std::collections::HashMap;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::globs::{glob_match, rule_match, valid_glob, valid_id, valid_rule};
+use crate::globs::{glob_match, rule_match, valid_glob, valid_id, valid_rule, valid_uuid};
 use crate::keys::{Alg, PublicKey};
 
 /// The lists' SSM prefix.
@@ -381,6 +381,179 @@ mod peers_tests {
         assert_eq!(unparsed.network(), (Ipv4Addr::UNSPECIFIED, 32), "an entry that does not parse holds no peer's network");
         assert!(!unparsed.contains(Ipv4Addr::new(198, 51, 100, 0)) && !unparsed.contains(Ipv4Addr::UNSPECIFIED));
         assert_eq!(PEERS, format!("{PARAMETER_PREFIX}/peers"));
+    }
+}
+
+/// The access list (R-143): the grants a chat holds beyond its token's own, a fifth list of WM-R7's grammar. The relay
+/// reads it on each request (R-145), so approving a chat changes this parameter and nothing in the chat or its VM.
+pub const ACCESS: &str = "/ai-env/relay/access";
+/// The most grants of one access entry.
+pub const ACCESS_GRANTS_MAX: usize = 16;
+
+/// One chat's approved grants (R-143).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessEntry {
+    /// The chat's access id, its tokens' `chat_id` (R-148): a `valid_uuid`, unique across entries.
+    pub chat: String,
+    /// The grants it adds: 1 to 16 ids (WM-R1), no repeat, sorted on render.
+    pub grants: Vec<String>,
+    /// `YYYY-MM-DDTHH:MM:SSZ`.
+    pub not_after: String,
+}
+
+impl AccessEntry {
+    /// `not_after` in unix seconds (0, never in force, if it does not parse).
+    pub fn not_after_unix(&self) -> u64 {
+        unix_of(&self.not_after).unwrap_or(0)
+    }
+}
+
+/// The access list.
+pub fn parse_access(json: &str) -> Result<Vec<AccessEntry>, PolicyError> {
+    let list = parse_list("access", json)?;
+    check_access(&list)?;
+    Ok(list)
+}
+
+/// Sorted by chat (each entry's grants sorted too), compact: a rendered list parses back to itself.
+pub fn render_access(list: &[AccessEntry]) -> Result<String, PolicyError> {
+    check_access(list)?;
+    let mut sorted = list.to_vec();
+    sorted.sort_by(|a, b| a.chat.cmp(&b.chat));
+    for entry in &mut sorted {
+        entry.grants.sort();
+    }
+    render("access", &sorted)
+}
+
+/// R-143, each entry in turn: its `chat` a uuid, its `grants` 1 to 16 ids with no repeat, its `not_after` a UTC time;
+/// then no `chat` twice and at most 64 entries. A text names the entry and the field, never a value.
+fn check_access(list: &[AccessEntry]) -> Result<(), PolicyError> {
+    for (i, a) in list.iter().enumerate() {
+        let bad = |why: String| PolicyError(format!("access: entry {i}: {why}"));
+        if !valid_uuid(&a.chat) {
+            return Err(bad("chat is not a uuid (lowercase 8-4-4-4-12 hex)".to_string()));
+        }
+        if a.grants.is_empty() || a.grants.len() > ACCESS_GRANTS_MAX {
+            return Err(bad(format!("{} grants, not 1 to {ACCESS_GRANTS_MAX}", a.grants.len())));
+        }
+        let mut seen = HashMap::new();
+        for (j, grant) in a.grants.iter().enumerate() {
+            if !valid_id(grant) {
+                return Err(bad(format!("grants[{j}] is not an id ({})", ai_env_source::names::NAME_RULE)));
+            }
+            if let Some(first) = seen.insert(grant.as_str(), j) {
+                return Err(bad(format!("grants[{j}] repeats grants[{first}]")));
+            }
+        }
+        unix_of(&a.not_after).map_err(|e| bad(format!("not_after: {e}")))?;
+    }
+    unique("access", "chat", list.iter().map(|a| (a.chat.as_str(), None)))
+}
+
+/// WM-T65 (R-143): the access list's grammar, as WM-T51 holds the peers list's.
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+
+    const CHAT_A: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+    const CHAT_B: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+    const CHAT_C: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+
+    fn entry(chat: &str, grants: &[&str]) -> AccessEntry {
+        AccessEntry { chat: chat.into(), grants: grants.iter().map(|g| g.to_string()).collect(), not_after: "2027-10-29T23:59:59Z".into() }
+    }
+
+    /// WM-T65.
+    #[test]
+    fn access_entries_render_sorted_and_parse_back() {
+        assert_eq!(ACCESS, "/ai-env/relay/access");
+        // Sorted by chat, each entry's grants sorted, compact, fields in the struct's order; the text parses back to
+        // exactly the entries it holds, and renders again to itself. One grant may sit in many chats.
+        let list = vec![entry(CHAT_C, &["g-b", "g-a"]), entry(CHAT_A, &["g-c"]), entry(CHAT_B, &["g-c", "g-a", "g-b"])];
+        let text = render_access(&list).expect("renders");
+        assert_eq!(
+            text,
+            r#"[{"chat":"0199a1b2-0000-7000-8000-0000000012a1","grants":["g-c"],"not_after":"2027-10-29T23:59:59Z"},{"chat":"0199a1b2-0000-7000-8000-0000000012a2","grants":["g-a","g-b","g-c"],"not_after":"2027-10-29T23:59:59Z"},{"chat":"0199a1b2-0000-7000-8000-0000000012a3","grants":["g-a","g-b"],"not_after":"2027-10-29T23:59:59Z"}]"#
+        );
+        let back = parse_access(&text).expect("parses");
+        assert_eq!(back, [entry(CHAT_A, &["g-c"]), entry(CHAT_B, &["g-a", "g-b", "g-c"]), entry(CHAT_C, &["g-a", "g-b"])]);
+        assert_eq!(render_access(&back).expect("renders"), text, "a rendered list parses back to itself");
+        assert_eq!(parse_access("[]").expect("empty"), vec![]);
+        assert_eq!(render_access(&[]).expect("empty"), "[]");
+        // Any uuid version, and WM-R1's whole alphabet.
+        assert!(render_access(&[entry("0199a1b2-0000-4000-8000-0000000012a1", &["g.a_b-c"])]).is_ok());
+        // A lapsed entry still parses: whether it is in force is the reader's (`now <= not_after_unix()`).
+        let lapsed = AccessEntry { not_after: "2026-01-01T00:00:00Z".into(), ..entry(CHAT_A, &["g-a"]) };
+        assert_eq!(parse_access(&render_access(std::slice::from_ref(&lapsed)).expect("renders")).expect("a lapsed entry still parses"), std::slice::from_ref(&lapsed));
+        assert_eq!(lapsed.not_after_unix(), 1_767_225_600);
+        assert_eq!(AccessEntry { not_after: "never".into(), ..lapsed }.not_after_unix(), 0, "never in force");
+
+        let refused = |list: Vec<AccessEntry>| {
+            let rendered = render_access(&list).expect_err("render refuses").to_string();
+            let parsed = parse_access(&serde_json::to_string(&list).expect("json")).expect_err("parse refuses").to_string();
+            assert_eq!(rendered, parsed, "one check on both sides");
+            parsed
+        };
+        // One chat, one entry (M-WM86).
+        assert_eq!(refused(vec![entry(CHAT_A, &["g-a"]), entry(CHAT_A, &["g-b"])]), "access: entry 1: chat repeats entry 0's");
+        assert_eq!(refused(vec![entry(CHAT_B, &["g-a"]), entry(CHAT_C, &["g-a"]), entry(CHAT_B, &["g-a"])]), "access: entry 2: chat repeats entry 0's");
+
+        // R-143's grammar: each refusal names the entry and the field, never a value.
+        let not_a_uuid = "access: entry 0: chat is not a uuid (lowercase 8-4-4-4-12 hex)";
+        for chat in ["", "0199A1B2-0000-7000-8000-0000000012A1", &CHAT_A[..35], &format!("{CHAT_A}0"), "0199a1b2x0000-7000-8000-0000000012a1", "g-a"] {
+            assert_eq!(refused(vec![entry(chat, &["g-a"])]), not_a_uuid, "{chat:?}");
+        }
+        let sized = |n: usize| AccessEntry { grants: (0..n).map(|i| format!("g-{i:02}")).collect(), ..entry(CHAT_A, &[]) };
+        assert_eq!(parse_access(&render_access(&[sized(16)]).expect("16 grants")).expect("parses"), [sized(16)]);
+        assert_eq!(refused(vec![sized(17)]), "access: entry 0: 17 grants, not 1 to 16");
+        assert_eq!(refused(vec![sized(0)]), "access: entry 0: 0 grants, not 1 to 16");
+        let planted = "zz-planted";
+        let not_an_id = format!("access: entry 1: grants[1] is not an id ({})", ai_env_source::names::NAME_RULE);
+        assert_eq!(refused(vec![entry(CHAT_A, &["g-a"]), entry(CHAT_B, &["g-a", &planted.to_uppercase()])]), not_an_id);
+        assert_eq!(refused(vec![entry(CHAT_A, &["g-a"]), entry(CHAT_B, &["g-a", ""])]), not_an_id);
+        assert_eq!(refused(vec![entry(CHAT_A, &["g-a", "g-b", "g-a"])]), "access: entry 0: grants[2] repeats grants[0]");
+        let bad_time = AccessEntry { not_after: planted.into(), ..entry(CHAT_A, &["g-a"]) };
+        assert_eq!(refused(vec![bad_time]), "access: entry 0: not_after: not a UTC time (YYYY-MM-DDTHH:MM:SSZ)");
+
+        // The shared texts of `parse_list`, each exact, so none holds the planted value.
+        let good = serde_json::to_value(entry(CHAT_A, &["g-a"])).expect("json");
+        let with = |field: &str, value: serde_json::Value| {
+            let mut entry = good.clone();
+            entry[field] = value;
+            serde_json::to_string(&[entry]).expect("json")
+        };
+        let without = |field: &str| {
+            let mut entry = good.clone();
+            entry.as_object_mut().expect("an object").remove(field);
+            serde_json::to_string(&[entry]).expect("json")
+        };
+        let other_type = "access: entry 0: a field of another type";
+        let texts = [
+            (with("chat", serde_json::json!(planted)), not_a_uuid),
+            (with("chat", serde_json::json!(1)), other_type),
+            (with("grants", serde_json::json!(planted)), other_type),
+            (with("grants", serde_json::json!([1])), other_type),
+            (with(planted, serde_json::json!(1)), "access: entry 0: an unknown field"),
+            (without("chat"), "access: entry 0: no chat"),
+            (without("grants"), "access: entry 0: no grants"),
+            (without("not_after"), "access: entry 0: no not_after"),
+            (format!("[{planted}]"), "access: not a JSON array (line 1, column 2)"),
+            ("[1]".to_string(), "access: entry 0: not a JSON object"),
+            (format!("[]{}", " ".repeat(4095)), "access: 4097 bytes, over 4096"),
+            (format!("[{}]", vec!["{}"; 65].join(",")), "access: 65 entries, over 64"),
+        ];
+        for (list, want) in texts {
+            assert_eq!(parse_access(&list).expect_err("refused").to_string(), want, "{list}");
+        }
+        assert_eq!(parse_access(&format!("[]{}", " ".repeat(4094))).expect("4096 bytes"), vec![]);
+
+        // Bytes bind before entries: an entry with one 14-character grant is 110 bytes, so 36 fit and 37 do not.
+        let many = |n: usize, grant: &str| (0..n).map(|i| entry(&format!("0199a1b2-0000-7000-8000-{i:012x}"), &[grant])).collect::<Vec<_>>();
+        assert_eq!(parse_access(&render_access(&many(36, "g-fourteen-abc")).expect("36 entries")).expect("parses").len(), 36);
+        assert_eq!(render_access(&many(37, "g-fourteen-abc")).expect_err("37 entries").to_string(), "access: would be 4108 bytes, over 4096");
+        assert_eq!(render_access(&many(65, "g")).expect_err("65 entries").to_string(), "access: 65 entries, over 64");
     }
 }
 

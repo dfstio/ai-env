@@ -80,7 +80,8 @@ pub struct MintRequest {
     pub vm_id: String,
     /// The spawn's id.
     pub session_id: String,
-    /// A resumed or moved chat's id.
+    /// The chat's access id (R-148), chosen by the Mac, never by a VM: the relay's key into the access list (R-145). The
+    /// relay never forwards or logs it.
     pub chat_id: Option<String>,
     /// The grant.
     pub grant_id: String,

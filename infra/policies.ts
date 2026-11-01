@@ -34,13 +34,13 @@
 // (canonicalPolicySha256) are stack outputs, which `ai-env egress status` compares with the live documents.
 //
 // S13 (plans/s13-contracts.md §I-infra.4.6) adds the relay: its role ai-env-relay (relayTrustPolicy, EC2 only;
-// relayRolePolicy: its six parameters by name, the decryption of its TLS pair alone, its binary and (LD-R56) boot script
+// relayRolePolicy: its seven parameters by name, the decryption of its TLS pair alone, its binary and (LD-R56) boot script
 // in the artifacts bucket, its log group; the AWS managed SSM agent policy beside it), a third statement of the S3
 // gateway endpoint's policy (the relay role's binary and boot script through the endpoint), the deployer's rights to
 // build it (the Elastic IP, the VM subnet's NACL entries, its parameters, log group, instance profile and role) and
-// ai-env-ops' (start, stop, its non-secret parameters and its log group: never the TLS pair, never a command or a
-// session). Its root units read the parameters and ship the logs; the internet-facing relay process holds no credential
-// at all (LD-I2).
+// ai-env-ops' (start, stop, its non-secret parameters and its log group, `access` alone written, R-147: never the TLS
+// pair, never a command or a session). Its root units read the parameters and ship the logs; the internet-facing relay
+// process holds no credential at all (LD-I2).
 
 import * as crypto from "crypto";
 
@@ -139,9 +139,10 @@ export const RELAY_INSTANCE_PROFILE_NAME = "ai-env-relay";
 export const RELAY_KEY_PREFIX = "relay/ai-env-relay-";
 /**
  * S13: what the relay's reload unit fetches (infra/relay/reload.py PARAMETERS, same order); `tls` alone is a SecureString.
- * The relay security plan (R-93) adds `peers`, the public face's allowlist, before `tls`.
+ * The relay security plan adds `peers`, the public face's allowlist, before `tls` (R-93), then `access`, the grants a
+ * chat holds beyond its token's own, right before it (R-147).
  */
-export const RELAY_PARAMETERS = ["artifact", "workers", "grants", "token-signers", "peers", "tls"] as const;
+export const RELAY_PARAMETERS = ["artifact", "workers", "grants", "token-signers", "peers", "access", "tls"] as const;
 export type RelayParameter = (typeof RELAY_PARAMETERS)[number];
 export const RELAY_TLS: RelayParameter = "tls";
 
@@ -399,7 +400,7 @@ export function relayTrustPolicy(): PolicyDocument {
 
 /**
  * S13: the relay role's inline policy (next to SSM_INSTANCE_POLICY_ARN), for its root units and its CloudWatch agent
- * (cwagent, R-96) only: the reload unit's one get-parameters of its six parameters by name (never by path: a later
+ * (cwagent, R-96) only: the reload unit's one get-parameters of its seven parameters by name (never by path: a later
  * /ai-env/relay/* stays out of reach), the decryption of the TLS pair through SSM, its binary and boot script in the artifacts bucket,
  * and its log group (the CloudWatch agent).
  * The Deny is what restricts the decryption: aws/ssm's key policy admits every principal of the account through SSM,
@@ -901,10 +902,12 @@ export function deployerPolicy(n: Names): PolicyDocument {
  *   - ec2:StartInstances and StopInstances on the proxy instance's ARN only (an ARN, never a tag: the deploy policy's
  *     ec2:CreateTags could tag any instance into reach); no ModifyInstanceAttribute (user data runs as root at the next
  *     start), CreateTags or any other write.
- *   - S13: the relay instance's start and stop on its ARN only (`ai-env relay start|stop`), its five non-secret
- *     parameters read (`ai-env relay status`; never `tls`; `peers` since the relay security plan's R-93), its log
- *     group read, and ec2:DescribeAddresses. No SSM document and no ssm:SendCommand ever reaches the relay instance,
- *     and no statement grants ssm:StartSession.
+ *   - S13: the relay instance's start and stop on its ARN only (`ai-env relay start|stop`), its six non-secret
+ *     parameters read (`ai-env relay status`; never `tls`; `peers` and `access` since the relay security plan's R-93 and
+ *     R-147), its log group read, and ec2:DescribeAddresses. No SSM document and no ssm:SendCommand ever reaches the relay
+ *     instance, and no statement grants ssm:StartSession.
+ *   - R-147: one relay parameter written, `access` (`ai-env relay access`, one Touch ID per approval in the panel), by
+ *     name and by no wildcard. Every other relay parameter stays the deployer's, and no delete or label reaches this one.
  *   - ssm:SendCommand on exactly the three proxy documents plus that instance (SendCommand authorizes the document
  *     and every target separately): never AWS-RunShellScript, another document or instance, nor StartSession.
  *   - The four proxy parameters read; only `suspended` written (O3: widening egress, `extras`, is the deployer's).
@@ -937,6 +940,8 @@ export function opsPolicy(n: Names): PolicyDocument {
         // S13: `ai-env relay start|stop`, and `ai-env relay status`'s reads (never the TLS pair).
         { Sid: "RelayInstance", Effect: "Allow", Resource: [relay], Action: ["ec2:StartInstances", "ec2:StopInstances"] },
         { Sid: "ReadRelayParameters", Effect: "Allow", Resource: RELAY_PARAMETERS.filter((p) => p !== RELAY_TLS).map((p) => relayParameterArn(n, p)), Action: ["ssm:GetParameters"] },
+        // R-147: `ai-env relay access`, as the panel's approval runs it.
+        { Sid: "WriteRelayAccess", Effect: "Allow", Resource: [relayParameterArn(n, "access")], Action: ["ssm:PutParameter"] },
         { Sid: "ProxyCommands", Effect: "Allow", Resource: [...proxyDocumentArns(n), instance], Action: ["ssm:SendCommand"] },
         { Sid: "ReadProxyParameters", Effect: "Allow", Resource: PROXY_PARAMETERS.map((p) => proxyParameterArn(n, p)), Action: ["ssm:GetParameters", "ssm:GetParameterHistory"] },
         { Sid: "WriteSuspendedParameter", Effect: "Allow", Resource: [proxyParameterArn(n, "suspended")], Action: ["ssm:PutParameter"] },

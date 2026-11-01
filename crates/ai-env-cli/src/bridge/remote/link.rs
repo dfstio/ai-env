@@ -299,7 +299,12 @@ impl RemoteLinks {
         let prepare = Rc::clone(&plan);
         let mut links = RemoteLinks::with_pipeline(paths, Box::new(move |gen, why, io| Box::pin(pipeline::run(Rc::clone(&run), gen, why, io))))
             .with_moves(plan.cfg.vm.clone(), Box::new(move |trigger| Box::pin(pipeline::prepare_move(Rc::clone(&prepare), trigger))));
-        links.shared.borrow_mut().snap.pinned = plan.pinned().map(str::to_string);
+        {
+            let mut shared = links.shared.borrow_mut();
+            shared.snap.pinned = plan.pinned().map(str::to_string);
+            shared.snap.access_id.clone_from(&plan.access_id);
+            shared.snap.access_foreign.clone_from(&plan.access_foreign);
+        }
         plan.set_quiet(links.quiet.subscribe());
         links.view = plan.view_sync();
         links.plan = Some(plan);
@@ -832,7 +837,7 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         },
     };
     // S11 (A.4): what P4 asked (the census's `claude_src` at `Started`) and V's fetch after the first output.
-    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started, seal, claude, after_output } = end;
+    let PipelineEnd { vm, vm_how, legs, seed, transcript, seeded_head, credential, delivery, spawn_id, started_by, trigger, session, carried, moved, after_started, seal, claude, after_output, relay } = end;
     let handed = tokio::time::Instant::now();
     if moving.as_ref().is_some_and(|m| m.kind == MoveKind::Migrate) {
         // S10 §B: the switch is over; one that fell back to the old VM counts against `MIGRATE_PREP_TRIES`.
@@ -886,6 +891,7 @@ async fn generation(gen: u32, run: PipelineRun, counts_legs: bool, moving: Optio
         s.snap.transcript = transcript;
         s.snap.seeded_head = seeded_head;
         s.snap.spawn = Some(spawn_id);
+        s.snap.relay = relay;
         // S10 (§2.7): a reopen's carry off its old VM, for the pump: generation 1's, kept by every later one.
         if carried.is_some() {
             s.snap.carried = carried;
@@ -2268,6 +2274,13 @@ pub struct RemoteSnapshot {
     /// S12 (T): what the session's view shows (the live trigger's `CodeoutTrigger::shown_title`): its session and
     /// title. No census part.
     pub view_title: Option<(String, crate::bridge::title::SessionTitle)>,
+    /// R-148: the chat's access id (`SessionPlan.access_id`), set once by [`RemoteLinks::new`]: what a row of this
+    /// session holds, a `/clear`'s too. No census part.
+    pub access_id: Option<String>,
+    /// R-148: the session whose row never takes it (`SessionPlan.access_foreign`). No census part.
+    pub access_foreign: Option<String>,
+    /// R-148: the word of the latest generation's session token (`PipelineEnd.relay`), for the row. No census part.
+    pub relay: Option<&'static str>,
 }
 
 impl RemoteSnapshot {
@@ -2743,6 +2756,7 @@ mod tests {
             seal: None,
             claude: None,
             after_output: None,
+            relay: None,
         }
     }
 

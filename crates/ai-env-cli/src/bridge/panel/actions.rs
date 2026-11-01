@@ -3,8 +3,14 @@
 //! [`NONCES_MAX`] held), the board of this run's actions (in memory only,
 //! never written), and the worker: one std thread that runs one action at a
 //! time, each as the CLI runs it (`Ctx::load`, its own current-thread
-//! runtime, `vm::cmd::backend`: one Touch ID, dropped with the action).
+//! runtime, `vm::cmd::backend`: one Touch ID, dropped with the action). A chat's
+//! relay access is its CLI twin as a child (R-151): `identity::operator` keeps
+//! the ops key for its process's life, and the panel never holds that key.
 use super::{Shared, NONCES_MAX, NONCE_TTL};
+use crate::bridge::config::Paths;
+use crate::bridge::doctor::{capture, without_credentials, Captured};
+use crate::bridge::registry;
+use crate::bridge::relay::params::access_outcome_unknown;
 use crate::bridge::vm::cmd::{backend, runtime, with_backend, Ctx};
 use crate::bridge::vm::ops;
 use crate::errors::{CliError, Result};
@@ -14,6 +20,9 @@ use std::collections::VecDeque;
 
 /// The target word of the one action with none (`vm-refresh`).
 pub const NO_TARGET: &str = "-";
+/// How long a relay-access child may run: its Touch ID's dialog, nobody perhaps at the Mac, the list's lock (60 s), its
+/// aws calls.
+const RELAY_ACCESS_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// What the panel can do, each a CLI command ([`Action::twin`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,12 +32,22 @@ pub enum Action {
     VmTerminate,
     VmRefresh,
     SessionMigrate,
+    /// R-151: its target is [`relay_target`]'s `<session>_<grant>`.
+    RelayAllow,
+    RelayRemove,
+}
+
+/// The session and the grant of a `relay-allow` or `relay-remove` target, `<session>_<grant>`: a uuid holds no `_`, so
+/// the first splits them (a grant may hold one), and a POST stays at its three word fields (R-151). Nothing checked.
+#[must_use]
+pub fn relay_target(target: &str) -> Option<(&str, &str)> {
+    target.split_once('_')
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [Action::VmSuspend, Action::VmResume, Action::VmTerminate, Action::VmRefresh, Action::SessionMigrate];
+    pub const ALL: [Action; 7] = [Action::VmSuspend, Action::VmResume, Action::VmTerminate, Action::VmRefresh, Action::SessionMigrate, Action::RelayAllow, Action::RelayRemove];
 
-    /// `vm-suspend`, `vm-resume`, `vm-terminate`, `vm-refresh`, `session-migrate`.
+    /// `vm-suspend`, `vm-resume`, `vm-terminate`, `vm-refresh`, `session-migrate`, `relay-allow`, `relay-remove`.
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
@@ -37,6 +56,8 @@ impl Action {
             Action::VmTerminate => "vm-terminate",
             Action::VmRefresh => "vm-refresh",
             Action::SessionMigrate => "session-migrate",
+            Action::RelayAllow => "relay-allow",
+            Action::RelayRemove => "relay-remove",
         }
     }
 
@@ -55,6 +76,10 @@ impl Action {
             Action::VmTerminate => format!("ai-env vm terminate {target}"),
             Action::VmRefresh => "ai-env vm list".to_string(),
             Action::SessionMigrate => format!("ai-env session migrate {target}"),
+            Action::RelayAllow | Action::RelayRemove => {
+                let (session, grant) = relay_target(target).unwrap_or((target, ""));
+                format!("ai-env relay access {session} {} {grant}", if self == Action::RelayAllow { "--allow" } else { "--remove" })
+            }
         }
     }
 
@@ -215,7 +240,7 @@ pub(crate) fn work(store: &Keystore, shared: &Shared, queue: &std::sync::mpsc::R
     while let Ok(job) = queue.recv() {
         shared.update(&job.id, |a| a.state = "running");
         tracing::info!("panel: action {} {}: running", job.action.word(), job.target);
-        let (state, line, code) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, &job))) {
+        let (state, line, code) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(store, &shared.paths, &job))) {
             Ok(Ok(line)) => ("done", line, 0),
             Ok(Err((line, code))) => ("failed", line, if code == 0 { 1 } else { code }),
             Err(_) => ("failed", "the action panicked (logs/ai-env.log)".to_string(), 101),
@@ -230,7 +255,7 @@ pub(crate) fn work(store: &Keystore, shared: &Shared, queue: &std::sync::mpsc::R
 }
 
 /// One action, as its CLI twin runs it: its result line, or its error's line and exit code.
-fn run(store: &Keystore, job: &Job) -> std::result::Result<String, (String, i32)> {
+fn run(store: &Keystore, paths: &Paths, job: &Job) -> std::result::Result<String, (String, i32)> {
     let failed = |e: CliError| (e.to_string(), e.exit_code());
     match job.action {
         Action::SessionMigrate => match crate::bridge::migrate::migrate(store, &job.target, &job.id) {
@@ -238,8 +263,45 @@ fn run(store: &Keystore, job: &Job) -> std::result::Result<String, (String, i32)
             Ok(m) => Err((m.line(&job.target), m.code)),
             Err(e) => Err(failed(e)),
         },
+        Action::RelayAllow | Action::RelayRemove => relay_access(store, paths, job),
         _ => vm_action(store, job).map_err(failed),
     }
+}
+
+/// `relay-allow` or `relay-remove` (R-151): `<this program> relay access <session> --allow|--remove <grant> --from-panel`
+/// as a child, without this process's credentials and its marker, `AI_ENV_DIR` the panel's keystore: the child unseals
+/// the ops key (one Touch ID) and it dies with the child. Its end is [`child_outcome`]'s.
+fn relay_access(store: &Keystore, paths: &Paths, job: &Job) -> std::result::Result<String, (String, i32)> {
+    let Some((session, grant)) = relay_target(&job.target) else {
+        return Err((format!("relay access: the target {} names no session and grant", job.target), 2));
+    };
+    let flag = if job.action == Action::RelayAllow { "--allow" } else { "--remove" };
+    let exe = std::env::current_exe().map_err(|e| (format!("relay access: this program's path: {e}"), 1))?;
+    let mut cmd = std::process::Command::new(exe);
+    without_credentials(cmd.args(["relay", "access", session, flag, grant, "--from-panel"]).env("AI_ENV_DIR", store.root()));
+    child_outcome(paths, job, capture(cmd, None, RELAY_ACCESS_WAIT))
+}
+
+/// A relay-access child's end as the action's: its `note:` lines, then its stdout, are the line; else its error's line and
+/// code. One that did not finish by itself (killed at [`RELAY_ACCESS_WAIT`], while its `aws` runs on, or by a signal) wrote
+/// no row of its own and may have written the list, so this does what its failed write would have (R-152,
+/// [`access_outcome_unknown`]).
+fn child_outcome(paths: &Paths, job: &Job, ended: std::result::Result<Captured, String>) -> std::result::Result<String, (String, i32)> {
+    if ended.as_ref().map_or(true, |out| out.code.is_none()) {
+        let (session, grant) = relay_target(&job.target).unwrap_or((&job.target, ""));
+        let mut pairs = vec![("op", if job.action == Action::RelayAllow { "allow" } else { "remove" }.to_string()), ("outcome", "unknown".to_string()), ("grant", grant.to_string())];
+        if let Some(access) = registry::read(paths, session).ok().flatten().and_then(|r| r.access().map(str::to_string)) {
+            pairs.push(("access", access));
+        }
+        access_outcome_unknown(paths, &pairs);
+    }
+    let out = ended.map_err(|e| (format!("relay access: {e}"), 1))?;
+    if out.success {
+        let notes = out.stderr.lines().filter(|l| l.starts_with("note: ")).map(str::to_string);
+        return Ok(notes.chain(std::iter::once(out.stdout.trim().to_string())).collect::<Vec<_>>().join("\n"));
+    }
+    let line = out.stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("relay access: the child said nothing");
+    Err((line.strip_prefix("ai-env: ").unwrap_or(line).to_string(), out.code.unwrap_or(1)))
 }
 
 /// A VM action: the context and its checks before any Touch ID, then the backend (one Touch ID) on a runtime
@@ -260,7 +322,7 @@ fn vm_action(store: &Keystore, job: &Job) -> Result<String> {
             Action::VmSuspend => ops::suspend_resume(&ctx, api, &job.target, true, false).await.map(|t| t.line()),
             Action::VmResume => ops::suspend_resume(&ctx, api, &job.target, false, false).await.map(|t| t.line()),
             Action::VmTerminate => ops::terminate_one(&ctx, api, &job.target, false).await.map(|t| terminated_lines(&t)),
-            Action::VmRefresh | Action::SessionMigrate => ops::survey(&ctx, api, false, true).await.map(|s| survey_lines(&s)),
+            Action::VmRefresh | Action::SessionMigrate | Action::RelayAllow | Action::RelayRemove => ops::survey(&ctx, api, false, true).await.map(|s| survey_lines(&s)),
         })
     });
     rt.shutdown_background();
@@ -293,6 +355,12 @@ mod tests {
         assert_eq!(Action::from_word("vm-reboot"), None);
         assert_eq!(Action::VmSuspend.twin("microvm-x"), "ai-env vm suspend microvm-x");
         assert_eq!(Action::VmRefresh.twin(NO_TARGET), "ai-env vm list");
+        // R-151: `<session>_<grant>`, the first `_` theirs (a uuid holds none, a grant may).
+        let target = "0199a1b2-0000-7000-8000-0000000012a1_g_a-b";
+        assert_eq!(relay_target(target), Some(("0199a1b2-0000-7000-8000-0000000012a1", "g_a-b")));
+        assert_eq!(relay_target("0199a1b2-0000-7000-8000-0000000012a1"), None);
+        assert_eq!(Action::RelayAllow.twin(target), "ai-env relay access 0199a1b2-0000-7000-8000-0000000012a1 --allow g_a-b");
+        assert_eq!(Action::RelayRemove.twin(target), "ai-env relay access 0199a1b2-0000-7000-8000-0000000012a1 --remove g_a-b");
         let mut n = Nonces::default();
         let t0: u64 = 1_792_000_000;
         let ttl = NONCE_TTL.as_secs();
@@ -311,5 +379,47 @@ mod tests {
         }
         assert!(!n.valid(&first, Action::VmRefresh, NO_TARGET, t0), "the oldest dropped");
         assert_eq!(n.held.len(), NONCES_MAX);
+    }
+
+    /// R-152: a relay-access child's end. One that finished is the action's, its row its own. One that did not (killed at the
+    /// wait, or by a signal) may have written the list: a `relay_access` row `outcome=unknown` naming the chat, and the cache
+    /// gone, whatever its line; the row with no id names none.
+    #[test]
+    fn a_child_that_did_not_finish_leaves_the_list_unknown() {
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012b1";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(dir.path().join("bridge"), None);
+        let cache = paths.relay_access_cache();
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        registry::write(&paths, &registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some(CHAT.into()), ..registry::SessionRow::default() }).unwrap();
+        let job = |action| Job { id: "n".into(), action, target: format!("{SID}_g-a") };
+        let rows = || crate::bridge::audit::read::read_all(&paths.audit()).unwrap_or_default();
+        let finished = |code, success, stderr: &str, stdout: &str| Ok(Captured { code: Some(code), success, stdout: stdout.into(), stderr: stderr.into() });
+        // It finished: its line and code, no row here, the cache as it left it.
+        std::fs::write(&cache, "{}").unwrap();
+        assert_eq!(child_outcome(&paths, &job(Action::RelayAllow), finished(0, true, "note: one\nai-env: other\nnote: two\n", "allowed\n")), Ok("note: one\nnote: two\nallowed".to_string()));
+        assert_eq!(child_outcome(&paths, &job(Action::RelayAllow), finished(9, false, "note: one\nai-env: refused\n\n", "")), Err(("refused".to_string(), 9)));
+        assert!(rows().is_empty() && cache.exists(), "a child that finished speaks for itself");
+        // Killed at the wait.
+        assert_eq!(child_outcome(&paths, &job(Action::RelayAllow), Err("ai-env: timed out after 300s".into())), Err(("relay access: ai-env: timed out after 300s".to_string(), 1)));
+        assert!(!cache.exists(), "the page then says `not read yet`");
+        let got = rows();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].event, "relay_access");
+        let want: Vec<(&str, &str)> = vec![("access", CHAT), ("grant", "g-a"), ("op", "allow"), ("outcome", "unknown")];
+        let detail: Vec<(&str, &str)> = got[0].detail.iter().filter(|(k, _)| k.as_str() != "actor").map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(detail, want, "{got:?}");
+        // By a signal: no code, the same; a removal's word; no cache to remove is no failure.
+        let killed = Ok(Captured { code: None, success: false, stdout: String::new(), stderr: String::new() });
+        assert_eq!(child_outcome(&paths, &job(Action::RelayRemove), killed), Err(("relay access: the child said nothing".to_string(), 1)));
+        let got = rows();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[1].detail.iter().any(|(k, v)| k == "op" && v == "remove") && got[1].detail.iter().any(|(k, v)| k == "outcome" && v == "unknown"), "{got:?}");
+        // A row with no id, or none at all, names no chat.
+        registry::write(&paths, &registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some("not a uuid".into()), ..registry::SessionRow::default() }).unwrap();
+        let _ = child_outcome(&paths, &job(Action::RelayRemove), Err("gone".into()));
+        let got = rows();
+        assert!(!got[2].detail.iter().any(|(k, _)| k == "access"), "{got:?}");
     }
 }

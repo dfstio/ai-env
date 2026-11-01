@@ -1,6 +1,6 @@
 //! The in-process relay (I-L2): `RelayApp` with a `ManualClock`, a `MemorySink` and `params_key` `[9u8; 32]`,
 //! both faces served over `tokio::io::duplex` streams wrapped in `Peered::new`, and a live directory written at
-//! run time (the four lists, `tls.pem` and `fetched`).
+//! run time (the four lists the relay needs, `tls.pem` and `fetched`; `access.json` only when a test writes it, R-144).
 
 use std::io;
 use std::net::IpAddr;
@@ -90,6 +90,16 @@ pub fn peer_entry(cidr: &str, label: &str) -> ai_env_worker::policy::PeerEntry {
 /// `PEER_NETS`, labelled `loopback`, `test-net-2` and `test-net-3`.
 pub fn default_peers() -> Vec<ai_env_worker::policy::PeerEntry> {
     PEER_NETS.iter().zip(["loopback", "test-net-2", "test-net-3"]).map(|(cidr, label)| peer_entry(cidr, label)).collect()
+}
+
+/// A chat's access id (R-148), the `chat_id` of `Rig::chat_token`.
+pub const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+/// Another chat's.
+pub const OTHER_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a4";
+
+/// One access entry in force through `NOT_AFTER` (R-143).
+pub fn access_entry(chat: &str, grants: &[&str]) -> ai_env_worker::policy::AccessEntry {
+    ai_env_worker::policy::AccessEntry { chat: chat.into(), grants: grants.iter().map(|g| g.to_string()).collect(), not_after: NOT_AFTER.into() }
 }
 
 /// A source with these ops (JSON output, read-only, an object schema).
@@ -354,6 +364,10 @@ impl Rig {
         self.write(ai_env_relay::lists::PEERS_FILE, policy::render_peers(list).unwrap().as_bytes());
     }
 
+    pub fn write_access(&self, list: &[ai_env_worker::policy::AccessEntry]) {
+        self.write(ai_env_relay::lists::ACCESS_FILE, policy::render_access(list).unwrap().as_bytes());
+    }
+
     pub fn write_fetched(&self, unix: u64) {
         self.write(FETCHED_FILE, format!("{unix}\n").as_bytes());
     }
@@ -364,7 +378,7 @@ impl Rig {
     }
 
     /// `poll_files()`.
-    pub fn poll(&self) -> [(&'static str, ai_env_relay::files::Poll); 5] {
+    pub fn poll(&self) -> [(&'static str, ai_env_relay::files::Poll); 6] {
         self.app.poll_files()
     }
 
@@ -437,6 +451,11 @@ impl Rig {
     /// A token of a fresh session with `grant_id`, minted with W/M's `session::mint` by `mac` (seed 7).
     pub fn token(&self, grant_id: &str) -> String {
         mint(7, &self.claims(grant_id))
+    }
+
+    /// The same, of the chat whose access id is `chat` (R-145: the access list's key).
+    pub fn chat_token(&self, grant_id: &str, chat: &str) -> String {
+        mint(7, &SessionClaims { chat_id: Some(chat.into()), ..self.claims(grant_id) })
     }
 
     /// The request log's lines of one kind.

@@ -1770,6 +1770,23 @@
       ],
       "session": "none",
       "vm_keys": []
+    },
+    {
+      "effects": [],
+      "name": "relay_access",
+      "optional": [
+        "grant",
+        "access",
+        "not_after",
+        "version",
+        "pruned"
+      ],
+      "required": [
+        "op",
+        "outcome"
+      ],
+      "session": "none",
+      "vm_keys": []
     }
   ],
   "v": 2

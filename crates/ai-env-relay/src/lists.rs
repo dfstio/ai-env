@@ -1,5 +1,5 @@
-//! The four relay lists of WM-R7 and R-85, parsed by ai-env-worker's `policy` (R never renders one). The writer (M's
-//! `ai-env relay allow|revoke` and grant commands) and this reader share one implementation (LD-R5); the relay
+//! The five relay lists of WM-R7, R-85 and R-143, parsed by ai-env-worker's `policy` (R never renders one). The writer
+//! (M's `ai-env relay allow|revoke` and grant commands) and this reader share one implementation (LD-R5); the relay
 //! adds only the 65 536-byte pre-check (`files::Watched`) and the unload on refusal (§R-relay.3.5).
 
 use ai_env_worker::policy;
@@ -140,6 +140,35 @@ impl Peers {
 }
 
 impl crate::files::Entries for Peers {
+    fn entries(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The live directory's access file: the grants a chat holds beyond its token's own (R-144).
+pub const ACCESS_FILE: &str = "access.json";
+
+/// The access list (R-144): read on each request (R-145), and nothing is ever closed by it.
+#[derive(Debug, Clone, Default)]
+pub struct Access {
+    /// Its entries.
+    pub entries: Vec<policy::AccessEntry>,
+}
+
+/// `policy::parse_access` of the bytes as UTF-8; refused whole on any fault, the text `PolicyError`'s.
+pub fn parse_access(bytes: &[u8]) -> Result<Access, String> {
+    policy::parse_access(text(bytes)?).map(|entries| Access { entries }).map_err(|e| e.to_string())
+}
+
+impl Access {
+    /// R-144: the grants of the entry of `chat` (chats are unique, R-143) when in force at `now_unix`
+    /// (`now <= not_after_unix()`).
+    pub fn grants_of(&self, chat: &str, now_unix: u64) -> Option<&[String]> {
+        self.entries.iter().find(|e| e.chat == chat).filter(|e| now_unix <= e.not_after_unix()).map(|e| e.grants.as_slice())
+    }
+}
+
+impl crate::files::Entries for Access {
     fn entries(&self) -> usize {
         self.entries.len()
     }
@@ -315,5 +344,38 @@ mod tests {
             assert_eq!(parse_peers(bad.as_bytes()).unwrap_err(), shared, "PolicyError's text");
         }
         assert_eq!(parse_peers(&[0xff, 0xfe]).unwrap_err(), "not UTF-8");
+    }
+
+    /// Unit 58 (R-144): an entry names its chat's grants through its `not_after` second and not one second later, and
+    /// only its own chat's; `[]` names nobody's. The bytes load as W/M's parser reads them, refused whole with its text.
+    #[test]
+    fn an_access_entry_names_its_chats_grants_while_in_force() {
+        use crate::files::Entries;
+        const CHAT_A: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+        const CHAT_B: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+        const CHAT_C: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+        let entry = |chat: &str, grants: &[&str], not_after: &str| policy::AccessEntry { chat: chat.into(), grants: grants.iter().map(|g| g.to_string()).collect(), not_after: not_after.into() };
+        let text = policy::render_access(&[entry(CHAT_B, &["g-b", "g-a"], "2026-10-29T23:59:59Z"), entry(CHAT_A, &["g-c"], "2027-01-01T23:59:59Z")]).unwrap();
+        let access = parse_access(text.as_bytes()).expect("W/M's rendering loads");
+        assert_eq!((access.entries.len(), access.entries()), (2, 2));
+        let at = policy::unix_of("2026-10-29T23:59:59Z").unwrap();
+        let (b, a): (&[String], &[String]) = (&["g-a".to_string(), "g-b".to_string()], &["g-c".to_string()]);
+        assert_eq!(access.grants_of(CHAT_B, at - 1), Some(b), "in force before its not_after second");
+        assert_eq!(access.grants_of(CHAT_B, at), Some(b), "in force through its not_after second");
+        assert_eq!(access.grants_of(CHAT_B, at + 1), None, "lapsed one second later");
+        assert_eq!(access.grants_of(CHAT_A, at + 1), Some(a), "the other entry still in force, its own grants");
+        assert_eq!(access.grants_of(CHAT_C, at), None, "no entry names it");
+        assert_eq!(access.grants_of("", at), None);
+        let none = parse_access(b"[]").expect("the empty list");
+        assert!(none.entries.is_empty() && none.grants_of(CHAT_A, 0).is_none());
+        assert!(Access::default().grants_of(CHAT_A, 0).is_none());
+
+        let unknown_field = text.replacen("\"chat\"", "\"extra\":1,\"chat\"", 1);
+        let repeated = text.replace(CHAT_B, CHAT_A);
+        for bad in [unknown_field, repeated, "[".to_string()] {
+            let shared = policy::parse_access(&bad).expect_err("the shared parser refuses it").to_string();
+            assert_eq!(parse_access(bad.as_bytes()).unwrap_err(), shared, "PolicyError's text");
+        }
+        assert_eq!(parse_access(&[0xff, 0xfe]).unwrap_err(), "not UTF-8");
     }
 }

@@ -441,8 +441,9 @@ async fn refused_before_tls(app: &RelayApp, flight: &[u8], ip: &str) {
 /// the private face completes TLS (it never reads the file). Through `admit`, with one accept a minute per address: a
 /// listed `/32` and an address inside a listed `/24` are admitted; an address beside them is refused `not_in_peers`
 /// five times and never `rate_limited` (the check precedes the bucket); a lapsed entry's address is refused; the file
-/// turned stale refuses a listed address `no_peers` while the private face still admits; `poll_files` gives five
-/// outcomes, peers last. Each refusal answers no ClientHello and comes at once (`refused_before_tls`).
+/// turned stale refuses a listed address `no_peers` while the private face still admits; `poll_files` gives six
+/// outcomes, peers and then access last (R-144, its absence admitted as ever). Each refusal answers no ClientHello and
+/// comes at once (`refused_before_tls`).
 #[tokio::test]
 async fn the_public_face_admits_listed_peers_only() {
     let _serial = SERIAL.lock().await;
@@ -473,8 +474,9 @@ async fn the_public_face_admits_listed_peers_only() {
     write(b.dir.path(), ai_env_relay::lists::PEERS_FILE, policy::render_peers(&list).unwrap().as_bytes());
     let polled = b.app.poll_files();
     let names: Vec<&str> = polled.iter().map(|(file, _)| *file).collect();
-    assert_eq!(names, ["workers", "token-signers", "grants", "tls", "peers"]);
+    assert_eq!(names, ["workers", "token-signers", "grants", "tls", "peers", "access"]);
     assert!(matches!(polled[4].1, ai_env_relay::files::Poll::Loaded { .. }), "{polled:?}");
+    assert_eq!(polled[5].1, ai_env_relay::files::Poll::Missing, "no access list written: {polled:?}");
     let cfg = client_config(&[&b.ca], &[&rustls::version::TLS13]);
     let flight = client_hello(&cfg);
     assert!(admitted(&b.app, Arc::clone(&cfg), "198.51.100.7".parse().unwrap()).await.is_some(), "a listed /32");
@@ -503,9 +505,12 @@ async fn the_public_face_admits_listed_peers_only() {
     assert!(served.is_some() && client.is_ok(), "the private face never reads the peers file");
 }
 
-/// TLS 13 (R-91): `ai-env-relay check`, the built binary, on a temporary env file and live directory: five lines in
-/// poll order, the fifth `peers.json: loaded version=<16 hex> entries=1 age_s=<n>`, exit 0 with every file loaded and
-/// every list fresh. peers.json refused, then removed: its line says so, the other four stand, and the exit is 1.
+/// TLS 13 (R-91, R-144): `ai-env-relay check`, the built binary, on a temporary env file and live directory: six lines in
+/// poll order, the fifth `peers.json: loaded version=<16 hex> entries=1 age_s=<n>`, the sixth `access.json: loaded
+/// version=<16 hex> entries=1 age_s=<n>`, exit 0 with every file loaded and every list fresh. access.json refused: its
+/// line says so, the other five stand, and the exit is 1; removed: `access.json: missing` and the exit is 0, the list's
+/// state until the first approval. Every list stale, access.json among them: the exit is 1. peers.json refused, then
+/// removed: its line says so, the others stand, and the exit is 1.
 #[tokio::test]
 async fn check_prints_one_line_per_live_file() {
     let _serial = SERIAL.lock().await;
@@ -519,6 +524,8 @@ async fn check_prints_one_line_per_live_file() {
     write(&live, TLS_FILE, certs::tls_pem(&leaf(&ca, 1, 12), &ca).as_bytes());
     let peers = policy::render_peers(&[common::rig::peer_entry("198.51.100.0/24", "office")]).unwrap();
     write(&live, ai_env_relay::lists::PEERS_FILE, peers.as_bytes());
+    let access = policy::render_access(&[common::rig::access_entry(common::rig::CHAT, &["g-all"])]).unwrap();
+    write(&live, ai_env_relay::lists::ACCESS_FILE, access.as_bytes());
     // `check` reads the real clock: the reload's stamp is now.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     write(&live, "fetched", format!("{now}\n").as_bytes());
@@ -533,23 +540,54 @@ async fn check_prints_one_line_per_live_file() {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_ai-env-relay")).arg("check").arg("--env-file").arg(&env).output().expect("the built binary runs");
         (out.status.code(), String::from_utf8(out.stdout).unwrap())
     };
+    let access_file = ai_env_relay::lists::ACCESS_FILE;
     let files = [WORKERS_FILE, SIGNERS_FILE, GRANTS_FILE, TLS_FILE, ai_env_relay::lists::PEERS_FILE];
 
     let (code, stdout) = check();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "{stdout}");
-    for (line, file) in lines.iter().zip(files) {
+    assert_eq!(lines.len(), 6, "{stdout}");
+    for (line, file) in lines.iter().zip(files.iter().chain(&[access_file])) {
         assert!(line.starts_with(&format!("{file}: loaded ")), "poll order: {stdout}");
     }
     let version = ai_env_relay::files::content_version(peers.as_bytes());
     let fifth = lines[4].strip_prefix(&format!("peers.json: loaded version={version:016x} entries=1 age_s=")).unwrap_or_else(|| panic!("{stdout}"));
     assert!(fifth.parse::<u64>().is_ok_and(|age| age < 600), "a fresh list's age: {stdout}");
+    let version = ai_env_relay::files::content_version(access.as_bytes());
+    let sixth = lines[5].strip_prefix(&format!("access.json: loaded version={version:016x} entries=1 age_s=")).unwrap_or_else(|| panic!("{stdout}"));
+    assert!(sixth.parse::<u64>().is_ok_and(|age| age < 600), "a fresh list's age: {stdout}");
+    assert!(!stdout.contains(common::rig::CHAT) && !stdout.contains("g-all"), "no value of the list: {stdout}");
     assert_eq!(code, Some(0), "{stdout}");
+
+    // Refused: exit 1.
+    write(&live, access_file, b"[");
+    let (code, stdout) = check();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "{stdout}");
+    assert_eq!(lines[5], "access.json: refused (access: not a JSON array (line 1, column 1))");
+    assert!(lines[..5].iter().zip(files).all(|(line, file)| line.starts_with(&format!("{file}: loaded "))), "{stdout}");
+    assert_eq!(code, Some(1), "{stdout}");
+
+    // Missing: exit 0.
+    std::fs::remove_file(live.join(access_file)).unwrap();
+    let (code, stdout) = check();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 6, "{stdout}");
+    assert_eq!(lines[5], "access.json: missing");
+    assert!(lines[..5].iter().zip(files).all(|(line, file)| line.starts_with(&format!("{file}: loaded "))), "{stdout}");
+    assert_eq!(code, Some(0), "{stdout}");
+
+    // Stale: `fetched` is every list's, so the exit is 1 for all of them.
+    write(&live, access_file, access.as_bytes());
+    write(&live, "fetched", format!("{}\n", now - 901).as_bytes());
+    let (code, stdout) = check();
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(stdout.lines().nth(5).is_some_and(|l| l.starts_with("access.json: loaded ")), "{stdout}");
+    write(&live, "fetched", format!("{now}\n").as_bytes());
 
     write(&live, ai_env_relay::lists::PEERS_FILE, b"[");
     let (code, stdout) = check();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "{stdout}");
+    assert_eq!(lines.len(), 6, "{stdout}");
     assert_eq!(lines[4], "peers.json: refused (peers: not a JSON array (line 1, column 1))");
     assert!(lines[..4].iter().zip(files).all(|(line, file)| line.starts_with(&format!("{file}: loaded "))), "{stdout}");
     assert_eq!(code, Some(1), "{stdout}");
@@ -557,7 +595,7 @@ async fn check_prints_one_line_per_live_file() {
     std::fs::remove_file(live.join(ai_env_relay::lists::PEERS_FILE)).unwrap();
     let (code, stdout) = check();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "{stdout}");
+    assert_eq!(lines.len(), 6, "{stdout}");
     assert_eq!(lines[4], "peers.json: missing");
     assert!(lines[..4].iter().zip(files).all(|(line, file)| line.starts_with(&format!("{file}: loaded "))), "{stdout}");
     assert_eq!(code, Some(1), "{stdout}");

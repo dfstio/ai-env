@@ -156,7 +156,7 @@ fn error_line(stderr: &str) -> &str {
 /// passphrase) and the `ai-env as` marker. Under `ai-env as ops -- ai-env
 /// doctor` the operator key is for the AWS rows alone, never for rustup, zig
 /// or claude.
-fn without_credentials(cmd: &mut Command) -> &mut Command {
+pub(crate) fn without_credentials(cmd: &mut Command) -> &mut Command {
     for name in crate::age_cmd::CHILD_ENV_REMOVED.iter().chain(&[crate::commands::RUNNER_MARKER]) {
         cmd.env_remove(name);
     }

@@ -242,7 +242,7 @@ pub(crate) fn read_fetched(path: &Path) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
-/// The five watched files of the live directory and its `fetched` stamp.
+/// The six watched files of the live directory and its `fetched` stamp.
 pub struct Live {
     /// `workers.json`.
     pub workers: Watched<Workers>,
@@ -254,6 +254,9 @@ pub struct Live {
     pub tls: Watched<rustls::ServerConfig>,
     /// `peers.json`, the public face's allowlist: a JSON list under R-15 to R-17, like the other three (R-88).
     pub peers: Watched<crate::lists::Peers>,
+    /// `access.json`, the grants a chat holds beyond its token's own: a JSON list under R-15 to R-17 (R-144), and
+    /// nothing is ever closed by it.
+    pub access: Watched<crate::lists::Access>,
     fetched: PathBuf,
 }
 
@@ -266,13 +269,14 @@ impl Live {
             grants: Watched::new(dir.join(GRANTS_FILE)),
             tls: Watched::new(dir.join(TLS_FILE)).keeping_on_refusal(),
             peers: Watched::new(dir.join(crate::lists::PEERS_FILE)),
+            access: Watched::new(dir.join(crate::lists::ACCESS_FILE)),
             fetched: dir.join(FETCHED_FILE),
         }
     }
 
-    /// Polls all five in the order workers, token-signers, grants, tls, peers (peers last, so tls keeps index 3:
-    /// R-88); returns each one's outcome.
-    pub fn poll(&self, now: SystemTime, max_stale: Duration) -> [(&'static str, Poll); 5] {
+    /// Polls all six in the order workers, token-signers, grants, tls, peers, access (each new one last, so tls keeps
+    /// index 3 and peers index 4: R-88, R-144); returns each one's outcome.
+    pub fn poll(&self, now: SystemTime, max_stale: Duration) -> [(&'static str, Poll); 6] {
         let fetched_at = read_fetched(&self.fetched);
         let workers = self.workers.poll(fetched_at, crate::lists::parse_workers);
         let workers = self.workers.staleness(workers, now, max_stale);
@@ -283,7 +287,9 @@ impl Live {
         let tls = self.tls.poll(fetched_at, crate::tls::server_config);
         let peers = self.peers.poll(fetched_at, crate::lists::parse_peers);
         let peers = self.peers.staleness(peers, now, max_stale);
-        [("workers", workers), ("token-signers", signers), ("grants", grants), ("tls", tls), ("peers", peers)]
+        let access = self.access.poll(fetched_at, crate::lists::parse_access);
+        let access = self.access.staleness(access, now, max_stale);
+        [("workers", workers), ("token-signers", signers), ("grants", grants), ("tls", tls), ("peers", peers), ("access", access)]
     }
 }
 
@@ -372,10 +378,10 @@ mod tests {
         assert_eq!(live.poll(at(t2), max)[3].1, Poll::Missing);
         assert!(live.tls.loaded().is_none(), "a missing tls.pem is unloaded");
 
-        // R-88: five outcomes, peers last; peers.json is a JSON list like workers.json: loaded fresh as of `fetched`,
+        // R-88, R-144: six outcomes, peers then access last; peers.json is a JSON list like workers.json: loaded fresh as of `fetched`,
         // stale after max_stale (reported once), unloaded at once when refused or missing.
         let names: Vec<&str> = live.poll(at(t2), max).iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, ["workers", "token-signers", "grants", "tls", "peers"]);
+        assert_eq!(names, ["workers", "token-signers", "grants", "tls", "peers", "access"]);
         std::fs::write(dir.path().join(FETCHED_FILE), format!("{t2}\n")).unwrap();
         let peers = ai_env_worker::policy::render_peers(&[ai_env_worker::policy::PeerEntry {
             cidr: "198.51.100.0/24".into(),
@@ -399,6 +405,31 @@ mod tests {
         assert_eq!(live.poll(at(t2), max)[4].1, Poll::Missing);
         assert!(live.peers.loaded().is_none(), "a missing peers.json is unloaded");
         assert_eq!(live.poll(at(t2), max)[4].1, Poll::Unchanged, "an absent file is reported once");
+
+        // R-144: access.json, last of six, is a JSON list as peers.json is; it never touches the file beside it.
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+        std::fs::write(dir.path().join(crate::lists::PEERS_FILE), &peers).unwrap();
+        assert!(matches!(live.poll(at(t2), max)[4].1, Poll::Loaded { .. }));
+        assert_eq!(live.poll(at(t2), max)[5], ("access", Poll::Unchanged), "absent, and reported at its first look already");
+        let access = ai_env_worker::policy::render_access(&[ai_env_worker::policy::AccessEntry { chat: CHAT.into(), grants: vec!["g-a".into()], not_after: "2027-12-31T23:59:59Z".into() }]).unwrap();
+        std::fs::write(dir.path().join(crate::lists::ACCESS_FILE), &access).unwrap();
+        assert_eq!(live.poll(at(t2), max)[5], ("access", Poll::Loaded { version: content_version(access.as_bytes()) }));
+        assert!(live.access.fresh(at(t2 + 900), max).is_some_and(|a| a.grants_of(CHAT, t2).is_some()));
+        assert!(live.access.fresh(at(t2 + 901), max).is_none());
+        assert_eq!(live.poll(at(t2 + 901), max)[5].1, Poll::Stale);
+        assert_eq!(live.poll(at(t2 + 902), max)[5].1, Poll::Unchanged, "stale is reported once a turn");
+        assert!(live.access.loaded().is_some(), "a stale list stays loaded, not fresh");
+        std::fs::write(dir.path().join(crate::lists::ACCESS_FILE), access.replace(CHAT, "not-a-uuid")).unwrap();
+        assert_eq!(live.poll(at(t2), max)[5].1, Poll::Refused("access: entry 0: chat is not a uuid (lowercase 8-4-4-4-12 hex)".into()));
+        assert!(live.access.loaded().is_none(), "a refused access.json is unloaded at once");
+        assert!(live.peers.loaded().is_some(), "and the file beside it stays");
+        std::fs::write(dir.path().join(crate::lists::ACCESS_FILE), &access).unwrap();
+        assert!(matches!(live.poll(at(t2), max)[5].1, Poll::Loaded { .. }));
+        std::fs::remove_file(dir.path().join(crate::lists::ACCESS_FILE)).unwrap();
+        assert_eq!(live.poll(at(t2), max)[5].1, Poll::Missing);
+        assert!(live.access.loaded().is_none(), "a missing access.json is unloaded");
+        assert!(live.peers.loaded().is_some());
+        assert_eq!(live.poll(at(t2), max)[5].1, Poll::Unchanged, "an absent file is reported once");
     }
 
     #[test]

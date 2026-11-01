@@ -263,13 +263,13 @@ console.log(JSON.stringify({
 
 /// I-T3: the endpoint's, the relay role's and its trust policy's documents for the example account are the pinned ones
 /// (I-R40, I-R42, I-R43), their sizes I-R45's, in Rust (`canonical_policy_sha256`) and in TypeScript alike. The relay
-/// role's moved with R-93 (it reads `peers` by name: S13's was `b48ef84b…9cfd`, 1523 characters), as print-policies
-/// measures it.
+/// role's moved with R-93 and R-147 (it reads `peers` and `access` by name: S13's was `b48ef84b…9cfd`, 1523 characters;
+/// R-93's `ef34503c…665f`, 1592), as print-policies measures it.
 #[test]
 fn the_relay_documents_of_policies_ts_are_the_pinned_ones() {
     for (name, pinned, size) in [
         ("s3-endpoint", "1e30d2178ae4648b2aca53e97c05e22c42d207c2295e1478ded56de73034cc47", 842),
-        ("relay", "ef34503c836d0dc945c20e177fbaf65cca49665246683c8211c3fb9ed0b0665f", 1592),
+        ("relay", "75f062a05605e30bc7884339ff96ecf9628484029bdb7814f5c75fc4b57a4d57", 1662),
         ("relay-trust", "131984e3027c5a54ad8ffbf5d543bf4c11a2eebdb7113e021f229772960667b9", 146),
     ] {
         let printed = pp(&["--name", name]);
@@ -281,9 +281,12 @@ fn the_relay_documents_of_policies_ts_are_the_pinned_ones() {
     }
 }
 
+/// The ops policy's size, as `every_document_fits_its_quota_offline` counts it: 6 144 is its quota.
+const OPS_SIZE: usize = 5752;
+
 /// I-T4: every document the printer lists is within its IAM quota, counted as check-policies.sh counts it (managed and
 /// inline 6 144, trust policies and `runtime` 2 048, the endpoint's and the bucket's 20 480): a statement too many fails
-/// here, offline, before part B.
+/// here, offline, before part B. `ops`, with R-147's statement, at its measured size: what room is left is a decision.
 #[test]
 fn every_document_fits_its_quota_offline() {
     let listed = pp(&[]);
@@ -299,13 +302,18 @@ fn every_document_fits_its_quota_offline() {
         };
         let size = pp(&["--name", name]).trim().chars().count();
         assert!(size <= max, "{name}: {size} characters, over its {max}");
+        if name == "ops" {
+            assert_eq!(size, OPS_SIZE, "ops: {size} characters of its {max}");
+        }
     }
     assert!(listed.contains("\nrelay-trust\tRESOURCE_POLICY\t") && listed.contains("\nrelay\tIDENTITY_POLICY\t"), "{listed}");
 }
 
-/// I-T5: ai-env-ops starts and stops the relay instance and reads its five non-secret parameters (`peers` since R-93,
-/// for `ai-env relay status`), and nothing more of it: never the TLS pair, never a relay parameter by a wildcard, never
-/// a command or a session on the relay instance; it reads the relay's log group and lists the account's addresses.
+/// I-T5: ai-env-ops starts and stops the relay instance and reads its six non-secret parameters (`peers` since R-93 and
+/// `access` since R-147, for `ai-env relay status`), writes `access` alone of them with `ssm:PutParameter` alone (R-147,
+/// `WriteRelayAccess`; `suspended` is the only other parameter it writes), and nothing more of it: never the TLS pair,
+/// never a relay parameter by a wildcard, never a command or a session on the relay instance; it reads the relay's log
+/// group and lists the account's addresses.
 #[test]
 fn ops_starts_the_relay_and_reads_its_parameters_but_the_tls_pair() {
     let ops = document("ops");
@@ -315,7 +323,14 @@ fn ops_starts_the_relay_and_reads_its_parameters_but_the_tls_pair() {
     assert_eq!(list(&relay["Resource"]), [format!("arn:aws:ec2:eu-central-1:{ACCOUNT}:instance/i-0123456789abcdef1")]);
     let read = statement(&ops, "ReadRelayParameters");
     assert_eq!(list(&read["Action"]), ["ssm:GetParameters"]);
-    assert_eq!(list(&read["Resource"]), ["artifact", "workers", "grants", "token-signers", "peers"].map(parameter));
+    assert_eq!(list(&read["Resource"]), ["artifact", "workers", "grants", "token-signers", "peers", "access"].map(parameter));
+    let write = statement(&ops, "WriteRelayAccess");
+    assert_eq!((write["Effect"].as_str(), list(&write["Action"])), (Some("Allow"), vec!["ssm:PutParameter".to_string()]));
+    assert_eq!(list(&write["Resource"]), [parameter("access")]);
+    assert_eq!(write.as_object().unwrap().len(), 4, "no condition: {write}");
+    let writes_parameters = |s: &&Value| list(&s["Action"]).iter().any(|a| a.starts_with("ssm:") && !a.contains("Get") && !a.contains("Describe") && !a.contains("SendCommand"));
+    let writers: Vec<&str> = ops["Statement"].as_array().unwrap().iter().filter(writes_parameters).map(|s| s["Sid"].as_str().unwrap()).collect();
+    assert_eq!(writers, ["WriteRelayAccess", "WriteSuspendedParameter"], "exactly one statement more of ssm writes");
     for s in ops["Statement"].as_array().unwrap() {
         let sid = s["Sid"].as_str().unwrap_or("(no Sid)");
         let actions = list(&s["Action"]);
@@ -815,26 +830,33 @@ fn reload_py_list(name: &str) -> Vec<String> {
     serde_json::from_str(line.split_once(" = ").unwrap().1).unwrap()
 }
 
-/// I-T9: policies.ts's, reload.py's and Rust's parameter lists are the same six in one order (`peers`, R-93, right
-/// before `tls`), `tls` alone the secret in each (the one that is neither the artifact nor a list document), and Rust's
-/// names of the four lists are the worker SDK's (B-16, R-85).
+/// I-T9: policies.ts's, reload.py's and Rust's parameter lists are the same seven in one order (`peers`, R-93, then
+/// `access`, R-147, right before `tls`), `tls` alone the secret in each (the one that is neither the artifact nor a list
+/// document), and Rust's names of the five lists are the worker SDK's (B-16, R-85, R-143). check-policies.sh and
+/// policies.ts, which count them in words, count seven for the relay's role and six for ai-env-ops.
 #[test]
 fn the_relay_parameter_lists_agree() {
     use ai_env_cli::bridge::egress::{relay_param_name, RELAY_PARAMETERS};
     let ts = node("console.log(JSON.stringify({ params: pol.RELAY_PARAMETERS, tls: pol.RELAY_TLS }));", &[]);
     let rust: Vec<String> = RELAY_PARAMETERS.iter().map(|p| p.to_string()).collect();
     let (py, lists) = (reload_py_list("PARAMETERS"), reload_py_list("LISTS"));
-    assert_eq!(rust, ["artifact", "workers", "grants", "token-signers", "peers", "tls"], "bridge::egress::RELAY_PARAMETERS");
+    assert_eq!(rust, ["artifact", "workers", "grants", "token-signers", "peers", "access", "tls"], "bridge::egress::RELAY_PARAMETERS");
     assert_eq!(ts["params"], json!(rust), "policies.ts RELAY_PARAMETERS");
     assert_eq!(py, rust, "reload.py PARAMETERS");
     assert_eq!(ts["tls"], "tls", "policies.ts RELAY_TLS");
-    let worker = [ai_env_worker::policy::WORKERS, ai_env_worker::policy::GRANTS, ai_env_worker::policy::TOKEN_SIGNERS, ai_env_worker::policy::PEERS];
-    assert_eq!(["workers", "grants", "token-signers", "peers"].map(relay_param_name), worker.map(String::from));
-    assert_eq!(lists, ["workers", "grants", "token-signers", "peers"], "reload.py LISTS");
+    let worker = [ai_env_worker::policy::WORKERS, ai_env_worker::policy::GRANTS, ai_env_worker::policy::TOKEN_SIGNERS, ai_env_worker::policy::PEERS, ai_env_worker::policy::ACCESS];
+    assert_eq!(["workers", "grants", "token-signers", "peers", "access"].map(relay_param_name), worker.map(String::from));
+    assert_eq!(lists, ["workers", "grants", "token-signers", "peers", "access"], "reload.py LISTS");
     let secret_py: Vec<&String> = py.iter().filter(|p| *p != "artifact" && !lists.contains(p)).collect();
     assert_eq!(secret_py, ["tls"]);
     let secret_rust: Vec<&&str> = RELAY_PARAMETERS.iter().filter(|p| **p != "artifact" && !worker.contains(&relay_param_name(p).as_str())).collect();
     assert_eq!(secret_rust, [&"tls"]);
+    // The counts in words: a reader takes them from these texts, and nothing else notices when a new list leaves them stale.
+    for (file, seven, six) in [("scripts/check-policies.sh", 2, 2), ("policies.ts", 2, 1)] {
+        let source = text(&infra().join(file));
+        let said = |count: &str| source.matches(count).count();
+        assert_eq!((said("its seven parameters"), said("its six non-secret"), said("its six parameters"), said("its five non-secret")), (seven, six, 0, 0), "{file}: a count of the relay's parameters");
+    }
 }
 
 /// I-T10: relayArtifactValue writes exactly the four keys in their order and parseRelayArtifactValue takes it back;
@@ -1381,11 +1403,11 @@ run([
 /// The bucket the tests' artifact names (the printer's placeholder suffix).
 const BUCKET: &str = "ai-env-artifacts-0000000";
 /// The one `get-parameters` of every run (I-R30), as the fake aws logs it.
-const GET_PARAMETERS: &str = "ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --with-decryption --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com --output json";
+const GET_PARAMETERS: &str = "ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/access /ai-env/relay/tls --with-decryption --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com --output json";
 /// The parameters published into live/, and their files.
-const PUBLISHED: [(&str, &str); 5] = [("workers", "workers.json"), ("grants", "grants.json"), ("token-signers", "token-signers.json"), ("peers", "peers.json"), ("tls", "tls.pem")];
+const PUBLISHED: [(&str, &str); 6] = [("workers", "workers.json"), ("grants", "grants.json"), ("token-signers", "token-signers.json"), ("peers", "peers.json"), ("access", "access.json"), ("tls", "tls.pem")];
 /// Everything live/ may ever hold.
-const LIVE: [&str; 6] = ["fetched", "grants.json", "peers.json", "tls.pem", "token-signers.json", "workers.json"];
+const LIVE: [&str; 7] = ["access.json", "fetched", "grants.json", "peers.json", "tls.pem", "token-signers.json", "workers.json"];
 /// The binaries the artifact names in turn (any bytes: the unit only hashes them).
 const V1: &[u8] = b"ai-env-relay test binary, version one\n";
 const V2: &[u8] = b"ai-env-relay test binary, version two\n";
@@ -1399,6 +1421,11 @@ fn placeholder(n: u32) -> String {
 /// A peers list (R-85) of one documentation network: the reload publishes any JSON, the relay judges it.
 fn peers(cidr: &str) -> String {
     json!([{"cidr": cidr, "label": "lab", "not_after": "2099-12-31T23:59:59Z"}]).to_string()
+}
+
+/// An access list (R-143) of one placeholder chat and these grants: the reload publishes any JSON, the relay judges it.
+fn access(grants: &[&str]) -> String {
+    json!([{"chat": "0199a1b2-0000-7000-8000-0000000012a3", "grants": grants, "not_after": "2099-12-31T23:59:59Z"}]).to_string()
 }
 
 /// A peers list of these (cidr, not_after), labelled in turn.
@@ -1609,12 +1636,13 @@ impl World {
         sha[..16].to_string()
     }
 
-    /// The four lists, the TLS pair and V1 in the bucket, V1 the binary that comes up; V1's sha16.
+    /// The five lists, the TLS pair and V1 in the bucket, V1 the binary that comes up; V1's sha16.
     fn complete(&mut self) -> String {
         for (p, n) in [("workers", 1), ("grants", 2), ("token-signers", 3)] {
             self.set(p, &placeholder(n));
         }
         self.set("peers", &peers("198.51.100.0/24"));
+        self.set("access", &access(&["g-a"]));
         self.set("tls", &tls_pair("QUFB"));
         let v1 = self.binary(V1);
         self.good = binary_name(&v1);
@@ -1669,7 +1697,7 @@ impl World {
         assert_eq!(stdout(&o), "", "the unit writes its one line to stderr: {line}");
         assert_eq!(line.lines().count(), 1, "one line per run: {line}");
         self.never_logged(&line);
-        assert!(std::fs::read_dir(self.live("")).unwrap().flatten().all(|e| LIVE.contains(&e.file_name().to_string_lossy().as_ref())), "live/ holds only its six files");
+        assert!(std::fs::read_dir(self.live("")).unwrap().flatten().all(|e| LIVE.contains(&e.file_name().to_string_lossy().as_ref())), "live/ holds only its seven files");
         Ran {
             code: o.status.code().unwrap_or(-1),
             line: line.trim_end().to_string(),
@@ -1701,7 +1729,7 @@ impl World {
     }
 }
 
-/// I-T14: all six parameters valid: the five files published byte for byte (0640), `fetched` stamped within the run,
+/// I-T14: all seven parameters valid: the six files published byte for byte (0640), `fetched` stamped within the run,
 /// one get-parameters, the binary downloaded, hashed, installed (0755) and started; a second run writes nothing but
 /// `fetched`, and neither restarts nor reloads the relay.
 #[test]
@@ -1726,7 +1754,7 @@ fn reload_publishes_the_parameters_and_stamps_the_fetch() {
     assert_eq!(mode(&w.libexec(&binary_name(&v1))), 0o755);
     assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reset-failed ai-env-relay.service", "restart ai-env-relay.service", "is-active ai-env-relay.service"]);
     assert!(
-        ran.line.starts_with("ai-env-relay-reload: ok fetched=") && ran.line.ends_with(&format!(" changed=workers,grants,token-signers,peers,tls absent=none artifact={v1} tls=present relay=active")),
+        ran.line.starts_with("ai-env-relay-reload: ok fetched=") && ran.line.ends_with(&format!(" changed=workers,grants,token-signers,peers,access,tls absent=none artifact={v1} tls=present relay=active")),
         "{}",
         ran.line
     );
@@ -1970,7 +1998,7 @@ fn reload_waits_for_the_tls_pair_before_starting_the_relay() {
     let ran = w.run(&[]);
     assert_eq!(ran.code, 0, "{}", ran.line);
     assert_eq!(w.current(), binary_name(&v1));
-    assert!(ran.line.contains(" absent=tls ") && ran.line.ends_with(" tls=absent relay=waiting-for-tls"), "{}", ran.line);
+    assert!(ran.line.contains(" absent=access,tls ") && ran.line.ends_with(" tls=absent relay=waiting-for-tls"), "{}", ran.line);
     assert_eq!(ran.systemctl, ["is-active ai-env-relay.service"], "no restart or start");
     w.set("tls", &tls_pair("QUFB"));
     let ran = w.run(&[]);
@@ -2097,8 +2125,8 @@ fn reload_ignores_its_knobs_outside_a_test_root() {
     );
 }
 
-/// I-T59 (R-93, R-96): `peers` is published as the other lists. PARAMETERS holds six names, `peers` among the lists and
-/// right before `tls`, which stays last; its value becomes live/peers.json byte for byte, 0640 (root:ai-env-relay on
+/// I-T59 (R-93, R-96, R-147): `peers` is published as the other lists. PARAMETERS holds seven names, `peers` among the lists
+/// and right before `access`, then `tls`, which stays last; its value becomes live/peers.json byte for byte, 0640 (root:ai-env-relay on
 /// the instance; ownership is skipped when not root, I-R29), a new value one new file renamed over the old while the
 /// other files keep theirs, written before `fetched`; an absent value removes it (the run ok, the relay told), a value
 /// not JSON too (the run failed, naming it). reload.log is 0644 after a run under the unit's 077 umask, whether the run
@@ -2106,8 +2134,8 @@ fn reload_ignores_its_knobs_outside_a_test_root() {
 #[test]
 fn the_reload_publishes_peers_as_the_other_lists() {
     let params = reload_py_list("PARAMETERS");
-    assert_eq!((params.len(), params.last().map(String::as_str)), (6, Some("tls")), "{params:?}");
-    assert_eq!(params.iter().position(|p| p == "peers"), Some(4), "peers right before tls: {params:?}");
+    assert_eq!((params.len(), params.last().map(String::as_str)), (7, Some("tls")), "{params:?}");
+    assert_eq!(params.iter().position(|p| p == "peers"), Some(4), "peers right before access and tls: {params:?}");
     assert!(reload_py_list("LISTS").iter().any(|l| l == "peers"));
 
     let mut w = World::new();
@@ -2148,10 +2176,10 @@ fn the_reload_publishes_peers_as_the_other_lists() {
     assert_eq!(ran.code, 1, "{}", ran.line);
     assert!(!w.live("peers.json").exists() && ran.line.contains(" why=peers: not JSON"), "{}", ran.line);
 
-    // One publication's writes, in order: the four lists, peers last of them, then tls.pem, and `fetched` after all.
+    // One publication's writes, in order: the five lists, peers then access last of them, then tls.pem, and `fetched` after all.
     let t = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(t.path().join("root/var/lib/ai-env-relay/live")).unwrap();
-    let values = json!({"artifact": null, "workers": placeholder(1), "grants": placeholder(2), "token-signers": placeholder(3), "peers": peers("198.51.100.0/24"), "tls": tls_pair("QUFB")});
+    let values = json!({"artifact": null, "workers": placeholder(1), "grants": placeholder(2), "token-signers": placeholder(3), "peers": peers("198.51.100.0/24"), "access": access(&["g-a"]), "tls": tls_pair("QUFB")});
     let written = reload_module(
         t.path(),
         "written, real = [], m.write\n\
@@ -2161,7 +2189,102 @@ fn the_reload_publishes_peers_as_the_other_lists() {
         &[&t.path().join("root").display().to_string(), &values.to_string()],
     );
     let written: Vec<String> = serde_json::from_str(written.trim()).unwrap();
-    assert_eq!(written, ["workers.json", "grants.json", "token-signers.json", "peers.json", "tls.pem", "fetched"]);
+    assert_eq!(written, ["workers.json", "grants.json", "token-signers.json", "peers.json", "access.json", "tls.pem", "fetched"]);
+}
+
+/// I-T67 (R-147, R-144): `access` is published as the other lists, and its absence is no fault. PARAMETERS holds it right
+/// before `tls`, LISTS last; the run's one `get-parameters` names it. Never written: `absent=access`, no file, the run ok,
+/// the binary installed and the relay up, on every run (B2.3 of the runbook). Its first value: live/access.json byte for
+/// byte, 0640, one new file while the others keep theirs, `changed=access absent=none` and the relay told once; an
+/// unchanged run tells it nothing. A new value: the same. Deleted: removed, the run ok, the relay told. Refused by the
+/// reload (not JSON, over 4096 bytes, not printable ASCII): removed, the run failed naming it and no value, every other
+/// list stays as it was and the rest of the run goes on. The relay judges what the reload lets through: a list it refuses
+/// still reaches live/.
+#[test]
+fn the_reload_publishes_access_as_the_other_lists() {
+    let params = reload_py_list("PARAMETERS");
+    assert_eq!(params[params.len() - 2..], ["access", "tls"], "access right before tls: {params:?}");
+    assert_eq!(reload_py_list("LISTS").last().map(String::as_str), Some("access"), "the lists' last");
+
+    let mut w = World::new();
+    w.complete();
+    w.delete("access");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.contains(" changed=workers,grants,token-signers,peers,tls absent=access ") && ran.line.ends_with(" tls=present relay=active"), "{}", ran.line);
+    assert!(!w.live("access.json").exists());
+    assert_eq!(ran.aws.iter().filter(|l| l.starts_with("ssm ")).cloned().collect::<Vec<_>>(), [GET_PARAMETERS]);
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.contains(" changed=none absent=access "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service"], "nothing to tell the relay");
+
+    // Its first value: one new file, the relay told once.
+    let inode = |w: &World, f: &str| std::fs::metadata(w.live(f)).unwrap().ino();
+    let others = PUBLISHED.iter().filter(|(p, _)| *p != "access").map(|(_, f)| *f);
+    let before: Vec<(&str, u64)> = others.clone().map(|f| (f, inode(&w, f))).collect();
+    w.set("access", &access(&["g-a"]));
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(ran.line.contains(" changed=access absent=none "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reload ai-env-relay.service"]);
+    assert_eq!((text(&w.live("access.json")), mode(&w.live("access.json"))), (w.value("access"), 0o640));
+    for (f, ino) in &before {
+        assert_eq!(inode(&w, f), *ino, "{f}: access.json alone written");
+    }
+    let ran = w.run(&[]);
+    assert!(ran.code == 0 && ran.line.contains(" changed=none absent=none "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service"], "an unchanged list tells the relay nothing");
+
+    // A new value: the file replaced, by one new file.
+    let ino = inode(&w, "access.json");
+    w.set("access", &access(&["g-a", "g-b"]));
+    let ran = w.run(&[]);
+    assert!(ran.code == 0 && ran.line.contains(" changed=access absent=none "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reload ai-env-relay.service"]);
+    assert!(text(&w.live("access.json")) == w.value("access") && inode(&w, "access.json") != ino);
+
+    // Deleted: removed, the run ok, the relay told.
+    w.delete("access");
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 0, "{}", ran.line);
+    assert!(!w.live("access.json").exists() && ran.line.contains(" changed=access absent=access "), "{}", ran.line);
+    assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reload ai-env-relay.service"]);
+
+    // What the reload refuses: removed, the run failed, naming the parameter and no value; nothing else moves.
+    let over = format!("[\"{}\"]", "0".repeat(4094));
+    let not_ascii = format!("{}\u{0}", access(&["g-a"]));
+    let unfinished = access(&["g-a"]).replace("]", "");
+    for (value, why) in [(unfinished.as_str(), "access: not JSON"), (over.as_str(), "access: over 4096 bytes"), (not_ascii.as_str(), "access: not printable ASCII")] {
+        w.set("access", &access(&["g-a"]));
+        assert_eq!(w.run(&[]).code, 0);
+        let before: Vec<(&str, u64)> = others.clone().map(|f| (f, inode(&w, f))).collect();
+        w.set("access", value);
+        let ran = w.run(&[]);
+        assert_eq!(ran.code, 1, "{why}: {}", ran.line);
+        assert!(!w.live("access.json").exists() && ran.line.contains(&format!(" why={why}")) && ran.line.contains(" changed=access absent=none "), "{why}: {}", ran.line);
+        assert_eq!(ran.systemctl, ["is-active ai-env-relay.service", "reload ai-env-relay.service"], "{why}: the relay told, and never restarted");
+        for (f, ino) in &before {
+            assert_eq!(inode(&w, f), *ino, "{why}: {f} stays");
+        }
+    }
+
+    // Alone: a list the reload refuses stops nothing after it. `fetched` is stamped and the TLS pair, published next, moves.
+    w.set("access", &access(&["g-a"]));
+    assert_eq!(w.run(&[]).code, 0);
+    w.set("access", "{");
+    w.set("tls", &tls_pair("QkJC"));
+    let ran = w.run(&[]);
+    assert_eq!(ran.code, 1, "{}", ran.line);
+    assert!(ran.line.contains(" changed=access,tls absent=none ") && ran.line.contains(" why=access: not JSON") && !ran.line.contains(" fetched=none "), "{}", ran.line);
+    assert_eq!(text(&w.live("tls.pem")), w.value("tls"));
+
+    // What only the relay refuses (R-143): JSON, published byte for byte, and judged there.
+    w.set("access", &placeholder(4));
+    let ran = w.run(&[]);
+    assert!(ran.code == 0 && ran.line.contains(" changed=access absent=none "), "{}", ran.line);
+    assert_eq!(text(&w.live("access.json")), w.value("access"));
+    assert!(ai_env_worker::policy::parse_access(&w.value("access")).is_err(), "a value R-143 refuses");
 }
 
 /// I-T61 (R-95): a root volume over 90 % full (the runs' `statvfs` stub) puts `disk` first in the run line's `why=`

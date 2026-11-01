@@ -1,8 +1,11 @@
-//! `PrivateSvc` (`Relay`), the limits and deadline arithmetic, the catalog filter (R-30 to R-57).
+//! `PrivateSvc` (`Relay`), the limits and deadline arithmetic, the catalog filter (R-30 to R-57), a token's effective
+//! grants (R-145).
 //!
 //! Every request carries a session token that W/M's verifier checks first (R-51 to R-53); the caller is the token's,
 //! never the request's (R-54). A refusal before the stream is a gRPC status (R-31, LD-R14); once the stream starts,
 //! the call ends with exactly one final chunk (R-42). Each call gets one call line (R-61), each list one list line.
+//! What a token reaches is worked out per request, with no cache: its own grant, and what the access list adds for its
+//! chat as the list is now (R-145).
 //!
 //! Each request is one of its connection's (R-103): pending from its handler's start to its answer or its call's
 //! conclusion, so the connection's watch knows when it is idle; its refused tokens count against the connection,
@@ -21,7 +24,7 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 use crate::calls::{CallState, CallStream, CallTable, Caps, Outcome, Permits};
 use crate::config;
 use crate::limits::Refusal;
-use crate::lists::Grant;
+use crate::lists::{Access, Grant, Grants};
 use crate::registry::Route;
 use crate::reqlog::{CallFields, CallLog, ListFields};
 use crate::serve::RelayState;
@@ -195,7 +198,9 @@ fn list(st: &RelayState, request: &tonic::Request<ListSourcesRequest>, conn: Opt
     line.grant = claims.grant_id.clone();
     st.sessions.enter(&claims.session_id, false, Instant::now()).map_err(session_refusal)?;
     let grants = st.live.grants.fresh(st.now(), st.max_stale()).ok_or_else(|| Refused::new(tonic::Code::Unavailable, "grants not loaded", "not_ready"))?;
-    let sources = filter_catalog(st.registry.statuses(), grants.get(&claims.grant_id));
+    // R-145: through `fresh`, so a list that is absent, refused or stale adds nothing. The list line keeps the token's.
+    let access = st.live.access.fresh(st.now(), st.max_stale());
+    let sources = filter_catalog(st.registry.statuses(), &effective(&grants, access.as_deref(), &claims, st.now_unix()));
     let response = ListSourcesResponse { sources };
     if response.encoded_len() > st.cfg.limits.list_max_bytes as usize {
         return Err(Refused::new(tonic::Code::ResourceExhausted, "catalog too large", "too_large"));
@@ -241,10 +246,14 @@ async fn call(
         return Err(Refused::new(tonic::Code::InvalidArgument, "invalid source or op name", "invalid"));
     }
     let grants = st.live.grants.fresh(st.now(), st.max_stale()).ok_or_else(|| Refused::new(tonic::Code::Unavailable, "grants not loaded", "not_ready"))?;
+    // R-145: through `fresh`, so a list that is absent, refused or stale adds nothing.
+    let access = st.live.access.fresh(st.now(), st.max_stale());
     // R-48: the grant before the lookup, so a caller learns nothing of sources it may not use.
-    if !grants.get(&claims.grant_id).is_some_and(|g| g.allows(&req.source, &req.op)) {
+    let Some(granted) = effective(&grants, access.as_deref(), &claims, st.now_unix()).into_iter().find(|g| g.allows(&req.source, &req.op)) else {
         return Err(Refused::new(tonic::Code::PermissionDenied, "not granted", "denied"));
-    }
+    };
+    // R-145: the line and the worker name the grant the call went through, from here on.
+    fields.grant = granted.grant_id.clone();
     let (live, descriptor) = match st.registry.route(&req.source) {
         Route::Unknown => return Err(Refused::new(tonic::Code::NotFound, "no such source", "not_found")),
         Route::Live(h, d) => (Some(h), Some(d)),
@@ -280,8 +289,9 @@ async fn call(
         }
     })?;
     let enqueueing = Enqueueing { table: Arc::clone(&handle.calls), state: Arc::clone(&state), armed: true };
-    // R-54: the caller is the token's; `chat_id` has no field and is not forwarded.
-    let caller = Caller { caller_id: claims.caller_id, session_id: claims.session_id, grant_id: claims.grant_id, vm_id: claims.vm_id };
+    // R-54: the caller is the token's; `chat_id` has no field and is not forwarded. R-145: the grant, the one that
+    // allowed this call.
+    let caller = Caller { caller_id: claims.caller_id, session_id: claims.session_id, grant_id: fields.grant.clone(), vm_id: claims.vm_id };
     let left = deadline.saturating_duration_since(Instant::now()).as_millis();
     let invoke = Invoke {
         request_id: fields.request_id.clone(),
@@ -408,15 +418,21 @@ pub fn effective_deadline_ms(requested: u32, cfg: &config::Limits) -> u32 {
     want.clamp(cfg.deadline_min_ms, cfg.deadline_max_ms)
 }
 
-/// R-49.
-pub fn filter_catalog(statuses: Vec<SourceStatus>, grant: Option<&Grant>) -> Vec<SourceStatus> {
-    let Some(grant) = grant else { return Vec::new() };
+/// R-145: what a token reaches, in the order a call tries them: its own grant, then the grants of the entry in force that
+/// names its chat. A token with no `chat_id` matches no entry, and a name `grants` does not hold adds nothing.
+fn effective<'a>(grants: &'a Grants, access: Option<&Access>, c: &SessionClaims, now: u64) -> Vec<&'a Grant> {
+    let more = c.chat_id.as_deref().and_then(|chat| access?.grants_of(chat, now)).unwrap_or_default();
+    grants.get(&c.grant_id).into_iter().chain(more.iter().filter(|g| **g != c.grant_id).filter_map(|g| grants.get(g))).collect()
+}
+
+/// R-49: the ops any of `grants` allows, in the catalog's order; with none, nothing.
+pub fn filter_catalog(statuses: Vec<SourceStatus>, grants: &[&Grant]) -> Vec<SourceStatus> {
     let mut out: Vec<SourceStatus> = statuses
         .into_iter()
         .filter_map(|mut s| {
             let d = s.descriptor.as_mut()?;
             let name = d.name.clone();
-            d.ops.retain(|op| grant.allows(&name, &op.name));
+            d.ops.retain(|op| grants.iter().any(|g| g.allows(&name, &op.name)));
             (!d.ops.is_empty()).then_some(s)
         })
         .collect();
@@ -500,19 +516,60 @@ mod tests {
     fn the_catalog_filter_keeps_granted_ops_only() {
         let statuses = vec![status("other.gamma", &["get"], true), status("example.beta", &["get"], false), status("example.alpha", &["get", "list", "put"], true)];
         let grant = Grant { grant_id: "g".into(), allow: vec!["example.*/get".into(), "example.*/list".into()] };
-        let out = filter_catalog(statuses.clone(), Some(&grant));
-        let view: Vec<(String, Vec<String>, bool)> = out
-            .iter()
-            .map(|s| {
-                let d = s.descriptor.as_ref().unwrap();
-                (d.name.clone(), d.ops.iter().map(|o| o.name.clone()).collect(), s.available)
-            })
-            .collect();
-        assert_eq!(
-            view,
-            vec![("example.alpha".to_string(), vec!["get".to_string(), "list".to_string()], true), ("example.beta".to_string(), vec!["get".to_string()], false)]
-        );
-        assert!(filter_catalog(statuses, None).is_empty(), "no grant: nothing");
+        let view = |out: Vec<SourceStatus>| -> Vec<(String, Vec<String>, bool)> {
+            out.iter()
+                .map(|s| {
+                    let d = s.descriptor.as_ref().unwrap();
+                    (d.name.clone(), d.ops.iter().map(|o| o.name.clone()).collect(), s.available)
+                })
+                .collect()
+        };
+        let row = |name: &str, ops: &[&str], available: bool| (name.to_string(), ops.iter().map(|o| o.to_string()).collect::<Vec<String>>(), available);
+        assert_eq!(view(filter_catalog(statuses.clone(), &[&grant])), [row("example.alpha", &["get", "list"], true), row("example.beta", &["get"], false)]);
+        // R-145: the union of two grants, each source's ops in the catalog's order whichever grant allows them.
+        let put = Grant { grant_id: "g-put".into(), allow: vec!["example.alpha/put".into(), "other.*/get".into()] };
+        let get = Grant { grant_id: "g-get".into(), allow: vec!["example.alpha/get".into()] };
+        let want = [row("example.alpha", &["get", "put"], true), row("other.gamma", &["get"], true)];
+        assert_eq!(view(filter_catalog(statuses.clone(), &[&put, &get])), want);
+        assert_eq!(view(filter_catalog(statuses.clone(), &[&get, &put])), want, "either order");
+        assert_eq!(view(filter_catalog(statuses.clone(), &[&get])), [row("example.alpha", &["get"], true)]);
+        assert!(filter_catalog(statuses, &[]).is_empty(), "no grant: nothing");
+    }
+
+    /// R-145: the token's own grant first, then its entry's in the entry's order; its own grant named again by the entry
+    /// comes once; a name no grant holds adds nothing; no chat, no list, another chat's entry or a lapsed one, nothing more.
+    #[test]
+    fn a_token_reaches_its_own_grant_then_its_entrys() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+        const OTHER: &str = "0199a1b2-0000-7000-8000-0000000012a4";
+        let grant = |id: &str| Grant { grant_id: id.into(), allow: vec!["example.*/*".into()] };
+        let grants = Grants { entries: vec![grant("g-a"), grant("g-b"), grant("g-own")] };
+        let claims = |own: &str, chat: Option<&str>| SessionClaims {
+            kid: "mac".into(),
+            aud: session::SESSION_AUD.into(),
+            caller_id: "mac".into(),
+            session_id: "0199a1b2-0000-7000-8000-0000000012a5".into(),
+            chat_id: chat.map(str::to_string),
+            grant_id: own.into(),
+            vm_id: "microvm-0199a1b2-0000-7000-8000-000000000001".into(),
+            iat: 0,
+            exp: 3600,
+        };
+        const NOT_AFTER: &str = "2027-01-01T23:59:59Z";
+        let until = ai_env_worker::policy::unix_of(NOT_AFTER).unwrap();
+        let access = Access {
+            entries: vec![ai_env_worker::policy::AccessEntry { chat: CHAT.into(), grants: vec!["g-a".into(), "g-gone".into(), "g-own".into(), "g-b".into()], not_after: NOT_AFTER.into() }],
+        };
+        let reach = |c: &SessionClaims, access: Option<&Access>, now: u64| -> Vec<String> { effective(&grants, access, c, now).iter().map(|g| g.grant_id.clone()).collect() };
+        assert_eq!(reach(&claims("g-own", Some(CHAT)), Some(&access), until), ["g-own", "g-a", "g-b"], "own first, once");
+        assert_eq!(reach(&claims("g-b", Some(CHAT)), Some(&access), until), ["g-b", "g-a", "g-own"]);
+        assert_eq!(reach(&claims("no-grant", Some(CHAT)), Some(&access), until), ["g-a", "g-own", "g-b"], "a token's name in no list adds nothing, and costs nothing");
+        for c in [claims("g-own", None), claims("g-own", Some(OTHER))] {
+            assert_eq!(reach(&c, Some(&access), until), ["g-own"], "no entry names it");
+        }
+        assert_eq!(reach(&claims("g-own", Some(CHAT)), None, until), ["g-own"], "no list");
+        assert_eq!(reach(&claims("g-own", Some(CHAT)), Some(&access), until + 1), ["g-own"], "lapsed");
+        assert!(reach(&claims("no-grant", None), Some(&access), until).is_empty());
     }
 
     #[test]

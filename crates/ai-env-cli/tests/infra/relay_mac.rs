@@ -1,5 +1,6 @@
 //! S13 slice M: the Mac side of the relay, through the real `ai-env` with the fake aws and age
-//! (plans/s13-contracts.md §WM-worker-mac.8.4, WM-T43 to WM-T48, WM-T48a and WM-T42a). Each test gets a
+//! (plans/s13-contracts.md §WM-worker-mac.8.4, WM-T43 to WM-T48, WM-T48a and WM-T42a; the relay security plan's WM-T58
+//! to WM-T60, and §RS.13's WM-T66 and WM-T67). Each test gets a
 //! [`World`]: one temp tree under `/tmp` (the agent's socket path stays well under 104 bytes) holding `bin/`
 //! (tests/fakes/age.sh as `age`, `age-keygen` and `age-plugin-se`, tests/fakes/aws.sh as `aws`), `keys/` (a
 //! keystore key with its public test recipients, as tests/infra/creds.rs makes one), `bridge/` (`bridge.toml`
@@ -626,18 +627,19 @@ fn relay_start_stop_and_status_are_ops_commands() {
     let o = w.run(&["status", "--json"], Who::Ops);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    for key in SEVEN_KEYS {
+    for key in EIGHT_KEYS {
         assert!(doc.get(key).is_some(), "{key}: {doc}");
     }
-    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(7), "the seven keys alone: {doc}");
+    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(8), "the eight keys alone: {doc}");
     assert_eq!(doc["peers"], serde_json::json!([{"label": "office", "cidr": "198.51.100.0/24", "not_after": IN_FORCE, "expired": false}]), "{doc}");
+    assert_eq!(doc["access"], serde_json::json!([]), "an absent access list: {doc}");
     assert_eq!(doc["instance"]["status_line"]["relay_version"].as_str(), Some("0.12.0"), "the relay's status line rides in instance: {doc}");
     assert_eq!(doc["mac"]["session_fp"].as_str(), Some(session.fingerprint().as_str()));
     assert!(!stdout(&o).contains(&session.b64()), "fingerprints, never a key, in --json");
     let o = w.run(&["status", "--local", "--json"], Who::Nobody);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
-    assert!(doc.as_object().map(serde_json::Map::len) == Some(7) && doc["instance"].is_null() && doc["grants"].is_null() && doc["peers"].is_null() && doc["mac"]["session_fp"].is_string(), "{doc}");
+    assert!(doc.as_object().map(serde_json::Map::len) == Some(8) && doc["instance"].is_null() && doc["grants"].is_null() && doc["peers"].is_null() && doc["access"].is_null() && doc["mac"]["session_fp"].is_string(), "{doc}");
     // No status line in 10 minutes: a warning.
     w.answer("logs.filter-log-events.json", "{\"events\": []}");
     let o = w.run(&["status"], Who::Ops);
@@ -951,13 +953,14 @@ fn relay_tls_value_reaches_ssm_on_stdin_never_through_a_file() {
 fn relay_help_says_what_each_command_does() {
     let w = World::new();
     let rules = format!("Its rules, <source-glob>/<op-glob>, 1 to {} (they replace the grant's whole set; grants are default-deny)", policy::RULES_MAX);
-    let wanted: [(&str, Vec<&str>); 6] = [
+    let wanted: [(&str, Vec<&str>); 7] = [
         ("stop", vec!["Stop the relay instance (as ai-env-ops): VM relay calls answer unavailable and workers keep dialing until ai-env relay start"]),
         ("revoke", vec!["The worker's id (with --token-signer: the token signer's)", "Remove a token signer, not a worker"]),
         ("grant", vec!["The grant's id, as [relay].grant or a workspace's relay_grant names it", rules.as_str(), "Delete the grant"]),
         ("status", vec!["One JSON object: the instance, the lists and this Mac's keys (each key as its fingerprint) and agent, and the verdict with its rows as printed"]),
         ("pubkey", vec!["Print this Mac's relay public keys from the sealed container's notes (no Touch ID; --verify checks them: one Touch ID)"]),
         ("allow", vec!["Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)", "The last valid day, UTC (default: a year from today; at most two years ahead)"]),
+        ("access", vec!["Approve a remote chat for a grant, or take it back, in /ai-env/relay/access (as ai-env-ops): the relay applies it within about 70 s, with no restart", "The grant to allow this chat, one of [relay].offer", "1 to 90 (default 30)"]),
     ];
     let mut missing = Vec::new();
     for (sub, texts) in wanted {
@@ -966,6 +969,7 @@ fn relay_help_says_what_each_command_does() {
         assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "relay {sub} --help calls nothing");
         let help = stdout(&o).split_whitespace().collect::<Vec<_>>().join(" ");
         missing.extend(texts.into_iter().filter(|t| !help.contains(t)).map(|t| format!("relay {sub} --help lacks {t:?}")));
+        assert!(!help.contains("--from-panel"), "relay {sub} --help names the panel's own flag: {help}");
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
@@ -973,8 +977,9 @@ fn relay_help_says_what_each_command_does() {
 // ---- the relay security plan's slice M: §RS.4, §RS.3.2 ------------------------------------------------------------
 
 const PEERS: &str = "/ai-env/relay/peers";
-/// The keys of `relay status --json` (§RS.3.2 row 8).
-const SEVEN_KEYS: [&str; 7] = ["instance", "workers", "token_signers", "grants", "peers", "status", "mac"];
+const ACCESS: &str = "/ai-env/relay/access";
+/// The keys of `relay status --json` (§RS.3.2 row 8, R-146).
+const EIGHT_KEYS: [&str; 8] = ["instance", "workers", "token_signers", "grants", "peers", "access", "status", "mac"];
 /// A `not_after` in force for the life of these tests, and one long lapsed.
 const IN_FORCE: &str = "2036-01-01T00:00:00Z";
 const LAPSED: &str = "2020-01-01T00:00:00Z";
@@ -1657,15 +1662,15 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     // The peers list in force, its rows and its JSON, the probe's word with its row, and the rows in §RS.3.2's order.
     let (rc, out) = s.status();
     assert_eq!(rc, 0, "{out}");
-    let order = ["[ok ] keys: sealed", "[-  ] agent:", "[ok ] instance ", "[ok ] ssm: Online", "probe: 127.0.0.1:443", "[ok ] relay 0.12.0: ", "refused in the last hour:", &format!("{WORKERS} v1"), &format!("{SIGNERS} v1"), "this Mac's session key", &format!("{GRANTS} v1"), &format!("[ok ] {PEERS} v1")];
+    let order = ["[ok ] keys: sealed", "[-  ] agent:", "[ok ] instance ", "[ok ] ssm: Online", "probe: 127.0.0.1:443", "[ok ] relay 0.12.0: ", "refused in the last hour:", &format!("{WORKERS} v1"), &format!("{SIGNERS} v1"), "this Mac's session key", &format!("{GRANTS} v1"), &format!("[ok ] {PEERS} v1"), &format!("[-  ] {ACCESS}: absent")];
     let at: Vec<usize> = order.iter().map(|t| out.find(t).unwrap_or_else(|| panic!("{t}\n{out}"))).collect();
     assert!(at.windows(2).all(|p| p[0] < p[1]), "not in §RS.3.2's order: {at:?}\n{out}");
     assert!(out.contains(&format!("[ok ] {PEERS} v1: 1 peer(s), 1 in force\n[-  ]   peer office 198.51.100.0/24 until {IN_FORCE}\n")), "{out}");
     assert!(out.contains("grants 2123456789abcdef (32 s old), peers 3123456789abcdef (33 s old)\n"), "{out}");
     let (rc, doc) = s.json();
     assert_eq!(rc, 0, "{doc}");
-    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(7), "{doc}");
-    for key in SEVEN_KEYS {
+    assert_eq!(doc.as_object().map(serde_json::Map::len), Some(8), "{doc}");
+    for key in EIGHT_KEYS {
         assert!(doc.get(key).is_some(), "{key}: {doc}");
     }
     assert_eq!(doc["peers"], serde_json::json!([{"label": "office", "cidr": "198.51.100.0/24", "not_after": IN_FORCE, "expired": false}]));
@@ -1741,9 +1746,10 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     assert_eq!(out.matches("[?? ]").count(), 1, "for it alone: {out}");
     assert!(out.contains(&format!("[ok ] {WORKERS} v1")) && out.contains(&format!("[ok ] {GRANTS} v1")) && out.contains(&format!("[ok ] {SIGNERS} v")), "{out}");
     let names: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
-    assert_eq!(names.len(), 2, "two reads: {names:?}");
+    assert_eq!(names.len(), 3, "three reads: {names:?}");
     assert!(names[0].contains(WORKERS) && names[0].contains(SIGNERS) && names[0].contains(GRANTS) && !names[0].contains(PEERS), "{names:?}");
     assert!(names[1].contains(&format!("--names {PEERS} ")) && !names[1].contains(WORKERS), "{names:?}");
+    assert!(names[2].contains(&format!("--names {ACCESS} ")) && !names[2].contains(WORKERS) && !names[2].contains(PEERS), "{names:?}");
     let (rc, doc) = s.json();
     assert_eq!(rc, 7, "{doc}");
     assert!(doc["peers"].is_null() && doc["workers"].is_array(), "{doc}");
@@ -1882,4 +1888,401 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     w.answer("ec2.describe-instances.stderr", "\nAn error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: not authorized\n");
     let (rc, doc) = s.json();
     assert!(rc == 7 && unread(&doc), "{doc}");
+}
+
+// ---- §RS.13: a chat's access (R-146, R-150, R-152) ----------------------------------------------------------------
+
+/// Two access ids and a session id, placeholders of no meaning.
+const CHAT_A: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+const CHAT_B: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+const SID_A: &str = "0199a1b2-0000-7000-8000-0000000012b1";
+
+impl World {
+    /// Session `sid`'s row: `mode`, its access id and its mint word.
+    fn session(&self, sid: &str, mode: &str, access: Option<&str>, relay: Option<&str>) {
+        use ai_env_cli::bridge::registry::{write, SessionRow, REGISTRY_SCHEMA_V};
+        let row = SessionRow { v: REGISTRY_SCHEMA_V, session_id: sid.into(), status: "closed".into(), mode: mode.into(), pid: 1, access_id: access.map(str::to_string), relay: relay.map(str::to_string), ..SessionRow::default() };
+        write(&self.paths(), &row).unwrap();
+    }
+
+    /// The entries of `/ai-env/relay/access`, and its version.
+    fn access_of(&self) -> (Vec<policy::AccessEntry>, u64) {
+        let (value, version) = self.param(ACCESS).expect("the access list exists");
+        (policy::parse_access(&value).unwrap(), version)
+    }
+
+    /// `state/relay-access.json`, which must be 0600.
+    fn access_cache(&self) -> serde_json::Value {
+        let path = self.bridge().join("state").join("relay-access.json");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "{}", path.display());
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
+    }
+
+    /// Whether `state/relay-access.json` is there.
+    fn has_access_cache(&self) -> bool {
+        self.bridge().join("state").join("relay-access.json").exists()
+    }
+
+    /// `ai-env session forget <sid>`, which asks nothing of AWS.
+    fn session_forget(&self, sid: &str) -> Output {
+        run(&mut ai_env(self.root(), &["session", "forget", sid]))
+    }
+}
+
+fn access_entry(chat: &str, grants: &[&str], not_after: &str) -> policy::AccessEntry {
+    policy::AccessEntry { chat: chat.into(), grants: grants.iter().map(|g| (*g).to_string()).collect(), not_after: not_after.into() }
+}
+
+fn access_value(entries: &[policy::AccessEntry]) -> String {
+    policy::render_access(entries).unwrap()
+}
+
+/// The last valid day `days` from today, as an entry holds it.
+fn access_end(days: u64) -> String {
+    let now = ai_env_cli::wire::time::unix_now();
+    format!("{}T23:59:59Z", &ai_env_cli::wire::time::rfc3339_utc(now - now % 86_400 + days * 86_400)[..10])
+}
+
+/// WM-T66 (R-150, R-152): `relay access` edits `/ai-env/relay/access`, as ai-env-ops with no gate, in R-150's order,
+/// version-checked under the lock, its lapsed entries pruned; the audit's `relay_access` and the cache follow every run
+/// that ends knowing what the list holds, and a write that reports failure, which may have landed, audits `unknown` and
+/// removes the cache. An entry has one end for all its grants, and a `note:` says so. A chat back on this Mac can leave the
+/// list and takes nothing new. `session forget` says when its row was the last way to name an entry in force.
+#[test]
+fn relay_access_edits_the_access_list() {
+    let w = World::new();
+    w.config("[relay]\noffer = [\"g-a\", \"g-b\", \"g-c\"]\n");
+    let allow = |grant: &'static str| ["access", SID_A, "--allow", grant];
+    // The arguments: exit 2, nothing asked of anyone.
+    for (args, why) in [
+        (vec!["access", "not-a-session", "--allow", "g-a"], "relay access: not a session id: not-a-session".to_string()),
+        (vec!["access", SID_A, "--allow", "G"], format!("relay access: \"G\" is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)),
+        (vec!["access", SID_A, "--remove", "a b"], "relay access: \"a b\" is not an id".to_string()),
+        (vec!["access", SID_A, "--allow", "g-a", "--days", "0"], "relay access: --days 0: 1 to 90".to_string()),
+        (vec!["access", SID_A, "--allow", "g-a", "--days", "91"], "relay access: --days 91: 1 to 90".to_string()),
+    ] {
+        let o = w.run(&args, Who::Ops);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&why), "{args:?}: {}", stderr(&o));
+        assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{args:?}: {:?}", w.aws_calls());
+    }
+    // A grant [relay].offer does not name: exit 9 for an allow, before the row.
+    let o = w.run(&["access", SID_A, "--allow", "g-z"], Who::Ops);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("relay access: grant g-z is not in [relay].offer of "), "{}", stderr(&o));
+    assert!(w.aws_calls().is_empty(), "{:?}", w.aws_calls());
+    // [relay].offer not valid: exit 1 naming the key.
+    w.config("[relay]\noffer = [\"g.a\"]\n");
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("[relay].offer[0] = \"g.a\" holds a `.`"), "{}", stderr(&o));
+    w.config("[relay]\noffer = [\"g-a\", \"g-b\", \"g-c\"]\n");
+    // The row: none is exit 1, a chat on this Mac exit 9, no access id exit 1; each before the context and any AWS call.
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!((code(&o), stderr(&o)), (1, format!("ai-env: no session {SID_A}\n")));
+    w.session(SID_A, "local-child", Some(CHAT_A), None);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: session {SID_A} runs on this Mac: only a chat on a VM holds a relay session")), "{}", stderr(&o));
+    w.session(SID_A, "local-child", None, None);
+    let o = w.run(&["access", SID_A, "--remove", "g-a"], Who::Ops);
+    assert_eq!(code(&o), 9, "on this Mac with no id, nothing to take back: {}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: session {SID_A} runs on this Mac: only a chat on a VM holds a relay session")), "{}", stderr(&o));
+    w.session(SID_A, "remote", None, None);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: session {SID_A} has no access id: it last ran before this ai-env, so reopen the chat first")), "{}", stderr(&o));
+    // A hand-edited id that is no uuid counts as none, and never reaches a render.
+    w.session(SID_A, "remote", Some("not a uuid"), None);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: session {SID_A} has no access id: it last ran before this ai-env, so reopen the chat first")), "{}", stderr(&o));
+    assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{:?}", w.aws_calls());
+    w.session(SID_A, "remote", Some(CHAT_A), Some("minted"));
+    // No gate: ops and the deployer pass it, and with no operator at all the sealed ops key is what is missing (exit 5).
+    let o = w.run(&allow("g-a"), Who::Nobody);
+    assert_eq!(code(&o), 5, "{}", stderr(&o));
+    assert!(stderr(&o).contains("no AWS operator identity"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("only ai-env-deployer"), "{}", stderr(&o));
+    // No such grant in the list (a missing list too): exit 9, nothing written.
+    for who in [Who::Ops, Who::Deployer] {
+        let o = w.run(&allow("g-a"), who);
+        assert_eq!(code(&o), 9, "{who:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(&format!("relay access: grant g-a is not in {GRANTS} v0, so this chat would reach nothing through it: ai-env as deployer -- ai-env relay grant g-a '<source-glob>/<op-glob>'")), "{who:?}: {}", stderr(&o));
+        assert!(puts(&w).is_empty(), "{:?}", puts(&w));
+    }
+    let grants: Vec<policy::Grant> = ["g-a", "g-b", "g-c"].iter().map(|g| policy::Grant { grant_id: (*g).into(), allow: vec!["example-*/*".into()] }).collect();
+    w.set_param(GRANTS, &policy::render_grants(&grants).unwrap(), 4);
+    // The first allow creates the list, as ops (M-WM91: under `gate` this is exit 9): 30 days by default, one read of both names.
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let end_30 = access_end(30);
+    assert_eq!(w.param(ACCESS), Some((access_value(&[access_entry(CHAT_A, &["g-a"], &end_30)]), 1)));
+    assert_eq!(stdout(&o), format!("allowed chat {CHAT_A} (session {SID_A}) grant g-a until {end_30} ({ACCESS} v1, 1 chat(s)); the relay applies it within about 70 s, with no restart\n"));
+    assert!(!stderr(&o).contains("note:"), "a chat holding a token, and no other grant, hears nothing more: {}", stderr(&o));
+    let reads: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
+    assert!(reads.len() == 1 && reads[0].contains(&format!("--names {ACCESS} {GRANTS} ")), "one read of both: {reads:?}");
+    let put = puts(&w);
+    assert!(put.len() == 1 && put[0].contains(&format!("--name {ACCESS} ")) && put[0].contains(" --type String ") && put[0].contains(" --tier Standard ") && !put[0].contains("--overwrite"), "{put:?}");
+    assert_eq!(w.age_calls("-d"), 0, "under ai-env as ops no unseal");
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!(row["detail"], serde_json::json!({"actor": "cli", "op": "allow", "outcome": "added", "grant": "g-a", "access": CHAT_A, "not_after": end_30, "version": "1", "pruned": "0"}), "{row}");
+    let cache = w.access_cache();
+    assert_eq!((&cache["version"], &cache["entries"]), (&serde_json::json!(1), &serde_json::json!([{"chat": CHAT_A, "grants": ["g-a"], "not_after": end_30}])), "{cache}");
+    assert!(cache["at"].as_str().is_some_and(|t| ai_env_cli::wire::time::parse_rfc3339_utc(t).is_some()), "{cache}");
+    // The same again: nothing written; the audit and the cache say so.
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("chat {CHAT_A} (session {SID_A}) holds grant g-a until {end_30} ({ACCESS} v1); nothing written\n"));
+    assert!(puts(&w).is_empty(), "{:?}", puts(&w));
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!((row["detail"]["outcome"].as_str(), row["detail"]["version"].as_str(), row["detail"].get("pruned")), (Some("unchanged"), Some("1"), None), "{row}");
+    // Another grant joins, overwriting; its entry's end the later of old and new, in both directions.
+    let o = w.run(&["access", SID_A, "--allow", "g-b", "--days", "1"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.param(ACCESS), Some((access_value(&[access_entry(CHAT_A, &["g-a", "g-b"], &end_30)]), 2)), "a shorter --days keeps the later end");
+    assert!(puts(&w)[0].contains("--overwrite"), "{:?}", puts(&w));
+    assert!(stdout(&o).contains(&format!("grant g-b until {end_30} ({ACCESS} v2, 1 chat(s))")), "{}", stdout(&o));
+    assert_eq!(stderr(&o).lines().filter(|l| l.starts_with("note:")).collect::<Vec<_>>(), [format!("note: chat {CHAT_A}'s entry holds g-a too: one end, {end_30}, covers them all")], "the end it asked for gave way, and g-a keeps it");
+    let o = w.run(&["access", SID_A, "--allow", "g-b", "--days", "90"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let end_90 = access_end(90);
+    assert_eq!(w.param(ACCESS), Some((access_value(&[access_entry(CHAT_A, &["g-a", "g-b"], &end_90)]), 3)), "a longer one moves it");
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["outcome"].as_str(), Some("extended"));
+    assert_eq!(stderr(&o).lines().filter(|l| l.starts_with("note:")).collect::<Vec<_>>(), [format!("note: chat {CHAT_A}'s entry holds g-a too: one end, {end_90}, covers them all")], "g-a is stretched with it");
+    // The same grant to the same end writes nothing, so it stretches nothing and says nothing.
+    let o = w.run(&["access", SID_A, "--allow", "g-b", "--days", "90"], Who::Ops);
+    assert!(code(&o) == 0 && !stderr(&o).contains("note:"), "{}", stderr(&o));
+    // A write that jumps a version (M-WM87): exit 7 naming both. It may have landed, so nothing here says what the list
+    // holds: its row says `unknown`, with no version, and the cache goes.
+    assert!(w.has_access_cache());
+    w.answer("ssm.put-parameter.json", "{\"Version\": 7, \"Tier\": \"Standard\"}\n");
+    let o = w.run(&["access", SID_A, "--allow", "g-c"], Who::Ops);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: {ACCESS} moved from v3 to v7 while it was written (another writer): run the command again to see what it holds")), "{}", stderr(&o));
+    assert!(!w.has_access_cache(), "the page says `not read yet`");
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!(row["detail"], serde_json::json!({"actor": "cli", "op": "allow", "outcome": "unknown", "grant": "g-c", "access": CHAT_A, "not_after": end_90}), "{row}");
+    w.unanswer("ssm.put-parameter.json");
+    // A put whose answer is lost (the CLI's timeout, a dropped connection): the same, and a removal's row names no end.
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert!(code(&o) == 0 && w.has_access_cache(), "{}", stderr(&o));
+    w.answer("ssm.put-parameter.rc", "255");
+    w.answer("ssm.put-parameter.stderr", "\nRead timeout on endpoint URL: \"https://ssm.eu-central-1.amazonaws.com/\"\n");
+    let o = w.run(&["access", SID_A, "--remove", "g-b"], Who::Ops);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(!w.has_access_cache() && stderr(&o).contains("Read timeout on endpoint URL"), "{}", stderr(&o));
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!(row["detail"], serde_json::json!({"actor": "cli", "op": "remove", "outcome": "unknown", "grant": "g-b", "access": CHAT_A}), "{row}");
+    w.unanswer("ssm.put-parameter.rc");
+    w.unanswer("ssm.put-parameter.stderr");
+    // A run that reads no list, or refuses before its write, leaves the cache as it was and writes no row.
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert!(code(&o) == 0 && w.has_access_cache(), "{}", stderr(&o));
+    let (rows, kept) = (w.audit("relay_access").len(), fs::read(w.bridge().join("state").join("relay-access.json")).unwrap());
+    w.answer("ssm.get-parameters.rc", "254");
+    w.answer("ssm.get-parameters.stderr", "\nAn error occurred (AccessDeniedException) when calling the GetParameters operation: not authorized\n");
+    let o = w.run(&["access", SID_A, "--allow", "g-c"], Who::Ops);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    w.unanswer("ssm.get-parameters.rc");
+    w.unanswer("ssm.get-parameters.stderr");
+    assert_eq!((w.audit("relay_access").len(), fs::read(w.bridge().join("state").join("relay-access.json")).unwrap()), (rows, kept), "the read failed: nothing changed, and nothing is unknown");
+    // Created meanwhile by another writer: exit 7, and the same: a retry of a create whose answer was lost reads the same.
+    let saved = w.param(ACCESS).unwrap();
+    let file = w.root().join("ssm").join(ACCESS.trim_start_matches('/'));
+    fs::remove_file(&file).unwrap();
+    fs::remove_file(format!("{}.version", file.display())).unwrap();
+    w.answer("ssm.put-parameter.rc", "254");
+    w.answer("ssm.put-parameter.stderr", "\nAn error occurred (ParameterAlreadyExists) when calling the PutParameter operation: The parameter already exists.\n");
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: {ACCESS} was created meanwhile (another writer): run the command again")), "{}", stderr(&o));
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["outcome"].as_str(), Some("unknown"));
+    w.unanswer("ssm.put-parameter.rc");
+    w.unanswer("ssm.put-parameter.stderr");
+    w.set_param(ACCESS, &saved.0, saved.1);
+    // A list that does not parse is never overwritten: exit 1.
+    w.set_param(ACCESS, "[{\"chat\":\"not a uuid\"}]", 9);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: {ACCESS} does not parse (")) && stderr(&o).contains("nothing was written"), "{}", stderr(&o));
+    assert_eq!(w.param(ACCESS).unwrap().1, 9, "{:?}", puts(&w));
+    // Lapsed entries are pruned by a write (M-WM88), this chat's own too: its old grants come back with nothing.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-a", "g-b"], LAPSED), access_entry(CHAT_B, &["g-b"], LAPSED), access_entry("0199a1b2-0000-7000-8000-0000000012a3", &["g-c"], IN_FORCE)]), 10);
+    let o = w.run(&allow("g-c"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of(), (vec![access_entry(CHAT_A, &["g-c"], &end_30), access_entry("0199a1b2-0000-7000-8000-0000000012a3", &["g-c"], IN_FORCE)], 11), "the lapsed gone, the one in force kept");
+    assert!(stdout(&o).contains(&format!("({ACCESS} v11, 2 chat(s)); 2 lapsed chat(s) pruned; the relay applies it within about 70 s")), "{}", stdout(&o));
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!((row["detail"]["outcome"].as_str(), row["detail"]["pruned"].as_str()), (Some("added"), Some("2")), "{row}");
+    // A full list: exit 1 with nothing written; a lapsed entry pruned makes the room.
+    let mut full = Vec::new();
+    for i in 0..70 {
+        let mut next: Vec<policy::AccessEntry> = full.clone();
+        next.push(access_entry(&format!("0199a1b2-0000-7000-8000-{:012x}", 0x1000 + i), &["g-a"], IN_FORCE));
+        if policy::render_access(&next).is_err() {
+            break;
+        }
+        full = next;
+    }
+    assert!(full.len() < policy::ENTRIES_MAX, "the bytes limit comes first: {}", full.len());
+    w.set_param(ACCESS, &access_value(&full), 20);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: {ACCESS} would be ")) && stderr(&o).contains("bytes, over its limit of 4096; nothing was written"), "{}", stderr(&o));
+    assert!(puts(&w).is_empty() && w.param(ACCESS).unwrap().1 == 20, "{:?}", puts(&w));
+    full[3].not_after = LAPSED.to_string();
+    w.set_param(ACCESS, &access_value(&full), 21);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 0, "pruned first: {}", stderr(&o));
+    assert_eq!(w.access_of().0.len(), full.len());
+    // An entry at its 16 grants takes no 17th: exit 1, nothing written.
+    let sixteen: Vec<String> = (0..16).map(|i| format!("g{i:02}")).collect();
+    let sixteen: Vec<&str> = sixteen.iter().map(String::as_str).collect();
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &sixteen, IN_FORCE)]), 25);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: {ACCESS} would not render (access: entry 0: 17 grants, not 1 to 16); nothing was written")), "{}", stderr(&o));
+    assert!(puts(&w).is_empty(), "{:?}", puts(&w));
+    // --remove: one grant; the entry left empty goes; nothing to remove writes nothing. Neither needs the grant offered
+    // or listed: a grant dropped from both must still leave a chat.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-a", "g-gone"], IN_FORCE), access_entry(CHAT_B, &["g-a"], IN_FORCE)]), 30);
+    let o = w.run(&["access", SID_A, "--remove", "g-gone"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of(), (vec![access_entry(CHAT_A, &["g-a"], IN_FORCE), access_entry(CHAT_B, &["g-a"], IN_FORCE)], 31));
+    assert_eq!(stdout(&o), format!("removed grant g-gone from chat {CHAT_A} (session {SID_A}) ({ACCESS} v31, 2 chat(s)); the relay refuses it within about 70 s, and calls in flight finish\n"));
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!(row["detail"], serde_json::json!({"actor": "cli", "op": "remove", "outcome": "removed", "grant": "g-gone", "access": CHAT_A, "version": "31", "pruned": "0"}), "{row}");
+    let o = w.run(&["access", SID_A, "--remove", "g-a"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of(), (vec![access_entry(CHAT_B, &["g-a"], IN_FORCE)], 32), "an entry left empty goes");
+    let o = w.run(&["access", SID_A, "--remove", "g-a"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("chat {CHAT_A} (session {SID_A}) does not hold grant g-a ({ACCESS} v32); nothing written\n"));
+    assert!(puts(&w).is_empty(), "{:?}", puts(&w));
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["outcome"].as_str(), Some("absent"));
+    // A chat back on this Mac keeps its id, so a later remote --resume keeps what it holds: it can leave the list, and takes
+    // nothing new.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-a", "g-gone"], IN_FORCE)]), 33);
+    w.session(SID_A, "local-child", Some(CHAT_A), None);
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(w.aws_calls().is_empty(), "{:?}", w.aws_calls());
+    let o = w.run(&["access", SID_A, "--remove", "g-gone"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of(), (vec![access_entry(CHAT_A, &["g-a"], IN_FORCE)], 34));
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_B, &["g-a"], IN_FORCE)]), 32);
+    // A chat with no token hears when an approval reaches it (stderr: stdout keeps the one line).
+    w.session(SID_A, "remote", Some(CHAT_A), Some("no_agent"));
+    let o = w.run(&allow("g-a"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("note: session {SID_A}'s latest spawn holds no session token (relay=no_agent): the chat reaches this grant from its next spawn (ai-env session migrate {SID_A})\n")), "{}", stderr(&o));
+    w.session(SID_A, "remote", Some(CHAT_A), Some("off"));
+    let o = w.run(&allow("g-b"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("note: session {SID_A}'s latest spawn holds no session token (relay=off): [relay].grant or its workspace's relay_grant names none, so the chat reaches this grant from the first spawn after one does\n")), "{}", stderr(&o));
+    // --from-panel, hidden: the same, and its rows say `panel`.
+    let o = w.run(&["access", SID_A, "--remove", "g-a", "--from-panel"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["actor"].as_str(), Some("panel"));
+    // --list and its JSON: each chat with its sessions on this Mac (rows that share an id after a /clear); the cache.
+    w.session("0199a1b2-0000-7000-8000-0000000012b2", "remote", Some(CHAT_B), Some("minted"));
+    w.session("0199a1b2-0000-7000-8000-0000000012b3", "remote", Some(CHAT_B), Some("minted"));
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-b", "g-a"], LAPSED), access_entry(CHAT_B, &["g-c"], IN_FORCE)]), 40);
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{ACCESS} v40: 2 chat(s), 1 in force\n  chat {CHAT_A} grants g-a,g-b until {LAPSED} EXPIRED: session {SID_A}\n  chat {CHAT_B} grants g-c until {IN_FORCE}: session 0199a1b2-0000-7000-8000-0000000012b2,0199a1b2-0000-7000-8000-0000000012b3\n"));
+    assert_eq!(w.access_cache()["version"], 40);
+    assert!(puts(&w).is_empty(), "{:?}", puts(&w));
+    let o = w.run(&["access", "--list", "--json"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(doc, serde_json::json!({"version": 40, "entries": [
+        {"chat": CHAT_A, "grants": ["g-a", "g-b"], "not_after": LAPSED, "expired": true, "sessions": [SID_A]},
+        {"chat": CHAT_B, "grants": ["g-c"], "not_after": IN_FORCE, "expired": false, "sessions": ["0199a1b2-0000-7000-8000-0000000012b2", "0199a1b2-0000-7000-8000-0000000012b3"]},
+    ]}));
+    let file = w.root().join("ssm").join(ACCESS.trim_start_matches('/'));
+    fs::remove_file(&file).unwrap();
+    fs::remove_file(format!("{}.version", file.display())).unwrap();
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert_eq!((code(&o), stdout(&o)), (0, format!("{ACCESS}: absent: no chat has more than its token's grant\n")));
+    let o = w.run(&["access", "--list", "--json"], Who::Ops);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&stdout(&o)).unwrap(), serde_json::json!({"version": 0, "entries": []}));
+    // `session forget`: the row is how `relay access` finds a chat, so one that leaves an entry in force with no row to name it
+    // says so, from the cache; another row of the chat (a `/clear`'s), a lapsed entry, or no cache says nothing.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-a"], LAPSED), access_entry(CHAT_B, &["g-b", "g-c"], IN_FORCE)]), 50);
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = w.session_forget("0199a1b2-0000-7000-8000-0000000012b2");
+    assert!(code(&o) == 0 && !stderr(&o).contains("note:"), "another row names it: {}", stderr(&o));
+    let o = w.session_forget("0199a1b2-0000-7000-8000-0000000012b3");
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stderr(&o), format!("note: no session on this Mac names chat {CHAT_B} now, so ai-env relay access cannot remove its entry in {ACCESS} (grants g-b,g-c until {IN_FORCE}, as of v50): its tokens end within 8 hours, and a write after that day prunes it\n"));
+    let o = w.session_forget(SID_A);
+    assert!(code(&o) == 0 && !stderr(&o).contains("note:"), "a lapsed entry: {}", stderr(&o));
+    w.session(SID_A, "remote", Some(CHAT_B), Some("minted"));
+    fs::remove_file(w.bridge().join("state").join("relay-access.json")).unwrap();
+    let o = w.session_forget(SID_A);
+    assert!(code(&o) == 0 && stderr(&o).is_empty(), "no cache: {}", stderr(&o));
+    // What the audit holds of it: ids, words and numbers, never a rule of a grant.
+    assert!(!fs::read_to_string(w.bridge().join("audit.jsonl")).unwrap().contains("example-*"));
+}
+
+/// WM-T67 (R-146, R-152): `relay status` shows the access list after the peers rows, in a read of its own, and writes the
+/// panel's cache from it. Absent is a note and never a finding; a failed read is `[?? ]` for it alone.
+#[test]
+fn relay_status_shows_the_access_list() {
+    let s = StatusWorld::new();
+    let w = &s.w;
+    // Absent: its note right after the peers rows, `[]`, the cache at version 0.
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    let absent = format!("[-  ] {ACCESS}: absent: no chat has more than its token's grant\n");
+    assert!(out.ends_with(&format!("[-  ]   peer office 198.51.100.0/24 until {IN_FORCE}\n{absent}")), "{out}");
+    let (rc, doc) = s.json();
+    assert_eq!((rc, &doc["access"]), (0, &serde_json::json!([])), "{doc}");
+    assert_eq!((&w.access_cache()["version"], &w.access_cache()["entries"]), (&serde_json::json!(0), &serde_json::json!([])));
+    // Two chats, one lapsed: never the exit code; each entry shown; its JSON; the cache at the list's version.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_B, &["g-b"], LAPSED), access_entry(CHAT_A, &["g-b", "g-a"], IN_FORCE)]), 3);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.ends_with(&format!("[ok ] {ACCESS} v3: 2 chat(s), 1 in force\n[-  ]   chat {CHAT_A} grants g-a,g-b until {IN_FORCE}\n[-  ]   chat {CHAT_B} grants g-b until {LAPSED} EXPIRED\n")), "{out}");
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 0, "{doc}");
+    assert_eq!(doc["access"], serde_json::json!([{"chat": CHAT_A, "grants": ["g-a", "g-b"], "not_after": IN_FORCE, "expired": false}, {"chat": CHAT_B, "grants": ["g-b"], "not_after": LAPSED, "expired": true}]), "{doc}");
+    let cache = w.access_cache();
+    assert_eq!(cache["version"], 3, "{cache}");
+    assert_eq!(cache["entries"][0], serde_json::json!({"chat": CHAT_A, "grants": ["g-a", "g-b"], "not_after": IN_FORCE}), "{cache}");
+    // None in force: still `[ok ]`, since the list has nothing to admit (no chat is then more than its grant).
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_B, &["g-b"], LAPSED)]), 4);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains(&format!("[ok ] {ACCESS} v4: 1 chat(s), 0 in force\n")), "{out}");
+    // Not parsing: [NO ], exit 1, `null`, the cache as it was.
+    w.set_param(ACCESS, "[{\"chat\":\"not a uuid\"}]", 5);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] {ACCESS} v5 does not parse (")), "{out}");
+    let (_, doc) = s.json();
+    assert!(doc["access"].is_null(), "{doc}");
+    assert_eq!(w.access_cache()["version"], 4, "as last read");
+    // Its own read: a denial is [?? ] for it alone, exit 7; the other rows stand, read by theirs; the cache as it was.
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-a"], IN_FORCE)]), 6);
+    w.answer("ssm.get-parameters.3.rc", "254");
+    w.answer("ssm.get-parameters.3.stderr", "\nAn error occurred (AccessDeniedException) when calling the GetParameters operation: not authorized\n");
+    let (rc, out) = s.status();
+    assert_eq!(rc, 7, "{out}");
+    assert!(out.contains(&format!("[?? ] {ACCESS} could not be read (")) && out.contains("AccessDeniedException"), "{out}");
+    assert_eq!(out.matches("[?? ]").count(), 1, "for it alone: {out}");
+    assert!(out.contains(&format!("[ok ] {PEERS} v1")) && out.contains(&format!("[ok ] {GRANTS} v1")), "{out}");
+    let reads: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
+    assert!(reads.len() == 3 && reads[2].contains(&format!("--names {ACCESS} ")), "{reads:?}");
+    let (rc, doc) = s.json();
+    assert!(rc == 7 && doc["access"].is_null() && doc["peers"].is_array(), "{doc}");
+    assert_eq!(w.access_cache()["version"], 4, "as last read");
+    w.unanswer("ssm.get-parameters.3.rc");
+    w.unanswer("ssm.get-parameters.3.stderr");
+    // --local reads nothing of it.
+    let o = w.run(&["status", "--local"], Who::Nobody);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(!stdout(&o).contains(ACCESS) && w.aws_calls().is_empty(), "{}", stdout(&o));
 }

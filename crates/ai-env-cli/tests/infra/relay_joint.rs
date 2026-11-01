@@ -161,7 +161,7 @@ fn the_lists_m_writes_are_the_lists_r_reads() {
     for (i, (name, (_, body))) in ["workers", "token-signers", "grants"].iter().zip(&bodies).enumerate() {
         assert_eq!(polled[i], (*name, Poll::Loaded { version: content_version(body.as_bytes()) }), "{name}");
     }
-    assert_eq!(polled[4], ("peers", Poll::Loaded { version: content_version(peers.as_bytes()) }), "the fifth file, peers last");
+    assert_eq!(polled[4], ("peers", Poll::Loaded { version: content_version(peers.as_bytes()) }), "the fifth file, peers");
     assert!(live.peers.fresh(now, max).is_some_and(|p| p.allows("127.0.0.1".parse().unwrap(), now_unix)), "the loopback peer in force");
     let (live_workers, live_signers, live_grants) = (live.workers.fresh(now, max).unwrap(), live.signers.fresh(now, max).unwrap(), live.grants.fresh(now, max).unwrap());
     assert!(live_workers.in_force("worker-a", now_unix).is_some_and(|e| e.allows_source("example-x") && !e.allows_source("example.beta-1")));

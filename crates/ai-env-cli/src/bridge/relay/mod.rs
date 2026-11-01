@@ -5,8 +5,9 @@
 //!   container, `credentials/relay-worker.env` (`ai-env relay keygen`, no Touch ID; `ai-env relay pubkey`).
 //! - `agent` (WM-R38 to WM-R40): `ai-env relay agent` unseals them once (one Touch ID) and, over a 0600 Unix
 //!   socket and for at most a working day, signs worker handshakes and mints VM session tokens.
-//! - `params` (WM-R41 to WM-R45): the relay's four lists, `/ai-env/relay/{workers,token-signers,grants,peers}`,
-//!   written as ai-env-deployer only (`ai-env relay allow|revoke|allow-ip|revoke-ip|grant`).
+//! - `params` (WM-R41 to WM-R45): the relay's five lists, `/ai-env/relay/{workers,token-signers,grants,peers,access}`,
+//!   the first four written as ai-env-deployer only (`ai-env relay allow|revoke|allow-ip|revoke-ip|grant`), the access
+//!   list by ai-env-ops too (`ai-env relay access`, R-150).
 //! - `tls` (WM-R59 to WM-R62): the relay CA, its key sealed on this Mac, and the relay's certificate in the
 //!   SecureString `/ai-env/relay/tls` (`ai-env relay tls init|rotate`, as ai-env-deployer; `ai-env relay ca`).
 //! - `ops` (WM-R47 to WM-R49): the relay instance as ai-env-ops (`ai-env relay status|start|stop`).

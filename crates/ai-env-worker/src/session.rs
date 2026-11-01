@@ -39,7 +39,8 @@ pub struct SessionClaims {
     pub caller_id: String,
     /// The spawn's id (a uuid, LD-WM4).
     pub session_id: String,
-    /// The Claude session id of a resumed or moved chat.
+    /// The chat's access id (R-148), chosen by the Mac, never by a VM: the relay's key into the access list (R-145). The
+    /// relay never forwards or logs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
     /// The grant.
@@ -418,5 +419,16 @@ mod tests {
         assert_eq!(verify(&by_decoy("other"), NOW, &signers(u64::MAX)), Err(SessionError::UnknownSigner));
         assert_eq!(verify(&by_decoy("mac"), NOW, &signers(u64::MAX)), Err(SessionError::BadSignature));
         assert_eq!(verify(&by_decoy("mac"), NOW, &signers(NOW - 1)), Err(SessionError::SignerExpired));
+    }
+
+    /// R-145, R-148: the claim's doc and the doc of the request that asks for it say what the id is, in the same words: a
+    /// maintainer who read "a resumed chat's id" and passed an init's session id again would let a VM choose the relay's key.
+    #[test]
+    fn the_chat_claim_is_documented_as_the_access_key() {
+        const DOC: &str = "    /// The chat's access id (R-148), chosen by the Mac, never by a VM: the relay's key into the access list (R-145). The\n    /// relay never forwards or logs it.\n";
+        let claim = format!("{DOC}    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub chat_id: Option<String>,\n");
+        let request = format!("{DOC}    pub chat_id: Option<String>,\n");
+        assert!(include_str!("session.rs").contains(&claim), "SessionClaims::chat_id's doc");
+        assert!(include_str!("agent.rs").contains(&request), "MintRequest::chat_id's doc");
     }
 }

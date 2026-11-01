@@ -126,8 +126,8 @@ pub const RELAY_PARAMETER_PREFIX: &str = "/ai-env/relay";
 pub const RELAY_LOG_GROUP: &str = "/ai-env/relay";
 /// S13: what the relay's reload unit fetches, in its order (infra/relay/reload.py, policies.ts RELAY_PARAMETERS):
 /// `artifact` is the stack's, the rest `ai-env relay`'s; `tls` alone is a SecureString. `peers` (the public face's
-/// allowlist) is the relay security plan's (R-93), before `tls`.
-pub const RELAY_PARAMETERS: [&str; 6] = ["artifact", "workers", "grants", "token-signers", "peers", "tls"];
+/// allowlist) and `access` (a chat's grants beyond its token's) are the relay security plan's (R-93, R-147), before `tls`.
+pub const RELAY_PARAMETERS: [&str; 7] = ["artifact", "workers", "grants", "token-signers", "peers", "access", "tls"];
 /// S13: `no_proxy` on vpc spawns: loopback, then the relay, which a VM reaches directly and never through squid.
 pub const NO_PROXY: &str = "localhost,127.0.0.1,::1,10.42.0.20";
 
@@ -1324,15 +1324,16 @@ mod tests {
 
     /// S13 (I-T27): `no_proxy` is loopback, then the relay's address (a VM
     /// reaches it directly, never through squid); `tls` is the relay's one
-    /// secret parameter, fetched last, `peers` (R-93) right before it.
+    /// secret parameter, fetched last, `peers` (R-93) and `access` (R-147) right before it.
     #[test]
     fn no_proxy_is_loopback_then_the_relay() {
         assert_eq!(NO_PROXY, format!("localhost,127.0.0.1,::1,{RELAY_IP}"));
         assert_eq!(RELAY_PARAMETERS.iter().filter(|p| **p == "tls").count(), 1);
         assert_eq!(RELAY_PARAMETERS.last(), Some(&"tls"));
-        assert_eq!(RELAY_PARAMETERS[RELAY_PARAMETERS.len() - 2..], ["peers", "tls"]);
+        assert_eq!(RELAY_PARAMETERS[RELAY_PARAMETERS.len() - 3..], ["peers", "access", "tls"]);
         assert_eq!(relay_param_name("tls"), format!("{RELAY_PARAMETER_PREFIX}/tls"));
         assert_eq!(relay_param_name("peers"), "/ai-env/relay/peers");
+        assert_eq!(relay_param_name("access"), "/ai-env/relay/access");
     }
 
     #[test]

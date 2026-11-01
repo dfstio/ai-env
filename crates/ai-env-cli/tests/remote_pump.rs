@@ -807,7 +807,7 @@ mod remote_link {
                     let api = FileFakeMicrovmApi::open(&fake).expect("the fake API");
                     let target = AgentTarget::from_row(&row).expect("the VM's target");
                     let trigger = CodeoutTrigger::spawn(CodeoutCtx { api: Arc::new(api), dp: Arc::new(NoDataPlane), tokens: Arc::new(NoDataPlane), paths, cfg: Arc::new(BridgeConfig::default()), target, ws, capture_settings: false, transcript: None });
-                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None, seal: None, claude: None, after_output: None })
+                    Ok(PipelineEnd { vm, vm_how: "reused", legs: Vec::new(), seed: "up_to_date", transcript: None, seeded_head: None, credential: None, delivery: None, spawn_id, started_by: None, trigger, session, carried: None, moved: None, after_started: None, seal: None, claude: None, after_output: None, relay: None })
                 })
             }),
         )
@@ -6022,8 +6022,8 @@ fn regular_files_holding(dir: &Path, needles: &[&str]) -> Vec<PathBuf> {
 /// leader gets, on fd 3 alone (`PATH` and `LC_ALL` its only variables), the session JSON of a token with the
 /// relay's private face `10.42.0.20:7443`, its name `10.42.0.20` and the CA's DER; the token verifies with the
 /// session key `relay keygen` sealed (as `relay pubkey --session` prints it) and names the VM
-/// (`session_remote_start`'s `id`), the spawn (its `spawn`, the spawn whose pid leads the client), no chat id
-/// (a new chat), the grant, and this Mac (`[relay].worker_id`) as `kid` and `caller_id`; its `exp` is the VM's
+/// (`session_remote_start`'s `id`), the spawn (its `spawn`, the spawn whose pid leads the client), the access id
+/// this Mac chose (R-148: the row holds it, a uuid and no session's id), the grant, and this Mac (`[relay].worker_id`) as `kid` and `caller_id`; its `exp` is the VM's
 /// wall, hours before `iat + 8 h`; claude's argv[1] is the MCP config. No other file of the rig (argv,
 /// environment and stdin logs, the VM's disk, the audit, the census, the wrapper's log, the sealed keys) and
 /// nothing the wrapper or the agent said holds the token. Then the agent stops (SIGTERM: exit 0, its socket gone,
@@ -6098,6 +6098,7 @@ fn a_vm_chat_gets_its_session_token_through_the_shim() {
     assert_eq!(starts.len(), 1, "{starts:?}");
     let d = &starts[0]["detail"];
     assert_eq!(d["relay"].as_str(), Some("minted"), "{d}");
+    let sid = h.out_json().iter().find(|v| is_init(v)).and_then(|v| v["session_id"].as_str()).expect("the init's session id").to_string();
     let (vm, spawn) = (d["id"].as_str().expect("the VM").to_string(), d["spawn"].as_str().expect("the spawn").to_string());
     // While its CLI lives: the spawn's leader on the VM's shim, and the client the shim started for it.
     let leader = h.rig().vm_spawns().iter().find(|s| s.spawn_id.to_string() == spawn).map(|s| s.pid).unwrap_or_else(|| panic!("spawn {spawn} on the VM's shim"));
@@ -6121,14 +6122,18 @@ fn a_vm_chat_gets_its_session_token_through_the_shim() {
     assert_eq!(session, want, "a token, the relay's private face, its name and the CA");
     assert_eq!((RELAY_IP, RELAY_PORT), ("10.42.0.20", 7443));
     // The token: the session key `relay keygen` sealed verifies it (the agent's own); it names the VM, the spawn,
-    // no chat id (a new chat), the grant, and this Mac as the agent's `kid` and `caller_id`.
+    // the chat's access id as its row holds it (R-148), the grant, and this Mac as the agent's `kid` and `caller_id`.
+    let row = session_row(&h, &sid);
+    let access = row.access_id.clone().expect("the row's access id");
+    assert!(ai_env_worker::globs::valid_uuid(&access) && access != sid && access != spawn, "{access}");
+    assert_eq!(row.relay.as_deref(), Some("minted"), "the row's mint word");
     let now = ai_env_cli::wire::time::unix_now();
     let lookup = |kid: &str| (kid == RELAY_MAC).then_some(SignerKey { public_key: session_key, not_after: now + 86_400 });
     let claims = ai_env_worker::session::verify(&token, now, &lookup).expect("the token verifies with the sealed session key").claims;
     assert_eq!(ai_env_worker::session::peek(&token).expect("peek"), claims);
     assert_eq!(
         (claims.kid.as_str(), claims.aud.as_str(), claims.caller_id.as_str(), claims.vm_id.as_str(), claims.session_id.as_str(), claims.chat_id.as_deref(), claims.grant_id.as_str()),
-        (RELAY_MAC, SESSION_AUD, RELAY_MAC, vm.as_str(), spawn.as_str(), None, RELAY_GRANT)
+        (RELAY_MAC, SESSION_AUD, RELAY_MAC, vm.as_str(), spawn.as_str(), Some(access.as_str()), RELAY_GRANT)
     );
     // Its bounds: `iat` within the chat, `exp` the VM's 2 h wall, which binds it by hours below `iat + 8 h`.
     let wall = ai_env_cli::bridge::vm::registry::read_row(&rig.paths(), &vm).expect("the registry").expect("the VM's row").wall_deadline.expect("the VM's wall");
@@ -6180,4 +6185,214 @@ fn a_vm_chat_gets_its_session_token_through_the_shim() {
     for text in [h.transcript(), second.transcript()] {
         assert!(!text.contains(token.as_str()) && !text.contains(signature.as_str()), "the token in a wrapper's output:\n{text}");
     }
+}
+
+// ---- §RS.13: WM-J5, a chat's access id (R-148) -----------------------------------------------------------------
+
+/// WM-J5's relay: as WM-J1's, the fake relay client and MCP config on the rig's shim, `[relay] grant = "no-grant"` (in no
+/// grant list: R-149's no-access setting), this Mac's keys, a CA and M's own agent, which answers until dropped.
+fn access_rig(p: &mut common::Prepared) -> RelayAgent {
+    use std::os::unix::fs::PermissionsExt as _;
+    let client = p.write_file(common::remote::RELAY_CLIENT, &read(Path::new(RELAY_FAKE)));
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).expect("chmod the fake relay client");
+    // macOS assesses a new file's first exec (about 200 ms): here, not while a spawn waits on it (no --socket: 64).
+    assert_eq!(Command::new(&client).stderr(Stdio::null()).status().expect("the fake relay client").code(), Some(64));
+    p.write_file(common::remote::RELAY_MCP_CONFIG, &format!("{}\n", ai_env_cli::wire::relay::MCP_CONFIG_JSON));
+    let rig = p.rig();
+    rig.config(|doc| {
+        common::remote::toml_table(doc, "relay").insert("grant".into(), "no-grant".into());
+    });
+    let o = rig.run(&["relay", "keygen"], None);
+    assert!(o.status.success(), "relay keygen: {}\n{}", o.status, String::from_utf8_lossy(&o.stderr));
+    let ca = ai_env_worker::certs::relay_ca(ai_env_cli::wire::time::unix_now()).expect("a relay CA");
+    let state = rig.bridge().join("state");
+    std::fs::create_dir_all(&state).expect("mkdir state/");
+    std::fs::write(state.join("relay-ca.der"), &ca.cert_der).expect("write state/relay-ca.der");
+    RelayAgent::start(rig)
+}
+
+/// The claims of the token spawn `spawn`'s relay client got on fd 3 (the fake client's `.session` record, on any VM of the
+/// rig), once it is there and whole.
+fn token_of_spawn(rig: &common::remote::RemoteRig, spawn: &str) -> ai_env_worker::session::SessionClaims {
+    let mut found = None;
+    wait_for(&format!("the relay client of spawn {spawn}"), T, || {
+        found = rig
+            .vm_ids()
+            .iter()
+            .flat_map(|vm| {
+                let dir = rig.vm_root_of(vm).join("run/ai-env/relay");
+                names_ending(&dir, ".session").into_iter().map(move |name| dir.join(name))
+            })
+            .filter_map(|file| serde_json::from_slice::<Value>(&std::fs::read(file).ok()?).ok())
+            .filter_map(|session| ai_env_worker::session::peek(session["token"].as_str()?).ok())
+            .find(|claims| claims.session_id == spawn);
+        found.is_some()
+    });
+    found.expect("the claims")
+}
+
+/// The chat id the token of the `n`th (from 0) `session_remote_start` of the rig names, its row `minted`.
+fn chat_of_start(h: &Harness, n: usize) -> String {
+    wait_for(&format!("session_remote_start {n}"), T, || h.audit_events("session_remote_start").len() > n);
+    let row = h.audit_events("session_remote_start").swap_remove(n);
+    assert_eq!(row["detail"]["relay"].as_str(), Some("minted"), "{row}");
+    token_of_spawn(h.rig(), row["detail"]["spawn"].as_str().expect("the spawn")).chat_id.unwrap_or_else(|| panic!("no chat id in the token of {row}"))
+}
+
+/// The host's start where the fake's init comes with the first turn: `initialize`, answered.
+fn initialized(h: &mut Harness) {
+    let init = h.send_initialize();
+    h.expect_out(|v| is_response_to(v, &init), T);
+}
+
+/// A later wrapper of `first`'s rig, started: `args`, and the CLI's knobs (WM-J5's own, then `more`).
+fn next_chat(first: &Harness, args: &[&str], more: &[(&str, &str)]) -> Harness {
+    let knobs: Vec<(&str, &str)> = [("FAKE_INIT_AT_TURN", "1"), ("FAKE_WRITE_TRANSCRIPT", "1")].into_iter().chain(more.iter().copied()).collect();
+    let mut h = Harness::prepare().launch_wrapper(first.rig().wrapper(args, &knobs));
+    initialized(&mut h);
+    h
+}
+
+/// WM-J5 (R-148, M-WM89, M-WM90): the access id is this Mac's, chosen once per chat. A new chat's first token names a fresh
+/// uuid, which its row holds. `/clear` keeps it: the new row holds it and so does the old one. A respawn after that `/clear`
+/// (the VM lost: the chat moves with its next message) names it, not the session the init says. A `--resume` names the row's. A
+/// fork names its own and leaves the parent's row alone. A hostile VM chooses nothing: its init naming another chat's row is
+/// refused and that row stays; a fork's init naming its parent adopts the parent's row, whose id stays; an init naming an id of
+/// its own gets a row with the plan's id. A start-up respawn names the plan's. A `--no-session-persistence` spawn mints nothing.
+/// A parent's row from before this build, with no id, takes none from a fork whose init names it, and its own next `--resume`
+/// gets a fresh one. A row's id that is no uuid counts as none: the next `--resume` replaces it.
+#[test]
+fn a_chat_keeps_its_access_id() {
+    let valid = ai_env_worker::globs::valid_uuid;
+    let mut p = Harness::prepare();
+    let _agent = access_rig(&mut p);
+    // A new chat: a fresh uuid from its first token on, its row's; `minted`, though `no-grant` is in no grant list.
+    let mut h = p.spawn_on(common::Link::Remote, "", &[], &[("FAKE_INIT_AT_TURN", "1"), ("FAKE_WRITE_TRANSCRIPT", "1"), ("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_NEW_SESSION_AFTER", "1")]);
+    initialized(&mut h);
+    turn(&mut h, "one");
+    let first = h.expect_out(is_init, T)["session_id"].as_str().expect("the init's session id").to_string();
+    let access = chat_of_start(&h, 0);
+    assert!(valid(&access) && access != first, "{access}");
+    let row = session_row(&h, &first);
+    assert_eq!((row.access_id.as_deref(), row.relay.as_deref()), (Some(access.as_str()), Some("minted")), "{row:?}");
+    let spawn = h.audit_events("session_remote_start")[0]["detail"]["spawn"].as_str().expect("the spawn").to_string();
+    assert_eq!(token_of_spawn(h.rig(), &spawn).grant_id, "no-grant", "the token's own grant reaches nothing");
+    // `/clear` in the same process: a new row, the same id (M-WM90); the token needs no change.
+    turn(&mut h, "two");
+    let cleared = common::fake_clear_sid();
+    assert_eq!(h.out_json().iter().filter(|v| is_init(v)).filter_map(|v| v["session_id"].as_str()).next_back(), Some(cleared.as_str()), "{}", h.transcript());
+    wait_for("the /clear's row", T, || ai_env_cli::bridge::registry::read(&h.rig().paths(), &cleared).ok().flatten().is_some());
+    let row = session_row(&h, &cleared);
+    assert_eq!((row.access_id.as_deref(), row.relay.as_deref()), (Some(access.as_str()), Some("minted")), "`/clear` keeps the chat's id: {row:?}");
+    assert_eq!(session_row(&h, &first).access_id.as_deref(), Some(access.as_str()), "and the old row its own");
+    // A respawn after that `/clear`: the VM ends, the next message moves the chat, and the new token names the same id,
+    // never the session the init said.
+    synced(&mut h, &cleared, 1);
+    let vm1 = h.audit_events("session_remote_start")[0]["detail"]["id"].as_str().expect("the VM").to_string();
+    h.rig().update_fake(|s| {
+        let v = s.vms.get_mut(&vm1).unwrap_or_else(|| panic!("no VM {vm1} in the fake"));
+        v.state = ai_env_cli::bridge::api::VmState::Terminating;
+        v.state_reason = Some("ended by the test".into());
+    });
+    h.expect_out(|v| v["subtype"] == "informational" && v["content"].as_str().is_some_and(|c| c.contains(&vm1) && c.contains("with your next message")), T);
+    turn(&mut h, "three");
+    let moved = chat_of_start(&h, 1);
+    let why = h.audit_events("session_remote_start")[1]["detail"]["why"].as_str().unwrap_or_default().to_string();
+    assert!(why.starts_with("readdress:"), "a move's spawn: {why}");
+    assert_eq!(moved, access, "the id survives a /clear, then a respawn");
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(access.as_str()));
+    closed(&mut h);
+    // A `--resume`: the row's id.
+    let mut resumed = next_chat(&h, &[&format!("--resume={cleared}")], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    turn(&mut resumed, "four");
+    assert_eq!(chat_of_start(&h, 2), access, "a later --resume names the row's id");
+    closed(&mut resumed);
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(access.as_str()));
+    // A fork: an id of its own, in its token and on its row; the parent's stays (M-WM89).
+    let mut fork = next_chat(&h, &[&format!("--resume={cleared}"), "--fork-session"], &[]);
+    turn(&mut fork, "five");
+    let forked_sid = fork.expect_out(is_init, T)["session_id"].as_str().expect("the fork's session id").to_string();
+    let forked = chat_of_start(&h, 3);
+    assert_ne!(forked, access, "a fork inherits nothing");
+    assert!(valid(&forked) && forked_sid != cleared, "{forked} {forked_sid}");
+    assert_eq!(session_row(&h, &forked_sid).access_id.as_deref(), Some(forked.as_str()));
+    closed(&mut fork);
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(access.as_str()), "the parent's row");
+    // A hostile init naming another chat's row: refused, and that row is as it was; the token names a fresh id.
+    let before = session_row(&h, &cleared);
+    let mut hostile = next_chat(&h, &[], &[("FAKE_SESSION_ID", &cleared)]);
+    turn(&mut hostile, "six");
+    let fresh = chat_of_start(&h, 4);
+    assert!(valid(&fresh) && fresh != access && fresh != cleared, "{fresh}");
+    closed(&mut hostile);
+    let census = h.census();
+    let note = census.iter().rev().find(|r| r.get("end").is_some()).and_then(|r| r["note"].as_str()).expect("its end row");
+    assert!(common::note_has(note, "init_id_refused:1"), "{note}");
+    assert_eq!(session_row(&h, &cleared), before, "another chat's row is untouched");
+    // A fork whose init names its parent: `may_adopt` takes its own --resume, and the row keeps the parent's id while the
+    // token holds the fork's, so approving that row reaches the parent's chat and never this process.
+    let mut parent = next_chat(&h, &[&format!("--resume={cleared}"), "--fork-session"], &[("FAKE_SESSION_ID", &cleared)]);
+    turn(&mut parent, "seven");
+    let own = chat_of_start(&h, 5);
+    assert_ne!(own, access, "the fork's token");
+    closed(&mut parent);
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(access.as_str()), "a row's id never changes");
+    // An init naming an id of its own: a row, with the plan's id; nothing of the VM's becomes it.
+    let chosen = common::uuid(0x7a11);
+    let mut named = next_chat(&h, &[], &[("FAKE_SESSION_ID", &chosen)]);
+    turn(&mut named, "eight");
+    let planned = chat_of_start(&h, 6);
+    closed(&mut named);
+    assert_eq!(session_row(&h, &chosen).access_id.as_deref(), Some(planned.as_str()));
+    assert!(valid(&planned) && planned != chosen, "{planned}");
+    // A start-up respawn on the same VM (`argv_retry`): the plan's id again, the row's.
+    let mut retried = next_chat(&h, &["--from-the-future"], &[("FAKE_REJECT_OPTION", "--from-the-future")]);
+    turn(&mut retried, "nine");
+    let again = h.audit_events("session_remote_start").len() - 1;
+    assert_eq!(h.audit_events("session_remote_start")[again]["detail"]["why"].as_str(), Some("argv_retry"));
+    let retry_chat = chat_of_start(&h, again);
+    let retry_sid = retried.expect_out(is_init, T)["session_id"].as_str().expect("the session id").to_string();
+    closed(&mut retried);
+    assert_eq!(session_row(&h, &retry_sid).access_id.as_deref(), Some(retry_chat.as_str()), "the row holds what the retry's token names");
+    // `--no-session-persistence`: no row to approve, so no token, no `relay` word, no client and no MCP config.
+    let clients = |rig: &common::remote::RemoteRig| rig.vm_ids().iter().map(|vm| names_ending(&rig.vm_root_of(vm).join("run/ai-env/relay"), ".session").len()).sum::<usize>();
+    let held = clients(h.rig());
+    let spawns = argv_generations(h.rig().root()).len();
+    let mut quiet = next_chat(&h, &["--no-session-persistence"], &[]);
+    turn(&mut quiet, "ten");
+    closed(&mut quiet);
+    let last = h.audit_events("session_remote_start").pop().expect("its start");
+    assert!(last["detail"].get("relay").is_none(), "{last}");
+    assert_eq!(clients(h.rig()), held, "no relay client for it");
+    let gens = argv_generations(h.rig().root());
+    assert!(gens.len() > spawns && gens[spawns..].iter().flatten().all(|a| !a.starts_with("--mcp-config")), "{gens:?}");
+    // A parent's row from before this build, with no id: a fork whose init names it adopts the row and takes nothing to it, or
+    // approving that chat, and any later `--resume` of it, would reach this fork.
+    let paths = h.rig().paths();
+    let set_id = |id: Option<&str>| {
+        let mut row = ai_env_cli::bridge::registry::read(&paths, &cleared).unwrap().unwrap();
+        row.access_id = id.map(str::to_string);
+        ai_env_cli::bridge::registry::write(&paths, &row).unwrap();
+    };
+    set_id(None);
+    let mut foreign = next_chat(&h, &[&format!("--resume={cleared}"), "--fork-session"], &[("FAKE_SESSION_ID", &cleared)]);
+    turn(&mut foreign, "eleven");
+    let forked_again = chat_of_start(&h, h.audit_events("session_remote_start").len() - 1);
+    closed(&mut foreign);
+    assert_eq!(session_row(&h, &cleared).access_id, None, "the fork's id {forked_again} never reaches its parent's row");
+    // That chat's own next `--resume` gets a new id, which is neither the fork's nor anyone else's, and its row takes it.
+    let mut back = next_chat(&h, &[&format!("--resume={cleared}")], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    turn(&mut back, "twelve");
+    let own_again = chat_of_start(&h, h.audit_events("session_remote_start").len() - 1);
+    closed(&mut back);
+    assert!(valid(&own_again) && own_again != forked_again && own_again != access, "{own_again}");
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(own_again.as_str()));
+    // A hand-edited id that is no uuid counts as none, on both sides: the token names a fresh one, and the row takes it.
+    set_id(Some("not a uuid"));
+    let mut edited = next_chat(&h, &[&format!("--resume={cleared}")], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    turn(&mut edited, "thirteen");
+    let replaced = chat_of_start(&h, h.audit_events("session_remote_start").len() - 1);
+    closed(&mut edited);
+    assert!(valid(&replaced) && replaced != own_again, "{replaced}");
+    assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(replaced.as_str()));
 }

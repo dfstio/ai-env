@@ -130,6 +130,23 @@ pub struct SessionRow {
     pub title: Option<String>,
     /// S12 (T): `custom` (a rename) or `ai` (the generated title): `bridge::title::TitleSource::WORDS`.
     pub title_source: Option<String>,
+    /// R-148: the chat's access id, what its tokens name as `chat_id` and `/ai-env/relay/access` lists: chosen by this
+    /// Mac at the chat's first start, kept by each later one (a `/clear`'s row takes it from its plan), never from the VM.
+    /// Left out of a document while it has none, so an older row's `session show --json` stays as it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_id: Option<String>,
+    /// R-148: the word of the latest spawn's session token (`mint::MintOutcome::word`: `minted`, `off`, `no_agent`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+impl SessionRow {
+    /// R-148: the row's access id, when it is one `/ai-env/relay/access` could name: a hand-edited row's other text counts
+    /// as none, everywhere a row's id is read.
+    #[must_use]
+    pub fn access(&self) -> Option<&str> {
+        self.access_id.as_deref().filter(|id| ai_env_worker::globs::valid_uuid(id))
+    }
 }
 
 /// One child generation's `SessionRow.vms` entry. Lenient: an older wrapper's entry lacks the S10 fields.
@@ -937,6 +954,7 @@ fn forget_sessions(store: &crate::store::Keystore, paths: &Paths, uuids: &[Strin
         forget_check(paths, uuid)?;
     }
     let purged = if purge { crate::bridge::s3::forget_purge_many(store, paths, uuids)? } else { vec![false; uuids.len()] };
+    let chats: Vec<String> = uuids.iter().filter_map(|uuid| read(paths, uuid).ok().flatten()?.access().map(str::to_string)).collect();
     let mut missing: Vec<&str> = Vec::new();
     for (uuid, purged) in uuids.iter().zip(purged.into_iter().chain(std::iter::repeat(false))) {
         let what = forget_suffix(forget(paths, uuid)?);
@@ -947,11 +965,34 @@ fn forget_sessions(store: &crate::store::Keystore, paths: &Paths, uuids: &[Strin
             (None, false) => missing.push(uuid),
         }
     }
+    note_access_left(paths, chats);
     let Some((last, earlier)) = missing.split_last() else { return Ok(()) };
     for uuid in earlier {
         eprintln!("ai-env: no session {uuid}");
     }
     bail!("no session {last}")
+}
+
+/// What `session forget` says of the chats its rows named (§RS.13's residual), as `state/relay-access.json` last read the
+/// list: an entry in force that no row left names can no longer be taken out by `ai-env relay access`, which finds a chat
+/// through its row, and no later start mints that id again. Its tokens end within 8 hours, and the entry holds its room in
+/// the list until a write after its end prunes it. One `note:` per chat, on stderr; nothing without a cache.
+fn note_access_left(paths: &Paths, mut chats: Vec<String>) {
+    let Some(cache) = crate::bridge::relay::params::read_access_cache(paths) else { return };
+    let rows = list(paths).unwrap_or_default();
+    let now = time::unix_now();
+    chats.sort();
+    chats.dedup();
+    for chat in chats.iter().filter(|chat| !rows.iter().any(|r| r.access() == Some(chat.as_str()))) {
+        if let Some(entry) = cache.entries.iter().find(|a| a.chat == *chat && now <= a.not_after_unix()) {
+            eprintln!(
+                "note: no session on this Mac names chat {chat} now, so ai-env relay access cannot remove its entry in /ai-env/relay/access (grants {} until {}, as of v{}): its tokens end within 8 hours, and a write after that day prunes it",
+                entry.grants.join(","),
+                entry.not_after,
+                cache.version
+            );
+        }
+    }
 }
 
 /// The signal `session drop-transport` sends the wrapper that owns a remote
@@ -1206,6 +1247,8 @@ mod tests {
             migrating_pid: Some(4251),
             title: Some("Harbour-s11 word memory".into()),
             title_source: Some("custom".into()),
+            access_id: Some("0199a1b2-0000-7000-8000-0000000012a7".into()),
+            relay: Some("minted".into()),
         }
     }
 
@@ -1825,6 +1868,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/s11/bridge/state/sessions/33333333-3333-4333-8333-333333333333.toml");
         let r = parse_row(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((r.session_id.as_str(), r.title.as_deref(), r.title_source.as_deref()), ("33333333-3333-4333-8333-333333333333", None, None));
+        assert_eq!((r.access_id.as_deref(), r.relay.as_deref()), (None, None), "R-148: an older row has neither");
         let d = tempfile::tempdir().unwrap();
         let p = paths_in(&d);
         write(&p, &r).unwrap();

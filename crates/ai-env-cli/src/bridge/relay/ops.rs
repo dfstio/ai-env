@@ -6,17 +6,18 @@
 //! connect to `<public ip>:443` when it runs (informational, LD-WM15: no TLS dial, and no byte sent, so no fault,
 //! R-102), the newest `ev:"status"` line of the relay's request log in CloudWatch (B-12), what the relay refused in
 //! the last hour and a root volume near full (§RS.3.2 row 4, never the exit code), the three lists in one
-//! `get-parameters`, and the peers list in one of its own (until RO-1's deploy the ops policy cannot read it, and IAM
-//! refuses a whole call for one such name).
+//! `get-parameters`, and the peers list and the access list in one each of their own (until a deploy the ops policy
+//! cannot read them, and IAM refuses a whole call for one such name).
 //! Findings are `[NO ]` and exit 1: this Mac's session key is not an in-force token signer under
 //! `[relay].worker_id`, a list does not parse, the instance is not running, the peers list is absent or holds no
-//! entry in force, a worker in force has no client certificate under a relay that requires one. A read that failed
+//! entry in force, a worker in force has no client certificate under a relay that requires one; an absent access list is
+//! no finding, since no chat is then more than its token's grant (R-146). A read that failed
 //! is `[?? ]` and exit 7 when nothing was found first. `start` and `stop` wait as `proxy start|stop` do, their polls
 //! scaled by the lab knob; a relay that stops answers VM relay tools `unavailable`, and workers keep dialing until it
 //! starts again.
 use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
 use super::keys::{read_notes, MacKeyNotes};
-use super::params::{fp16, MAC_LABEL, WIDE_BELOW};
+use super::params::{fp16, write_access_cache, MAC_LABEL, WIDE_BELOW};
 use crate::bridge::audit::event::{RELAY_START, RELAY_STOP};
 use crate::bridge::awscli::aws_json;
 use crate::bridge::config::{BridgeConfig, Paths};
@@ -26,7 +27,7 @@ use crate::errors::{CliError, Result};
 use crate::wire::time::{rfc3339_utc, unix_now, unix_now_ms};
 use ai_env_worker::agent::{request, AgentStatus, Request, Response};
 use ai_env_worker::keys::PublicKey;
-use ai_env_worker::policy::{self, GRANTS, PEERS, TOKEN_SIGNERS, WORKERS};
+use ai_env_worker::policy::{self, ACCESS, GRANTS, PEERS, TOKEN_SIGNERS, WORKERS};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -90,9 +91,9 @@ impl Mark {
     }
 }
 
-/// The rows of one `status` run, and its JSON (WM-R47, §RS.3.2): always the seven keys `instance`, `workers`,
-/// `token_signers`, `grants`, `peers`, `status` and `mac`, `null` for what was not read (`--local`, a failed read, a
-/// list that does not parse). `status` is the verdict and the rows; the relay's newest status line (B-12) rides in
+/// The rows of one `status` run, and its JSON (WM-R47, §RS.3.2, R-146): always the eight keys `instance`, `workers`,
+/// `token_signers`, `grants`, `peers`, `access`, `status` and `mac`, `null` for what was not read (`--local`, a failed
+/// read, a list that does not parse). `status` is the verdict and the rows; the relay's newest status line (B-12) rides in
 /// `instance.status_line`, the refused hour in `instance.refused`, the disk in `instance.disk_full`.
 #[derive(Default)]
 struct Report {
@@ -101,7 +102,7 @@ struct Report {
 }
 
 /// The keys of `--json`'s object.
-const JSON_KEYS: [&str; 7] = ["instance", "workers", "token_signers", "grants", "peers", "status", "mac"];
+const JSON_KEYS: [&str; 8] = ["instance", "workers", "token_signers", "grants", "peers", "access", "status", "mac"];
 
 impl Report {
     fn row(&mut self, mark: Mark, line: impl Into<String>) {
@@ -185,8 +186,9 @@ fn mac_rows(paths: &Paths, report: &mut Report) -> Option<MacKeyNotes> {
     notes
 }
 
-/// The agent's `status` answer within [`AGENT_WAIT`], if one answers on this Mac's socket.
-fn agent_status(paths: &Paths) -> Option<AgentStatus> {
+/// The agent's `status` answer within [`AGENT_WAIT`], if one answers on this Mac's socket (no Touch ID: the panel's
+/// pages read it too, R-151).
+pub(crate) fn agent_status(paths: &Paths) -> Option<AgentStatus> {
     let socket = paths.relay_agent_socket();
     if !socket.exists() {
         return None;
@@ -225,6 +227,7 @@ pub fn cmd_status(json: bool, local: bool) -> Result<()> {
     let stance = instance_rows(&ctx, &instance, &mut report);
     list_rows(&worker_id, notes.as_ref(), stance, &mut report);
     peer_rows(&mut report);
+    access_rows(&paths, &mut report);
     report.finish(json)
 }
 
@@ -654,6 +657,41 @@ fn peer_rows(report: &mut Report) {
     }
     let docs: Vec<Value> = list.iter().map(|p| json!({"label": p.label, "cidr": p.cidr, "not_after": p.not_after, "expired": now > p.not_after_unix()})).collect();
     report.doc.insert("peers".into(), Value::Array(docs));
+}
+
+/// The access list (R-146), in a `get-parameters` of its own as row 8's: until the deploy that names it the ops policy
+/// cannot read it, and IAM refuses a whole call for one such name. What it reads goes in the panel's cache (R-152).
+fn access_rows(paths: &Paths, report: &mut Report) {
+    let (got, _) = match ops::get_parameters(&[ACCESS.to_string()]) {
+        Ok(g) => g,
+        Err(e) => {
+            report.row(Mark::Unknown, format!("{ACCESS} could not be read ({e})"));
+            return;
+        }
+    };
+    let Some(param) = got.get(ACCESS) else {
+        report.row(Mark::Note, format!("{ACCESS}: absent: no chat has more than its token's grant"));
+        report.doc.insert("access".into(), json!([]));
+        write_access_cache(paths, 0, &[]);
+        return;
+    };
+    let n = param.version;
+    let list = match policy::parse_access(&param.value) {
+        Ok(list) => list,
+        Err(e) => {
+            report.row(Mark::No, format!("{ACCESS} v{n} does not parse ({e})"));
+            return;
+        }
+    };
+    let now = unix_now();
+    let in_force = list.iter().filter(|a| now <= a.not_after_unix()).count();
+    report.row(Mark::Ok, format!("{ACCESS} v{n}: {} chat(s), {in_force} in force", list.len()));
+    for a in &list {
+        report.row(Mark::Note, format!("  chat {} grants {} until {}{}", a.chat, a.grants.join(","), a.not_after, if now > a.not_after_unix() { " EXPIRED" } else { "" }));
+    }
+    let docs: Vec<Value> = list.iter().map(|a| json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix()})).collect();
+    report.doc.insert("access".into(), Value::Array(docs));
+    write_access_cache(paths, n, &list);
 }
 
 /// An aws failure of `what`: exit 7.

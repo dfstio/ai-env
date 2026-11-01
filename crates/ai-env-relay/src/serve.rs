@@ -201,8 +201,9 @@ impl RelayApp {
     }
 
     /// One poll of the live directory, with R-18's revocations and R-26's sweep, then R-90's judgement of every live
-    /// tunnel's peer; tests call it instead of waiting for the tick.
-    pub fn poll_files(&self) -> [(&'static str, files::Poll); 5] {
+    /// tunnel's peer; tests call it instead of waiting for the tick. The access list has no such step: nothing is ever
+    /// closed by it (R-144), and each request reads it (R-145).
+    pub fn poll_files(&self) -> [(&'static str, files::Poll); 6] {
         let st = &self.state;
         let now = st.now();
         let outcomes = st.live.poll(now, st.max_stale());
@@ -217,6 +218,7 @@ impl RelayApp {
                 "token-signers" => described(st, &st.live.signers.loaded()),
                 "grants" => described(st, &st.live.grants.loaded()),
                 "peers" => described(st, &st.live.peers.loaded()),
+                "access" => described(st, &st.live.access.loaded()),
                 _ => described(st, &st.live.tls.loaded()),
             };
             let version = if matches!(outcome, Poll::Missing) { String::new() } else { version };
@@ -577,6 +579,7 @@ impl RelayApp {
         let (signers_version, _, signers_age_s) = described(st, &st.live.signers.loaded());
         let (grants_version, _, grants_age_s) = described(st, &st.live.grants.loaded());
         let (peers_version, _, peers_age_s) = described(st, &st.live.peers.loaded());
+        let (access_version, _, access_age_s) = described(st, &st.live.access.loaded());
         StatusLine {
             relay_version: crate::RELAY_VERSION.to_string(),
             protocol: ai_env_relay_proto::PROTOCOL,
@@ -595,6 +598,8 @@ impl RelayApp {
             grants_age_s,
             peers_version,
             peers_age_s,
+            access_version,
+            access_age_s,
             tls_loaded: st.live.tls.loaded().is_some(),
             unknown_frames: st.unknown_frames.load(Ordering::SeqCst),
             log_dropped: reqlog::dropped(),

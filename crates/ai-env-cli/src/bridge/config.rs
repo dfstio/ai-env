@@ -314,6 +314,13 @@ impl Paths {
         self.root.join("state").join("relay.lock")
     }
 
+    /// `state/relay-access.json` (R-152, 0600): the access list as `ai-env relay access` and `relay status` last read
+    /// it, for the panel to show; the relay alone is the gate.
+    #[must_use]
+    pub fn relay_access_cache(&self) -> PathBuf {
+        self.root.join("state").join("relay-access.json")
+    }
+
     /// `state/creds.toml`: what is known against sealed credential containers
     /// (S7: a setup-token Anthropic refused, by seal id).
     #[must_use]
@@ -1251,20 +1258,26 @@ pub struct RelayCfg {
     pub grant: String,
     /// relay agent's life in hours, 1 to 24.
     pub agent_hours: u32,
+    /// The grants the panel offers each remote chat, and the only ones `ai-env relay access --allow` takes (R-149):
+    /// at most [`RelayCfg::OFFER_MAX`] ids, none holding a `.` (a panel form's value refuses one), none twice.
+    pub offer: Vec<String>,
 }
 
 impl Default for RelayCfg {
     fn default() -> Self {
-        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12 }
+        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12, offer: Vec::new() }
     }
 }
 
 impl RelayCfg {
     /// The longest life `ai-env relay agent` takes (LD-WM13: an unsealed key should not outlive a working day).
     pub const AGENT_HOURS_MAX: u32 = 24;
+    /// The most grants `offer` names (R-149): as many as an access entry holds.
+    pub const OFFER_MAX: usize = ai_env_worker::policy::ACCESS_GRANTS_MAX;
 
     /// `worker_id` an id, `grant` empty or an id (WM-R1: 1 to 64 of `[a-z0-9._-]`, starting with `[a-z0-9]`),
-    /// `agent_hours` 1 to 24; else `Config` naming the key (exit 1).
+    /// `agent_hours` 1 to 24, `offer` at most 16 ids with no `.`, none twice (R-149); else `Config` naming the key
+    /// (exit 1).
     pub fn validate(&self) -> Result<(), BridgeError> {
         use ai_env_worker::globs::valid_id;
         let rule = ai_env_worker::ai_env_source::names::NAME_RULE;
@@ -1276,6 +1289,21 @@ impl RelayCfg {
         }
         if !(1..=Self::AGENT_HOURS_MAX).contains(&self.agent_hours) {
             return Err(BridgeError::Config(format!("[relay].agent_hours = {} is outside 1..={}", self.agent_hours, Self::AGENT_HOURS_MAX)));
+        }
+        if self.offer.len() > Self::OFFER_MAX {
+            return Err(BridgeError::Config(format!("[relay].offer names {} grants, over {}", self.offer.len(), Self::OFFER_MAX)));
+        }
+        for (i, grant) in self.offer.iter().enumerate() {
+            let shown = crate::wire::redact::scrub(grant);
+            if !valid_id(grant) {
+                return Err(BridgeError::Config(format!("[relay].offer[{i}] = {shown:?} is not an id ({rule})")));
+            }
+            if grant.contains('.') {
+                return Err(BridgeError::Config(format!("[relay].offer[{i}] = {shown:?} holds a `.`, which a panel form refuses: name a grant without one")));
+            }
+            if self.offer[..i].contains(grant) {
+                return Err(BridgeError::Config(format!("[relay].offer[{i}] = {shown:?} is named twice")));
+            }
         }
         Ok(())
     }
@@ -1467,10 +1495,25 @@ mod tests {
             assert!(matches!(&e, BridgeError::Config(m) if m.starts_with(key)), "{body}: {e}");
             assert_eq!(crate::errors::CliError::from(e).exit_code(), 1, "{body}");
         }
-        for ok in ["agent_hours = 1", "agent_hours = 24", "grant = \"example-grant\"", "worker_id = \"w1\""] {
+        for ok in ["agent_hours = 1", "agent_hours = 24", "grant = \"example-grant\"", "worker_id = \"w1\"", "offer = []", "offer = [\"g-a\", \"g_b\"]", "grant = \"no-grant\""] {
             BridgeConfig::parse(&format!("[relay]\n{ok}\n")).unwrap().relay.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
+        // R-149: `offer` defaults to none and names at most 16 ids, each once, none with a `.`.
+        assert!(d.offer.is_empty(), "no grant offered by default");
+        assert_eq!(BridgeConfig::parse("[relay]\noffer = [\"g-a\", \"g-b\"]\n").unwrap().relay.offer, ["g-a", "g-b"]);
+        let of = |n: usize| (0..n).map(|i| format!("\"g-{i}\"")).collect::<Vec<_>>().join(", ");
+        BridgeConfig::parse(&format!("[relay]\noffer = [{}]\n", of(16))).unwrap().relay.validate().unwrap();
+        for (body, want) in [
+            (format!("offer = [{}]", of(17)), "[relay].offer names 17 grants, over 16".to_string()),
+            ("offer = [\"G\"]".to_string(), format!("[relay].offer[0] = \"G\" is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)),
+            ("offer = [\"g-a\", \"g.b\"]".to_string(), "[relay].offer[1] = \"g.b\" holds a `.`, which a panel form refuses: name a grant without one".to_string()),
+            ("offer = [\"g-a\", \"g-a\"]".to_string(), "[relay].offer[1] = \"g-a\" is named twice".to_string()),
+        ] {
+            let e = BridgeConfig::parse(&format!("[relay]\n{body}\n")).unwrap_or_else(|e| panic!("{body}: {e}")).relay.validate().unwrap_err();
+            assert!(matches!(&e, BridgeError::Config(m) if *m == want), "{body}: {e}");
+        }
         let p = Paths::from_root_and_env(PathBuf::from("/r"), None);
+        assert_eq!(p.relay_access_cache(), PathBuf::from("/r/state/relay-access.json"));
         assert_eq!(p.relay_worker_env(), PathBuf::from("/r/credentials/relay-worker.env"));
         assert_eq!(p.relay_agent_socket(), PathBuf::from("/r/state/relay-agent.sock"));
         assert_eq!(p.relay_agent_lock(), PathBuf::from("/r/state/relay-agent.lock"));

@@ -14,8 +14,8 @@ import time
 
 SELF = "ai-env-relay-reload"
 # In this order (infra/policies.ts RELAY_PARAMETERS, bridge::egress::RELAY_PARAMETERS); `tls` alone is a SecureString.
-PARAMETERS = ["artifact", "workers", "grants", "token-signers", "peers", "tls"]
-LISTS = ["workers", "grants", "token-signers", "peers"]
+PARAMETERS = ["artifact", "workers", "grants", "token-signers", "peers", "access", "tls"]
+LISTS = ["workers", "grants", "token-signers", "peers", "access"]
 BINARY_RE = re.compile(r"ai-env-relay-([0-9a-f]{16})")
 BINARY_MAX = 64 << 20
 # PEM markers built from parts: no key block in this file (I-R78).

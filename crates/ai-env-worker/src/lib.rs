@@ -2,7 +2,7 @@
 //! prove a whitelisted Ed25519 key, serve `DataSource`s.
 //!
 //! Without the `runtime` feature (as ai-env-cli and the relay take it) the crate holds the shared formats
-//! only: ids and globs, keys, session tokens, the four relay lists, the signing agent's protocol, the signers,
+//! only: ids and globs, keys, session tokens, the five relay lists, the signing agent's protocol, the signers,
 //! the relay's certificates (`certs`) and the mapping of ai-env-source's types to the wire (`map`, review A-M13).
 //!
 //! The runtime: `Worker::builder().worker_id(…).relay(…).signer(…).source(…).build()?.run_until(shutdown)`.

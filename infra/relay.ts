@@ -1,9 +1,9 @@
 // The relay (S13, plans/s13-contracts.md §I-infra.4.3): a t4g.nano `ai-env-relay` in the proxy subnet at a fixed
 // private address, with an Elastic IP for the workers, its role (relayRolePolicy beside the AWS managed SSM agent
 // policy) and instance profile, its log group, its boot script and its binary in the artifacts bucket and the `artifact`
-// parameter that pins the binary. Its other five parameters (workers, grants, token-signers, peers, tls) are `ai-env relay`'s, written as the deployer at
-// their first use: Pulumi never holds them (LD-I5: the grants name private sources; a SecureString in Pulumi's state
-// would hold the key).
+// parameter that pins the binary. Its other six parameters (workers, grants, token-signers, peers, access, tls) are `ai-env relay`'s, written as the deployer at
+// their first use (`access` by ops as well, R-147): Pulumi never holds them (LD-I5: the grants name private sources; a
+// SecureString in Pulumi's state would hold the key).
 //
 // Why this shape: administration through SSM only (no key pair, no port 22), IMDSv2 with hop limit 1, the AMI pinned
 // by ignoreChanges as the proxy's; two boot scripts (relay-spec.ts, plans/relay-security-contracts.md LD-R56): the user

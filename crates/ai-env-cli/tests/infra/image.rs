@@ -3211,12 +3211,12 @@ fn the_destroy_checklist_names_the_egress_leftovers() {
         "\n     cd infra && pulumi stack rm dev\n",
         "the account root ran this destroy (BREAKGLASS=1): when done, unset its key and close this terminal (README \"Break-glass\"); delete the key when nothing else uses it (IAM console as the root, with MFA: Security credentials, Access keys)",
         // S13 (I-T53): the relay instance and its Elastic IP (billed while allocated), its log group, its artifact
-        // parameter and the five writes of ai-env relay Pulumi never held (deleted by hand; `peers` since R-93), its
-        // role and profile.
+        // parameter and the six writes of ai-env relay Pulumi never held (deleted by hand; `peers` since R-93, `access`
+        // since R-147), its role and profile.
         " 12. the relay instance, terminated only, and no Elastic IP of the stack left (one still allocated is billed):\n     aws ec2 describe-instances --filters Name=tag:Name,Values=ai-env-relay --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n     aws ec2 describe-addresses --filters Name=tag:Name,Values=ai-env-relay --query 'Addresses[].[AllocationId,PublicIp]' --output text --region eu-central-1 --endpoint-url https://ec2.eu-central-1.amazonaws.com\n",
-        " 13. no relay log group; the relay's artifact parameter listed as invalid; the five ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/relay --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
-        "\n     aws ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --query InvalidParameters --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
-        "\n     aws ssm delete-parameters --names /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/tls --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        " 13. no relay log group; the relay's artifact parameter listed as invalid; the six ai-env relay writes Pulumi never held, deleted by hand (the only write of this list):\n     aws logs describe-log-groups --log-group-name-prefix /ai-env/relay --region eu-central-1 --endpoint-url https://logs.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm get-parameters --names /ai-env/relay/artifact /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/access /ai-env/relay/tls --query InvalidParameters --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
+        "\n     aws ssm delete-parameters --names /ai-env/relay/workers /ai-env/relay/grants /ai-env/relay/token-signers /ai-env/relay/peers /ai-env/relay/access /ai-env/relay/tls --region eu-central-1 --endpoint-url https://ssm.eu-central-1.amazonaws.com\n",
         " 14. NoSuchEntity for each:\n",
         "\n     aws iam get-role --role-name ai-env-relay --region eu-central-1; aws iam get-instance-profile --instance-profile-name ai-env-relay --region eu-central-1\n",
         " 17. the account root ran this destroy (BREAKGLASS=1)",

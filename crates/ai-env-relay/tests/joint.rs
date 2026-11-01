@@ -138,9 +138,14 @@ async fn start() -> Relay {
     let app = RelayApp::new(cfg, deps).expect("the config is valid");
     // R's I-L2 note: the in-process relay needs one poll before any handshake (the poll tick is `run`'s alone).
     let polled = app.poll_files();
-    assert_eq!(polled.iter().map(|(file, _)| *file).collect::<Vec<_>>(), ["workers", "token-signers", "grants", "tls", "peers"]);
+    assert_eq!(polled.iter().map(|(file, _)| *file).collect::<Vec<_>>(), ["workers", "token-signers", "grants", "tls", "peers", "access"]);
     for (file, outcome) in polled {
-        assert!(matches!(outcome, Poll::Loaded { .. }), "{file} is loaded by the first poll");
+        // R-144: the access list is absent until the first approval, and nothing here waits for it.
+        if file == "access" {
+            assert_eq!(outcome, Poll::Missing);
+        } else {
+            assert!(matches!(outcome, Poll::Loaded { .. }), "{file} is loaded by the first poll");
+        }
     }
     let (public, public_rx) = mpsc::unbounded_channel();
     let (private, private_rx) = mpsc::unbounded_channel();
