@@ -57,11 +57,17 @@ pub enum AuthFault {
     Timeout,
     /// The stream ended.
     Eof,
+    /// `open()`: no client certificate on the connection (R-126; `admit`'s config lets none through).
+    NoCert,
+    /// `open()`: no entry in force holds the connection's certificate (R-126).
+    UnknownCert,
+    /// The key is right and the certificate another's, or the entry holds none (R-127).
+    CertMismatch,
 }
 
 impl AuthFault {
     /// The tunnel line's `reason` (R-65): not_loaded, stale, malformed, bad_protocol, bad_alg, unknown_worker,
-    /// expired, bad_signature, out_of_order, timeout, eof.
+    /// expired, bad_signature, out_of_order, timeout, eof, no_cert, unknown_cert, cert_mismatch.
     pub fn word(self) -> &'static str {
         match self {
             AuthFault::NotLoaded => "not_loaded",
@@ -75,6 +81,9 @@ impl AuthFault {
             AuthFault::OutOfOrder => "out_of_order",
             AuthFault::Timeout => "timeout",
             AuthFault::Eof => "eof",
+            AuthFault::NoCert => "no_cert",
+            AuthFault::UnknownCert => "unknown_cert",
+            AuthFault::CertMismatch => "cert_mismatch",
         }
     }
 
@@ -90,7 +99,10 @@ impl AuthFault {
             | AuthFault::Expired
             | AuthFault::BadSignature
             | AuthFault::OutOfOrder
-            | AuthFault::Timeout => true,
+            | AuthFault::Timeout
+            | AuthFault::NoCert
+            | AuthFault::UnknownCert
+            | AuthFault::CertMismatch => true,
         }
     }
 }
@@ -118,12 +130,16 @@ fn verify_once(key: &PublicKey, signed: &[u8], signature: &[u8]) -> bool {
 /// and the fault R-10's order names first is returned after it. So a worker id that is unknown, holds another key or
 /// lapsed costs what a whitelisted one does, and the time of a refusal says nothing about the whitelist. An unshaped
 /// one (an id that is no id, a key or a signature of another length) is refused before anything is hashed.
+///
+/// R-127 is the last check: an entry with no `tls_fp`, no fingerprint presented, or the entry's `tls_fp` not the hex of
+/// `cert_fp` is `CertMismatch`, so one worker's certificate never serves another's key (LD-R34).
 pub fn verify_proof(
     workers: Option<&Workers>,
     relay_id: &str,
     nonce: &[u8; NONCE_LEN],
     hello: &Hello,
     proof: &AuthProof,
+    cert_fp: Option<&[u8; 32]>,
     now_unix: u64,
 ) -> Result<WorkerEntry, AuthFault> {
     let shaped = ai_env_worker::globs::valid_id(&hello.worker_id)
@@ -162,12 +178,15 @@ pub fn verify_proof(
     let verified = verify_once(&key, &signed, &proof.signature);
     match (fault, entry) {
         (Some(fault), _) => Err(fault),
-        (None, Some((e, _))) if verified => Ok(e.clone()),
+        (None, Some((e, _))) if verified => match (e.tls_fp.as_deref(), cert_fp) {
+            (Some(held), Some(presented)) if held == hex::encode(presented) => Ok(e.clone()),
+            _ => Err(AuthFault::CertMismatch),
+        },
         _ => Err(AuthFault::BadSignature),
     }
 }
 
-/// The workers file as R-10's first check reads it: loaded (`NotLoaded`) and fresh (`Stale`, R-17).
+/// The workers file as R-10's first check, and `open()`'s (R-126), read it: loaded (`NotLoaded`) and fresh (`Stale`, R-17).
 pub(crate) fn whitelist(workers: &Watched<Workers>, now: SystemTime, max_stale: Duration) -> Result<Loaded<Workers>, AuthFault> {
     let loaded = workers.loaded().ok_or(AuthFault::NotLoaded)?;
     if !crate::files::is_fresh(loaded.fresh_at, now, max_stale) {
@@ -228,10 +247,18 @@ mod tests {
         AuthProof { signature: SigningKey::from_seed(&[seed; 32]).unwrap().sign(&t).to_vec() }
     }
 
-    fn workers(not_after: &str) -> Workers {
+    /// The fingerprint of `worker-a`'s client certificate in `workers`, and another's.
+    const CERT_A: [u8; 32] = [0xa1; 32];
+    const CERT_B: [u8; 32] = [0xb2; 32];
+
+    fn entry(not_after: &str, tls_fp: Option<String>) -> Workers {
         let key = SigningKey::from_seed(&[1; 32]).unwrap().public_key().b64();
-        let entry = WorkerEntry { worker_id: "worker-a".into(), alg: "ed25519".into(), public_key: key, sources: vec!["example.alpha*".into()], not_after: not_after.into(), tls_fp: None };
+        let entry = WorkerEntry { worker_id: "worker-a".into(), alg: "ed25519".into(), public_key: key, sources: vec!["example.alpha*".into()], not_after: not_after.into(), tls_fp };
         crate::lists::parse_workers(policy::render_workers(&[entry]).unwrap().as_bytes()).unwrap()
+    }
+
+    fn workers(not_after: &str) -> Workers {
+        entry(not_after, Some(hex(&CERT_A)))
     }
 
     /// Unit 7.
@@ -267,30 +294,49 @@ mod tests {
         let n = nonce();
         let h = hello("worker-a", 1);
         let proof = sign(1, "relay-test", &n, &h);
-        let ok = verify_proof(Some(&w), "relay-test", &n, &h, &proof, now).expect("the golden proof");
+        let cert = Some(&CERT_A);
+        let ok = verify_proof(Some(&w), "relay-test", &n, &h, &proof, cert, now).expect("the golden proof, with its certificate");
         assert_eq!(ok.worker_id, "worker-a");
 
         let mut other_nonce = n;
         other_nonce[0] ^= 1;
-        assert_eq!(verify_proof(Some(&w), "relay-test", &other_nonce, &h, &proof, now), Err(AuthFault::BadSignature));
-        assert_eq!(verify_proof(Some(&w), "relay-other", &n, &h, &proof, now), Err(AuthFault::BadSignature));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &other_nonce, &h, &proof, cert, now), Err(AuthFault::BadSignature));
+        assert_eq!(verify_proof(Some(&w), "relay-other", &n, &h, &proof, cert, now), Err(AuthFault::BadSignature));
         let hb = Hello { worker_id: "worker-b".into(), ..h.clone() };
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hb, &sign(1, "relay-test", &n, &hb), now), Err(AuthFault::UnknownWorker));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hb, &sign(1, "relay-test", &n, &hb), cert, now), Err(AuthFault::UnknownWorker));
         let h2 = hello("worker-a", 2);
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h2, &sign(2, "relay-test", &n, &h2), now), Err(AuthFault::UnknownWorker));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h2, &sign(2, "relay-test", &n, &h2), cert, now), Err(AuthFault::UnknownWorker));
         let h0 = Hello { alg: 0, ..h.clone() };
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h0, &sign(1, "relay-test", &n, &h0), now), Err(AuthFault::BadAlg));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h0, &sign(1, "relay-test", &n, &h0), cert, now), Err(AuthFault::BadAlg));
         let hp = Hello { protocol: 2, ..h.clone() };
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hp, &sign(1, "relay-test", &n, &hp), now), Err(AuthFault::BadProtocol));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hp, &sign(1, "relay-test", &n, &hp), cert, now), Err(AuthFault::BadProtocol));
         let mut flipped = proof.clone();
         flipped.signature[10] ^= 0x01;
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &flipped, now), Err(AuthFault::BadSignature));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &flipped, cert, now), Err(AuthFault::BadSignature));
         let short = AuthProof { signature: proof.signature[..63].to_vec() };
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &short, now), Err(AuthFault::Malformed));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &short, cert, now), Err(AuthFault::Malformed));
         let at = policy::unix_of(not_after).unwrap();
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, at + 1), Err(AuthFault::Expired), "not_after one second before now");
-        assert!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, at).is_ok(), "not_after equal to now");
-        assert_eq!(verify_proof(None, "relay-test", &n, &h, &proof, now), Err(AuthFault::NotLoaded));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, cert, at + 1), Err(AuthFault::Expired), "not_after one second before now");
+        assert!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, cert, at).is_ok(), "not_after equal to now");
+        assert_eq!(verify_proof(None, "relay-test", &n, &h, &proof, cert, now), Err(AuthFault::NotLoaded));
+
+        // R-127: the certificate is the last check. Another fingerprint, none, and an entry that holds none are each
+        // `CertMismatch`; every other fault comes first (LD-R34), so the word means the key is right.
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, Some(&CERT_B), now), Err(AuthFault::CertMismatch));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, None, now), Err(AuthFault::CertMismatch));
+        let no_tls_fp = entry(not_after, None);
+        assert_eq!(verify_proof(Some(&no_tls_fp), "relay-test", &n, &h, &proof, cert, now), Err(AuthFault::CertMismatch));
+        assert_eq!(verify_proof(Some(&no_tls_fp), "relay-test", &n, &h, &proof, None, now), Err(AuthFault::CertMismatch), "none on either side is no match");
+        for presented in [Some(&CERT_B), None] {
+            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &flipped, presented, now), Err(AuthFault::BadSignature));
+            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &proof, presented, at + 1), Err(AuthFault::Expired));
+            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h2, &sign(2, "relay-test", &n, &h2), presented, now), Err(AuthFault::UnknownWorker));
+        }
+        // The words of R-126 and R-127, each a fault of the peer's (R-102).
+        for (fault, word) in [(AuthFault::NoCert, "no_cert"), (AuthFault::UnknownCert, "unknown_cert"), (AuthFault::CertMismatch, "cert_mismatch")] {
+            assert_eq!(fault.word(), word);
+            assert!(fault.is_fault(), "{word}");
+        }
 
         // The workers file as the tunnel reads it: not loaded, then stale (R-17).
         let dir = tempfile::tempdir().unwrap();
@@ -340,9 +386,15 @@ mod tests {
             ("no whitelist, a short signature", None, &h, short, now, Err(AuthFault::NotLoaded), 0),
         ];
         for (what, list, hello, proof, at, want, n_verifies) in cases {
-            let (got, verifies) = counted(|| verify_proof(list, "relay-test", &n, hello, &proof, at));
+            let (got, verifies) = counted(|| verify_proof(list, "relay-test", &n, hello, &proof, Some(&CERT_A), at));
             assert_eq!(got.as_ref().map(|e| e.worker_id.as_str()), want.as_ref().copied(), "{what}");
             assert_eq!(verifies, n_verifies, "{what}: one verify for a shaped Hello, whatever the outcome; none for an unshaped one");
+        }
+        // R-127's fault comes after the one verify too.
+        for (what, presented) in [("another certificate", Some(&CERT_B)), ("no certificate", None)] {
+            let (got, verifies) = counted(|| verify_proof(Some(&w), "relay-test", &n, &h, &good, presented, now));
+            assert_eq!(got, Err(AuthFault::CertMismatch), "{what}");
+            assert_eq!(verifies, 1, "{what}");
         }
 
         let decoy = SigningKey::from_seed(&THROWAWAY_SEED).unwrap();
@@ -358,13 +410,13 @@ mod tests {
         };
         for (worker_id, at, want) in [("worker-a", now, AuthFault::UnknownWorker), ("worker-b", now, AuthFault::UnknownWorker)] {
             let (hd, pd) = with_decoy(worker_id);
-            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hd, &pd, at), Err(want), "{worker_id}: the decoy's own proof");
+            assert_eq!(verify_proof(Some(&w), "relay-test", &n, &hd, &pd, Some(&CERT_A), at), Err(want), "{worker_id}: the decoy's own proof");
         }
         // Signed with the decoy for the entry's own key: the decoy is never the entry's key, lapsed or not.
         let t = transcript("relay-test", &n, &h.worker_id, h.alg as u32, &h.public_key, h.protocol);
         let pd = AuthProof { signature: decoy.sign(&t).to_vec() };
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, now), Err(AuthFault::BadSignature));
-        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, lapsed), Err(AuthFault::Expired));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, Some(&CERT_A), now), Err(AuthFault::BadSignature));
+        assert_eq!(verify_proof(Some(&w), "relay-test", &n, &h, &pd, Some(&CERT_A), lapsed), Err(AuthFault::Expired));
     }
 
     /// Unit 51 (R-102): which faults count toward an address's ban: all but the relay's own and the client's leaving.
@@ -382,6 +434,9 @@ mod tests {
             (AuthFault::OutOfOrder, true),
             (AuthFault::Timeout, true),
             (AuthFault::Eof, false),
+            (AuthFault::NoCert, true),
+            (AuthFault::UnknownCert, true),
+            (AuthFault::CertMismatch, true),
         ];
         for (fault, counts) in table {
             assert_eq!(fault.is_fault(), counts, "{}", fault.word());

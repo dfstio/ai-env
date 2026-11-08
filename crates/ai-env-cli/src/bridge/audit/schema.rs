@@ -136,7 +136,8 @@ pub mod event {
     pub const RELAY_KEYGEN: &str = "relay_keygen";
     /// S13 (WM-R43): `relay allow` (the deployer): `kind` (`worker`, `token_signer`), `id`, `fp`, `outcome`
     /// (`added`, `replaced`, `unchanged`); `version`, `sources` (a count), `not_after`; `tls_fp` (§RS.4.3: the
-    /// 16-hex fingerprint of the client certificate `--tls-key` issued).
+    /// 16-hex fingerprint of the client certificate `--tls-key` issued); `grants` (§RS.4.3: a token signer's grant
+    /// globs, a count).
     pub const RELAY_ALLOW: &str = "relay_allow";
     /// S13 (WM-R44): `relay revoke`: `kind`, `id`, `outcome` (`revoked`, `absent`); `version`.
     pub const RELAY_REVOKE: &str = "relay_revoke";
@@ -352,7 +353,7 @@ pub static EVENTS: &[EventSpec] = &[
     ev("panel_serve", &["port", "outcome"], NO, NO, NoSession, NONE),
     // S13 (§WM-worker-mac.6.7): ids, words, numbers and 16-hex fingerprints only (WM-R57); no VM key, no cost effect.
     ev("relay_keygen", &["worker_id", "worker_fp", "session_fp"], &["replaced"], NO, NoSession, NONE),
-    ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after", "tls_fp"], NO, NoSession, NONE),
+    ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after", "tls_fp", "grants"], NO, NoSession, NONE),
     ev("relay_revoke", &["kind", "id", "outcome"], &["version"], NO, NoSession, NONE),
     ev("relay_grant", &["id", "outcome"], &["rules", "version"], NO, NoSession, NONE),
     ev("relay_start", &["id", "outcome"], &["ms"], NO, NoSession, NONE),

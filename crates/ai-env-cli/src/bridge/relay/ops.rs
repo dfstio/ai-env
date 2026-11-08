@@ -10,7 +10,8 @@
 //! cannot read them, and IAM refuses a whole call for one such name).
 //! Findings are `[NO ]` and exit 1: this Mac's session key is not an in-force token signer under
 //! `[relay].worker_id`, a list does not parse, the instance is not running, the peers list is absent or holds no
-//! entry in force, a worker in force has no client certificate under a relay that requires one; an absent access list is
+//! entry in force, a worker in force has no client certificate under a relay that requires one, this Mac's token signer
+//! holds grants that leave out `[relay].grant`; an absent access list is
 //! no finding, since no chat is then more than its token's grant (R-146). A read that failed
 //! is `[?? ]` and exit 7 when nothing was found first. `start` and `stop` wait as `proxy start|stop` do, their polls
 //! scaled by the lab knob; a relay that stops answers VM relay tools `unavailable`, and workers keep dialing until it
@@ -26,6 +27,7 @@ use crate::bridge::egress::RELAY_LOG_GROUP;
 use crate::errors::{CliError, Result};
 use crate::wire::time::{rfc3339_utc, unix_now, unix_now_ms};
 use ai_env_worker::agent::{request, AgentStatus, Request, Response};
+use ai_env_worker::globs::{glob_match, valid_id};
 use ai_env_worker::keys::PublicKey;
 use ai_env_worker::policy::{self, ACCESS, GRANTS, PEERS, TOKEN_SIGNERS, WORKERS};
 use serde_json::{json, Value};
@@ -53,6 +55,11 @@ const DISK_WINDOW_MS: u64 = 600_000;
 const DISK_WORD: &str = "why=disk";
 /// The public face's allowlist refusals: the internet's noise, counted apart (R-66, §RS.3.2 row 4).
 const UNLISTED_REASONS: [&str; 2] = ["no_peers", "not_in_peers"];
+/// A failed TLS handshake on the public face, the one line a worker refused at TLS writes (R-124, §RS.3.2 row 4).
+const TLS_FAILED_REASON: &str = "tls_failed";
+/// How many of them in the hour warn (§RS.3.2 row 4): such a worker writes about one a minute and, alone on its address,
+/// never reaches a ban (R-101), while each `relay status` probe writes one with no fault (R-102).
+const TLS_FAILED_WARN: u64 = 10;
 /// What the agent has to answer `status` in (WM-R47).
 const AGENT_WAIT: Duration = Duration::from_secs(1);
 
@@ -202,7 +209,7 @@ pub(crate) fn agent_status(paths: &Paths) -> Option<AgentStatus> {
 /// `ai-env relay status [--json] [--local]` (WM-R47).
 pub fn cmd_status(json: bool, local: bool) -> Result<()> {
     let paths = Paths::resolve()?;
-    let worker_id = BridgeConfig::load(&paths)?.unwrap_or_default().relay.worker_id;
+    let cfg = BridgeConfig::load(&paths)?.unwrap_or_default();
     let mut report = Report::default();
     let notes = mac_rows(&paths, &mut report);
     if local {
@@ -225,7 +232,7 @@ pub fn cmd_status(json: bool, local: bool) -> Result<()> {
         }
     };
     let stance = instance_rows(&ctx, &instance, &mut report);
-    list_rows(&worker_id, notes.as_ref(), stance, &mut report);
+    list_rows(&cfg, notes.as_ref(), stance, &mut report);
     peer_rows(&mut report);
     access_rows(&paths, &mut report);
     report.finish(json)
@@ -239,7 +246,11 @@ enum CertStance {
     /// No `peers_version`: a relay from before the relay security plan, which refuses a list with `tls_fp` and unloads
     /// its whole whitelist, so no certificate may be issued yet (RO-3).
     TooEarly,
-    /// `client_certs: false`, a relay with no such key but a `peers_version`, or no line read.
+    /// A `peers_version` and no `client_certs` key: a relay that asks for no client certificate, so part D's is not
+    /// running. Right during RO-4's steps 3 to 5, and for up to 5 minutes after the new relay starts (the reload's next run
+    /// after the apply), plus the log agent's delivery, until its first status line; past that, a rollback (`list_rows`'s row).
+    Unasked,
+    /// `client_certs: false`, or no line read.
     Later,
 }
 
@@ -248,6 +259,7 @@ impl CertStance {
         match line {
             Some(l) if l.get("client_certs").and_then(Value::as_bool) == Some(true) => CertStance::Required,
             Some(l) if l.get("peers_version").is_none() => CertStance::TooEarly,
+            Some(l) if l.get("client_certs").is_none() => CertStance::Unasked,
             _ => CertStance::Later,
         }
     }
@@ -384,10 +396,12 @@ fn status_line(instance: &str, report: &mut Report) -> Option<Value> {
         Some(version) if !version.is_empty() => format!("{version} ({} s old)", field("peers_age_s")),
         _ => "-".to_string(),
     };
+    // R-132: the row that tells part D's relay from the first deploy's, whose `relay_version` can be the same.
+    let required = if line.get("client_certs").and_then(Value::as_bool) == Some(true) { "; client certificates required" } else { "" };
     report.row(
         Mark::Ok,
         format!(
-            "relay {}: {} tunnel(s), {} source(s) live; workers {} ({} s old), token-signers {} ({} s old), grants {} ({} s old), peers {peers}",
+            "relay {}: {} tunnel(s), {} source(s) live; workers {} ({} s old), token-signers {} ({} s old), grants {} ({} s old), peers {peers}{required}",
             field("relay_version"),
             field("tunnels"),
             field("sources_live"),
@@ -403,6 +417,11 @@ fn status_line(instance: &str, report: &mut Report) -> Option<Value> {
     // reads in SSM.
     if line.get("peers_version").and_then(Value::as_str) == Some("") {
         report.row(Mark::Warn, "relay: its peers list is not loaded: it admits no worker".to_string());
+    }
+    // No TLS config, so both faces refuse `no_tls`: a first load that refused `tls.pem`, which nothing rolls back (R-124), or
+    // the file gone (R-4).
+    if line.get("tls_loaded").and_then(Value::as_bool) == Some(false) {
+        report.row(Mark::Warn, "relay: it holds no TLS config: it serves nobody (make relay-logs: a live file was refused, or relay=waiting-for-tls)".to_string());
     }
     Some(line)
 }
@@ -427,6 +446,8 @@ struct Refused {
     banned: usize,
     /// `U`: the public face's `no_peers` and `not_in_peers` lines, plus their `suppressed`.
     unlisted: u64,
+    /// `T`: the public face's `tls_failed` lines, plus their `suppressed` (they count in `P` too).
+    tls_failed: u64,
     /// The three most frequent reasons of the tunnel lines and of `P`'s lines, by line count, ties by name.
     top: Vec<(String, u64)>,
 }
@@ -454,6 +475,9 @@ impl Refused {
                     if reason == "banned" {
                         banned.insert(peer);
                     }
+                    if reason == TLS_FAILED_REASON && word(line, "face") == "public" {
+                        out.tls_failed += counted;
+                    }
                 }
                 _ => continue,
             }
@@ -469,10 +493,11 @@ impl Refused {
         out
     }
 
-    /// Its row: `[warn]` with a refused handshake or a banned address, the allowlist's noise (`U`) never.
+    /// Its row: `[warn]` with a refused handshake, a banned address or `T` at [`TLS_FAILED_WARN`], the allowlist's noise
+    /// (`U`) never.
     fn row(&self) -> (Mark, String) {
         let top = if self.top.is_empty() { "none".to_string() } else { self.top.iter().map(|(reason, count)| format!("{reason} {count}")).collect::<Vec<_>>().join(", ") };
-        let mark = if self.handshakes > 0 || self.banned > 0 { Mark::Warn } else { Mark::Ok };
+        let mark = if self.handshakes > 0 || self.banned > 0 || self.tls_failed >= TLS_FAILED_WARN { Mark::Warn } else { Mark::Ok };
         let text = format!(
             "refused in the last hour: {} handshake(s) from {} address(es), {} connection(s) refused or cut, {} address(es) banned, {} connection(s) from unlisted addresses; top reasons: {top}",
             self.handshakes, self.addresses, self.connections, self.banned, self.unlisted
@@ -483,7 +508,7 @@ impl Refused {
     /// `instance.refused`.
     fn doc(&self) -> Value {
         let top: Vec<Value> = self.top.iter().map(|(reason, count)| json!({"reason": reason, "count": count})).collect();
-        json!({"handshakes": self.handshakes, "addresses": self.addresses, "connections": self.connections, "banned": self.banned, "unlisted": self.unlisted, "top": top})
+        json!({"handshakes": self.handshakes, "addresses": self.addresses, "connections": self.connections, "banned": self.banned, "unlisted": self.unlisted, "tls_failed": self.tls_failed, "top": top})
     }
 }
 
@@ -520,9 +545,10 @@ fn disk_full(instance: &str, report: &mut Report) -> Value {
     json!(newest.is_some())
 }
 
-/// The three lists in one `get-parameters`, each entry shown, and this Mac's session key judged; `stance` is what the
-/// newest status line says of the workers' certificates.
-fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, stance: CertStance, report: &mut Report) {
+/// The three lists in one `get-parameters`, each entry shown, and this Mac's session key judged, its grants against what
+/// `cfg` names; `stance` is what the newest status line says of the workers' certificates.
+fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance, report: &mut Report) {
+    let worker_id = cfg.relay.worker_id.as_str();
     let names: Vec<String> = [WORKERS, TOKEN_SIGNERS, GRANTS].iter().map(|n| (*n).to_string()).collect();
     let (got, _) = match ops::get_parameters(&names) {
         Ok(g) => g,
@@ -552,12 +578,21 @@ fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, stance: CertStance, r
                     report.row(mark, text);
                 }
             }
+            let holding = list.iter().filter(|w| w.tls_fp.is_some() && now <= w.not_after_unix()).count();
+            if stance == CertStance::Unasked && holding > 0 {
+                report.row(Mark::Warn, format!("relay: this relay asks for no client certificate, though {holding} worker(s) hold one: part D's relay is not running (make relay-logs: rollback=)"));
+            }
             let docs: Vec<Value> = list.iter().map(|w| json!({"id": w.worker_id, "fp": fp(&w.public_key), "cert_fp": w.tls_fp.as_deref().map(fp16), "sources": w.sources, "not_after": w.not_after, "expired": now > w.not_after_unix()})).collect();
             report.doc.insert("workers".into(), Value::Array(docs));
         }
     }
     // token signers, and this Mac's session key among them
     let mut in_force = false;
+    // RO-6, RO-8: part D's deploy carries part H, so a status line with `client_certs` (R-132) is a relay that parses a
+    // signer's `grants`. A line without it is one that refuses them; with none read, it is not known.
+    let status_line = report.doc.get("instance").and_then(|i| i.get("status_line")).filter(|line| line.is_object());
+    let parses_grants = status_line.is_some_and(|line| line.get("client_certs").is_some());
+    let refuses_grants = status_line.is_some_and(|line| line.get("client_certs").is_none());
     match value(TOKEN_SIGNERS).map(|(v, n)| (policy::parse_signers(&v), n)) {
         None => {
             report.row(Mark::Note, format!("{TOKEN_SIGNERS}: absent (ai-env relay allow --token-signer creates it)"));
@@ -567,10 +602,26 @@ fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, stance: CertStance, r
         Some((Ok(list), n)) => {
             report.row(Mark::Ok, format!("{TOKEN_SIGNERS} v{n}: {} token signer(s)", list.len()));
             for s in &list {
-                report.row(Mark::Note, format!("  token signer {} (key fp {}) until {}{}", s.signer_id, fp(&s.public_key), s.not_after, expired(s.not_after_unix())));
+                let reach = s.grants.as_ref().map_or_else(|| "every grant".to_string(), |globs| format!("grants {}", globs.join(",")));
+                report.row(Mark::Note, format!("  token signer {} (key fp {}) for {reach} until {}{}", s.signer_id, fp(&s.public_key), s.not_after, expired(s.not_after_unix())));
+                if now > s.not_after_unix() {
+                    continue;
+                }
+                let mine = s.signer_id == worker_id;
+                if let Some(text) = every_grant_row(s, parses_grants, mine.then_some(cfg.relay.grant.as_str())) {
+                    report.row(Mark::Warn, text);
+                }
+                if mine && !refuses_grants {
+                    own_grant_rows(s, cfg, report);
+                }
+            }
+            // RO-6: one entry with `grants`, a lapsed one too, and that relay refuses the whole list.
+            let bound: Vec<&str> = list.iter().filter(|s| s.grants.is_some()).map(|s| s.signer_id.as_str()).collect();
+            if refuses_grants && !bound.is_empty() {
+                report.row(Mark::No, format!("{TOKEN_SIGNERS} holds grants (token signer {}), but this relay refuses such a list, so every token fails (RO-6): deploy part D's relay, or ai-env as deployer -- ai-env relay revoke <id> --token-signer for each and allow it again without --grants", bound.join(",")));
             }
             in_force = notes.is_some_and(|n| list.iter().any(|s| s.signer_id == worker_id && s.public_key == n.session_key.b64() && now <= s.not_after_unix()));
-            let docs: Vec<Value> = list.iter().map(|s| json!({"id": s.signer_id, "fp": fp(&s.public_key), "not_after": s.not_after, "expired": now > s.not_after_unix()})).collect();
+            let docs: Vec<Value> = list.iter().map(|s| json!({"id": s.signer_id, "fp": fp(&s.public_key), "grants": s.grants, "not_after": s.not_after, "expired": now > s.not_after_unix()})).collect();
             report.doc.insert("token_signers".into(), Value::Array(docs));
         }
     }
@@ -606,11 +657,69 @@ fn list_rows(worker_id: &str, notes: Option<&MacKeyNotes>, stance: CertStance, r
 /// command at all: running it now would unload that relay's whole whitelist (RO-3).
 fn no_cert_row(w: &policy::WorkerEntry, stance: CertStance) -> (Mark, String) {
     let key = PublicKey::parse_b64(&w.public_key).map_or_else(|_| "<its key>".to_string(), |k| k.text());
-    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow {} --key {key} --sources {} --tls-key <its p256 text>", w.worker_id, shell_word(&w.sources.join(",")));
+    // Its day: with no `--not-after`, `allow` would move the entry and the new certificate a year from today (WM-R43).
+    let day = entry_day(&w.not_after);
+    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow {} --key {key} --sources {} --tls-key <its p256 text> --not-after {day}", w.worker_id, shell_word(&w.sources.join(",")));
     match stance {
         CertStance::Required => (Mark::No, format!("worker {} has no client certificate: the relay refuses it ({command})", w.worker_id)),
-        CertStance::Later => (Mark::Warn, format!("worker {} has no client certificate yet: a relay that requires client certificates would refuse it ({command})", w.worker_id)),
+        CertStance::Unasked | CertStance::Later => (Mark::Warn, format!("worker {} has no client certificate yet: a relay that requires client certificates would refuse it ({command})", w.worker_id)),
         CertStance::TooEarly => (Mark::Warn, format!("worker {} has no client certificate yet: a relay that requires client certificates would refuse it (not yet: this relay refuses a list with tls_fp and unloads its whole whitelist (RO-3))", w.worker_id)),
+    }
+}
+
+/// The day of an entry's `not_after`, as `--not-after` takes it.
+fn entry_day(not_after: &str) -> &str {
+    not_after.get(..10).unwrap_or(not_after)
+}
+
+/// A key's text as a command takes it.
+fn signer_key_text(s: &policy::SignerEntry) -> String {
+    PublicKey::parse_b64(&s.public_key).map_or_else(|_| "<its key>".to_string(), |k| k.text())
+}
+
+/// A grant `bridge.toml` names, if it names one: empty is none, and a value that is no id mints nothing (`RelayCfg::validate`).
+fn named_grant(grant: &str) -> Option<&str> {
+    valid_id(grant).then_some(grant)
+}
+
+/// The `[warn]` of an in-force token signer that reaches every grant (§RS.3.2 row 6), `None` when its `grants` set a limit.
+/// With no `grants` it names the command with its key and its day: with no `--not-after`, `allow` would move the entry's
+/// end a year from today (WM-R43). A relay older than wave 4 refuses a list with `grants`, and every token then fails
+/// (RO-6), so `parses_grants` false gets no command at all, as RO-3 does for a worker's certificate. `mac_grant` is
+/// `[relay].grant` for this Mac's own entry, which the set must keep or this Mac's tokens are refused (R-135). A glob of
+/// nothing but `*` matches every grant, so a set holding one limits nothing.
+fn every_grant_row(s: &policy::SignerEntry, parses_grants: bool, mac_grant: Option<&str>) -> Option<String> {
+    let id = &s.signer_id;
+    if let Some(globs) = &s.grants {
+        return globs.iter().any(|glob| glob.bytes().all(|b| b == b'*')).then(|| format!("token signer {id} may mint tokens for every grant (its grants hold *)"));
+    }
+    if !parses_grants {
+        return Some(format!("token signer {id} may mint tokens for every grant (not yet: a relay before part H refuses a list with grants, and every token then fails (RO-6))"));
+    }
+    let key = signer_key_text(s);
+    let day = entry_day(&s.not_after);
+    let first = mac_grant.and_then(named_grant).map_or_else(String::new, |grant| format!("{grant},"));
+    Some(format!("token signer {id} may mint tokens for every grant (ai-env as deployer -- ai-env relay allow {id} --token-signer --key {key} --grants {first}<grant globs> --not-after {day})"))
+}
+
+/// This Mac's own token signer, in force, against what `bridge.toml` names (§RS.3.2 row 6): its `grants` bind every token
+/// it mints (R-135) and every grant an approval adds (R-145). No glob matching `[relay].grant` refuses every token, a
+/// finding; none matching a `[[workspace]].relay_grant` or a `[relay].offer` id leaves a chat with nothing through it.
+fn own_grant_rows(s: &policy::SignerEntry, cfg: &BridgeConfig, report: &mut Report) {
+    let Some(globs) = &s.grants else {
+        return;
+    };
+    let id = &s.signer_id;
+    let held = globs.join(",");
+    let matched = |name: &str| globs.iter().any(|glob| glob_match(glob, name));
+    let grant = named_grant(&cfg.relay.grant);
+    if let Some(grant) = grant.filter(|g| !matched(g)) {
+        let (key, day, set) = (signer_key_text(s), entry_day(&s.not_after), shell_word(&format!("{grant},{held}")));
+        report.row(Mark::No, format!("token signer {id} holds grants {held}, none of which matches [relay].grant {grant}: every token this Mac mints is refused 7 not granted (R-135) (ai-env as deployer -- ai-env relay allow {id} --token-signer --key {key} --grants {set} --not-after {day})"));
+    }
+    let named: BTreeSet<&str> = cfg.workspace_overrides.iter().filter_map(|w| w.relay_grant.as_deref()).chain(cfg.relay.offer.iter().map(String::as_str)).filter_map(named_grant).filter(|name| Some(*name) != grant).collect();
+    for name in named.into_iter().filter(|name| !matched(name)) {
+        report.row(Mark::Warn, format!("token signer {id} holds grants {held}, none of which matches {name}: a chat reaches nothing through it"));
     }
 }
 
@@ -873,7 +982,7 @@ mod tests {
         let (mark, text) = refused.row();
         assert_eq!(mark, Mark::Warn);
         assert_eq!(text, "refused in the last hour: 5 handshake(s) from 2 address(es), 8 connection(s) refused or cut, 1 address(es) banned, 43 connection(s) from unlisted addresses; top reasons: bad_signature 2, banned 2, auth_timeout 1");
-        assert_eq!(refused.doc(), json!({"handshakes": 5, "addresses": 2, "connections": 8, "banned": 1, "unlisted": 43, "top": [{"reason": "bad_signature", "count": 2}, {"reason": "banned", "count": 2}, {"reason": "auth_timeout", "count": 1}]}));
+        assert_eq!(refused.doc(), json!({"handshakes": 5, "addresses": 2, "connections": 8, "banned": 1, "unlisted": 43, "tls_failed": 1, "top": [{"reason": "bad_signature", "count": 2}, {"reason": "banned", "count": 2}, {"reason": "auth_timeout", "count": 1}]}));
         // Nothing: no reason. Scanners alone: `[ok ]`, whatever their number. A cut alone: `[ok ]` too (`N` and `B` warn).
         let (mark, text) = Refused::of([].iter()).row();
         assert!(mark == Mark::Ok && text.ends_with("; top reasons: none"), "{text}");
@@ -886,5 +995,19 @@ mod tests {
         let ban = [line("public", "198.51.100.4", "banned", 0)];
         let (mark, text) = Refused::of(ban.iter()).row();
         assert!(mark == Mark::Warn && text.ends_with("; top reasons: banned 1"), "{text}");
+        // `T`: from part D a worker refused at TLS writes only the public face's `tls_failed` lines, so ten in the hour warn, a
+        // line's `suppressed` counting; nine do not, since each `relay status` probe writes one with no fault. The private
+        // face's never, nor another reason's. They stay in `P`.
+        let failed = |face: &str, reason: &str, lines: usize, suppressed: u64| (0..lines).map(|_| line(face, "198.51.100.5", reason, suppressed)).collect::<Vec<Value>>();
+        let t = |lines: &[Value]| {
+            let refused = Refused::of(lines.iter());
+            (refused.tls_failed, refused.connections, refused.row().0)
+        };
+        assert_eq!(t(&failed("public", "tls_failed", 9, 0)), (9, 9, Mark::Ok));
+        assert_eq!(t(&failed("public", "tls_failed", 10, 0)), (10, 10, Mark::Warn));
+        assert_eq!(t(&failed("public", "tls_failed", 1, 8)), (9, 9, Mark::Ok));
+        assert_eq!(t(&failed("public", "tls_failed", 1, 9)), (10, 10, Mark::Warn));
+        assert_eq!(t(&failed("private", "tls_failed", 50, 0)), (0, 50, Mark::Ok));
+        assert_eq!(t(&failed("public", "tls_timeout", 50, 0)), (0, 50, Mark::Ok));
     }
 }

@@ -7,10 +7,12 @@
 //! testkit's `EchoSource`) dial it through W's `Dial` seam over `tokio::io::duplex`, and a third runs W's `check` in
 //! (b). W runs TLS 1.3 under the pinned CA on every stream it dials (WM-R11: there is no plaintext path), so the
 //! relay's end of each dial goes through `RelayApp::admit`, the public face's own admission and TLS from the live
-//! `tls.pem`, before `serve_public`. V's client joins the private face through `RelayLink::over`, its duplex end
-//! served as `Peered::new(duplex_end, ip)`.
+//! `tls.pem`, before `serve_public`, and each worker presents its client certificate under the run-time CA (R-124 to
+//! R-127): its own P-256 key from W's `certs`, the fingerprint in the whitelist. V's client joins the private face
+//! through `RelayLink::over`, its duplex end served as `Peered::new(duplex_end, ip, None)`.
 //!
-//! Every key, token and certificate is built at run time from a seed (R's `tests/common`); every name is generic.
+//! Every key, token and certificate is built at run time, from a seed (R's `tests/common`) or, a worker's TLS key, by
+//! W's `certs`; every name is generic.
 
 mod common;
 
@@ -33,7 +35,7 @@ use ai_env_source::testkit::EchoSource;
 use ai_env_source::wire::close;
 use ai_env_source::{BoxFuture, CallContext, CallRequest, DataSource, Health, Output, Redactor, SourceDescriptor, SourceError};
 use ai_env_worker::keys::SigningKey;
-use ai_env_worker::session::{self, SessionClaims, SESSION_AUD};
+use ai_env_worker::session::{self, SessionClaims};
 use ai_env_worker::signer::FileSigner;
 use ai_env_worker::{policy, Dial, Io, RelayEndpoint, Tuning, Worker, WorkerError};
 use common::certs;
@@ -61,6 +63,8 @@ const ROUTES: [(&str, &str); 4] = [("example.alpha", "worker-a"), ("example.beta
 const IP_A: &str = "198.51.100.10";
 const IP_B: &str = "198.51.100.11";
 const IP_C: &str = "198.51.100.12";
+/// A worker's address that holds no client certificate.
+const IP_BARE: &str = "198.51.100.13";
 
 type PublicTx = mpsc::UnboundedSender<Result<Peered<TlsStream<DuplexStream>>, io::Error>>;
 type PrivateTx = mpsc::UnboundedSender<Result<Peered<DuplexStream>, io::Error>>;
@@ -72,6 +76,8 @@ struct Relay {
     dir: tempfile::TempDir,
     /// The run-time CA's certificate: W's only trust anchor.
     ca_pem: String,
+    /// Each whitelisted worker's client certificate.
+    clients: Clients,
     public: PublicTx,
     private: PrivateTx,
     servers: Vec<JoinHandle<Result<(), RelayError>>>,
@@ -98,15 +104,48 @@ fn write_live(dir: &Path, file: &str, bytes: &[u8]) {
     std::fs::rename(&tmp, dir.join(file)).unwrap();
 }
 
+/// One worker's client identity: its certificate under the run-time CA, its P-256 key from W's `certs::client_key`
+/// (never committed, made at run time), as `RelayEndpoint::client_identity` takes them, and the `tls_fp` the whitelist
+/// holds.
+struct ClientCert {
+    cert_pem: String,
+    key_pem: String,
+    tls_fp: String,
+}
+
+type Clients = BTreeMap<&'static str, ClientCert>;
+
+/// The three workers' client certificates under `ca`.
+fn client_certs(ca: &certs::Ca) -> Clients {
+    let private_key = ["PRIVATE", "KEY"].join(" ");
+    ["worker-a", "worker-b", "worker-c"]
+        .into_iter()
+        .zip(101u64..)
+        .map(|(id, serial)| {
+            let key = ai_env_worker::certs::client_key().expect("a P-256 key");
+            let point = ai_env_worker::certs::client_point(&key).expect("its point");
+            let der = ca.client_leaf_of_point(serial, id, point.bytes());
+            (id, ClientCert { cert_pem: certs::pem("CERTIFICATE", &der), key_pem: certs::pem(&private_key, &key), tls_fp: ai_env_worker::certs::tls_fp(&der) })
+        })
+        .collect()
+}
+
 /// The whitelist of these workers, rendered with W/M's `policy::render_workers`: A is seed 1 (`example.alpha*`),
-/// B seed 2 (`example.beta*`), C seed 5 (`example.gamma*`).
-fn write_workers(dir: &Path, ids: &[&str]) {
+/// B seed 2 (`example.beta*`), C seed 5 (`example.gamma*`), each holding its client certificate.
+fn write_workers(dir: &Path, clients: &Clients, ids: &[&str]) {
     let all = [
         worker_entry("worker-a", 1, &["example.alpha*"], NOT_AFTER),
         worker_entry("worker-b", 2, &["example.beta*"], NOT_AFTER),
         worker_entry("worker-c", 5, &["example.gamma*"], NOT_AFTER),
     ];
-    let list: Vec<_> = all.into_iter().filter(|e| ids.contains(&e.worker_id.as_str())).collect();
+    let list: Vec<_> = all
+        .into_iter()
+        .filter(|e| ids.contains(&e.worker_id.as_str()))
+        .map(|e| {
+            let tls_fp = clients.get(e.worker_id.as_str()).map(|c| c.tls_fp.clone());
+            policy::WorkerEntry { tls_fp, ..e }
+        })
+        .collect();
     write_live(dir, WORKERS_FILE, policy::render_workers(&list).unwrap().as_bytes());
 }
 
@@ -115,7 +154,8 @@ async fn start() -> Relay {
     let dir = tempfile::tempdir().unwrap();
     let ca = certs::Ca::new("test relay CA", [11; 32]);
     let leaf = ca.leaf(1, &["ai-env-relay"], &[[10, 42, 0, 20]], [12; 32]);
-    write_workers(dir.path(), &["worker-a", "worker-b", "worker-c"]);
+    let clients = client_certs(&ca);
+    write_workers(dir.path(), &clients, &["worker-a", "worker-b", "worker-c"]);
     write_live(dir.path(), SIGNERS_FILE, policy::render_signers(&[mac_signer(NOT_AFTER)]).unwrap().as_bytes());
     let grants = [Grant { grant_id: "g-all".into(), allow: vec!["*/*".into()] }];
     write_live(dir.path(), GRANTS_FILE, policy::render_grants(&grants).unwrap().as_bytes());
@@ -159,7 +199,7 @@ async fn start() -> Relay {
             async move { app.serve_private(UnboundedReceiverStream::new(private_rx)).await }
         }),
     ];
-    Relay { app, sink, dir, ca_pem: certs::ca_pem(&ca), public, private, servers }
+    Relay { app, sink, dir, ca_pem: certs::ca_pem(&ca), clients, public, private, servers }
 }
 
 /// The request log's lines of one kind.
@@ -257,18 +297,22 @@ impl Running {
     }
 }
 
-/// W's builder: the worker id, the relay under the run-time CA (`expect_relay_id` too), a `FileSigner` of the
-/// seed's key, a `RecordingSource` over an `EchoSource` per name; the default `Tuning`.
+/// W's builder: the worker id, the relay under the run-time CA (`expect_relay_id` too), the worker's client
+/// certificate when it has one, a `FileSigner` of the seed's key, a `RecordingSource` over an `EchoSource` per name;
+/// the default `Tuning`.
 fn build_worker(relay: &Relay, id: &str, seed: u8, ip: &str, sources: &[&str]) -> Built {
     let dials = Arc::new(Mutex::new(Vec::new()));
     let dial = DuplexDial { app: relay.app.clone(), ip: ip.parse().unwrap(), public: relay.public.clone(), dials: dials.clone() };
-    let endpoint = RelayEndpoint::new("ai-env-relay:443")
+    let mut endpoint = RelayEndpoint::new("ai-env-relay:443")
         .unwrap()
         .ca_pem(relay.ca_pem.as_bytes())
         .expect("the CA's PEM")
         .expect_relay_id(RELAY_ID)
         .unwrap()
         .dialer(Arc::new(dial));
+    if let Some(client) = relay.clients.get(id) {
+        endpoint = endpoint.client_identity(client.cert_pem.as_bytes(), client.key_pem.as_bytes()).expect("its certificate and key");
+    }
     let signer = FileSigner::from_key(SigningKey::from_seed(&[seed; 32]).unwrap());
     let mut builder = Worker::builder().worker_id(id).relay(endpoint).signer(Arc::new(signer)).max_in_flight(64).max_queued(1024);
     let mut seen = Seen::new();
@@ -291,10 +335,10 @@ fn spawn_worker(relay: &Relay, id: &str, seed: u8, ip: &str, sources: &[&str]) -
     Running { dials, seen, stop, task }
 }
 
-/// A new HTTP/2 connection to the private face from the VM subnet: its relay end is `Peered::new(duplex_end, ip)`.
+/// A new HTTP/2 connection to the private face from the VM subnet: its relay end is `Peered::new(duplex_end, ip, None)`.
 async fn vm_channel(relay: &Relay) -> Channel {
     let (client, server) = tokio::io::duplex(1 << 20);
-    relay.private.send(Ok(Peered::new(server, VM_IP.parse().unwrap()))).expect("the private face is served");
+    relay.private.send(Ok(Peered::new(server, VM_IP.parse().unwrap(), None))).expect("the private face is served");
     let mut once = Some(client);
     Endpoint::from_static("http://10.42.0.20:7443")
         .connect_with_connector(tower::service_fn(move |_: Uri| {
@@ -305,12 +349,13 @@ async fn vm_channel(relay: &Relay) -> Channel {
         .expect("the private face's duplex connects")
 }
 
-/// A session's claims under `kid`: grant `g-all`, issued at the relay's `T0` for an hour.
+/// A session's claims under `kid`, its own caller (R-133): for this relay (R-137), grant `g-all`, issued at the relay's
+/// `T0` for an hour.
 fn claims(kid: &str, session: u64) -> SessionClaims {
     SessionClaims {
         kid: kid.into(),
-        aud: SESSION_AUD.into(),
-        caller_id: "mac".into(),
+        aud: RELAY_ID.into(),
+        caller_id: kid.into(),
         session_id: format!("0199a1b2-0000-7000-8000-{session:012x}"),
         chat_id: None,
         grant_id: "g-all".into(),
@@ -320,9 +365,9 @@ fn claims(kid: &str, session: u64) -> SessionClaims {
     }
 }
 
-/// A token of these claims from W/M's `session::mint`, signed by a seed's key (`mac`, the whitelisted signer, is 7).
+/// A token of these claims from W/M's `session::mint_for`, signed by a seed's key (`mac`, the whitelisted signer, is 7).
 fn token(seed: u8, claims: &SessionClaims) -> String {
-    session::mint(&SigningKey::from_seed(&[seed; 32]).unwrap(), claims, claims.iat).expect("W/M's mint")
+    session::mint_for(&SigningKey::from_seed(&[seed; 32]).unwrap(), claims, &claims.aud, claims.iat).expect("W/M's mint")
 }
 
 /// One call of `EchoSource` through V's link.
@@ -383,6 +428,10 @@ async fn a_worker_behind_the_real_relay() {
     authed.sort_unstable();
     assert_eq!(authed, ["worker-a", "worker-b"], "W's handshake, each worker once");
     assert!(auth.iter().all(|l| l["sdk"] == ai_env_worker::SDK_VERSION), "W's Hello: {auth:?}");
+    // R-124: a worker with no client certificate fails TLS on this relay, and W says so (R-121).
+    let bare = build_worker(&relay, "worker-d", 6, IP_BARE, &["example.delta"]).worker.check().await;
+    assert!(matches!(&bare, Err(WorkerError::Tls(text)) if text == "the relay requires a client certificate"), "a worker without a certificate: {bare:?}");
+    until(Duration::from_secs(5), "its peer line", || lines(&relay.sink, "peer").iter().any(|l| l["peer"] == IP_BARE && l["reason"] == "tls_failed")).await;
 
     // (a) A thousand interleaved calls over both workers' sources, all in flight together: each answer is its own.
     let tokens: Vec<String> = (1..=SESSIONS).map(|n| token(7, &claims("mac", n))).collect();
@@ -457,7 +506,7 @@ async fn a_worker_behind_the_real_relay() {
     })
     .await;
     let revoked_at = Instant::now();
-    write_workers(relay.dir.path(), &["worker-b"]);
+    write_workers(relay.dir.path(), &relay.clients, &["worker-b"]);
     let polled = relay.app.poll_files();
     assert!(polled.iter().any(|(file, outcome)| *file == "workers" && matches!(outcome, Poll::Loaded { .. })), "the new whitelist is loaded");
     let closes = || lines(&relay.sink, "tunnel").into_iter().filter(|l| l["phase"] == "close").collect::<Vec<_>>();
@@ -490,8 +539,9 @@ async fn a_worker_behind_the_real_relay() {
     until(floor + Duration::from_secs(10), "worker-a's next dial", || a.dials().len() >= 2).await;
     let gap = a.dials()[1] - revoked_at;
     assert!(gap >= floor && gap < floor + Duration::from_secs(1), "worker-a dialed again {gap:?} after the revoke (floor {floor:?})");
+    // No entry in force holds its certificate now: refused at `open()` (R-126), with no Challenge, so no worker id.
     until(Duration::from_secs(10), "the refused handshake's line", || {
-        lines(&relay.sink, "tunnel").iter().any(|l| l["phase"] == "auth" && l["worker"] == "worker-a" && l["reason"] == "unknown_worker")
+        lines(&relay.sink, "tunnel").iter().any(|l| l["phase"] == "auth" && l["peer"] == IP_A && l["reason"] == "unknown_cert")
     })
     .await;
     until(floor + Duration::from_secs(10), "worker-a's third dial", || a.dials().len() >= 3).await;

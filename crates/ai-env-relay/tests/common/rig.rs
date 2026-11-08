@@ -19,7 +19,7 @@ use ai_env_relay_proto::v1::relay_client::RelayClient;
 use ai_env_relay_proto::v1::{CallChunk, CallRequest, ListSourcesRequest, ListSourcesResponse, OpDescriptor, SourceDescriptor};
 use ai_env_worker::keys::SigningKey;
 use ai_env_worker::policy;
-use ai_env_worker::session::{self, SessionClaims, SESSION_AUD};
+use ai_env_worker::session::{self, SessionClaims};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -41,7 +41,16 @@ pub const VM_IP: &str = "10.42.1.10";
 /// The VM id in every token.
 pub const VM_ID: &str = "microvm-0199a1b2-0000-7000-8000-000000000001";
 
-/// A whitelist entry of a seed's key.
+/// The plaintext rig's client certificate of a seed (R-129): the rig has no TLS, so a connection's fingerprint is a
+/// label, the SHA-256 of `b"rig client certificate"` and the seed byte.
+pub fn client_fp(seed: u8) -> [u8; 32] {
+    let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &[b"rig client certificate".as_slice(), &[seed]].concat());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
+/// A whitelist entry of a seed's key and its client certificate (`client_fp`).
 pub fn worker_entry(id: &str, seed: u8, globs: &[&str], not_after: &str) -> WorkerEntry {
     WorkerEntry {
         worker_id: id.into(),
@@ -49,7 +58,7 @@ pub fn worker_entry(id: &str, seed: u8, globs: &[&str], not_after: &str) -> Work
         public_key: SigningKey::from_seed(&[seed; 32]).unwrap().public_key().b64(),
         sources: globs.iter().map(|g| g.to_string()).collect(),
         not_after: not_after.into(),
-        tls_fp: None,
+        tls_fp: Some(hex::encode(client_fp(seed))),
     }
 }
 
@@ -64,7 +73,7 @@ pub fn default_workers() -> Vec<WorkerEntry> {
 
 /// The token signer `mac` (seed 7).
 pub fn mac_signer(not_after: &str) -> SignerEntry {
-    SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: SigningKey::from_seed(&[7; 32]).unwrap().public_key().b64(), not_after: not_after.into() }
+    SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: SigningKey::from_seed(&[7; 32]).unwrap().public_key().b64(), not_after: not_after.into(), grants: None }
 }
 
 /// `g-all` (`*/*`), `g-alpha-get` (`example.alpha/get`) and `g-example` (`example.*/*`).
@@ -242,10 +251,11 @@ impl AsyncWrite for LinkIo {
 
 type Incoming = mpsc::UnboundedSender<Result<Peered<DuplexStream>, io::Error>>;
 
-/// A client over a new duplex connection to one face; the endpoint's options are the caller's.
-pub async fn connect_with(tx: &Incoming, ip: IpAddr, endpoint: Endpoint, pipe: usize) -> (Channel, Link) {
+/// A client over a new duplex connection to one face, presenting the certificate of `cert_fp`; the endpoint's options
+/// are the caller's.
+pub async fn connect_with(tx: &Incoming, ip: IpAddr, cert_fp: Option<[u8; 32]>, endpoint: Endpoint, pipe: usize) -> (Channel, Link) {
     let (client, server) = tokio::io::duplex(pipe);
-    tx.send(Ok(Peered::new(server, ip))).expect("the face is served");
+    tx.send(Ok(Peered::new(server, ip, cert_fp))).expect("the face is served");
     let ctl = Arc::new(LinkCtl { io: Mutex::new(Some(client)), paused: AtomicBool::new(false), waker: Mutex::new(None), peer_closed: Mutex::new(None) });
     let mut once = Some(LinkIo(Arc::clone(&ctl)));
     let channel = endpoint
@@ -382,43 +392,59 @@ impl Rig {
         self.app.poll_files()
     }
 
-    /// A worker's connection to the public face.
+    /// A worker's connection to the public face, presenting seed 1's certificate.
     pub async fn public_channel(&self) -> (Channel, Link) {
-        connect_with(&self.public, WORKER_IP.parse().unwrap(), Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
+        self.public_channel_as(1).await
     }
 
-    /// A worker's connection with these endpoint options and pipe size.
+    /// A worker's connection to the public face, presenting this seed's certificate (R-129).
+    pub async fn public_channel_as(&self, seed: u8) -> (Channel, Link) {
+        connect_with(&self.public, WORKER_IP.parse().unwrap(), Some(client_fp(seed)), Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
+    }
+
+    /// A connection to the public face that presents no certificate (R-129): `admit` never lets one through (R-124).
+    pub async fn public_channel_bare(&self) -> (Channel, Link) {
+        connect_with(&self.public, WORKER_IP.parse().unwrap(), None, Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
+    }
+
+    /// A worker's connection with these endpoint options and pipe size, presenting seed 1's certificate.
     pub async fn public_channel_with(&self, endpoint: Endpoint, pipe: usize) -> (Channel, Link) {
-        connect_with(&self.public, WORKER_IP.parse().unwrap(), endpoint, pipe).await
+        connect_with(&self.public, WORKER_IP.parse().unwrap(), Some(client_fp(1)), endpoint, pipe).await
     }
 
-    /// A worker's connection to the public face from `ip` (every other channel dials from `WORKER_IP`): relay 37's
-    /// second address.
+    /// A worker's connection to the public face from `ip` (every other channel dials from `WORKER_IP`), presenting seed
+    /// 1's certificate (R-129).
     pub async fn public_channel_from(&self, ip: IpAddr) -> (Channel, Link) {
-        connect_with(&self.public, ip, Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
+        self.public_channel_from_as(ip, 1).await
+    }
+
+    /// A worker's connection to the public face from `ip`, presenting this seed's certificate: relay 37's second address.
+    pub async fn public_channel_from_as(&self, ip: IpAddr, seed: u8) -> (Channel, Link) {
+        connect_with(&self.public, ip, Some(client_fp(seed)), Endpoint::from_static("http://ai-env-relay"), 1 << 20).await
     }
 
     /// A VM's connection to the private face.
     pub async fn private_channel(&self) -> (Channel, Link) {
-        connect_with(&self.private, VM_IP.parse().unwrap(), Endpoint::from_static("http://10.42.0.20"), 1 << 20).await
+        connect_with(&self.private, VM_IP.parse().unwrap(), None, Endpoint::from_static("http://10.42.0.20"), 1 << 20).await
     }
 
     /// A VM's connection with these endpoint options and pipe size.
     pub async fn private_channel_with(&self, endpoint: Endpoint, pipe: usize) -> (Channel, Link) {
-        connect_with(&self.private, VM_IP.parse().unwrap(), endpoint, pipe).await
+        connect_with(&self.private, VM_IP.parse().unwrap(), None, endpoint, pipe).await
     }
 
     /// A bare connection to the private face, its client's end, for a test that speaks HTTP/2 frame by frame.
     pub fn private_raw(&self, pipe: usize) -> DuplexStream {
         let (client, server) = tokio::io::duplex(pipe);
-        self.private.send(Ok(Peered::new(server, VM_IP.parse().unwrap()))).expect("the face is served");
+        self.private.send(Ok(Peered::new(server, VM_IP.parse().unwrap(), None))).expect("the face is served");
         client
     }
 
-    /// A bare connection to the public face from the worker's address, its client's end (relay 36).
+    /// A bare connection to the public face from the worker's address, presenting seed 1's certificate, its client's
+    /// end (relay 36).
     pub fn public_raw(&self, pipe: usize) -> DuplexStream {
         let (client, server) = tokio::io::duplex(pipe);
-        self.public.send(Ok(Peered::new(server, WORKER_IP.parse().unwrap()))).expect("the face is served");
+        self.public.send(Ok(Peered::new(server, WORKER_IP.parse().unwrap(), Some(client_fp(1))))).expect("the face is served");
         client
     }
 
@@ -432,12 +458,12 @@ impl Rig {
         format!("0199a1b2-0000-7000-8000-{:012x}", self.sessions.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// The claims of a fresh session with `grant_id`, issued now for an hour.
+    /// The claims of a fresh session with `grant_id`, for this relay (R-137), issued now for an hour.
     pub fn claims(&self, grant_id: &str) -> SessionClaims {
         let iat = self.clock.unix();
         SessionClaims {
             kid: "mac".into(),
-            aud: SESSION_AUD.into(),
+            aud: RELAY_ID.into(),
             caller_id: "mac".into(),
             session_id: self.session_id(),
             chat_id: None,
@@ -448,7 +474,7 @@ impl Rig {
         }
     }
 
-    /// A token of a fresh session with `grant_id`, minted with W/M's `session::mint` by `mac` (seed 7).
+    /// A token of a fresh session with `grant_id`, minted with W/M's `session::mint_for` by `mac` (seed 7).
     pub fn token(&self, grant_id: &str) -> String {
         mint(7, &self.claims(grant_id))
     }
@@ -478,9 +504,9 @@ impl Rig {
     }
 }
 
-/// A token of `claims` signed by a seed's key.
+/// A token of `claims`, for the relay its `aud` names, signed by a seed's key.
 pub fn mint(seed: u8, claims: &SessionClaims) -> String {
-    session::mint(&SigningKey::from_seed(&[seed; 32]).unwrap(), claims, claims.iat).expect("W/M's mint")
+    session::mint_for(&SigningKey::from_seed(&[seed; 32]).unwrap(), claims, &claims.aud, claims.iat).expect("W/M's mint")
 }
 
 /// A request carrying `token` in `x-ai-env-session`.

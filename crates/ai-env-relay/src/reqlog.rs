@@ -93,12 +93,12 @@ pub const TUNNEL_KEYS: [&str; 12] = ["ts", "ev", "tunnel", "worker", "peer", "sd
 pub const RELOAD_KEYS: [&str; 7] = ["ts", "ev", "file", "outcome", "version", "entries", "age_s"];
 /// A peer line's keys.
 pub const PEER_KEYS: [&str; 6] = ["ts", "ev", "face", "peer", "reason", "suppressed"];
-/// The status line's keys (R-67; `log_suppressed`, F23; `peers_version` and `peers_age_s`, §RS.3.1; `access_version` and
-/// `access_age_s`, R-146).
-pub const STATUS_KEYS: [&str; 24] = [
+/// The status line's keys (R-67; `log_suppressed`, F23; `peers_version`, `peers_age_s` and `client_certs`, §RS.3.1;
+/// `access_version` and `access_age_s`, R-146).
+pub const STATUS_KEYS: [&str; 25] = [
     "ts", "ev", "relay_version", "protocol", "uptime_s", "tunnels", "sources_live", "sources_offline", "calls_in_flight", "sessions", "workers_version",
     "workers_age_s", "signers_version", "signers_age_s", "grants_version", "grants_age_s", "peers_version", "peers_age_s", "access_version", "access_age_s",
-    "tls_loaded", "unknown_frames", "log_dropped", "log_suppressed",
+    "tls_loaded", "client_certs", "unknown_frames", "log_dropped", "log_suppressed",
 ];
 
 /// R-63: the first 16 hex characters of HMAC-SHA256(key, params).
@@ -149,6 +149,8 @@ pub struct StatusLine {
     pub access_age_s: u64,
     /// Whether a TLS config is loaded.
     pub tls_loaded: bool,
+    /// Whether a TLS config is loaded and its public face requires client certificates (R-132).
+    pub client_certs: bool,
     /// WorkerFrames with no known variant (P-R17).
     pub unknown_frames: u64,
     /// Lines a sink failed to write (R-68).
@@ -162,7 +164,8 @@ pub struct StatusLine {
 /// face's line (§RS.9's R-66).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Limited {
-    /// Private-face request lines with outcome `unauthenticated` or `rate_limited`.
+    /// Private-face request lines with outcome `unauthenticated`, `rate_limited`, `denied` or `too_many`: every refusal
+    /// a request reaches before its session's bucket (R-135, R-136) has one of these words.
     Request,
     /// Tunnel lines with outcome `refused`.
     Tunnel,
@@ -175,6 +178,11 @@ pub(crate) enum Limited {
 }
 
 impl Limited {
+    /// A call or list line's kind, by its outcome, if R-66 limits it.
+    fn of_request(outcome: &str) -> Option<Limited> {
+        matches!(outcome, "unauthenticated" | "rate_limited" | "denied" | "too_many").then_some(Limited::Request)
+    }
+
     /// A peer line's kind, by its face and reason.
     fn of_peer(face: &str, reason: &str) -> Limited {
         match (face, reason) {
@@ -370,8 +378,7 @@ impl RequestLog {
     /// One `ev:"call"` line (R-61, R-64).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn call(&self, ts: SystemTime, f: &CallFields, outcome: &str, code: i32, bytes: u64, chunks: u64, truncated: bool, duration_ms: u64) {
-        let limited = matches!(outcome, "unauthenticated" | "rate_limited").then_some(Limited::Request);
-        let Some(suppressed) = self.admit(limited) else { return };
+        let Some(suppressed) = self.admit(Limited::of_request(outcome)) else { return };
         let line = Line::new(ts, "call")
             .str("request_id", &f.request_id)
             .str("caller", &f.caller)
@@ -397,8 +404,7 @@ impl RequestLog {
 
     /// One `ev:"list"` line (R-61); its refusals share the call lines' limit (R-66).
     pub(crate) fn list(&self, ts: SystemTime, f: &ListFields, outcome: &str, code: i32, duration_ms: u64) {
-        let limited = matches!(outcome, "unauthenticated" | "rate_limited").then_some(Limited::Request);
-        let Some(suppressed) = self.admit(limited) else { return };
+        let Some(suppressed) = self.admit(Limited::of_request(outcome)) else { return };
         let line = Line::new(ts, "list")
             .str("request_id", &f.request_id)
             .str("caller", &f.caller)
@@ -474,6 +480,7 @@ impl RequestLog {
             .str("access_version", &s.access_version)
             .num("access_age_s", s.access_age_s)
             .bool("tls_loaded", s.tls_loaded)
+            .bool("client_certs", s.client_certs)
             .num("unknown_frames", s.unknown_frames)
             .num("log_dropped", s.log_dropped)
             .num("log_suppressed", s.log_suppressed)
@@ -677,17 +684,20 @@ mod tests {
             access_version: "fedcba9876543210".into(),
             access_age_s: 9,
             tls_loaded: false,
+            client_certs: true,
             unknown_frames: 0,
             log_dropped: 0,
             log_suppressed: 0,
         });
         let lines = sink.lines();
         assert_eq!(lines.len(), 6);
-        assert_eq!(STATUS_KEYS.len(), 24, "§RS.3.1: F's log_suppressed, L's peers_version and peers_age_s; R-146: access_version and access_age_s");
+        assert_eq!(STATUS_KEYS.len(), 25, "§RS.3.1: F's log_suppressed, L's peers_version and peers_age_s, T-relay's client_certs; R-146: access_version and access_age_s");
         assert_eq!(STATUS_KEYS[16..20], ["peers_version", "peers_age_s", "access_version", "access_age_s"], "R-146: right after peers_age_s");
-        // The peers and access keys in their place, each with its own value.
+        // The peers, access and client_certs keys in their place, each with its own value.
         assert!(
-            lines[5].contains(r#""grants_age_s":0,"peers_version":"0123456789abcdef","peers_age_s":7,"access_version":"fedcba9876543210","access_age_s":9,"tls_loaded":false"#),
+            lines[5].contains(
+                r#""grants_age_s":0,"peers_version":"0123456789abcdef","peers_age_s":7,"access_version":"fedcba9876543210","access_age_s":9,"tls_loaded":false,"client_certs":true,"unknown_frames":0"#
+            ),
             "{}",
             lines[5]
         );
@@ -734,6 +744,32 @@ mod tests {
         let counts: Vec<(&str, u64)> = last.iter().map(|v| (v["ev"].as_str().unwrap(), v["suppressed"].as_u64().unwrap())).collect();
         assert_eq!(counts, [("call", 40), ("tunnel", 10), ("peer", 10)]);
         assert!(lines[..65].iter().all(|l| l.contains("\"suppressed\":0")));
+    }
+
+    /// Unit 53 (paused; R-66 amended): `denied` and `too_many` lines share the request lines' budget, call and list alike:
+    /// R-135's refusal and a new session past its share come before the session's bucket, so nothing else bounds what a
+    /// token holder writes with them. Refusals behind the bucket with other words are not limited.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_before_the_session_bucket_is_limited() {
+        for outcome in ["denied", "too_many"] {
+            let sink = Arc::new(MemorySink::default());
+            let log = RequestLog::new(sink.clone(), [9; 32], 60);
+            let ts = SystemTime::UNIX_EPOCH;
+            for _ in 0..50 {
+                log.call(ts, &CallFields::default(), outcome, 7, 0, 0, false, 0);
+                log.list(ts, &ListFields::default(), outcome, 7, 0);
+            }
+            assert_eq!(sink.lines().len(), 60, "{outcome}: call and list lines take one budget");
+            for other in ["not_found", "invalid", "busy", "ok"] {
+                log.call(ts, &CallFields::default(), other, 5, 0, 0, false, 0);
+            }
+            assert_eq!(sink.lines().len(), 64, "{outcome}: these are never limited");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            log.call(ts, &CallFields::default(), "unauthenticated", 16, 0, 0, false, 0);
+            let lines = sink.lines();
+            let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert_eq!((lines.len(), last["suppressed"].as_u64()), (65, Some(40)), "{outcome}: the next written line of the kind carries the count");
+        }
     }
 
     /// Unit 49 (paused; R-66 amended): the peer lines are three kinds, each with its own 60 a minute and its own

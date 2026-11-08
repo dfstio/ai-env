@@ -11,13 +11,26 @@
 FROM public.ecr.aws/lambda/microvms:al2023-minimal@sha256:05cb9b38d841e7ff1b693dc9e894909612f340bf99ec97d426e8000a5bbe96c3
 
 # Packages the agent needs (git, archives, ps, useradd, find; dig for the S5
-# egress check and dns-path probe); no weak deps, so no systemd. No chrony
+# egress check and dns-path probe; jq and python3.14, AL2023's newest Python,
+# for the chat); no weak deps, so no systemd and no pip. No chrony
 # and no nftables: the shim measures the clock, and the hooks are guarded by
 # socket ownership (`--hook-source peer`, S6), not by a firewall.
-RUN microdnf -y --setopt=install_weak_deps=0 install tar gzip unzip git-core procps-ng shadow-utils findutils bind-utils \
+RUN microdnf -y --setopt=install_weak_deps=0 install tar gzip unzip git-core procps-ng shadow-utils findutils bind-utils jq python3.14 \
  && microdnf clean all \
  && rm -rf /var/cache/dnf /var/cache/yum /var/lib/dnf/history* /var/log/dnf* /var/log/hawkey.log \
  && rm -f /etc/machine-id /var/lib/systemd/random-seed
+
+# The agent's python3: python3.14 ships only /usr/bin/python3.14 and AL2023
+# keeps /usr/bin/python3 for its system 3.9, so the link is in /usr/local/bin,
+# ahead of /usr/bin on the shim's child PATH. The gate, on that PATH, writes
+# nothing.
+RUN set -eu; \
+    ln -s /usr/bin/python3.14 /usr/local/bin/python3; \
+    v=$(env -i PATH=/usr/local/bin:/usr/bin:/bin python3 -I -B -c 'import json, sys; print("%d.%d" % sys.version_info[:2])'); \
+    test "$v" = 3.14 || { echo "python3 is $v, not 3.14"; exit 1; }; \
+    j=$(printf '{"a":[1,2]}' | env -i PATH=/usr/local/bin:/usr/bin:/bin jq -c '.a | add'); \
+    test "$j" = 3 || { echo "jq printed $j, not 3"; exit 1; }; \
+    echo "tools gate: $(/usr/local/bin/python3 -V), $(jq --version)"
 
 # Git smart-HTTP (S9): the shim's helper runs `git http-backend` as the agent,
 # upload-pack only. The gate: git-core ships it, and on a throwaway bare

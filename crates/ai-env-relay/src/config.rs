@@ -34,7 +34,7 @@ const ENV_FILE_MAX: u64 = 65_536;
 /// The relay's config.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The relay's id (P-R40), `ai-env-relay` by default.
+    /// The relay's id (P-R40), `ai-env-relay` by default: the `aud` of the tokens it takes (R-137).
     pub relay_id: String,
     /// The public face's address (443).
     pub public_addr: SocketAddr,
@@ -118,6 +118,8 @@ pub struct Limits {
     pub session_per_min: u32,
     /// R-57: sessions.
     pub sessions_max: u32,
+    /// R-136: the sessions of one token signer, so one key cannot fill `sessions_max`.
+    pub sessions_per_signer: u32,
     /// R-112: a session's charged evictions in its 600 s window that refuse its new calls.
     pub session_evictions_per_10min: u32,
     /// R-34: `params_json`.
@@ -188,6 +190,7 @@ impl Default for Limits {
             session_burst: 20,
             session_per_min: 120,
             sessions_max: 1024,
+            sessions_per_signer: 256,
             session_evictions_per_10min: 3,
             params_max_bytes: 65_536,
             deadline_default_ms: 30_000,
@@ -279,7 +282,7 @@ impl Limits {
             ("status_log_s", self.status_log_s.into(), 10, 3600),
             ("log_refusals_per_min", self.log_refusals_per_min.into(), 1, 6000),
         ];
-        let relative: [(&str, u64, u64, u64); 8] = [
+        let relative: [(&str, u64, u64, u64); 9] = [
             ("ping_dead_ms", self.ping_dead_ms.into(), 2 * u64::from(self.ping_interval_ms), 300_000),
             ("deadline_min_ms", self.deadline_min_ms.into(), 100, self.deadline_max_ms.into()),
             ("deadline_max_ms", self.deadline_max_ms.into(), self.deadline_min_ms.into(), 3_600_000),
@@ -288,6 +291,7 @@ impl Limits {
             // R-107: one permitted call within a minute never closes its tunnel (Q-R20), and the bucket holds the
             // largest frame.
             ("tunnel_bytes_per_min", self.tunnel_bytes_per_min.into(), self.call_bytes_max, 1_073_741_824),
+            ("sessions_per_signer", self.sessions_per_signer.into(), 1, self.sessions_max.into()),
             ("call_rows_default", self.call_rows_default.into(), 1, self.call_rows_max.into()),
             ("call_chunks_default", self.call_chunks_default.into(), 1, self.call_chunks_max.into()),
         ];
@@ -488,7 +492,7 @@ mod tests {
 
         // §RS.2's new limits (R-98 to R-112): each taken at both ends of its range and refused one past either.
         type Field = fn(&mut Limits) -> &mut u32;
-        let ranges: [(&str, Field, u32, u32, u32); 10] = [
+        let ranges: [(&str, Field, u32, u32, u32); 11] = [
             ("ban_faults", |l| &mut l.ban_faults, 20, 1, 1000),
             ("ban_window_s", |l| &mut l.ban_window_s, 600, 10, 3600),
             ("ban_s", |l| &mut l.ban_s, 900, 60, 86_400),
@@ -499,6 +503,8 @@ mod tests {
             ("tunnel_frames_per_min", |l| &mut l.tunnel_frames_per_min, 600, 60, 60_000),
             ("tunnel_bytes_per_min", |l| &mut l.tunnel_bytes_per_min, 33_554_432, 16_777_216, 1_073_741_824),
             ("session_evictions_per_10min", |l| &mut l.session_evictions_per_10min, 3, 1, 1000),
+            // R-136's ceiling is `sessions_max`, 1024 here.
+            ("sessions_per_signer", |l| &mut l.sessions_per_signer, 256, 1, 1024),
         ];
         for (name, field, default, lo, hi) in ranges {
             assert_eq!(*field(&mut Limits::default()), default, "{name}'s default");
@@ -511,6 +517,12 @@ mod tests {
                 }
             }
         }
+        // R-136's ceiling follows `sessions_max`.
+        let mut share = cfg.clone();
+        (share.limits.sessions_max, share.limits.sessions_per_signer) = (8, 8);
+        assert!(share.validate().is_ok());
+        share.limits.sessions_max = 7;
+        assert!(share.validate().unwrap_err().contains("sessions_per_signer"));
         // The bytes floor is `call_bytes_max` (Q-R20): one permitted call within a minute never closes its tunnel.
         let mut floor = cfg.clone();
         (floor.limits.call_bytes_max, floor.limits.call_bytes_default, floor.limits.tunnel_bytes_per_min) = (1 << 20, 1 << 20, 1 << 20);

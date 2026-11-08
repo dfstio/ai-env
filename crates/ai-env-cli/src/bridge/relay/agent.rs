@@ -8,7 +8,7 @@
 //!   it is handed;
 //! - `mint_session`: a VM session token for a remote spawn (`relay::mint`), only for a VM this Mac's registry
 //!   holds as a live vpc VM whose egress gate passed, only for a grant `bridge.toml` names (read at each
-//!   request), at most 8 h and never past the VM's wall.
+//!   request), at most 8 h and never past the VM's wall, for the relay `[relay].relay_id` names (R-137).
 //!
 //! It answers only its own uid (the peer's credentials), at most 16 connections at once, one request within
 //! 5 s each. Its life is measured on the wall clock (Darwin's `Instant` stops while the Mac sleeps): 1 to 24 h,
@@ -31,7 +31,7 @@ use crate::wire::time::{rfc3339_utc, unix_now};
 use ai_env_worker::agent::{decode_request, encode_response, AgentStatus, MintRequest, Request, Response, SignRequest, IO_TIMEOUT, REQUEST_MAX};
 use ai_env_worker::globs::{valid_relay_id, valid_uuid};
 use ai_env_worker::keys::Alg;
-use ai_env_worker::session::{self, SessionClaims, SESSION_AUD, SESSION_MAX_S};
+use ai_env_worker::session::{self, SessionClaims, SESSION_MAX_S};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -309,8 +309,9 @@ impl Shared {
             exp = exp.min(wall);
         }
         let worker = self.keys.worker_id.clone();
-        let claims = SessionClaims { kid: worker.clone(), aud: SESSION_AUD.to_string(), caller_id: worker, session_id: m.session_id.clone(), chat_id: m.chat_id.clone(), grant_id: m.grant_id.clone(), vm_id: m.vm_id.clone(), iat: now, exp };
-        match session::mint(&self.keys.session, &claims, now) {
+        let aud = cfg.relay.relay_id.as_str();
+        let claims = SessionClaims { kid: worker.clone(), aud: aud.to_string(), caller_id: worker, session_id: m.session_id.clone(), chat_id: m.chat_id.clone(), grant_id: m.grant_id.clone(), vm_id: m.vm_id.clone(), iat: now, exp };
+        match session::mint_for(&self.keys.session, &claims, aud, now) {
             Ok(token) => {
                 self.minted.fetch_add(1, Ordering::SeqCst);
                 signals::say(&format!("relay agent: minted a session token for {} (spawn {}, grant {}, until {})", m.vm_id, m.session_id, m.grant_id, rfc3339_utc(exp)));
@@ -418,7 +419,7 @@ mod tests {
     use crate::bridge::vm::registry::{write_row, VmRow};
     use ai_env_worker::agent::request;
     use ai_env_worker::keys::{PublicKey, SigningKey};
-    use ai_env_worker::session::SignerKey;
+    use ai_env_worker::session::{SignerKey, SESSION_AUD};
     use std::sync::atomic::AtomicU64;
 
     const VM: &str = "microvm-0199a1b2-0000-7000-8000-000000000001";
@@ -520,7 +521,7 @@ mod tests {
         assert_eq!(refused(&ask(&socket, sign("worker-a", SigningKey::from_seed(&[2; 32]).unwrap().public_key())).await), "wrong_key");
         // A token for the gated VM, verified with the session key.
         let session_key = SigningKey::from_seed(&[7; 32]).unwrap().public_key();
-        let lookup = |kid: &str| (kid == "worker-a").then_some(SignerKey { public_key: session_key, not_after: now + 86_400 });
+        let lookup = |kid: &str| (kid == "worker-a").then_some(SignerKey { public_key: session_key, not_after: now + 86_400, grants: None });
         let Response::Minted { token, exp } = ask(&socket, mint_req(VM, "default", now + 3600)).await else { panic!("no token") };
         assert_eq!(exp, now + 3600, "the request's exp");
         let v = session::verify(&token, now, &lookup).unwrap();
@@ -549,6 +550,30 @@ mod tests {
         let out = task.await.unwrap();
         assert_eq!(out, Outcome { end: End::Stopped, signed: 1, minted: 3 });
         assert!(!socket.exists(), "the socket goes with the agent");
+    }
+
+    /// R-137: a token's `aud` is `[relay].relay_id`, read at each mint, and its `kid` and `caller_id` this agent's worker
+    /// (R-133): by default the relay's own default; with another relay named, a token that relay alone takes; with a name
+    /// that is no id, no token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_agent_mints_for_the_relay_bridge_toml_names() {
+        let (_t, paths) = root();
+        let now = unix_now();
+        write_row(&paths, &row(VM, "vpc", GATE_PASSED, RowStatus::Running, Some(now + 36_000))).unwrap();
+        let (task, _clock, socket, stop) = start(&paths, now, now + 3600).await;
+        let session_key = SigningKey::from_seed(&[7; 32]).unwrap().public_key();
+        let lookup = |kid: &str| (kid == "worker-a").then_some(SignerKey { public_key: session_key, not_after: now + 86_400, grants: None });
+        let Response::Minted { token, .. } = ask(&socket, mint_req(VM, "default", now + 3600)).await else { panic!("no token") };
+        let claims = session::verify(&token, now, &lookup).expect("the default relay's token").claims;
+        assert_eq!((claims.aud.as_str(), claims.kid.as_str(), claims.caller_id.as_str()), (SESSION_AUD, "worker-a", "worker-a"));
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\nrelay_id = \"relay-b\"\n").unwrap();
+        let Response::Minted { token, .. } = ask(&socket, mint_req(VM, "default", now + 3600)).await else { panic!("no token") };
+        assert_eq!(session::verify_for(&token, "relay-b", now, &lookup).expect("relay-b's token").claims.aud, "relay-b");
+        assert_eq!(session::verify(&token, now, &lookup), Err(session::SessionError::BadClaim("aud")), "the default relay refuses it");
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\nrelay_id = \"Relay B\"\n").unwrap();
+        assert_eq!(refused(&ask(&socket, mint_req(VM, "default", now + 3600)).await), "bad_request");
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Outcome { end: End::Stopped, signed: 0, minted: 2 });
     }
 
     /// WM-T38: the lock refuses a second agent (naming the first's pid); a leftover socket is replaced; a regular

@@ -220,7 +220,7 @@ impl RelayEndpoint {
             TlsConnector::from(config).connect(name, io).await.map_err(|e| Failure::Tls(alert_of(&e).and_then(|a| alert_words(a, presented)).unwrap_or_else(|| e.to_string())))
         };
         let stream = tokio::time::timeout(budget, attempt).await.map_err(|_| Failure::Timeout)??;
-        Ok(Connection { stream, alert: RelayAlert::new(presented) })
+        Ok(Connection { stream, alert: RelayAlert::new(presented), heard: false, failed: None })
     }
 }
 
@@ -271,6 +271,10 @@ fn alert_words(alert: AlertDescription, presented: bool) -> Option<String> {
 pub(crate) struct Connection {
     stream: TlsStream<Box<dyn Io>>,
     alert: RelayAlert,
+    /// A byte of the relay's was read: it took this worker's certificate, so no alert of R-121 is left to come.
+    heard: bool,
+    /// A write that found the relay gone, its error held until the read has answered (`poll_out`).
+    failed: Option<io::Error>,
 }
 
 impl Connection {
@@ -278,26 +282,62 @@ impl Connection {
     pub(crate) fn alert(&self) -> RelayAlert {
         self.alert.clone()
     }
+
+    /// One read of the stream, its first error kept.
+    fn poll_in(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
+        match &polled {
+            Poll::Ready(Ok(())) => self.heard |= buf.filled().len() > before,
+            Poll::Ready(Err(e)) => self.alert.first_read_error(e),
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    /// One write or flush of the stream. The relay closes right after its alert, so the worker's next write can fail on that
+    /// close with the alert still unread, and HTTP/2 flushes before it reads: it would end the connection on the
+    /// write's error, and `check` would say `transport error`, not R-121's words. So while the relay has said nothing,
+    /// a write that finds it gone reads what it left, and its error waits for that read's answer. A closed
+    /// connection answers (its bytes, its end or its error) as soon as the reactor has seen the close, and the
+    /// handshake's own budgets stand above this.
+    fn poll_out<T>(&mut self, cx: &mut Context<'_>, write: impl FnOnce(Pin<&mut TlsStream<Box<dyn Io>>>, &mut Context<'_>) -> Poll<io::Result<T>>) -> Poll<io::Result<T>> {
+        let written = match self.failed.take() {
+            Some(e) => Poll::Ready(Err(e)),
+            None => write(Pin::new(&mut self.stream), cx),
+        };
+        match written {
+            Poll::Ready(Err(e)) if !self.heard && self.alert.first.get().is_none() && relay_gone(&e) => {
+                let mut left = [0u8; 64];
+                if self.poll_in(cx, &mut ReadBuf::new(&mut left)).is_pending() {
+                    self.failed = Some(e);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Err(e))
+            }
+            other => other,
+        }
+    }
+}
+
+/// A write's error that says the relay closed this connection, so that its read side has an answer too.
+fn relay_gone(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
 }
 
 impl AsyncRead for Connection {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let polled = Pin::new(&mut this.stream).poll_read(cx, buf);
-        if let Poll::Ready(Err(e)) = &polled {
-            this.alert.first_read_error(e);
-        }
-        polled
+        self.get_mut().poll_in(cx, buf)
     }
 }
 
 impl AsyncWrite for Connection {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        self.get_mut().poll_out(cx, |stream, cx| stream.poll_write(cx, buf))
     }
 
     fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[io::IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+        self.get_mut().poll_out(cx, |stream, cx| stream.poll_write_vectored(cx, bufs))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -305,7 +345,7 @@ impl AsyncWrite for Connection {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        self.get_mut().poll_out(cx, |stream, cx| stream.poll_flush(cx))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -315,7 +355,8 @@ impl AsyncWrite for Connection {
 
 /// The alert a connection's first read error carried, if it was one (R-121). TLS 1.3 reports the relay's
 /// refusal of a client certificate after the client's Finished: `connect` has passed, and the first read
-/// (HTTP/2's, under tonic) meets the alert, which tonic's status would otherwise reduce to a transport error.
+/// (HTTP/2's, under tonic, or `Connection::poll_out`'s after a write that found the relay gone) meets the alert, which
+/// tonic's status would otherwise reduce to a transport error.
 #[derive(Clone, Default)]
 pub(crate) struct RelayAlert {
     first: Arc<OnceLock<Option<AlertDescription>>>,
@@ -420,8 +461,9 @@ mod tests {
 
     /// A test relay: a TLS 1.3 server of rustls over a duplex, with the relay's leaf under `ca`, requiring a
     /// client certificate under `ca` or asking for none. Each connection answers `ping` with `pong` and says
-    /// which client certificate it was shown; a failed handshake keeps its connection until the client leaves,
-    /// as TCP would, so the client reads the alert (tokio-rustls writes it before the failure returns).
+    /// which client certificate it was shown; a failed handshake keeps its connection until the client leaves, so
+    /// the client reads the alert (tokio-rustls writes it before the failure returns). The relay itself closes at
+    /// once: `Closes` below has that case's writes, and WM-J4 the real thing over TCP.
     struct TestRelay {
         config: Arc<rustls::ServerConfig>,
         shown: tokio::sync::mpsc::UnboundedSender<Option<Vec<u8>>>,
@@ -494,6 +536,152 @@ mod tests {
         let tuning = Tuning { connect_timeout: Duration::from_secs(5), handshake_timeout: Duration::from_secs(5), ..Tuning::default() };
         let signer = Arc::new(FileSigner::from_key(SigningKey::from_seed(&[1; 32]).expect("seed")));
         Worker::builder().worker_id("worker-a").relay(endpoint).signer(signer).source(Arc::new(ai_env_source::testkit::EchoSource::new())).tuning(tuning).build().expect("a worker")
+    }
+
+    /// What `ClosedWrites` does with a write.
+    #[derive(Clone, Copy)]
+    enum Writes {
+        Pass,
+        /// A full socket: rustls keeps the bytes for the next flush.
+        Block,
+        /// A socket the relay closed.
+        Fail(io::ErrorKind),
+    }
+
+    type WritesNow = Arc<std::sync::Mutex<Writes>>;
+
+    /// A stream of `TestRelay`'s whose writes do as `writes` says; its reads go on.
+    struct ClosedWrites {
+        io: Box<dyn Io>,
+        writes: WritesNow,
+    }
+
+    impl AsyncRead for ClosedWrites {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ClosedWrites {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let writes = *this.writes.lock().expect("unpoisoned");
+            match writes {
+                Writes::Pass => Pin::new(&mut this.io).poll_write(cx, buf),
+                Writes::Block => Poll::Pending,
+                Writes::Fail(kind) => Poll::Ready(Err(kind.into())),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        }
+    }
+
+    /// `TestRelay`'s dial, each stream a `ClosedWrites`.
+    struct Closes {
+        relay: Arc<TestRelay>,
+        writes: WritesNow,
+    }
+
+    impl Dial for Closes {
+        fn dial(&self) -> crate::BoxFuture<'static, io::Result<Box<dyn Io>>> {
+            let (dialing, writes) = (self.relay.dial(), self.writes.clone());
+            Box::pin(async move { Ok(Box::new(ClosedWrites { io: dialing.await?, writes }) as Box<dyn Io>) })
+        }
+    }
+
+    /// R-121, beside WM-T56: the relay closes right after its alert, so a write can fail with that alert unread, and
+    /// HTTP/2 flushes before it reads. While the relay has said nothing, a write or a flush that finds it gone reads what
+    /// it left: its error waits for the alert still on its way, and takes one already there at once. A write's other
+    /// errors, and any write once the relay was heard, are returned at once and read nothing. Single-threaded, so
+    /// `connect` returns with the relay yet to read the worker's Finished.
+    #[tokio::test]
+    async fn a_write_that_finds_the_relay_gone_reads_its_alert() {
+        use io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, TimedOut};
+        use std::future::Future as _;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("after 1970").as_secs();
+        let ca = certs::relay_ca(now).expect("the relay CA");
+        let ca_pem = certs::pem("CERTIFICATE", &ca.cert_der);
+        let (requiring, _seen) = TestRelay::start(&ca, now, true);
+        let (asking_none, _seen_none) = TestRelay::start(&ca, now, false);
+        let writes: WritesNow = Arc::new(std::sync::Mutex::new(Writes::Pass));
+        let endpoint = |relay: &Arc<TestRelay>| {
+            let dialer: Arc<dyn Dial> = Arc::new(Closes { relay: relay.clone(), writes: writes.clone() });
+            RelayEndpoint::new("203.0.113.10:443").expect("an address").server_name(RELAY_NAME).expect("a name").dialer(dialer).ca_pem(ca_pem.as_bytes()).expect("the CA")
+        };
+        let set = |now: Writes| *writes.lock().expect("unpoisoned") = now;
+        let required = Some("the relay requires a client certificate".to_string());
+
+        // Each way a socket says the relay is gone: the alert is on its way, so the first poll waits; then it reads.
+        for kind in [BrokenPipe, ConnectionReset, ConnectionAborted] {
+            set(Writes::Pass);
+            let mut conn = endpoint(&requiring).connect(Duration::from_secs(5)).await.expect("TLS 1.3: the worker's handshake ends first");
+            let alert = conn.alert();
+            set(Writes::Fail(kind));
+            let mut write = std::pin::pin!(conn.write_all(b"ping"));
+            let first = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+            assert!(first.is_pending(), "{kind:?}: its error waits for the read's answer: {first:?}");
+            assert_eq!(alert.words(), None, "{kind:?}: nothing read yet");
+            assert_eq!(write.await.expect_err("the write failed").kind(), kind, "{kind:?}: the write's own error");
+            assert_eq!(alert.words(), required, "{kind:?}: R-121's words");
+        }
+
+        // A flush the same way: a full socket kept the bytes in rustls, and the relay then closed it.
+        set(Writes::Pass);
+        let mut conn = endpoint(&requiring).connect(Duration::from_secs(5)).await.expect("the worker's handshake");
+        let alert = conn.alert();
+        set(Writes::Block);
+        assert_eq!(conn.write(b"ping").await.expect("taken, not sent"), 4);
+        set(Writes::Fail(BrokenPipe));
+        let mut flush = std::pin::pin!(conn.flush());
+        let first = std::future::poll_fn(|cx| Poll::Ready(flush.as_mut().poll(cx))).await;
+        assert!(first.is_pending(), "its error waits for the read's answer: {first:?}");
+        assert_eq!(flush.await.expect_err("the flush failed").kind(), BrokenPipe);
+        assert_eq!(alert.words(), required);
+
+        // HTTP/2's vectored write, with the alert already there: no wait.
+        set(Writes::Pass);
+        let mut conn = endpoint(&requiring).connect(Duration::from_secs(5)).await.expect("the worker's handshake");
+        let alert = conn.alert();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        set(Writes::Fail(BrokenPipe));
+        let bufs = [io::IoSlice::new(b"ping")];
+        let mut write = std::pin::pin!(conn.write_vectored(&bufs));
+        let first = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(matches!(&first, Poll::Ready(Err(e)) if e.kind() == BrokenPipe), "at once: {first:?}");
+        assert_eq!(alert.words(), required, "the alert read at once");
+
+        // Another error of a write says nothing of the relay: no wait, no read.
+        set(Writes::Pass);
+        let mut conn = endpoint(&requiring).connect(Duration::from_secs(5)).await.expect("the worker's handshake");
+        let alert = conn.alert();
+        set(Writes::Fail(TimedOut));
+        let mut write = std::pin::pin!(conn.write_all(b"ping"));
+        let first = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(matches!(&first, Poll::Ready(Err(e)) if e.kind() == TimedOut), "at once: {first:?}");
+        assert_eq!(alert.words(), None);
+
+        // A relay that was heard took the certificate: its close is returned at once, and nothing is read for it.
+        set(Writes::Pass);
+        let mut conn = endpoint(&asking_none).connect(Duration::from_secs(5)).await.expect("the worker's handshake");
+        let alert = conn.alert();
+        conn.write_all(b"ping").await.expect("the write");
+        conn.flush().await.expect("the flush");
+        let mut pong = [0u8; 4];
+        conn.read_exact(&mut pong).await.expect("the answer");
+        assert_eq!(&pong, b"pong");
+        set(Writes::Fail(BrokenPipe));
+        let mut write = std::pin::pin!(conn.write_all(b"ping"));
+        let first = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
+        assert!(matches!(&first, Poll::Ready(Err(e)) if e.kind() == BrokenPipe), "at once: {first:?}");
+        assert_eq!(alert.first.get().copied(), None, "no read error, for no read");
     }
 
     fn presents(endpoint: &RelayEndpoint) -> bool {

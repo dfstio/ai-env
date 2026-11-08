@@ -1,7 +1,8 @@
 //! The run-time CA of the relay's tests (LD-R23): a small DER writer for X.509 v3 certificates with Ed25519 keys
 //! from aws-lc-rs, so no key or certificate is committed and no crate is added. Every key comes from a seed at run
 //! time, and the PEM markers are assembled from parts, so no source file holds a private-key marker. The
-//! production profile (ECDSA P-256) is W's `certs`; this one only has to satisfy rustls's verifier.
+//! production profile (ECDSA P-256) is W's `certs`; this one only has to satisfy rustls's verifier, of server and
+//! client certificates alike (R-129).
 //!
 //! Also compiled into the crate's unit tests (`src/lib.rs`, `#[path]`).
 #![allow(dead_code)]
@@ -17,6 +18,9 @@ const KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x0f];
 const SUBJECT_ALT_NAME: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x11];
 const EXT_KEY_USAGE: &[u8] = &[0x06, 0x03, 0x55, 0x1d, 0x25];
 const SERVER_AUTH: &[u8] = &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+const CLIENT_AUTH: &[u8] = &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+const EC_PUBLIC_KEY: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+const PRIME256V1: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
 fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
@@ -82,14 +86,25 @@ fn validity() -> Vec<u8> {
     seq(&[&utc_time(now - Duration::from_secs(86_400)), &utc_time(now + Duration::from_secs(30 * 86_400))])
 }
 
+/// A window that holds any run of the tests, and no clock in it: a client leaf's bytes, and so its fingerprint, are the
+/// same at every issue (an Ed25519 signature is deterministic), so a list written from one issue holds a client built
+/// from another.
+fn fixed_validity() -> Vec<u8> {
+    seq(&[&tlv(0x17, b"200101000000Z"), &tlv(0x17, b"491231235959Z")])
+}
+
 fn spki(public_key: &[u8]) -> Vec<u8> {
     seq(&[&seq(&[ED25519]), &bits(public_key)])
 }
 
 fn certificate(serial: u64, issuer: &[u8], subject: &[u8], subject_key: &[u8], extensions: &[Vec<u8>], signer: &Ed25519KeyPair) -> Vec<u8> {
+    certificate_of(serial, issuer, &validity(), subject, &spki(subject_key), extensions, signer)
+}
+
+fn certificate_of(serial: u64, issuer: &[u8], validity: &[u8], subject: &[u8], subject_key_info: &[u8], extensions: &[Vec<u8>], signer: &Ed25519KeyPair) -> Vec<u8> {
     let alg = seq(&[ED25519]);
     let ext_refs: Vec<&[u8]> = extensions.iter().map(Vec::as_slice).collect();
-    let tbs = seq(&[&[0xa0, 0x03, 0x02, 0x01, 0x02], &integer(serial), &alg, issuer, &validity(), subject, &spki(subject_key), &tlv(0xa3, &seq(&ext_refs))]);
+    let tbs = seq(&[&[0xa0, 0x03, 0x02, 0x01, 0x02], &integer(serial), &alg, issuer, validity, subject, subject_key_info, &tlv(0xa3, &seq(&ext_refs))]);
     let signature = signer.sign(&tbs);
     seq(&[&tbs, &alg, &bits(signature.as_ref())])
 }
@@ -110,16 +125,36 @@ pub struct Leaf {
     pub key_pkcs8: Vec<u8>,
 }
 
+impl Leaf {
+    /// The SHA-256 of its certificate: what the relay reads into `PeerInfo.cert_fp`, and an entry's `tls_fp` in hex.
+    pub fn sha256(&self) -> [u8; 32] {
+        let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &self.cert_der);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(d.as_ref());
+        out
+    }
+}
+
+/// A CA's extensions: CA:TRUE with no pathlen, keyCertSign and cRLSign.
+fn ca_extensions() -> [Vec<u8>; 2] {
+    [extension(BASIC_CONSTRAINTS, true, &seq(&[&[0x01, 0x01, 0xff]])), extension(KEY_USAGE, true, &[0x03, 0x02, 0x01, 0x06])]
+}
+
 impl Ca {
     /// A CA named `cn` with the key of `seed`.
     pub fn new(cn: &str, seed: [u8; 32]) -> Ca {
         let key = Ed25519KeyPair::from_seed_unchecked(&seed).expect("an Ed25519 seed");
         let name = name(cn);
-        let extensions = [
-            extension(BASIC_CONSTRAINTS, true, &seq(&[&[0x01, 0x01, 0xff]])),
-            extension(KEY_USAGE, true, &[0x03, 0x02, 0x01, 0x06]),
-        ];
-        let cert_der = certificate(1, &name, &name, key.public_key().as_ref(), &extensions, &key);
+        let cert_der = certificate(1, &name, &name, key.public_key().as_ref(), &ca_extensions(), &key);
+        Ca { key, name, cert_der }
+    }
+
+    /// A CA named `cn` with the key of `seed`, signed by this one: `[a leaf of it, it]` is a sound chain to this CA for a
+    /// verifier that reads intermediates, since this rig's CA has no pathlen (production's has `pathlen:0`).
+    pub fn sub_ca(&self, serial: u64, cn: &str, seed: [u8; 32]) -> Ca {
+        let key = Ed25519KeyPair::from_seed_unchecked(&seed).expect("an Ed25519 seed");
+        let name = name(cn);
+        let cert_der = certificate(serial, &self.name, &name, key.public_key().as_ref(), &ca_extensions(), &self.key);
         Ca { key, name, cert_der }
     }
 
@@ -142,6 +177,30 @@ impl Ca {
         let cert_der = certificate(serial, &self.name, &name("ai-env-relay"), key.public_key().as_ref(), &extensions, &self.key);
         let key_pkcs8 = key.to_pkcs8().expect("PKCS#8").as_ref().to_vec();
         Leaf { cert_der, key_pkcs8 }
+    }
+
+    /// A client leaf (R-129): CN `cn`, an Ed25519 key from `seed` (fine in TLS 1.3 on aws-lc-rs), EKU clientAuth,
+    /// CA:FALSE, keyUsage digitalSignature, no SAN, signed by this CA. The same arguments make the same bytes.
+    pub fn client_leaf(&self, serial: u64, cn: &str, seed: [u8; 32]) -> Leaf {
+        let key = Ed25519KeyPair::from_seed_unchecked(&seed).expect("an Ed25519 seed");
+        let cert_der = self.client_certificate(serial, cn, &spki(key.public_key().as_ref()));
+        let key_pkcs8 = key.to_pkcs8().expect("PKCS#8").as_ref().to_vec();
+        Leaf { cert_der, key_pkcs8 }
+    }
+
+    /// The same client leaf's DER for a P-256 public point (65 bytes uncompressed): a real worker's key, which W's
+    /// `RelayEndpoint::client_identity` takes alone (WM-J2). W's `certs::client_point` gives the point.
+    pub fn client_leaf_of_point(&self, serial: u64, cn: &str, point: &[u8; 65]) -> Vec<u8> {
+        self.client_certificate(serial, cn, &seq(&[&seq(&[EC_PUBLIC_KEY, PRIME256V1]), &bits(point)]))
+    }
+
+    fn client_certificate(&self, serial: u64, cn: &str, subject_key_info: &[u8]) -> Vec<u8> {
+        let extensions = [
+            extension(BASIC_CONSTRAINTS, true, &seq(&[])),
+            extension(KEY_USAGE, true, &[0x03, 0x02, 0x07, 0x80]),
+            extension(EXT_KEY_USAGE, false, &seq(&[CLIENT_AUTH])),
+        ];
+        certificate_of(serial, &self.name, &fixed_validity(), &name(cn), subject_key_info, &extensions, &self.key)
     }
 }
 

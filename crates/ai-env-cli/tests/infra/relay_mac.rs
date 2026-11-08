@@ -433,7 +433,7 @@ fn relay_lists_are_written_by_the_deployer_only() {
     assert!(stdout(&o).contains(&format!("({WORKERS} v2, 1 worker(s))")), "{}", stdout(&o));
     let o = w.run(&["allow", "mac", "--token-signer", "--key", &k7], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
-    let signer = policy::SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_of(7).b64(), not_after: format!("{}T23:59:59Z", default_day()) };
+    let signer = policy::SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_of(7).b64(), not_after: format!("{}T23:59:59Z", default_day()), grants: None };
     assert_eq!(w.param(SIGNERS), Some((policy::render_signers(&[signer]).unwrap(), 2)));
     let o = w.run(&["allow", "mac", "--token-signer", "--key", &k7], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -459,7 +459,7 @@ fn relay_lists_are_written_by_the_deployer_only() {
     // WM-J3's half in this slice: what M wrote parses back, with the shared `policy` the relay's loader wraps
     // (`ai_env_relay::lists::parse_*`), into the entries it was given.
     assert_eq!(policy::parse_workers(&w.param(WORKERS).unwrap().0).unwrap(), Vec::<policy::WorkerEntry>::new());
-    let signer = policy::SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_of(7).b64(), not_after: format!("{}T23:59:59Z", default_day()) };
+    let signer = policy::SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_of(7).b64(), not_after: format!("{}T23:59:59Z", default_day()), grants: None };
     assert_eq!(policy::parse_signers(&w.param(SIGNERS).unwrap().0).unwrap(), [signer]);
     let grant = policy::Grant { grant_id: "default".into(), allow: vec!["example-*/get".into(), "example-*/list".into()] };
     assert_eq!(policy::parse_grants(&w.param(GRANTS).unwrap().0).unwrap(), [grant]);
@@ -707,7 +707,7 @@ fn relay_agent_answers_a_worker_and_the_wrapper_with_one_touch_id() {
     let mint = Request::MintSession(MintRequest { vm_id: VM.into(), session_id: SPAWN.into(), chat_id: None, grant_id: "default".into(), exp: now + 3600 });
     let Response::Minted { token, exp } = rt.block_on(request(&socket, &mint, Duration::from_secs(2))).unwrap() else { panic!("no token") };
     assert_eq!(exp, now + 3600);
-    let lookup = |kid: &str| (kid == "mac").then_some(ai_env_worker::session::SignerKey { public_key: session, not_after: now + 86_400 });
+    let lookup = |kid: &str| (kid == "mac").then_some(ai_env_worker::session::SignerKey { public_key: session, not_after: now + 86_400, grants: None });
     let claims = ai_env_worker::session::verify(&token, now, &lookup).unwrap().claims;
     assert_eq!((claims.vm_id.as_str(), claims.session_id.as_str(), claims.grant_id.as_str()), (VM, SPAWN, "default"));
     assert!(w.holding(&token).is_empty(), "the token is in no file: {:?}", w.holding(&token));
@@ -750,12 +750,17 @@ fn pem_blocks(text: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The line of a `tls init` that replaces a CA (R-131).
+const STRANDED: &str = "every worker's relay_ca file and client certificate must then be replaced";
+
 /// WM-T48 (B-1): `relay tls init` seals the CA's key, writes its certificate to `state/`, and writes the leaf, the
 /// CA and the leaf's key as one SecureString; `rotate` unseals once and writes a new leaf under the same CA, and
 /// refuses a CA certificate the sealed key does not match; both refuse no marker and an ops, a root or an ambient
 /// marker before any aws call (§Q.8 F5 for root and ambient), and never give a `tls` of another type the key;
 /// `relay ca` prints the CA's certificate; an `init` whose write fails leaves the CA, under which `rotate` writes
-/// the value.
+/// the value, and when it replaced one it says what it strands. A live `tls` with no file here refuses an `init` with no
+/// `--force` before anything is sealed, after the operator's first call and naming what `rotate` needs; a read of it that
+/// fails is exit 7 with nothing sealed; and a parameter made after that read is refused by SSM, never overwritten.
 #[test]
 fn relay_tls_init_seals_the_ca_and_writes_one_securestring() {
     use base64::Engine as _;
@@ -779,6 +784,7 @@ fn relay_tls_init_seals_the_ca_and_writes_one_securestring() {
     }
     let o = w.run(&["tls", "init"], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!((w.age_calls("-e"), w.age_calls("-d")), (1, 0), "sealing is public-key only: no Touch ID");
     let puts: Vec<String> = w.aws_calls().into_iter().filter(|l| l.starts_with("ssm put-parameter")).collect();
     assert_eq!(puts.len(), 1, "{puts:?}");
     assert!(puts[0].contains(&format!("--name {TLS} ")) && puts[0].contains(" --type SecureString --key-id alias/aws/ssm ") && puts[0].contains(" --tier Standard ") && !puts[0].contains("--overwrite"), "{}", puts[0]);
@@ -804,10 +810,30 @@ fn relay_tls_init_seals_the_ca_and_writes_one_securestring() {
     let out = stdout(&o);
     assert!(!out.contains("PRIVATE KEY") && longest_b64(&out) <= 44 && !out.contains(&blocks[2].1[..40]), "{out}");
     assert!(out.contains(&format!("relay CA fp {ca_fp}")) && out.contains(&format!("in {TLS} v1")), "{out}");
+    assert!(!out.contains(STRANDED), "a first init, nothing here and nothing live, strands nobody: {out}");
     // A second init names --force.
     let o = w.run(&["tls", "init"], Who::Deployer);
     assert_eq!(code(&o), 1, "{}", stderr(&o));
-    assert!(stderr(&o).contains("ai-env relay tls init --force"), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay tls init: a relay CA exists (credentials/relay-ca.env, state/relay-ca.pem, state/relay-ca.der): ai-env relay tls init --force makes a new one, and {STRANDED} (ai-env relay tls rotate issues a new certificate under this one)")), "{}", stderr(&o));
+    // `tls rotate` reads the sealed key and the DER: with either gone it is exit 5, naming `tls init`, and the refusal says what
+    // it needs. It reads no PEM, so with that alone gone the refusal stands as above.
+    let (sealed, state, aside) = (w.bridge().join("credentials").join("relay-ca.env"), w.bridge().join("state"), w.root().join("aside"));
+    let refusal = |held: &str, tail: &str| format!("relay tls init: a relay CA exists ({held}): ai-env relay tls init --force makes a new one, and {STRANDED} (ai-env relay tls rotate issues a new certificate under this one{tail})");
+    let needs = ", once credentials/relay-ca.env and state/relay-ca.der are back on this Mac";
+    for (gone, held) in [(sealed, "state/relay-ca.pem, state/relay-ca.der"), (state.join("relay-ca.der"), "credentials/relay-ca.env, state/relay-ca.pem")] {
+        fs::rename(&gone, &aside).unwrap();
+        let o = w.run(&["tls", "init"], Who::Deployer);
+        assert_eq!(code(&o), 1, "{}", stderr(&o));
+        assert!(stderr(&o).contains(&refusal(held, needs)), "{}", stderr(&o));
+        let o = w.run(&["tls", "rotate"], Who::Deployer);
+        assert_eq!(code(&o), 5, "what the refusal says of it: {}", stderr(&o));
+        fs::rename(&aside, &gone).unwrap();
+    }
+    fs::rename(state.join("relay-ca.pem"), &aside).unwrap();
+    let o = w.run(&["tls", "init"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&refusal("credentials/relay-ca.env, state/relay-ca.der", "")), "{}", stderr(&o));
+    fs::rename(&aside, state.join("relay-ca.pem")).unwrap();
     // rotate: one unseal, --overwrite, the CA unchanged, the leaf new.
     let o = w.run(&["tls", "rotate"], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -817,6 +843,7 @@ fn relay_tls_init_seals_the_ca_and_writes_one_securestring() {
     let (rotated, version) = w.param(TLS).unwrap();
     assert_eq!(version, 2);
     let after = pem_blocks(&rotated);
+    assert_eq!(after.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), ["CERTIFICATE", "CERTIFICATE", "PRIVATE KEY"], "two certificates, then one key: R-124's");
     assert_eq!(after[1], blocks[1], "the CA unchanged");
     assert!(after[0] != blocks[0] && after[2] != blocks[2], "a new leaf and key");
     // A CA certificate that is not the sealed key's: rotate is exit 9 naming init --force, and writes nothing.
@@ -851,13 +878,74 @@ fn relay_tls_init_seals_the_ca_and_writes_one_securestring() {
     w2.answer("ssm.put-parameter.stderr", "\nAn error occurred (InternalServerError) when calling the PutParameter operation: try again.\n");
     let o = w2.run(&["tls", "init"], Who::Deployer);
     assert_eq!(code(&o), 7, "{}", stderr(&o));
-    assert!(stderr(&o).contains(&format!("is made and sealed: ai-env relay tls rotate writes {TLS} under it")), "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("is made and sealed: ai-env relay tls rotate writes {TLS} under it")) && !stderr(&o).contains(STRANDED), "a first init strands nobody: {}", stderr(&o));
     assert!(w2.param(TLS).is_none() && w2.bridge().join("state").join("relay-ca.der").exists() && w2.bridge().join("credentials").join("relay-ca.env").exists());
     w2.unanswer("ssm.put-parameter.rc");
     w2.unanswer("ssm.put-parameter.stderr");
     let o = w2.run(&["tls", "rotate"], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert_eq!(w2.param(TLS).map(|(_, v)| v), Some(1), "created under that CA");
+    // Only the state files here and no parameter: nothing live and no backup made, and --force still says what it strands.
+    fs::remove_file(w2.bridge().join("credentials").join("relay-ca.env")).unwrap();
+    for name in ["", ".version", ".type"] {
+        fs::remove_file(w2.root().join("ssm").join(format!("{}{name}", TLS.trim_start_matches('/')))).unwrap();
+    }
+    let o = w2.run(&["tls", "init", "--force"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains(STRANDED), "{}", stdout(&o));
+    assert_eq!(w2.param(TLS).map(|(_, v)| v), Some(1), "created again");
+
+    // A live CA this Mac holds no file of (a rebuilt bridge directory, another AI_ENV_BRIDGE_DIR): the parameter alone
+    // refuses an init with no --force, read with no decryption, before anything is sealed.
+    let w3 = World::new();
+    w3.set_param(TLS, "a live value", 4);
+    let nothing_sealed = |what: &str, o: &Output| {
+        let state = w3.bridge().join("state");
+        assert!(!w3.bridge().join("credentials").join("relay-ca.env").exists() && !state.join("relay-ca.pem").exists() && !state.join("relay-ca.der").exists(), "{what}: {}", stderr(o));
+        assert_eq!((w3.age_calls("-e"), w3.age_calls("-d")), (0, 0), "{what}: no key sealed, no Touch ID");
+        assert!(!w3.aws_calls().iter().any(|l| l.starts_with("ssm put-parameter")), "{what}: {:?}", w3.aws_calls());
+        assert_eq!(w3.param(TLS), Some(("a live value".to_string(), 4)), "{what}: the live value untouched");
+    };
+    let o = w3.run(&["tls", "init"], Who::Deployer);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay tls init: a relay CA exists ({TLS}): ai-env relay tls init --force makes a new one, and every worker's relay_ca file and client certificate must then be replaced (ai-env relay tls rotate issues a new certificate under this one, once credentials/relay-ca.env and state/relay-ca.der are back on this Mac)")), "{}", stderr(&o));
+    nothing_sealed("the parameter set", &o);
+    assert!(w3.aws_calls()[0].starts_with("sts get-caller-identity"), "after the operator: {:?}", w3.aws_calls());
+    let reads: Vec<String> = w3.aws_calls().into_iter().filter(|l| l.starts_with("ssm get-parameters")).collect();
+    assert!(reads.len() == 1 && reads[0].starts_with(&format!("ssm get-parameters --names {TLS} ")) && !reads[0].contains("decryption"), "{reads:?}");
+    // A read that fails: exit 7, nothing sealed, with --force or without.
+    w3.answer("ssm.get-parameters.rc", "254");
+    w3.answer("ssm.get-parameters.stderr", "\nAn error occurred (AccessDeniedException) when calling the GetParameters operation: not authorized\n");
+    for args in [&["tls", "init"][..], &["tls", "init", "--force"][..]] {
+        let o = w3.run(args, Who::Deployer);
+        assert_eq!(code(&o), 7, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains("relay tls init: ") && stderr(&o).contains("(AccessDeniedException) when calling the GetParameters operation"), "{args:?}: {}", stderr(&o));
+        nothing_sealed("a failed read", &o);
+    }
+    w3.unanswer("ssm.get-parameters.rc");
+    w3.unanswer("ssm.get-parameters.stderr");
+    // --force replaces it, and says what it strands though nothing was here to back up.
+    let o = w3.run(&["tls", "init", "--force"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains(STRANDED), "{}", stdout(&o));
+    assert_eq!(w3.param(TLS).map(|(_, v)| v), Some(5), "overwritten");
+    // R-131 on the way a failed write sends the operator: `tls rotate` says nothing of what the new CA strands, so the failure says it.
+    let w4 = World::new();
+    w4.set_param(TLS, "a live value", 4);
+    w4.answer("ssm.put-parameter.rc", "254");
+    w4.answer("ssm.put-parameter.stderr", "\nAn error occurred (InternalServerError) when calling the PutParameter operation: try again.\n");
+    let o = w4.run(&["tls", "init", "--force"], Who::Deployer);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("is made and sealed: ai-env relay tls rotate writes {TLS} under it: {STRANDED}")), "{}", stderr(&o));
+    assert_eq!(w4.param(TLS), Some(("a live value".to_string(), 4)), "the live value untouched");
+    // A parameter made after the read: the write creates, with no --overwrite, so SSM refuses it: never overwritten without --force.
+    let w5 = World::new();
+    w5.set_param(TLS, "made meanwhile", 2);
+    w5.answer("ssm.get-parameters.1.json", &format!("{{\"Parameters\": [], \"InvalidParameters\": [\"{TLS}\"]}}"));
+    let o = w5.run(&["tls", "init"], Who::Deployer);
+    assert_eq!(code(&o), 7, "{}", stderr(&o));
+    assert!(stderr(&o).contains("(ParameterAlreadyExists) when calling the PutParameter operation"), "{}", stderr(&o));
+    assert_eq!(w5.param(TLS), Some(("made meanwhile".to_string(), 2)), "never overwritten");
 }
 
 /// In front of the fake aws (`aws-fake` beside it): a `put-parameter` while one of ai-env's temp files
@@ -959,7 +1047,7 @@ fn relay_help_says_what_each_command_does() {
         ("grant", vec!["The grant's id, as [relay].grant or a workspace's relay_grant names it", rules.as_str(), "Delete the grant"]),
         ("status", vec!["One JSON object: the instance, the lists and this Mac's keys (each key as its fingerprint) and agent, and the verdict with its rows as printed"]),
         ("pubkey", vec!["Print this Mac's relay public keys from the sealed container's notes (no Touch ID; --verify checks them: one Touch ID)"]),
-        ("allow", vec!["Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)", "The last valid day, UTC (default: a year from today; at most two years ahead)"]),
+        ("allow", vec!["Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)", "The last valid day, UTC (default: a year from today; at most two years ahead)", "The grant ids this token signer may mint tokens for: globs (default: every grant)"]),
         ("access", vec!["Approve a remote chat for a grant, or take it back, in /ai-env/relay/access (as ai-env-ops): the relay applies it within about 70 s, with no restart", "The grant to allow this chat, one of [relay].offer", "1 to 90 (default 30)"]),
     ];
     let mut missing = Vec::new();
@@ -1406,6 +1494,7 @@ fn relay_allow_tls_key_issues_a_client_certificate() {
     let line = format!("ai-env: allowed worker worker-a (key fp {}, cert fp {}) for sources example-* until {day} ({WORKERS} v1, 1 worker(s)); the relay applies it within 60 s\n", key_of(1).fingerprint(), &fp[..16]);
     assert!(stderr(&o).contains(&line), "{}\nnot in\n{}", line, stderr(&o));
     assert!(stderr(&o).contains("ai-env: the certificate on stdout goes to the worker's relay_client_cert file (0640, the worker's group)\n"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("note:"), "a first certificate replaces none: {}", stderr(&o));
     // It verifies under the relay CA, up to the entry's not_after and not past it.
     let until = list[0].not_after_unix();
     let now = ai_env_cli::wire::time::unix_now();
@@ -1464,6 +1553,10 @@ fn relay_allow_tls_key_issues_a_client_certificate() {
     let fp2 = sha256_hex(&der2);
     assert!(fp2 != fp);
     assert!(stderr(&o).contains(&format!("; the relay applies it within 60 s; replaced its client certificate fp {} by fp {}\n", &fp[..16], &fp2[..16])), "{}", stderr(&o));
+    // LD-R61: a live tunnel passed its proof, so a new certificate alone closes nothing, and the line's `within 60 s` must not
+    // read as if it did.
+    let stays = |id: &str| format!("note: worker {id}: a live tunnel stays up on the old certificate until it next connects (LD-R61): if its keys may be stolen, rotate --key too, or revoke\n");
+    assert!(stderr(&o).contains(&stays("worker-a")), "{}", stderr(&o));
     let (value, _) = w.param(WORKERS).unwrap();
     assert_eq!(policy::parse_workers(&value).unwrap().iter().find(|e| e.worker_id == "worker-a").and_then(|e| e.tls_fp.clone()), Some(fp2.clone()));
     assert_eq!(w.audit("relay_allow").last().unwrap()["detail"]["outcome"].as_str(), Some("replaced"));
@@ -1476,6 +1569,13 @@ fn relay_allow_tls_key_issues_a_client_certificate() {
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     one_certificate(&stdout(&o));
     assert!(stderr(&o).contains("ai-env: this worker may register any source name\n"), "{}", stderr(&o));
+    // Its key rotated in the same run: that closes the tunnel (R-18), so no such note. The same key again: the note.
+    let o = w.run(&tls_args("worker-c", &key_text(5), "*", &point_text()), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains("; replaced its key fp ") && !stderr(&o).contains("note:"), "{}", stderr(&o));
+    let o = w.run(&tls_args("worker-c", &key_text(5), "*", &point_text()), Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&stays("worker-c")), "{}", stderr(&o));
     // Refused before the Touch ID, nothing written: a key another id or the other list holds, a list that does not parse.
     for (key, why) in [(k3.as_str(), "is already allowed as worker-b: one key, one id"), (k7.as_str(), "is already allowed as token signer mac: one key, one role")] {
         let o = w.run(&tls_args("worker-z", key, "example-*", &point), Who::Deployer);
@@ -1580,9 +1680,15 @@ fn relay_allow_tls_key_issues_a_client_certificate() {
     assert!(stderr(&o).contains("every worker's relay_ca file and client certificate must then be replaced"), "{}", stderr(&o));
     let o = w.run(&["tls", "init", "--force"], Who::Deployer);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 0, "a new CA unseals nothing: the old key is only backed up");
     assert!(stdout(&o).contains("every worker's relay_ca file and client certificate must then be replaced"), "{}", stdout(&o));
     let new_ca = fs::read(w.bridge().join("state").join("relay-ca.der")).unwrap();
     assert!(!verifies_under(&new_ca, &der2, now), "the old certificate is stranded");
+    // The way `unseal_ca`'s text sends the operator: the sealed file moved away, then --force. No backup, and it still says so.
+    fs::rename(w.bridge().join("credentials").join("relay-ca.env"), w.root().join("relay-ca.env.moved")).unwrap();
+    let o = w.run(&["tls", "init", "--force"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains(STRANDED), "{}", stdout(&o));
 }
 
 /// The `filter-log-events` answer holding these lines of the request log.
@@ -1698,6 +1804,24 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     assert_eq!(rc, 0, "{out}");
     assert!(out.contains(&format!("grants 2123456789abcdef (32 s old), peers -\n{not_loaded}")), "{out}");
     assert!(out.contains(&format!("[ok ] {PEERS} v1: 1 peer(s), 1 in force\n")), "row 8 stands: {out}");
+    // `tls_loaded` false: no TLS config, so both faces refuse `no_tls` (R-4's file gone; R-124's first load, which nothing rolls
+    // back): a warning of its own, after the peers one; never the exit code. True (above), or no such key, shows nothing.
+    let no_tls = "[warn] relay: it holds no TLS config: it serves nobody (make relay-logs: a live file was refused, or relay=waiting-for-tls)\n";
+    assert!(!out.contains(no_tls), "{out}");
+    let mut no_config = status_of(Some(false), true);
+    no_config["tls_loaded"] = serde_json::json!(false);
+    s.logs(no_config.clone(), &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("peers 3123456789abcdef (33 s old)\n{no_tls}")) && !out.contains(not_loaded), "{out}");
+    no_config["peers_version"] = serde_json::json!("");
+    s.logs(no_config.clone(), &[], &[]);
+    let (_, out) = s.status();
+    assert!(out.contains(&format!("peers -\n{not_loaded}{no_tls}")), "after the peers one: {out}");
+    no_config.as_object_mut().unwrap().remove("tls_loaded");
+    s.logs(no_config, &[], &[]);
+    let (_, out) = s.status();
+    assert!(!out.contains(no_tls), "no such key: {out}");
     // The peers list absent: [NO ], exit 1, `[]`.
     let held = w.param(PEERS).unwrap();
     let peers_file = w.root().join("ssm").join(PEERS.trim_start_matches('/'));
@@ -1760,13 +1884,14 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     let cert = "ab".repeat(32);
     let list = [entry("worker-a", 1, IN_FORCE, None), entry("worker-b", 2, IN_FORCE, Some(cert.clone())), entry("worker-c", 3, LAPSED, None)];
     w.set_param(WORKERS, &policy::render_workers(&list).unwrap(), 2);
-    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow worker-a --key {} --sources 'example-*,other' --tls-key <its p256 text>", key_text(1));
+    let command = format!("on the worker: tls-keygen; then ai-env as deployer -- ai-env relay allow worker-a --key {} --sources 'example-*,other' --tls-key <its p256 text> --not-after {}", key_text(1), &IN_FORCE[..10]);
     let no = format!("[NO ] worker worker-a has no client certificate: the relay refuses it ({command})\n");
     let warned = format!("[warn] worker worker-a has no client certificate yet: a relay that requires client certificates would refuse it ({command})\n");
     s.logs(status_of(Some(true), true), &[], &[]);
     let (rc, out) = s.status();
     assert_eq!(rc, 1, "a finding: {out}");
     assert!(out.contains(&no) && !out.contains(&warned), "{out}");
+    assert!(out.contains("peers 3123456789abcdef (33 s old); client certificates required\n"), "row 3 says so: {out}");
     assert!(out.contains(&format!("[-  ]   worker worker-a (key fp {}, no cert fp) for sources example-*,other until {IN_FORCE}\n", key_of(1).fingerprint())), "{out}");
     assert!(out.contains(&format!("[-  ]   worker worker-b (key fp {}, cert fp {}) for sources example-*,other until {IN_FORCE}\n", key_of(2).fingerprint(), &cert[..16])), "{out}");
     assert!(out.contains(&format!("[-  ]   worker worker-c (key fp {}, no cert fp) for sources example-*,other until {LAPSED} EXPIRED\n", key_of(3).fingerprint())), "{out}");
@@ -1781,6 +1906,7 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
         let (rc, out) = s.status();
         assert_eq!(rc, 0, "{out}");
         assert!(out.contains(&warned) && !out.contains(&no), "{out}");
+        assert!(out.contains("peers 3123456789abcdef (33 s old)\n"), "only `true` says so in row 3: {out}");
     }
     w.answer("logs.filter-log-events.1.json", "{\"events\": []}");
     let (rc, out) = s.status();
@@ -1792,7 +1918,40 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     assert_eq!(rc, 0, "{out}");
     assert!(out.contains("[warn] worker worker-a has no client certificate yet: a relay that requires client certificates would refuse it (not yet: this relay refuses a list with tls_fp and unloads its whole whitelist (RO-3))\n"), "{out}");
     assert!(!out.contains("--tls-key") && !out.contains("tls-keygen"), "{out}");
-    w.set_param(WORKERS, "[]", 3);
+    // A relay that asks for no certificate though a worker in force holds one (a rollback of part D's): `[warn]` when the key
+    // is absent, and only then; the lapsed holder is not counted; never the exit code. No holder in force: no row.
+    let not_asked = "this relay asks for no client certificate";
+    let unasked = format!("relay: {not_asked}, though 2 worker(s) hold one: part D's relay is not running (make relay-logs: rollback=)");
+    let holders = [entry("worker-a", 1, IN_FORCE, None), entry("worker-b", 2, IN_FORCE, Some(cert.clone())), entry("worker-c", 3, IN_FORCE, Some("cd".repeat(32))), entry("worker-d", 4, LAPSED, Some("ef".repeat(32)))];
+    w.set_param(WORKERS, &policy::render_workers(&holders).unwrap(), 3);
+    s.logs(status_of(None, true), &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "never the exit code: {out}");
+    assert!(out.contains(&format!("[warn] {unasked}\n")), "{out}");
+    assert!(out.contains(&warned), "a worker with none is told as under `false`: {out}");
+    let at = |t: &str| out.find(t).unwrap_or_else(|| panic!("{t}\n{out}"));
+    assert!(at("worker worker-d") < at(not_asked) && at(not_asked) < at(SIGNERS), "after the workers' rows: {out}");
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 0, "{doc}");
+    assert!(doc["status"]["verdict"] == "ok" && doc["status"]["rows"].as_array().is_some_and(|rows| rows.contains(&serde_json::json!({"mark": "warn", "text": unasked}))), "the row as printed: {doc}");
+    s.logs(status_of(Some(false), true), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains(not_asked), "`false`: {out}");
+    s.logs(status_of(Some(true), true), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 1 && !out.contains(not_asked), "`true`, whose [NO ] is worker-a's: {out}");
+    s.logs(status_of(None, false), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains(not_asked), "no peers_version: {out}");
+    w.answer("logs.filter-log-events.1.json", "{\"events\": []}");
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains(not_asked), "no line read: {out}");
+    let lapsed_only = [entry("worker-a", 1, IN_FORCE, None), entry("worker-d", 4, LAPSED, Some("ef".repeat(32)))];
+    w.set_param(WORKERS, &policy::render_workers(&lapsed_only).unwrap(), 4);
+    s.logs(status_of(None, true), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains(not_asked) && out.contains(&warned), "only a lapsed holder: {out}");
+    w.set_param(WORKERS, "[]", 5);
     // The refused hour from fake lines: N, M, P, B, U and the top reasons, each with its suppressed, in text and JSON;
     // [warn] for N > 0, never the exit code. The two reads name their streams, windows and filters.
     let tunnel = |peer: &str, reason: &str, suppressed: u64| serde_json::json!({"ts": "2026-10-29T10:00:00.000Z", "ev": "tunnel", "tunnel": "", "worker": "", "peer": peer, "sdk": "", "phase": "auth", "outcome": "refused", "reason": reason, "sources": 0, "duration_ms": 0, "suppressed": suppressed});
@@ -1826,7 +1985,7 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     assert!(now_ms.abs_diff(start(&logs[1]) + 3_600_000) < 60_000 && now_ms.abs_diff(start(&logs[2]) + 600_000) < 60_000, "the last 3600 s, the last 600 s: {logs:?}");
     let (rc, doc) = s.json();
     assert_eq!(rc, 0, "{doc}");
-    assert_eq!(doc["instance"]["refused"], serde_json::json!({"handshakes": 8, "addresses": 2, "connections": 6, "banned": 2, "unlisted": 104, "top": [{"reason": "banned", "count": 3}, {"reason": "bad_signature", "count": 2}, {"reason": "auth_timeout", "count": 1}]}), "{doc}");
+    assert_eq!(doc["instance"]["refused"], serde_json::json!({"handshakes": 8, "addresses": 2, "connections": 6, "banned": 2, "unlisted": 104, "tls_failed": 1, "top": [{"reason": "banned", "count": 3}, {"reason": "bad_signature", "count": 2}, {"reason": "auth_timeout", "count": 1}]}), "{doc}");
     // [ok ] for unlisted scanners alone, and the private face's cuts; none at all: `top reasons: none`.
     let scanners = [peer("public", "203.0.113.50", "not_in_peers", 5000), peer("public", "203.0.113.51", "no_peers", 0)];
     s.logs(status_of(Some(false), true), &scanners, &[]);
@@ -1839,6 +1998,17 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     s.logs(status_of(Some(false), true), &[peer("public", "198.51.100.3", "banned", 0)], &[]);
     let (rc, out) = s.status();
     assert!(rc == 0 && out.contains("[warn] refused in the last hour: 0 handshake(s) from 0 address(es), 1 connection(s) refused or cut, 1 address(es) banned, "), "B > 0 warns: {out}");
+    // A worker refused at TLS writes only these, about one a minute (R-101): ten in the hour warn, nine do not, since each
+    // `relay status` probe writes one; never the exit code.
+    let failed: Vec<serde_json::Value> = (0..10).map(|_| peer("public", "198.51.100.5", "tls_failed", 0)).collect();
+    s.logs(status_of(Some(true), true), &failed, &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains("[warn] refused in the last hour: 0 handshake(s) from 0 address(es), 10 connection(s) refused or cut, 0 address(es) banned, 0 connection(s) from unlisted addresses; top reasons: tls_failed 10\n"), "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["instance"]["refused"]["tls_failed"], serde_json::json!(10), "{doc}");
+    s.logs(status_of(Some(true), true), &failed[..9], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains("[ok ] refused in the last hour: 0 handshake(s) from 0 address(es), 9 connection(s) refused or cut, "), "{out}");
     // A failed read warns, never the exit code; `null`.
     s.logs(status_of(Some(false), true), &[], &[]);
     let denied = "\nAn error occurred (AccessDeniedException) when calling the FilterLogEvents operation: not authorized\n";
@@ -1888,6 +2058,26 @@ fn relay_status_shows_the_peers_the_certificates_and_the_refused_hour() {
     w.answer("ec2.describe-instances.stderr", "\nAn error occurred (UnauthorizedOperation) when calling the DescribeInstances operation: not authorized\n");
     let (rc, doc) = s.json();
     assert!(rc == 7 && unread(&doc), "{doc}");
+    // Following row 5's command issues the certificate and leaves the entry's end, and so the certificate's, where they were:
+    // no year added (WM-R43).
+    let r = StatusWorld::new();
+    assert_eq!(code(&r.w.run(&["tls", "init"], Who::Deployer)), 0);
+    let now = ai_env_cli::wire::time::unix_now();
+    let soon = ai_env_cli::wire::time::rfc3339_utc(now - now % 86_400 + 30 * 86_400)[..10].to_string();
+    let o = r.w.run(&["allow", "worker-a", "--key", &key_text(1), "--sources", "example-*,other", "--not-after", &soon], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    r.logs(status_of(Some(true), true), &[], &[]);
+    let (rc, out) = r.status();
+    assert_eq!(rc, 1, "{out}");
+    let row = out.lines().find(|l| l.starts_with("[NO ] worker worker-a ")).unwrap_or_else(|| panic!("{out}"));
+    let command = row.split("ai-env relay ").nth(1).unwrap_or_else(|| panic!("{row}")).trim_end_matches(')').replace("<its p256 text>", &point_text()).replace('\'', "");
+    let o = r.w.run(&command.split(' ').collect::<Vec<_>>(), Who::Deployer);
+    assert_eq!(code(&o), 0, "{command}: {}", stderr(&o));
+    let der = one_certificate(&stdout(&o));
+    let held = policy::parse_workers(&r.w.param(WORKERS).unwrap().0).unwrap().remove(0);
+    assert_eq!((held.not_after.clone(), held.tls_fp.clone()), (format!("{soon}T23:59:59Z"), Some(sha256_hex(&der))), "{command}");
+    let ca = fs::read(r.w.bridge().join("state").join("relay-ca.der")).unwrap();
+    assert!(verifies_under(&ca, &der, held.not_after_unix()) && !verifies_under(&ca, &der, held.not_after_unix() + 1), "the certificate ends with the entry");
 }
 
 // ---- §RS.13: a chat's access (R-146, R-150, R-152) ----------------------------------------------------------------
@@ -1946,7 +2136,8 @@ fn access_end(days: u64) -> String {
 /// WM-T66 (R-150, R-152): `relay access` edits `/ai-env/relay/access`, as ai-env-ops with no gate, in R-150's order,
 /// version-checked under the lock, its lapsed entries pruned; the audit's `relay_access` and the cache follow every run
 /// that ends knowing what the list holds, and a write that reports failure, which may have landed, audits `unknown` and
-/// removes the cache. An entry has one end for all its grants, and a `note:` says so. A chat back on this Mac can leave the
+/// removes the cache. An entry has one end for all its grants, and a `note:` says so; another says when this Mac's token
+/// signer leaves the grant out (R-135, R-145). A chat back on this Mac can leave the
 /// list and takes nothing new. `session forget` says when its row was the last way to name an entry in force.
 #[test]
 fn relay_access_edits_the_access_list() {
@@ -2021,7 +2212,7 @@ fn relay_access_edits_the_access_list() {
     assert_eq!(stdout(&o), format!("allowed chat {CHAT_A} (session {SID_A}) grant g-a until {end_30} ({ACCESS} v1, 1 chat(s)); the relay applies it within about 70 s, with no restart\n"));
     assert!(!stderr(&o).contains("note:"), "a chat holding a token, and no other grant, hears nothing more: {}", stderr(&o));
     let reads: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
-    assert!(reads.len() == 1 && reads[0].contains(&format!("--names {ACCESS} {GRANTS} ")), "one read of both: {reads:?}");
+    assert!(reads.len() == 1 && reads[0].contains(&format!("--names {ACCESS} {GRANTS} {SIGNERS} ")), "one read of the three: {reads:?}");
     let put = puts(&w);
     assert!(put.len() == 1 && put[0].contains(&format!("--name {ACCESS} ")) && put[0].contains(" --type String ") && put[0].contains(" --tier Standard ") && !put[0].contains("--overwrite"), "{put:?}");
     assert_eq!(w.age_calls("-d"), 0, "under ai-env as ops no unseal");
@@ -2181,6 +2372,29 @@ fn relay_access_edits_the_access_list() {
     let o = w.run(&allow("g-b"), Who::Ops);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stderr(&o).contains(&format!("note: session {SID_A}'s latest spawn holds no session token (relay=off): [relay].grant or its workspace's relay_grant names none, so the chat reaches this grant from the first spawn after one does\n")), "{}", stderr(&o));
+    // This Mac's token signer leaves the grant out (R-135, R-145): the approval is written, and a note says it reaches
+    // nothing; one already held says so too. No `grants`, a glob that matches, another signer's set and a list that does not
+    // parse say nothing, and none refuses the approval. `--remove` reads no signers.
+    w.session(SID_A, "remote", Some(CHAT_A), Some("minted"));
+    let signers = |id: &str, grants: Option<&[&str]>| policy::render_signers(&[policy::SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_of(5).b64(), not_after: IN_FORCE.into(), grants: grants.map(|set| set.iter().map(|g| (*g).to_string()).collect()) }]).unwrap();
+    let left_out = "note: token signer mac's grants leave out g-c: this chat reaches nothing through it\n";
+    w.set_param(SIGNERS, &signers("mac", Some(&["no-grant"])), 3);
+    let o = w.run(&allow("g-c"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).starts_with(&format!("allowed chat {CHAT_A} (session {SID_A}) grant g-c until ")) && stderr(&o).contains(left_out), "{}{}", stdout(&o), stderr(&o));
+    let o = w.run(&allow("g-c"), Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).ends_with("; nothing written\n") && stderr(&o).contains(left_out), "{}{}", stdout(&o), stderr(&o));
+    for (value, why) in [(signers("mac", None), "no grants"), (signers("mac", Some(&["a-nothing", "g-*"])), "a glob that matches"), (signers("mac-b", Some(&["no-grant"])), "another signer's"), ("not a list".to_string(), "a list that does not parse")] {
+        w.set_param(SIGNERS, &value, 3);
+        let o = w.run(&allow("g-c"), Who::Ops);
+        assert!(code(&o) == 0 && !stderr(&o).contains("leave out"), "{why}: {}", stderr(&o));
+    }
+    w.set_param(SIGNERS, &signers("mac", Some(&["no-grant"])), 3);
+    let o = w.run(&["access", SID_A, "--remove", "g-c"], Who::Ops);
+    assert!(code(&o) == 0 && !stderr(&o).contains("leave out"), "{}", stderr(&o));
+    let reads: Vec<String> = w.aws_calls().into_iter().filter(|c| c.starts_with("ssm get-parameters")).collect();
+    assert!(reads.len() == 1 && reads[0].contains(&format!("--names {ACCESS} {GRANTS} ")) && !reads[0].contains(SIGNERS), "{reads:?}");
     // --from-panel, hidden: the same, and its rows say `panel`.
     let o = w.run(&["access", SID_A, "--remove", "g-a", "--from-panel"], Who::Ops);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
@@ -2285,4 +2499,271 @@ fn relay_status_shows_the_access_list() {
     let o = w.run(&["status", "--local"], Who::Nobody);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(!stdout(&o).contains(ACCESS) && w.aws_calls().is_empty(), "{}", stdout(&o));
+}
+
+// ---- §RS.3.2 row 6: a signer's grants -----------------------------------------------------------------------------
+
+/// WM-T63 (§RS.4.1, §RS.4.2, §RS.4.3, §RS.3.2 row 6, R-134, R-135, R-145, RO-6): `allow --token-signer --grants` binds a
+/// signer to its grants, and `relay status` shows each signer's reach, with a `[warn]` for one in force that reaches every
+/// grant, and judges this Mac's own entry against what `bridge.toml` names.
+#[test]
+fn relay_allow_grants_binds_a_signer() {
+    let s = StatusWorld::new();
+    let w = &s.w;
+    let day = default_day();
+    let until = format!("{day}T23:59:59Z");
+    let fp = |seed: u8| key_of(seed).fingerprint();
+    let (k8, k9) = (key_text(8), key_text(9));
+    let entry = |list: &[policy::SignerEntry], id: &str| list.iter().find(|e| e.signer_id == id).cloned().unwrap_or_else(|| panic!("{id}: {list:?}"));
+    let held = |w: &World| policy::parse_signers(&w.param(SIGNERS).unwrap().0).unwrap();
+    let audit_row = |w: &World| w.audit("relay_allow").pop().unwrap();
+    let start = w.param(SIGNERS).unwrap().1;
+
+    // `--grants g-b,g-a --grants g-b` writes the sorted set, each once; the line and the audit say so, a count alone.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k8, "--grants", "g-b,g-a", "--grants", "g-b"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-b").grants, Some(vec!["g-a".to_string(), "g-b".to_string()]));
+    assert!(w.param(SIGNERS).unwrap().0.contains(r#","grants":["g-a","g-b"]}"#), "{:?}", w.param(SIGNERS));
+    assert_eq!(stdout(&o), format!("allowed token signer mac-b (key fp {}) for grants g-a,g-b until {day} ({SIGNERS} v{}, 2 token signer(s)); the relay takes its tokens within 60 s\n", fp(8), start + 1));
+    // RO-6 on stderr: a hard guard is not worth it, as for `--tls-key` (LD-R65), and `relay status` then says `[NO ]`.
+    let before_part_h = "note: a relay before part H refuses this list whole and every token then fails (RO-6): ai-env relay status's relay row must end client certificates required first\n";
+    assert!(stderr(&o).contains(before_part_h), "{}", stderr(&o));
+    let row = audit_row(w);
+    assert_eq!((row["detail"]["outcome"].as_str(), row["detail"]["grants"].as_str()), (Some("added"), Some("2")), "{row}");
+    assert!(!row.to_string().contains("g-a"), "a count, no glob, in the audit: {row}");
+    // The same set again, in any order: nothing written.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k8, "--grants", "g-a,g-b"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("token signer mac-b (key fp {}) is already allowed for grants g-a,g-b until {day} ({SIGNERS} v{}); nothing written\n", fp(8), start + 1));
+    assert!(!stderr(&o).contains("note:"), "nothing written: {}", stderr(&o));
+    assert_eq!((audit_row(w)["detail"]["outcome"].as_str(), audit_row(w)["detail"]["grants"].as_str()), (Some("unchanged"), Some("2")));
+    // Without it the set is kept: a key rotation, and the same key again.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-b").grants, Some(vec!["g-a".to_string(), "g-b".to_string()]), "kept through a new key");
+    assert_eq!(entry(&held(w), "mac-b").public_key, key_of(9).b64());
+    assert_eq!(stdout(&o), format!("allowed token signer mac-b (key fp {}) for grants g-a,g-b until {day} ({SIGNERS} v{}, 2 token signer(s)); replaced its key fp {} by fp {}; the relay takes its tokens within 60 s\n", fp(9), start + 2, fp(8), fp(9)));
+    assert!(!stderr(&o).contains("note:"), "no --grants: {}", stderr(&o));
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9], Who::Deployer);
+    assert!(stdout(&o).ends_with("; nothing written\n") && stdout(&o).contains(" for grants g-a,g-b until "), "{}", stdout(&o));
+    // Another set replaces the whole set; `*` reaches every grant, by name.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9, "--grants", "g-c"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-b").grants, Some(vec!["g-c".to_string()]), "exactly the new set");
+    assert_eq!(audit_row(w)["detail"]["outcome"].as_str(), Some("replaced"));
+    let o = w.run(&["allow", "mac-c", "--token-signer", "--key", &key_text(10), "--grants", "*"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-c").grants, Some(vec!["*".to_string()]));
+    assert!(stdout(&o).contains(" for grants * until "), "{}", stdout(&o));
+    // No --grants on a new entry: no key in the list, ` for every grant`, no count in the audit.
+    let o = w.run(&["allow", "mac-d", "--token-signer", "--key", &key_text(11)], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-d").grants, None);
+    assert!(stdout(&o).contains(&format!("allowed token signer mac-d (key fp {}) for every grant until {day} (", fp(11))), "{}", stdout(&o));
+    assert!(audit_row(w)["detail"].get("grants").is_none(), "{}", audit_row(w));
+    let o = w.run(&["allow", "mac-d", "--token-signer", "--key", &key_text(11)], Who::Deployer);
+    assert!(stdout(&o).contains(&format!("token signer mac-d (key fp {}) is already allowed for every grant until {day} (", fp(11))), "{}", stdout(&o));
+    // A worker's line and audit are as they were.
+    let o = w.run(&["allow", "worker-a", "--key", &key_text(1), "--sources", "example-*"], Who::Deployer);
+    assert!(code(&o) == 0 && stdout(&o).contains(" for sources example-* until ") && !stdout(&o).contains("grant"), "{}", stdout(&o));
+    assert!(audit_row(w)["detail"].get("grants").is_none(), "{}", audit_row(w));
+    w.set_param(WORKERS, "[]", 9);
+
+    // Exit 2 before the gate and any read: a glob that is none, 17 globs, --grants on a worker.
+    let version = w.param(SIGNERS).unwrap().1;
+    let seventeen = (0..17).map(|i| format!("g{i:02}")).collect::<Vec<_>>().join(",");
+    let sixteen = (0..16).map(|i| format!("g{i:02}")).collect::<Vec<_>>().join(",");
+    for (args, why) in [
+        (vec!["allow", "mac-b", "--token-signer", "--key", k9.as_str(), "--grants", "G-A"], r#"relay allow: --grants "G-A" is not a glob (1 to 64 of [a-z0-9._-*], starting with [a-z0-9*], at most 4 *)"#),
+        (vec!["allow", "mac-b", "--token-signer", "--key", k9.as_str(), "--grants", ""], r#"relay allow: --grants "" is not a glob"#),
+        (vec!["allow", "mac-b", "--token-signer", "--key", k9.as_str(), "--grants", seventeen.as_str()], "relay allow: --grants names 17 glob(s): 1 to 16"),
+        (vec!["allow", "worker-b", "--key", k9.as_str(), "--sources", "x", "--grants", "g-a"], "--grants"),
+    ] {
+        let o = w.run(&args, Who::Nobody);
+        assert_eq!(code(&o), 2, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(why), "{args:?}: {}", stderr(&o));
+        assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{args:?}");
+    }
+    assert_eq!(w.param(SIGNERS).unwrap().1, version, "nothing written");
+    // Repeats count once: sixteen, one of them twice, is sixteen.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9, "--grants", &format!("{sixteen},g00")], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(entry(&held(w), "mac-b").grants.map(|g| g.len()), Some(16));
+    assert_eq!(audit_row(w)["detail"]["grants"].as_str(), Some("16"));
+    // The gate's refusal names the command as given, --grants with it.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9, "--grants", "g-*"], Who::Ops);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("run ai-env as deployer -- ai-env relay allow mac-b --key {k9} --token-signer --grants 'g-*'")), "{}", stderr(&o));
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k9, "--grants", "g-c"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // The rows: each signer's reach; a [warn] for an in-force signer with no `grants`, naming the command with its key.
+    let (_, session) = sealed_keys(w);
+    let warned = |id: &str, key: &str| format!("[warn] token signer {id} may mint tokens for every grant (ai-env as deployer -- ai-env relay allow {id} --token-signer --key {key} --grants <grant globs> --not-after {day})\n");
+    for status in [status_of(Some(false), true), status_of(Some(true), true)] {
+        s.logs(status, &[], &[]);
+        let (rc, out) = s.status();
+        assert_eq!(rc, 0, "never the exit code: {out}");
+        assert!(out.contains(&format!("[-  ]   token signer mac-b (key fp {}) for grants g-c until {until}\n", fp(9))), "{out}");
+        assert!(out.contains(&format!("[-  ]   token signer mac-c (key fp {}) for grants * until {until}\n[warn] token signer mac-c may mint tokens for every grant (its grants hold *)\n", fp(10))), "{out}");
+        assert!(out.contains(&format!("[-  ]   token signer mac (key fp {}) for every grant until {until}\n{}", session.fingerprint(), warned("mac", &session.text()))), "{out}");
+        assert!(out.contains(&format!("[-  ]   token signer mac-d (key fp {}) for every grant until {until}\n{}", fp(11), warned("mac-d", &key_text(11)))), "{out}");
+        assert_eq!(out.matches("may mint tokens for every grant").count(), 3, "mac-b's set is named: {out}");
+    }
+    // A signer that lapsed: no [warn]; `EXPIRED` on its row.
+    let mut list = held(w);
+    list.iter_mut().find(|e| e.signer_id == "mac-d").unwrap().not_after = LAPSED.to_string();
+    let bound_lapsed = policy::SignerEntry { signer_id: "mac-e".into(), alg: "ed25519".into(), public_key: key_of(12).b64(), not_after: LAPSED.to_string(), grants: Some(vec!["g-e".into()]) };
+    list.push(bound_lapsed);
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), 20);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("[-  ]   token signer mac-d (key fp {}) for every grant until {LAPSED} EXPIRED\n", fp(11))), "{out}");
+    assert!(out.contains(&format!("[-  ]   token signer mac-e (key fp {}) for grants g-e until {LAPSED} EXPIRED\n", fp(12))), "{out}");
+    assert!(!out.contains("token signer mac-d may mint") && !out.contains("token signer mac-e may mint") && !out.contains("token signer mac-b may mint"), "{out}");
+    // JSON: each signer's `grants`, a list or null.
+    let (rc, doc) = s.json();
+    assert_eq!(rc, 0, "{doc}");
+    let signers = doc["token_signers"].as_array().unwrap();
+    let of = |id: &str| signers.iter().find(|e| e["id"] == id).unwrap_or_else(|| panic!("{id}: {doc}"));
+    assert_eq!(of("mac-b")["grants"], serde_json::json!(["g-c"]), "{doc}");
+    assert_eq!(of("mac-c")["grants"], serde_json::json!(["*"]), "{doc}");
+    assert!(of("mac")["grants"].is_null() && of("mac").get("grants").is_some(), "null, not absent: {doc}");
+    assert_eq!(of("mac-e")["expired"], serde_json::json!(true), "{doc}");
+    // RO-6: a status line without `client_certs` (a relay before part H), or none read, gets no command, since running
+    // it now would make that relay refuse the whole list. A list that already holds grants, a lapsed entry's among them,
+    // is refused by that relay, so every token fails: `[NO ]`, naming them. With none read that is not known.
+    let not_yet = "[warn] token signer mac may mint tokens for every grant (not yet: a relay before part H refuses a list with grants, and every token then fails (RO-6))\n";
+    let refused = format!("[NO ] {SIGNERS} holds grants (token signer mac-b,mac-c,mac-e), but this relay refuses such a list, so every token fails (RO-6): deploy part D's relay, or ai-env as deployer -- ai-env relay revoke <id> --token-signer for each and allow it again without --grants\n");
+    for status in [status_of(None, true), status_of(None, false)] {
+        s.logs(status, &[], &[]);
+        let (rc, out) = s.status();
+        assert_eq!(rc, 1, "{out}");
+        assert!(out.contains(not_yet) && out.contains(&refused) && !out.contains("<grant globs>"), "{out}");
+    }
+    w.answer("logs.filter-log-events.1.json", "{\"events\": []}");
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains("[warn] relay: no status line in 10 min") && out.contains(not_yet) && !out.contains("--grants"), "{out}");
+    // No grants held: that same relay loads the list, so no `[NO ]` and no exit code.
+    let mut list = held(w);
+    for e in &mut list {
+        e.grants = None;
+    }
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), 21);
+    s.logs(status_of(None, true), &[], &[]);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && out.contains(not_yet) && !out.contains("holds grants"), "{out}");
+    // Following the row's command binds the signer and leaves its end where it was: no year added.
+    let now = ai_env_cli::wire::time::unix_now();
+    let soon = ai_env_cli::wire::time::rfc3339_utc(now - now % 86_400 + 30 * 86_400)[..10].to_string();
+    let o = w.run(&["allow", "mac-f", "--token-signer", "--key", &key_text(13), "--not-after", &soon], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    s.logs(status_of(Some(true), true), &[], &[]);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    let row = out.lines().find(|l| l.starts_with("[warn] token signer mac-f ")).unwrap_or_else(|| panic!("{out}"));
+    let command = row.split("ai-env relay ").nth(1).unwrap_or_else(|| panic!("{row}")).trim_end_matches(')').replace("<grant globs>", "g-f");
+    let o = w.run(&command.split(' ').collect::<Vec<_>>(), Who::Deployer);
+    assert_eq!(code(&o), 0, "{command}: {}", stderr(&o));
+    let bound = entry(&held(w), "mac-f");
+    assert_eq!((bound.grants, bound.not_after), (Some(vec!["g-f".to_string()]), format!("{soon}T23:59:59Z")), "{command}");
+
+    // This Mac's own entry against bridge.toml (§RS.3.2 row 6, R-135, R-145): a set that leaves out `[relay].grant` refuses every
+    // token this Mac mints, a finding; one that leaves out a workspace's grant or an offered id leaves a chat with nothing.
+    let m = StatusWorld::new();
+    let w = &m.w;
+    let (_, session) = sealed_keys(w);
+    let key = session.text();
+    let bind = |set: &str| {
+        let o = w.run(&["allow", "mac", "--token-signer", "--key", &key, "--grants", set], Who::Deployer);
+        assert_eq!(code(&o), 0, "{set}: {}", stderr(&o));
+    };
+    let finding = |held: &str, set: &str| format!("[NO ] token signer mac holds grants {held}, none of which matches [relay].grant no-grant: every token this Mac mints is refused 7 not granted (R-135) (ai-env as deployer -- ai-env relay allow mac --token-signer --key {key} --grants {set} --not-after {day})\n");
+    let nothing = |held: &str, name: &str| format!("[warn] token signer mac holds grants {held}, none of which matches {name}: a chat reaches nothing through it\n");
+    let none_of = "none of which matches";
+    w.config("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-p\"]\n\n[[workspace]]\npath = \"/w\"\nrelay_grant = \"g-w\"\n\n[[workspace]]\npath = \"/x\"\nrelay_grant = \"\"\n\n[[workspace]]\npath = \"/y\"\nrelay_grant = \"no-grant\"\n");
+    m.logs(status_of(Some(true), true), &[], &[]);
+    // No `grants`: neither row, and the [warn]'s command keeps `[relay].grant`.
+    let (rc, out) = m.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("[warn] token signer mac may mint tokens for every grant (ai-env as deployer -- ai-env relay allow mac --token-signer --key {key} --grants no-grant,<grant globs> --not-after {day})\n")) && !out.contains(none_of), "{out}");
+    // Missing `[relay].grant`: [NO ], exit 1, naming the command; each offered id and workspace grant it misses is a [warn]; the
+    // empty workspace grant is none.
+    bind("g-o");
+    let (rc, out) = m.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[-  ]   token signer mac (key fp {}) for grants g-o until {until}\n{}{}{}", session.fingerprint(), finding("g-o", "no-grant,g-o"), nothing("g-o", "g-p"), nothing("g-o", "g-w"))), "{out}");
+    assert_eq!(out.matches(none_of).count(), 3, "{out}");
+    // Following it clears the finding and leaves the entry's end: the [warn]s stay, exit 0.
+    let row = out.lines().find(|l| l.starts_with("[NO ] token signer mac ")).unwrap_or_else(|| panic!("{out}"));
+    let command = row.split("ai-env relay ").nth(1).unwrap_or_else(|| panic!("{row}")).trim_end_matches(')').to_string();
+    let o = w.run(&command.split(' ').collect::<Vec<_>>(), Who::Deployer);
+    assert_eq!(code(&o), 0, "{command}: {}", stderr(&o));
+    let bound = entry(&held(w), "mac");
+    assert_eq!((bound.grants, bound.not_after), (Some(vec!["g-o".to_string(), "no-grant".to_string()]), until.clone()), "{command}");
+    let (rc, out) = m.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&nothing("g-o,no-grant", "g-p")) && out.contains(&nothing("g-o,no-grant", "g-w")) && out.matches(none_of).count() == 2, "{out}");
+    // A glob in the set: the command quotes it. `no-grant` alone, the plan's first wording: every offered id is a [warn].
+    bind("g-*");
+    let (rc, out) = m.status();
+    assert!(rc == 1 && out.contains(&finding("g-*", "'no-grant,g-*'")) && out.matches(none_of).count() == 1, "the globs cover the rest: {out}");
+    bind("no-grant");
+    let (rc, out) = m.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&nothing("no-grant", "g-o")) && out.contains(&nothing("no-grant", "g-p")) && out.contains(&nothing("no-grant", "g-w")) && out.matches(none_of).count() == 3, "{out}");
+    // A set with them all, by name or by glob, adds neither. A glob of `*`, beside another or doubled, reaches every grant.
+    for set in ["g-o,g-p,g-w,no-grant", "g-*,no-*"] {
+        bind(set);
+        let (rc, out) = m.status();
+        assert!(rc == 0 && !out.contains(none_of) && !out.contains("token signer mac may mint"), "{set}: {out}");
+    }
+    for set in ["*", "**", "*,g-o"] {
+        bind(set);
+        let (rc, out) = m.status();
+        assert!(rc == 0 && !out.contains(none_of) && out.contains("[warn] token signer mac may mint tokens for every grant (its grants hold *)\n"), "{set}: {out}");
+    }
+    let (_, doc) = m.json();
+    assert_eq!(doc["status"]["verdict"], "ok", "{doc}");
+    // With no line read the relay is not known, and the set is still wrong: the finding stands. A relay that refuses such a list
+    // has its own [NO ], whose cure is another: no second one.
+    bind("g-o");
+    w.answer("logs.filter-log-events.1.json", "{\"events\": []}");
+    let (rc, out) = m.status();
+    assert!(rc == 1 && out.contains(&finding("g-o", "no-grant,g-o")), "{out}");
+    m.logs(status_of(None, true), &[], &[]);
+    let (rc, out) = m.status();
+    assert!(rc == 1 && out.contains("holds grants (token signer mac), but this relay refuses such a list") && !out.contains(none_of), "{out}");
+    m.logs(status_of(Some(true), true), &[], &[]);
+    // Another signer's set is not this Mac's: no row.
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &key_text(8), "--grants", "g-z"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (_, out) = m.status();
+    assert!(!out.contains("token signer mac-b holds grants"), "{out}");
+    // [relay].worker_id names the entry.
+    w.config("[relay]\nworker_id = \"mac-b\"\ngrant = \"no-grant\"\n");
+    let (rc, out) = m.status();
+    assert!(rc == 1 && out.contains(&format!("[NO ] token signer mac-b holds grants g-z, none of which matches [relay].grant no-grant: every token this Mac mints is refused 7 not granted (R-135) (ai-env as deployer -- ai-env relay allow mac-b --token-signer --key {} --grants no-grant,g-z --not-after {day})\n", key_text(8))) && !out.contains("token signer mac holds grants"), "{out}");
+    // No `[relay].grant`: the offered ids alone, and no finding. One that is no id mints nothing: no row of it.
+    w.config("[relay]\noffer = [\"g-o\", \"g-p\"]\n");
+    let (rc, out) = m.status();
+    assert!(rc == 0 && out.contains(&nothing("g-o", "g-p")) && out.matches(none_of).count() == 1, "{out}");
+    w.config("[relay]\ngrant = \"Not An Id\"\n");
+    let (rc, out) = m.status();
+    assert!(rc == 0 && !out.contains(none_of), "{out}");
+    let o = w.run(&["revoke", "mac", "--token-signer"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let o = w.run(&["allow", "mac", "--token-signer", "--key", &key], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (rc, out) = m.status();
+    assert!(rc == 0 && out.contains(&format!("[warn] token signer mac may mint tokens for every grant (ai-env as deployer -- ai-env relay allow mac --token-signer --key {key} --grants <grant globs> --not-after {day})\n")), "{out}");
+    // A lapsed entry is refused 16 before any of this, and `this Mac's session key` says so: neither row.
+    w.config("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\"]\n");
+    let mut list = held(w);
+    let mine = list.iter_mut().find(|e| e.signer_id == "mac").unwrap();
+    mine.not_after = LAPSED.to_string();
+    mine.grants = Some(vec!["g-z".to_string()]);
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), 40);
+    let (rc, out) = m.status();
+    assert!(rc == 1 && !out.contains("token signer mac holds grants") && out.contains("is not an in-force token signer as mac"), "{out}");
 }

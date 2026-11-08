@@ -16,7 +16,7 @@ use crate::keys::{PublicKey, SigningKey, SIGNATURE_LEN};
 pub const SESSION_DOMAIN: &[u8] = b"ai-env/relay/session/v1";
 /// Every token starts with it.
 pub const TOKEN_PREFIX: &str = "v1.";
-/// The `aud` claim.
+/// The `aud` claim's default: the id of a relay that names no other (R-137).
 pub const SESSION_AUD: &str = "ai-env-relay";
 /// The longest session: 8 h.
 pub const SESSION_MAX_S: u64 = 28_800;
@@ -33,9 +33,9 @@ pub const CLAIMS_MAX: usize = 1024;
 pub struct SessionClaims {
     /// The token signer's id.
     pub kid: String,
-    /// `SESSION_AUD`.
+    /// The id of the relay it is for (R-137): `SESSION_AUD` unless `[relay].relay_id` says otherwise.
     pub aud: String,
-    /// The caller's id.
+    /// The caller's id: always its signer's, `kid` (R-133).
     pub caller_id: String,
     /// The spawn's id (a uuid, LD-WM4).
     pub session_id: String,
@@ -53,12 +53,14 @@ pub struct SessionClaims {
     pub exp: u64,
 }
 
-/// A token signer's key and its `not_after`, as `verify` looks it up.
+/// A token signer's key, its `not_after` and its grants, as `verify` looks it up.
 pub struct SignerKey {
     /// The key.
     pub public_key: crate::keys::PublicKey,
     /// Unix seconds.
     pub not_after: u64,
+    /// The grant-id globs it may mint tokens for (R-134); `None`: every grant.
+    pub grants: Option<Vec<String>>,
 }
 
 /// A token that verified.
@@ -66,6 +68,8 @@ pub struct SignerKey {
 pub struct VerifiedSession {
     /// Its claims.
     pub claims: SessionClaims,
+    /// Its signer's grant-id globs, which the relay holds the token's grant to (R-134, R-135); `None`: every grant.
+    pub signer_grants: Option<Vec<String>>,
 }
 
 /// `lp(SESSION_DOMAIN) ‖ lp(claims)`.
@@ -81,7 +85,12 @@ pub fn signing_input(claims_json: &[u8]) -> Vec<u8> {
 
 /// `v1.` ‖ b64url(claims) ‖ `.` ‖ b64url(signature); refuses what `verify` would (WM-R5).
 pub fn mint(key: &crate::keys::SigningKey, claims: &SessionClaims, now: u64) -> Result<String, SessionError> {
-    check_claims(claims, now)?;
+    mint_for(key, claims, SESSION_AUD, now)
+}
+
+/// [`mint`] for the relay named `aud`, which `claims.aud` must be: refuses what [`verify_for`] would (R-137).
+pub fn mint_for(key: &crate::keys::SigningKey, claims: &SessionClaims, aud: &str, now: u64) -> Result<String, SessionError> {
+    check_claims(claims, aud, now)?;
     let json = serde_json::to_vec(claims).map_err(|_| SessionError::Malformed("claims"))?;
     if json.len() > CLAIMS_MAX {
         return Err(SessionError::Malformed("claims over 1024 bytes"));
@@ -115,6 +124,11 @@ fn verify_once(key: &PublicKey, input: &[u8], signature: &[u8]) -> bool {
 /// force, else the throw-away key, with `UnknownSigner` or `SignerExpired` returned after it; so the time of a
 /// refusal says nothing about which `kid`s are signers.
 pub fn verify(token: &str, now: u64, signer: &dyn Fn(&str) -> Option<SignerKey>) -> Result<VerifiedSession, SessionError> {
+    verify_for(token, SESSION_AUD, now, signer)
+}
+
+/// [`verify`] for the relay named `aud` (R-137): `aud` is the one claim a relay's own id decides.
+pub fn verify_for(token: &str, aud: &str, now: u64, signer: &dyn Fn(&str) -> Option<SignerKey>) -> Result<VerifiedSession, SessionError> {
     let shape = parse(token)?;
     let key = signer(&shape.claims.kid);
     let fault = match &key {
@@ -133,8 +147,8 @@ pub fn verify(token: &str, now: u64, signer: &dyn Fn(&str) -> Option<SignerKey>)
     if !verified {
         return Err(SessionError::BadSignature);
     }
-    check_claims(&shape.claims, now)?;
-    Ok(VerifiedSession { claims: shape.claims })
+    check_claims(&shape.claims, aud, now)?;
+    Ok(VerifiedSession { claims: shape.claims, signer_grants: key.and_then(|k| k.grants) })
 }
 
 /// The claims unverified: for display only.
@@ -172,15 +186,20 @@ fn parse(token: &str) -> Result<Shape, SessionError> {
     Ok(Shape { json, claims: parsed, signature })
 }
 
-/// WM-R6's claim steps after the signature: `aud`, the ids, then the times.
-fn check_claims(c: &SessionClaims, now: u64) -> Result<(), SessionError> {
-    if c.aud != SESSION_AUD {
+/// WM-R6's claim steps after the signature: `aud` (this relay's id, R-137), the ids, the caller its signer (R-133),
+/// then the times.
+fn check_claims(c: &SessionClaims, aud: &str, now: u64) -> Result<(), SessionError> {
+    if c.aud != aud || !valid_id(aud) {
         return Err(SessionError::BadClaim("aud"));
     }
     for (name, value) in [("kid", &c.kid), ("caller_id", &c.caller_id), ("grant_id", &c.grant_id)] {
         if !valid_id(value) {
             return Err(SessionError::BadClaim(name));
         }
+    }
+    // LD-WM5 made the caller id the Mac's id, and the agent mints both as `[relay].worker_id`: no signer names another.
+    if c.caller_id != c.kid {
+        return Err(SessionError::BadClaim("caller_id"));
     }
     if !valid_uuid(&c.session_id) {
         return Err(SessionError::BadClaim("session_id"));
@@ -266,7 +285,7 @@ mod tests {
     /// The seed-7 key, in force until `not_after`, as the only signer `mac`.
     fn signers(not_after: u64) -> impl Fn(&str) -> Option<SignerKey> {
         let public_key = seven().public_key();
-        move |kid: &str| (kid == "mac").then_some(SignerKey { public_key, not_after })
+        move |kid: &str| (kid == "mac").then_some(SignerKey { public_key, not_after, grants: None })
     }
 
     /// A token of these exact claim bytes, signed by `key`: what `mint` would refuse to make.
@@ -430,5 +449,63 @@ mod tests {
         let request = format!("{DOC}    pub chat_id: Option<String>,\n");
         assert!(include_str!("session.rs").contains(&claim), "SessionClaims::chat_id's doc");
         assert!(include_str!("agent.rs").contains(&request), "MintRequest::chat_id's doc");
+    }
+
+    /// WM-T61 (R-133): `mint` and `verify` refuse a `caller_id` that is not the token's `kid`, whatever its spelling, and
+    /// after the one verify; the verified token hands back its signer's grants as `SignerKey` holds them (R-134).
+    #[test]
+    fn a_token_is_its_signers_own() {
+        let key = seven();
+        let forged = SessionClaims { caller_id: "mac-desk".into(), ..claims() };
+        assert_eq!(mint(&key, &forged, NOW), Err(SessionError::BadClaim("caller_id")));
+        let signed = token_of(&key, &serde_json::to_vec(&forged).expect("json"));
+        VERIFIES.with(|c| c.set(0));
+        assert_eq!(verify(&signed, NOW, &signers(u64::MAX)), Err(SessionError::BadClaim("caller_id")));
+        assert_eq!(VERIFIES.with(std::cell::Cell::get), 1, "refused after the one verify");
+        assert_eq!(peek(&signed).expect("peeks").caller_id, "mac-desk", "peek checks nothing");
+        // The ids' grammar comes first: an empty caller is no id at all.
+        let none = SessionClaims { caller_id: String::new(), ..claims() };
+        assert_eq!(mint(&key, &none, NOW), Err(SessionError::BadClaim("caller_id")));
+        // Under another signer's name: the caller has to follow the `kid`, not stay this Mac's.
+        let public_key = key.public_key();
+        let lookup = move |kid: &str| (kid == "mac-b").then_some(SignerKey { public_key, not_after: u64::MAX, grants: None });
+        let moved = SessionClaims { kid: "mac-b".into(), ..claims() };
+        assert_eq!(mint(&key, &moved, NOW), Err(SessionError::BadClaim("caller_id")));
+        assert_eq!(verify(&token_of(&key, &serde_json::to_vec(&moved).expect("json")), NOW, &lookup), Err(SessionError::BadClaim("caller_id")));
+        let own = SessionClaims { kid: "mac-b".into(), caller_id: "mac-b".into(), ..claims() };
+        assert_eq!(verify(&mint(&key, &own, NOW).expect("minted"), NOW, &lookup).expect("verifies").claims, own);
+
+        // WM-T6's bytes hold both as `mac`: `claims()`, with no grants on its signer. A signer's grants come back as given.
+        let good = mint(&key, &claims(), NOW).expect("minted");
+        assert_eq!(verify(&good, NOW, &signers(u64::MAX)).expect("verifies"), VerifiedSession { claims: claims(), signer_grants: None });
+        let bound = move |_: &str| Some(SignerKey { public_key, not_after: u64::MAX, grants: Some(vec!["g-*".to_string()]) });
+        assert_eq!(verify(&good, NOW, &bound).expect("verifies").signer_grants, Some(vec!["g-*".to_string()]));
+    }
+
+    /// WM-T64 (R-137): a token is minted for one relay's id and verified by that relay alone; `mint` and `verify` keep
+    /// `SESSION_AUD` as the default, so two sides at their defaults change nothing, and an `aud` that is no id is refused.
+    #[test]
+    fn a_token_for_another_relay_is_refused() {
+        let key = seven();
+        let for_b = SessionClaims { aud: "relay-b".into(), ..claims() };
+        let token = mint_for(&key, &for_b, "relay-b", NOW).expect("minted for its relay");
+        assert_eq!(verify_for(&token, "relay-b", NOW, &signers(u64::MAX)).expect("verifies").claims, for_b);
+        assert_eq!(verify_for(&token, "relay-a", NOW, &signers(u64::MAX)), Err(SessionError::BadClaim("aud")));
+        assert_eq!(verify_for(&token, SESSION_AUD, NOW, &signers(u64::MAX)), Err(SessionError::BadClaim("aud")));
+        assert_eq!(verify(&token, NOW, &signers(u64::MAX)), Err(SessionError::BadClaim("aud")), "verify is the default relay's");
+        assert_eq!(mint(&key, &for_b, NOW), Err(SessionError::BadClaim("aud")), "mint is the default relay's");
+        assert_eq!(mint_for(&key, &for_b, "relay-a", NOW), Err(SessionError::BadClaim("aud")), "the claim must name the relay");
+        // The defaults meet: WM-T6's token is `verify_for(SESSION_AUD)`'s, and a relay of another id refuses it.
+        let default = mint(&key, &claims(), NOW).expect("minted");
+        assert_eq!(default, mint_for(&key, &claims(), SESSION_AUD, NOW).expect("minted"));
+        assert_eq!(verify_for(&default, SESSION_AUD, NOW, &signers(u64::MAX)).expect("verifies").claims, claims());
+        assert_eq!(verify_for(&default, "relay-b", NOW, &signers(u64::MAX)), Err(SessionError::BadClaim("aud")));
+        // A relay id out of the ids' grammar (a bridge.toml edited under a running agent) makes no token.
+        let bad = SessionClaims { aud: "Relay B".into(), ..claims() };
+        assert_eq!(mint_for(&key, &bad, "Relay B", NOW), Err(SessionError::BadClaim("aud")));
+        // Still one verify, wherever the token was meant to go.
+        VERIFIES.with(|c| c.set(0));
+        assert!(verify_for(&token, "relay-a", NOW, &signers(u64::MAX)).is_err());
+        assert_eq!(VERIFIES.with(std::cell::Cell::get), 1);
     }
 }

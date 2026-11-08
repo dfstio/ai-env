@@ -49,9 +49,10 @@ public. Keep that list in your repository's own pre-push hook.
 
 ## The client certificate
 
-This relay asks for none yet, so a worker runs without one, and rustls presents a certificate only when a
-relay asks, so one installed now changes nothing. A later relay requires them, and the order is certificates
-first, then the relay that requires them: with every worker's certificate in place it deploys with no window.
+The relay requires one: it refuses at TLS a worker with no certificate under the relay CA, and gives no challenge
+to one whose fingerprint no whitelist entry in force holds. Moving from a relay that asks for none, the order is
+certificates first, then the relay that requires them: rustls presents a certificate only when a relay asks, so one
+installed early changes nothing, and with every worker's certificate in place that relay deploys with no window.
 Issue none while a relay from before the allowlist runs: it refuses a whitelist that carries a certificate's
 fingerprint and unloads the whole list, and `ai-env relay status` then says `not yet` in the worker's row.
 
@@ -62,15 +63,21 @@ fingerprint and unloads the whole list, and `ai-env relay status` then says `not
 2. On the Mac, the deployer issues the certificate, for one paste and one Touch ID (the sealed relay CA's key):
    `ai-env as deployer -- ai-env relay allow <worker-id> --key <its ed25519 key> --sources '<glob>' --tls-key 'p256:…' > relay-client.pem`.
    Stdout holds the certificate alone, which is public, and the lines go to stderr. The whitelist entry records
-   its SHA-256, and it ends with the entry's last day (`--not-after`).
+   its SHA-256, and it ends with the entry's last day (`--not-after`). Name an existing entry's day: with none,
+   `allow` moves the entry and its new certificate to a year from today.
 3. Install it as `/etc/ai-env-worker/relay-client.pem` (0640, `root:ai-env-worker`), and set
    `relay_client_cert` and `relay_client_key` in `worker.toml` (both or neither; the example has them commented
    out).
 4. `systemctl restart ai-env-worker`: the tunnel comes back at once. `ai-env relay status` on the Mac then
-   shows `cert fp …` beside the worker, in place of `[warn] worker … has no client certificate yet: …`.
+   shows `cert fp …` beside the worker, in place of `[NO ] worker … has no client certificate: the relay refuses it …`,
+   or `[warn] worker … has no client certificate yet: …` under a relay that asks for none. `my-worker check --config
+   /etc/ai-env-worker/worker.toml --offline` ends its line with `, cert fp <16 hex>`, the file its next start presents,
+   which must equal that `cert fp`.
 
 `allow` without `--tls-key` moves the entry's end, never the certificate's; a key rotation past the
-certificate's end needs `--tls-key`, or the relay refuses the worker at TLS on that day. A new relay CA
+certificate's end needs `--tls-key`, or the relay refuses the worker at TLS on that day. A new certificate closes
+no live tunnel, which stays up on the old one until it next connects: if the worker's keys may be stolen, rotate
+`--key` too, or revoke it. A new relay CA
 (`ai-env relay tls init --force`) strands every client certificate, as it strands every `relay_ca` file. Under
 a relay that requires them, `check` says `tls: the relay requires a client certificate` for a worker with
 none, and `tls: the relay refused this worker's client certificate (…)` for one it refuses.

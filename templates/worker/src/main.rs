@@ -19,6 +19,8 @@ use ai_env_worker::signer::{AgentSigner, FileSigner, Signer};
 use ai_env_worker::{RelayEndpoint, Worker};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::CertificateDer;
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -117,7 +119,16 @@ async fn check(path: &Path, offline: bool) -> Result<()> {
     let cfg = config::Config::load(path)?;
     let worker = build(&cfg).await?;
     if offline {
-        println!("config ok: worker {}, {} source(s), key fp {}", worker.worker_id(), cfg.sources.len(), worker.public_key().fingerprint());
+        // The certificate in the file, as `ai-env relay status` shows its cert fp (RO-4): a running worker keeps the one it
+        // started with, so this says what its next start presents.
+        let cert = match &cfg.relay_client_cert {
+            Some(file) => {
+                let der = CertificateDer::from_pem_file(file).with_context(|| format!("relay_client_cert {}", file.display()))?;
+                format!(", cert fp {}", certs::fingerprint(&der))
+            }
+            None => String::new(),
+        };
+        println!("config ok: worker {}, {} source(s), key fp {}{cert}", worker.worker_id(), cfg.sources.len(), worker.public_key().fingerprint());
         return Ok(());
     }
     let r = worker.check().await?;

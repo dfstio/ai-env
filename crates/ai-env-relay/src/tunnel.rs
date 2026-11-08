@@ -1,12 +1,14 @@
 //! `TunnelSvc` (`WorkerTunnel`), the close codes, the pinger, `TunnelStream` (R-6 to R-29).
 //!
-//! `open()` answers at once with the `Challenge` queued (R-7) and leaves the rest to one task per tunnel: the
-//! handshake within one budget from the connection's TLS accept, the one its `Open` had (R-9 to R-13, F24), the
+//! `open()` refuses a connection whose certificate no entry in force holds (R-126), and otherwise answers at once with
+//! the `Challenge` queued (R-7) and leaves the rest to one task per tunnel: the handshake within one budget from the
+//! connection's TLS accept, the one its `Open` had (R-9 to R-13, F24), the
 //! first catalog (R-12, R-20), then the frame loop: chunks routed through the tunnel's call table (R-37 to R-41),
 //! later catalogs (R-28), pings and the liveness timer (R-29), and at the end the teardown (R-24). Everything that
 //! awaits on behalf of the call table awaits here, on values cloned out of it (R-75). The tunnel's task and its
-//! response stream each end their connection's one use (R-2a): the first of them to go starts the grace after which
-//! `serve.rs`'s watch cuts the connection. A second `Open` on the connection cuts it at once (R-6).
+//! response stream each end their connection's one use (R-2a), as `open()`'s refusal does: the first of them to go
+//! starts the grace after which `serve.rs`'s watch cuts the connection. A second `Open` on the connection cuts it at
+//! once (R-6).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -82,6 +84,18 @@ impl WorkerTunnel for TunnelSvc {
             }
             Err(OpenRefused::Closing) => return Err(closing()),
         }
+        // R-126: the connection's one use is taken; its certificate must be an in-force worker's before any Challenge,
+        // so an ex-worker reaches no gRPC byte past here, whatever state the lists are in.
+        if let Err(fault) = certificate_in_force(st, &peer) {
+            let line = TunnelFields { peer: peer.ip.to_string(), phase: "auth", outcome: "refused", reason: fault.word(), ..TunnelFields::default() };
+            st.log.tunnel(st.now(), &line);
+            if fault.is_fault() {
+                st.slots.fault(peer.ip, Instant::now());
+            }
+            // R-2a: the connection's use ends at once, and its watch cuts it after the grace.
+            drop(TunnelEnd::new(&conn));
+            return Err(tonic::Status::unauthenticated("authentication failed"));
+        }
         let nonce = handshake::new_nonce();
         let (tx, rx) = mpsc::channel(st.cfg.limits.tunnel_queue as usize);
         let challenge = Challenge { nonce: nonce.to_vec(), relay_id: st.cfg.relay_id.clone(), protocol: ai_env_relay_proto::PROTOCOL };
@@ -98,6 +112,20 @@ impl WorkerTunnel for TunnelSvc {
 /// R-2a: an `Open` on a connection whose deadline passed, or whose cut is under way.
 fn closing() -> tonic::Status {
     tonic::Status::unavailable("the connection is closing")
+}
+
+/// R-126: `no_cert` with no client certificate on the connection; `not_loaded` or `stale` while the workers file is not
+/// loaded or not fresh (the relay's own, LD-R33); `unknown_cert` when no entry in force holds its fingerprint.
+fn certificate_in_force(st: &RelayState, peer: &PeerInfo) -> Result<(), AuthFault> {
+    let cert_fp = peer.cert_fp.as_ref().ok_or(AuthFault::NoCert)?;
+    let workers = handshake::whitelist(&st.live.workers, st.now(), st.max_stale())?;
+    let (presented, now_unix) = (hex::encode(cert_fp), st.now_unix());
+    let held = workers.value.entries.iter().any(|e| e.tls_fp.as_deref() == Some(presented.as_str()) && now_unix <= e.not_after_unix());
+    if held {
+        Ok(())
+    } else {
+        Err(AuthFault::UnknownCert)
+    }
 }
 
 fn frame(msg: relay_frame::Msg) -> RelayFrame {
@@ -315,7 +343,7 @@ impl Tunnel {
             _ => return Err(AuthFault::OutOfOrder),
         };
         let loaded = handshake::whitelist(&st.live.workers, st.now(), st.max_stale())?;
-        let entry = handshake::verify_proof(Some(&loaded.value), &st.cfg.relay_id, &self.nonce, &hello, &proof, st.now_unix())?;
+        let entry = handshake::verify_proof(Some(&loaded.value), &st.cfg.relay_id, &self.nonce, &hello, &proof, self.peer.cert_fp.as_ref(), st.now_unix())?;
         Ok(Authed { entry, hello, whitelist_version: loaded.version })
     }
 

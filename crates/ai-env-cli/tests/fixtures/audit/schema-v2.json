@@ -1661,7 +1661,8 @@
         "version",
         "sources",
         "not_after",
-        "tls_fp"
+        "tls_fp",
+        "grants"
       ],
       "required": [
         "kind",

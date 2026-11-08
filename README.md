@@ -211,9 +211,10 @@ ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a 
 ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
 ai-env relay  keygen [--force] | pubkey [--worker|--session] [--verify] | ca [--der]   # this Mac's two relay keys, sealed with no Touch ID /
                                                           #   printed (--verify: one Touch ID) / the relay CA's certificate, for a worker (S13; no AWS)
-ai-env relay  allow ID --key KEY --sources GLOBS [--tls-key P256]|--token-signer [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
+ai-env relay  allow ID --key KEY --sources GLOBS [--tls-key P256]|--token-signer [--grants GLOBS] [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
                                                           #   whitelist and token signers, as ai-env-deployer only (S13); --tls-key also issues
-                                                          #   the worker's client certificate, printed on stdout (one Touch ID)
+                                                          #   the worker's client certificate, printed on stdout (one Touch ID); --grants binds a
+                                                          #   token signer to the grants it may mint tokens for
 ai-env relay  allow-ip CIDR --label ID [--not-after YYYY-MM-DD] [--wide] | allow-ip --mine [--hours N] | revoke-ip CIDR|--label ID   # the networks the
                                                           #   relay's public face admits, as ai-env-deployer only; --mine: this Mac's address, 24 h
 ai-env relay  grant GRANT RULE… | grant GRANT --remove | tls init [--force] | tls rotate   # the grants (default-deny), the relay CA and
@@ -647,14 +648,14 @@ token Anthropic refuses ends with 5 and such a line too: Credentials).
   stays the interactive path.
 - **What a command runs as.** uid/gid 1000 in its own session and process group, `NO_NEW_PRIVS` (no
   setuid binary or file capability changes its uid), a cleared environment (`HOME=/Users/mike`, `PATH`,
-  `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, then `--env K=V`: never `AWS_*`, `CLAUDECODE`,
-  `NODE_OPTIONS` or a TOKEN/KEY/SECRET/PASSWORD name; `vpc` rows also get the proxy variables), the
-  working directory created and entered as the agent (`--cwd`, default HOME: no root filesystem
-  operation ever touches an agent-writable path), fds 0–2 only. When the command's leader exits, its
-  group gets TERM, then KILL 1 s later; once no command is left, any agent process still alive (a
-  `setsid` escaper) is killed. `vm exec` and `vm attach` are refused (exit 9) on `--shell` VMs (the
-  session itself refuses such a VM, whoever asks) until the platform shell's in-VM listener is shown
-  unreachable from the agent.
+  `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, `PYTHONDONTWRITEBYTECODE=1`, then `--env K=V`: never
+  `AWS_*`, `CLAUDECODE`, `NODE_OPTIONS` or a TOKEN/KEY/SECRET/PASSWORD name; `vpc` rows also get the
+  proxy variables), the working directory created and entered as the agent (`--cwd`, default HOME: no
+  root filesystem operation ever touches an agent-writable path), fds 0–2 only. When the command's
+  leader exits, its group gets TERM, then KILL 1 s later; once no command is left, any agent process
+  still alive (a `setsid` escaper) is killed. `vm exec` and `vm attach` are refused (exit 9) on `--shell`
+  VMs (the session itself refuses such a VM, whoever asks) until the platform shell's in-VM listener is
+  shown unreachable from the agent.
 - **The peer guard.** The platform POSTs its hooks from 127.0.0.1 inside the VM, so an address cannot
   tell it from the agent; socket ownership can. Under `--hook-source peer` (the image default) a runtime
   hook (`run`, `resume`, `suspend`, `terminate`) from a local client is admitted only when the client's
@@ -2383,6 +2384,11 @@ time, and calls in flight finish. The relay reads the list on each request and j
 refused or lapsed adds nothing, unloads nothing else and closes nothing.
 If the reload cannot fetch or write, the old list stays in force until it goes stale, at most 900 s after its
 last good fetch, and then every list fails closed; `ai-env relay stop` is the immediate cut.
+An approval reaches a grant only within the `--grants` of the signer whose token names the chat: the relay refuses a
+token whose own grant none of its signer's globs matches, `not granted`, and adds only the approved grants they match.
+So a signer bound for these chats names `no-grant` and every offered grant (`--grants no-grant,example-a`).
+`relay status` says `[NO ]` when the set leaves out `[relay].grant`, and `[warn]` when it leaves out a workspace's
+grant or an offered id, and `relay access --allow` says so in a `note:` when it leaves out the grant it approves.
 
 Each chat has one access id, a uuid this Mac chooses at its first start and keeps in its registry row
 (`access_id`), which every token of the chat names as its `chat_id`. So approval survives a respawn, a move,
@@ -2503,7 +2509,9 @@ call, exit 9), and ai-env-ops also writes the fifth (`ai-env relay access`, whic
   (globs), its last valid day (`--not-after`: a year by default, at most two) and, once it has a client
   certificate, that certificate's SHA-256 (`tls_fp`, below);
 - `token-signers`: the keys whose VM session tokens the relay takes, each Mac's session key
-  (`--token-signer`); a key has one id and one role, so a worker's key never mints tokens;
+  (`--token-signer`); a key has one id and one role, so a worker's key never mints tokens; a signer may hold
+  grant globs (`--grants`, 1 to 16), the grants its tokens and its chats' approvals then reach, and with none it
+  reaches every grant; a token's caller is its signer, and one signer holds at most 256 sessions;
 - `grants`, default-deny: each grant is a list of `SOURCE-GLOB/OP-GLOB` rules, and a chat lists and
   calls only what its token's grant reaches (`*/*` reaches everything, which the command notes);
 - `peers`, the public face's allowlist: each entry a network, a label and the moment it lapses (below);
@@ -2572,7 +2580,9 @@ dialing until `ai-env relay start`.
 then, as ai-env-ops, the instance, SSM's ping, a TCP probe of port 443, the relay's newest status line, what
 it refused in the last hour, the workers, the token signers, the grants, the peers list and the access list. `[NO ]` is exit
 1: this Mac's session key is no token signer in force, a list does not parse, the instance is not running,
-or the peers list is absent or holds no entry in force. `[?? ]` is a read that failed, exit 7 unless a finding
+the peers list is absent or holds no entry in force, a worker in force has no client certificate under a relay that
+requires one, the token-signers list holds grants under a relay that refuses them, or this Mac's token signer
+holds grants that leave out `[relay].grant`. `[?? ]` is a read that failed, exit 7 unless a finding
 came first. `[warn]` and `[-  ]` never change the exit. `--json` holds the same under `instance` (with its
 `refused` and `disk_full`), `workers`, `token_signers`, `grants`, `peers`, `access`, `status` and `mac`. The rows that
 speak of the allowlist, the bans, the certificates and the chats:
@@ -2582,15 +2592,32 @@ speak of the allowlist, the bans, the certificates and the chats:
   relay itself refused this Mac (a ban, or no fresh list); `[warn] probe: …:443 did not accept a TCP connection
   within 3 s (…); …`, this Mac's address is off the list, or its network blocks it.
 - The status line's row ends `peers … (… s old)`, or `peers -` when the relay is older than the list or holds
-  none. `[warn] relay: its peers list is not loaded: it admits no worker` says so whatever SSM holds.
+  none, then `; client certificates required` on a relay that requires them, which also parses a signer's grants.
+  `[warn] relay: its peers list is not loaded: it admits no worker` says so whatever SSM holds, and
+  `[warn] relay: it holds no TLS config: it serves nobody (…)` when both faces refuse `no_tls`.
 - The refused hour counts the request log's last hour: `refused in the last hour: N handshake(s) from M
   address(es), P connection(s) refused or cut, B address(es) banned, U connection(s) from unlisted addresses;
   top reasons: r1 n1, r2 n2, r3 n3`. `N` is refused handshakes, `P` the peer lines but the allowlist's refusals,
-  `U` those refusals. It is `[warn]` when `N` or `B` is above zero, else `[ok ]`, and never the exit. `U` never
-  warns, and with the kernel dropping unlisted SYNs it stays near zero. Beside it,
+  `U` those refusals. It is `[warn]` when `N` or `B` is above zero, or with 10 or more `tls_failed` lines on the
+  public face (`refused.tls_failed` in `--json`), else `[ok ]`, and never the exit: a worker refused at TLS (no
+  certificate, an expired one, one under another CA, or not restarted since its install) writes only those, about
+  one a minute, and alone on its address never reaches a ban, while each `relay status` probe writes one with no
+  fault. `U` never warns, and with the kernel dropping unlisted SYNs it stays near zero. Beside it,
   `[warn] relay: the root volume is over 90 % full (the reload's why=disk at …)`.
-- Each worker's row shows `cert fp …` or `no cert fp`. `[warn] worker … has no client certificate yet: a relay
-  that requires client certificates would refuse it (…)` is the row to expect while this relay asks for none.
+- Each worker's row shows `cert fp …` or `no cert fp`. A worker in force with none is `[NO ] worker … has no client
+  certificate: the relay refuses it (…)` when the newest status line says `client_certs: true`, naming the command
+  with its key, its globs and its day, and `[warn] worker … has no client certificate yet: a relay that requires
+  client certificates would refuse it (…)` when it says otherwise or was not read. After the workers' rows,
+  `[warn] relay: this relay asks for no client certificate, though N worker(s) hold one: part D's relay is not
+  running (make relay-logs: rollback=)` is right while certificates are installed and for up to 5 minutes after
+  the new relay starts, and past that says the binary rolled back.
+- Each token signer's row shows `for every grant` or `for grants …`. One in force that reaches every grant, with no
+  `grants` or with a glob of `*` alone, is `[warn] token signer … may mint tokens for every grant (…)`; before a relay
+  that parses a signer's grants that row says `not yet`, and a list already holding some is `[NO ] … holds grants
+  (token signer …), but this relay refuses such a list, so every token fails (RO-6): …`. This Mac's own entry, in force,
+  is read against `bridge.toml`: `[NO ] token signer … holds grants …, none of which matches [relay].grant …: every
+  token this Mac mints is refused 7 not granted (R-135) (…)`, and `[warn] token signer … holds grants …, none of which
+  matches …: a chat reaches nothing through it` for a workspace's grant or an offered id.
 - The peers list is read in a call of its own: `[ok ] /ai-env/relay/peers v2: 3 peer(s), 2 in force`, then one
   `[-  ]   peer … until …` per entry, a lapsed one's ending `EXPIRED`. It is `[NO ]` when absent or with none in
   force (`the relay admits no worker`) or when it does not parse, and `[?? ] /ai-env/relay/peers could not be
@@ -2612,7 +2639,11 @@ seals its key into `credentials/relay-ca.env` (no Touch ID), writes its certific
 within a minute and ops never reads. `--force` makes a new CA, which strands every worker's pinned
 `relay_ca` file and client certificate; `ai-env relay tls rotate` issues a new certificate under the
 sealed CA (one paste, one
-Touch ID). Both run only as ai-env-deployer, and hand the value to aws on its stdin, never in a file: under
+Touch ID). Without `--force`, `tls init` is exit 1 when a CA exists, on this Mac or behind a live
+`/ai-env/relay/tls` this Mac holds no file of (read with no decryption, before anything is sealed), and says what
+`tls rotate` needs when `credentials/relay-ca.env` or `state/relay-ca.der` is not here. If its write of the value fails
+(exit 7), the new CA stands: `tls rotate` writes the value under it, and the text says what a replaced CA strands.
+Both run only as ai-env-deployer, and hand the value to aws on its stdin, never in a file: under
 `ai-env as root` or `ambient` they are refused (exit 9), since that aws CLI reads your own aws config, whose
 `cli_history` would record the relay's private key. `ai-env relay ca` prints the CA's certificate for a worker
 (no AWS, no Touch ID).
@@ -2624,6 +2655,7 @@ grant = "default"       # the grant a remote chat's token names; "" (the default
                         #   a name in no grant list ("no-grant"): a token and the tools, an empty catalog until approved
 agent_hours = 12        # ai-env relay agent's life, 1 to 24
 offer = ["example-a"]   # what the panel offers each chat and relay access --allow takes: at most 16 ids with no `.`; none by default
+relay_id = "ai-env-relay"  # the relay these tokens are for: it must equal the relay's AI_ENV_RELAY_ID, and both default to this
 
 [[workspace]]
 path = "/path/to/a/repo"
@@ -2647,7 +2679,8 @@ ai-env egress check                             # (two Touch IDs) before any rem
 ai-env as deployer -- ai-env relay tls init     # (one paste) the relay CA, sealed here, and the relay's certificate
 make relay-logs SINCE=10m                       # (ops: one Touch ID) within two minutes, the reload's ok line
 ai-env relay keygen                             # no Touch ID; prints the allow commands with this Mac's keys
-ai-env as deployer -- ai-env relay allow mac --token-signer --key 'ed25519:…'   # (one paste) the relay takes this Mac's tokens
+ai-env as deployer -- ai-env relay allow mac --token-signer --key 'ed25519:…' --grants default,example-a   # (one paste) the relay takes this Mac's tokens,
+                                                #   for [relay].grant and each offered grant: a set without the first refuses every token
 ai-env as deployer -- ai-env relay grant default 'example-*/*'                  # (one paste) every op of the sources example-*
 ai-env relay agent                              # one Touch ID; leave it running, and name the grant in bridge.toml (above)
 ai-env as deployer -- ai-env relay allow example-worker --key 'ed25519:…' --sources 'example-*'   # (one paste) a server's worker
@@ -2693,30 +2726,38 @@ this Mac, through `ai-env relay agent`). Workers for your own databases, APIs an
 repositories that pin an ai-env release tag (`relay-v…`; the template names `relay-v0.2.0`, which comes with
 the client certificates' roll-out); ai-env names none of them.
 
-**A worker's client certificate.** This relay asks for none yet, so a worker runs with or without one, and
-rustls presents a certificate only when a relay asks, so one installed now changes nothing. A relay that
-requires them refuses any worker without a certificate under the relay CA whose SHA-256 its whitelist entry
-holds. The order is certificates first, then the relay that requires them. On each worker,
+**A worker's client certificate.** The relay requires one on its public face. A worker with no certificate under
+the relay CA is refused at TLS, one whose SHA-256 no whitelist entry in force holds gets no challenge
+(`unknown_cert`), and a certificate serves only the key of the entry that holds it (`cert_mismatch`). rustls presents
+a certificate only when a relay asks, so moving from a relay that asks for none, the order is certificates first,
+then the relay that requires them: one installed early changes nothing. On each worker,
 `my-worker tls-keygen --out …` makes a P-256 key (0600, the worker's own user; apart from its Ed25519 key,
 which goes on proving who it is) and prints its point, `p256:…`, and the next command. On the Mac,
 `ai-env as deployer -- ai-env relay allow ID --key 'ed25519:…' --sources 'GLOBS' --tls-key 'p256:…'` costs one
 paste and one Touch ID, the sealed relay CA's key (the deployer alone: `ai-env as root` or `ambient` is exit 9).
 It issues a certificate that ends with the entry's last day, prints it alone on stdout (it is public; the
-lines go to stderr) and writes its SHA-256 as the entry's `tls_fp`, which this relay parses and ignores. The
+lines go to stderr) and writes its SHA-256 as the entry's `tls_fp`, which a relay that asks for none parses and
+ignores. Name an existing entry's day with `--not-after`: with none, `allow` moves the entry and its new certificate
+to a year from today. The
 certificate goes on the worker as a 0640 file of the worker's group, `relay_client_cert` and `relay_client_key`
 in `worker.toml` name the two files (both or neither), and after a restart the tunnel is back at once.
-`relay status` then shows `cert fp …` beside the worker. With a `cert fp` for every worker in force, the
+`relay status` then shows `cert fp …` beside the worker, and `my-worker check --offline` ends its line with the
+same `, cert fp …` for the file its next start presents. With a `cert fp` for every worker in force, the
 relay that requires them deploys with no window; in the other order each worker is refused at TLS until its
 certificate arrives (`check` says `tls: the relay requires a client certificate`), and those retries count as
 faults. `allow` without `--tls-key` moves the entry's end, never the certificate's; a key rotation past the
-certificate's end needs `--tls-key`, or the relay refuses the worker at TLS on that day. A worker on this Mac
+certificate's end needs `--tls-key`, or the relay refuses the worker at TLS on that day. A new certificate closes
+no live tunnel, which stays up on the old one until it next connects: if a worker's keys may be stolen, rotate `--key`
+too, or revoke it. A worker on this Mac
 keeps the same two files in the bridge's `state/` (`relay-client.key`, `relay-client.pem`), and a worker not
 built from the template passes both to `RelayEndpoint::client_identity`. `templates/worker/README.md` has the
 steps.
 
 **The security model.** The public face admits only listed addresses: the instance's kernel drops any
 other address's SYN, the relay refuses it again before any TLS byte or per-address state, and 20 faults in 10
-minutes ban a listed address for 15. A worker proves a whitelisted Ed25519 key by challenge-response: it signs a
+minutes ban a listed address for 15. A worker presents a client certificate under the relay CA at TLS, and gets a
+challenge only when an entry in force holds that certificate's SHA-256; it then proves that entry's Ed25519 key by
+challenge-response, so a stolen certificate alone reaches nothing: it signs a
 domain-separated transcript of the relay's fresh nonce, the relay's id, its own id and its key; every
 failure gets one generic `unauthenticated`, after one signature check on every well-shaped proof, known id or
 not. A connection has one budget from its TLS accept: 3 s for TLS, 5 s for its `Open`, `Hello` and
@@ -2749,7 +2790,7 @@ but the relay's own at most 60 lines a minute (`log_suppressed` in the status li
 **Also in the relay security plan.**
 
 - two audit events, `relay_allow_ip` and `relay_revoke_ip` (the label and the prefix length, never the
-  address), and `relay_allow` gains `tls_fp` (stage S11's audit); then `relay_access` (`op`, `outcome`; the grant, the
+  address), and `relay_allow` gains `tls_fp` and `grants`, a count (stage S11's audit); then `relay_access` (`op`, `outcome`; the grant, the
   chat's access id, the entry's end, the version, how many lapsed entries a write pruned), on this Mac alone;
 - `make check-advisories` checks the workspace's lock against the RustSec advisories (`cargo deny`,
   `deny.toml`). An unreachable database falls back to the cached copy, else the check is skipped with a note.
@@ -3182,7 +3223,8 @@ the diffs annoy you.
   SecureString or a worker's own 0600 key file. Workers and VM relay clients trust the relay CA alone (S13).
 - The relay's public face refuses an address outside its in-force `/ai-env/relay/peers` before any TLS byte
   and any per-address state, and with no fresh list it admits nobody; an address's 20th fault in 10 minutes
-  bans it for 15, unless it holds a tunnel or ended one in those 10 minutes (the relay security plan).
+  bans it for 15, unless it holds a tunnel or ended one in those 10 minutes. A listed address still needs a client
+  certificate under the relay CA whose fingerprint an entry in force holds (the relay security plan).
 
 ## Workspace
 

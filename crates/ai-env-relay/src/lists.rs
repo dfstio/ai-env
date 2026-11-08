@@ -67,12 +67,13 @@ impl Workers {
 }
 
 impl Signers {
-    /// The key `session::verify` needs for `signer_id` (`kid`), its own expiry checked there (WM-R6).
+    /// The key `session::verify_for` needs for `signer_id` (`kid`), its own expiry checked there (WM-R6), with the grant globs
+    /// the verified token hands back (R-134).
     pub fn key(&self, signer_id: &str) -> Option<ai_env_worker::session::SignerKey> {
         self.entries
             .iter()
             .find(|e| e.signer_id == signer_id)
-            .map(|e| ai_env_worker::session::SignerKey { public_key: e.key(), not_after: e.not_after_unix() })
+            .map(|e| ai_env_worker::session::SignerKey { public_key: e.key(), not_after: e.not_after_unix(), grants: e.grants.clone() })
     }
 }
 
@@ -253,6 +254,7 @@ mod tests {
             alg: "ed25519".into(),
             public_key: key_b64(7),
             not_after: "2027-01-01T23:59:59Z".into(),
+            grants: None,
         }])
         .unwrap();
         assert_eq!(parse_signers(signers.as_bytes()).unwrap().entries.len(), 1);
@@ -282,8 +284,8 @@ mod tests {
     fn signers_hand_their_keys_to_the_verifier() {
         let signers = Signers {
             entries: vec![
-                SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_b64(7), not_after: "2027-01-01T23:59:59Z".into() },
-                SignerEntry { signer_id: "mac-2".into(), alg: "ed25519".into(), public_key: key_b64(8), not_after: "2027-02-01T23:59:59Z".into() },
+                SignerEntry { signer_id: "mac".into(), alg: "ed25519".into(), public_key: key_b64(7), not_after: "2027-01-01T23:59:59Z".into(), grants: None },
+                SignerEntry { signer_id: "mac-2".into(), alg: "ed25519".into(), public_key: key_b64(8), not_after: "2027-02-01T23:59:59Z".into(), grants: None },
             ],
         };
         let k = signers.key("mac").expect("mac is a signer");
@@ -292,6 +294,22 @@ mod tests {
         let k2 = signers.key("mac-2").expect("mac-2 is a signer");
         assert_eq!(k2.public_key, SigningKey::from_seed(&[8; 32]).unwrap().public_key());
         assert!(signers.key("mac-9").is_none());
+    }
+
+    /// Unit 46 (R-134): the bytes a list holds reach the verifier: a signer's globs with its key, sorted as rendered; a
+    /// signer without them hands `None`, which keeps today's reach; a list with a bad glob is refused whole.
+    #[test]
+    fn a_signer_hands_its_grants_with_its_key() {
+        let signer = |id: &str, seed: u8, grants: Option<Vec<String>>| SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_b64(seed), not_after: "2027-01-01T23:59:59Z".into(), grants };
+        let text = policy::render_signers(&[signer("mac", 7, None), signer("mac-b", 8, Some(vec!["g-z".into(), "g-a".into()]))]).unwrap();
+        let signers = parse_signers(text.as_bytes()).expect("W/M's rendering loads");
+        let bound = signers.key("mac-b").expect("mac-b is a signer");
+        assert_eq!(bound.grants, Some(vec!["g-a".to_string(), "g-z".to_string()]));
+        assert_eq!(bound.public_key, SigningKey::from_seed(&[8; 32]).unwrap().public_key());
+        assert_eq!(signers.key("mac").expect("mac is a signer").grants, None);
+        assert!(signers.key("mac-9").is_none());
+        let bad = text.replace("g-z", "G-Z");
+        assert_eq!(parse_signers(bad.as_bytes()).unwrap_err(), "token-signers: entry 1: grants[1] is not a glob");
     }
 
     /// Unit 6.

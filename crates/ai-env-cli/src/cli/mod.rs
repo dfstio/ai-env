@@ -848,6 +848,9 @@ pub enum RelayCmd {
         /// Issue the worker a client certificate for this P-256 point, p256:<base64>, as tls-keygen printed it (one Touch ID: the relay CA)
         #[arg(long, value_name = "P256", conflicts_with = "token_signer")]
         tls_key: Option<String>,
+        /// The grant ids this token signer may mint tokens for: globs (default: every grant)
+        #[arg(long, value_name = "GLOB", value_delimiter = ',', requires = "token_signer", conflicts_with = "sources")]
+        grants: Vec<String>,
     },
     /// Remove a worker (or with --token-signer a token signer) from the relay's lists (as ai-env-deployer)
     Revoke {
@@ -2178,13 +2181,17 @@ mod tests {
         let RelayCmd::Pubkey { worker: false, session: false, verify: false } = relay(&["pubkey"]) else { panic!("pubkey") };
         let RelayCmd::Pubkey { worker: true, session: false, verify: true } = relay(&["pubkey", "--worker", "--verify"]) else { panic!("pubkey --worker --verify") };
         let RelayCmd::Pubkey { worker: false, session: true, verify: false } = relay(&["pubkey", "--session"]) else { panic!("pubkey --session") };
-        let RelayCmd::Allow { id, key, sources, token_signer: false, not_after, tls_key: None, .. } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
+        let RelayCmd::Allow { id, key, sources, token_signer: false, not_after, tls_key: None, grants } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
             panic!("allow --sources")
         };
+        assert!(grants.is_empty());
         assert_eq!((id.as_str(), key.as_str(), not_after.as_deref()), ("worker-a", "ed25519:K", Some("2027-10-29")));
         assert_eq!(sources, ["a", "b", "c"], "comma-separated and repeated: three globs");
-        let RelayCmd::Allow { id, sources, token_signer: true, not_after: None, tls_key: None, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K"]) else { panic!("allow --token-signer") };
-        assert!(id == "mac" && sources.is_empty());
+        let RelayCmd::Allow { id, sources, token_signer: true, not_after: None, tls_key: None, grants, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K"]) else { panic!("allow --token-signer") };
+        assert!(id == "mac" && sources.is_empty() && grants.is_empty());
+        // §RS.4.1: --grants, comma-separated or repeated; the globs' check is the command's.
+        let RelayCmd::Allow { token_signer: true, grants, .. } = relay(&["allow", "mac", "--token-signer", "--key", "ed25519:K", "--grants", "g-a,g-b", "--grants", "*"]) else { panic!("allow --grants") };
+        assert_eq!(grants, ["g-a", "g-b", "*"], "comma-separated and repeated: three globs");
         let RelayCmd::Allow { tls_key: Some(point), .. } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a", "--tls-key", "p256:P"]) else { panic!("allow --tls-key") };
         assert_eq!(point, "p256:P", "the text's check is the command's");
         // §RS.4.1: allow-ip and revoke-ip.
@@ -2229,6 +2236,9 @@ mod tests {
             &["relay", "allow", "w", "--key", "ed25519:K"],
             &["relay", "allow", "w", "--sources", "a"],
             &["relay", "allow", "w", "--key", "ed25519:K", "--token-signer", "--tls-key", "p256:P"],
+            &["relay", "allow", "w", "--key", "ed25519:K", "--sources", "a", "--grants", "g-a"],
+            &["relay", "allow", "w", "--key", "ed25519:K", "--grants", "g-a"],
+            &["relay", "allow", "w", "--key", "ed25519:K", "--token-signer", "--grants"],
             &["relay", "allow-ip"],
             &["relay", "allow-ip", "198.51.100.0/24"],
             &["relay", "allow-ip", "--label", "office"],

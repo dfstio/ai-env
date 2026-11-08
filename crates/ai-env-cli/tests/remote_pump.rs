@@ -1713,8 +1713,9 @@ fn holding(dirs: &[&Path], needles: &[String]) -> Vec<String> {
 
 /// L4 in the VM: what the VM's CLI was started with, as its fake dumps it
 /// (`FAKE_ENV_DUMP`). The shim's own (`HOME`, `PATH`, `CLAUDE_CONFIG_DIR`,
-/// `DISABLE_AUTOUPDATER`, which the wrapper names too: its half is the lib's
-/// `remote::env` test), a vpc row's six proxy variables at the proxy's
+/// `PYTHONDONTWRITEBYTECODE`, `DISABLE_AUTOUPDATER`, which
+/// the wrapper names too: its half is the lib's `remote::env`
+/// test), a vpc row's six proxy variables at the proxy's
 /// address (Cursor's own proxy setting never in their place), the wrapper's
 /// names over Cursor's values (telemetry and error reports off: Cursor's
 /// `DISABLE_TELEMETRY=0`, forwarded by `env_extra`, arrives as 1), the
@@ -1786,6 +1787,7 @@ fn the_vm_env_is_the_allowlist_plus_the_wrapper_names() {
         ("HOME", home.as_str()),
         ("CLAUDE_CONFIG_DIR", config.as_str()),
         ("DISABLE_AUTOUPDATER", "1"),
+        ("PYTHONDONTWRITEBYTECODE", "1"),
         // A vpc row's proxy variables (the spawn's first; no session name replaces one).
         ("https_proxy", proxy.as_str()),
         ("HTTPS_PROXY", proxy.as_str()),
@@ -6128,7 +6130,7 @@ fn a_vm_chat_gets_its_session_token_through_the_shim() {
     assert!(ai_env_worker::globs::valid_uuid(&access) && access != sid && access != spawn, "{access}");
     assert_eq!(row.relay.as_deref(), Some("minted"), "the row's mint word");
     let now = ai_env_cli::wire::time::unix_now();
-    let lookup = |kid: &str| (kid == RELAY_MAC).then_some(SignerKey { public_key: session_key, not_after: now + 86_400 });
+    let lookup = |kid: &str| (kid == RELAY_MAC).then_some(SignerKey { public_key: session_key, not_after: now + 86_400, grants: None });
     let claims = ai_env_worker::session::verify(&token, now, &lookup).expect("the token verifies with the sealed session key").claims;
     assert_eq!(ai_env_worker::session::peek(&token).expect("peek"), claims);
     assert_eq!(

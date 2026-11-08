@@ -23,8 +23,8 @@ pub fn main(store: &Keystore, cmd: RelayCmd) -> Result<()> {
     match cmd {
         RelayCmd::Keygen { force } => super::keys::cmd_keygen(store, force),
         RelayCmd::Pubkey { worker, session, verify } => super::keys::cmd_pubkey(store, worker, session, verify),
-        RelayCmd::Allow { id, key, sources, token_signer, not_after, tls_key } => {
-            super::params::cmd_allow(store, &super::params::AllowArgs { id: &id, key: &key, sources: &sources, token_signer, not_after: not_after.as_deref(), tls_key: tls_key.as_deref() })
+        RelayCmd::Allow { id, key, sources, token_signer, not_after, tls_key, grants } => {
+            super::params::cmd_allow(store, &super::params::AllowArgs { id: &id, key: &key, sources: &sources, token_signer, not_after: not_after.as_deref(), tls_key: tls_key.as_deref(), grants: &grants })
         }
         RelayCmd::Revoke { id, token_signer } => super::params::cmd_revoke(&id, token_signer),
         RelayCmd::Grant { grant_id, rules, remove } => super::params::cmd_grant(&grant_id, &rules, remove),

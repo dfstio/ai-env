@@ -1,5 +1,5 @@
 //! Token buckets, per-IP slots and bans, the private face's accept bucket, and sessions (R-2, R-57, R-58, R-98 to
-//! R-104, R-112). Synchronous only (R-75, a `make lint` guard): nothing in this file awaits; every map is a private
+//! R-104, R-112, R-136). Synchronous only (R-75, a `make lint` guard): nothing in this file awaits; every map is a private
 //! field here, and every method returns owned values.
 
 use std::collections::HashMap;
@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::time::Instant;
 
@@ -344,6 +345,8 @@ impl Drop for SessionPass {
 }
 
 struct Slot {
+    /// The token signer that made it, whose share of the sessions it counts in and whose tokens alone enter it (R-136).
+    signer: String,
     bucket: TokenBucket,
     in_flight: Arc<AtomicU32>,
     last_used: Instant,
@@ -361,38 +364,56 @@ impl Slot {
 /// The private face's sessions.
 pub struct Sessions {
     map: DashMap<String, Slot>,
+    /// R-136: the slots each token signer holds. Taken only while one of `map`'s shards is held, never the other way
+    /// round, so the two maps cannot deadlock.
+    per_signer: DashMap<String, u32>,
     burst: u32,
     per_min: u32,
     calls_per_session: u32,
     sessions_max: usize,
+    sessions_per_signer: u32,
     evictions_max: u32,
 }
 
 impl Sessions {
-    /// The sessions of R-57's and R-112's limits.
+    /// The sessions of R-57's, R-112's and R-136's limits.
     pub(crate) fn new(l: &Limits) -> Sessions {
         Sessions {
             map: DashMap::new(),
+            per_signer: DashMap::new(),
             burst: l.session_burst,
             per_min: l.session_per_min,
             calls_per_session: l.calls_per_session,
             sessions_max: l.sessions_max as usize,
+            sessions_per_signer: l.sessions_per_signer,
             evictions_max: l.session_evictions_per_10min,
         }
     }
 
-    /// One request of a session: the bucket, then for a Call its evictions (R-112) and its in-flight permit (R-57).
-    pub fn enter(&self, session_id: &str, call: bool, now: tokio::time::Instant) -> Result<Option<SessionPass>, Refusal> {
+    /// One request of a session of the token signer `signer_id`: a new session within `sessions_max` and the signer's
+    /// share, a held one only for the signer that made it (R-136), the bucket, then for a Call its evictions (R-112) and
+    /// its in-flight permit (R-57).
+    pub fn enter(&self, session_id: &str, signer_id: &str, call: bool, now: tokio::time::Instant) -> Result<Option<SessionPass>, Refusal> {
         if !self.map.contains_key(session_id) && self.map.len() >= self.sessions_max {
             return Err(Refusal::TooManySessions);
         }
-        let mut slot = self.map.entry(session_id.to_string()).or_insert_with(|| Slot {
-            bucket: TokenBucket::new(self.burst, self.per_min, now),
-            in_flight: Arc::new(AtomicU32::new(0)),
-            last_used: now,
-            evictions: 0,
-            evicted_from: None,
-        });
+        let mut slot = match self.map.entry(session_id.to_string()) {
+            // Workers see a session's id: another signer's token naming it takes nothing from its bucket, charges it no
+            // eviction and keeps it no longer.
+            Entry::Occupied(held) if held.get().signer != signer_id => return Err(Refusal::TooManySessions),
+            Entry::Occupied(held) => held.into_ref(),
+            Entry::Vacant(new) => {
+                self.count_new(signer_id)?;
+                new.insert(Slot {
+                    signer: signer_id.to_string(),
+                    bucket: TokenBucket::new(self.burst, self.per_min, now),
+                    in_flight: Arc::new(AtomicU32::new(0)),
+                    last_used: now,
+                    evictions: 0,
+                    evicted_from: None,
+                })
+            }
+        };
         if !slot.bucket.take(now) {
             return Err(Refusal::RateLimited);
         }
@@ -411,6 +432,24 @@ impl Sessions {
         Ok(Some(SessionPass { in_flight: Arc::clone(&slot.in_flight) }))
     }
 
+    /// R-136: one more session of `signer_id`, unless it holds its share: one key cannot fill `sessions_max`.
+    fn count_new(&self, signer_id: &str) -> Result<(), Refusal> {
+        let mut held = self.per_signer.entry(signer_id.to_string()).or_insert(0);
+        if *held >= self.sessions_per_signer {
+            return Err(Refusal::TooManySessions);
+        }
+        *held += 1;
+        Ok(())
+    }
+
+    /// R-136: one session of `signer_id` less; a signer that holds none is forgotten.
+    fn count_gone(&self, signer_id: &str) {
+        if let Some(mut held) = self.per_signer.get_mut(signer_id) {
+            *held = held.saturating_sub(1);
+        }
+        self.per_signer.remove_if(signer_id, |_, held| *held == 0);
+    }
+
     /// R-112: one charged eviction of the session's calls. The first opens a fixed 600 s window; the session's
     /// `session_evictions_per_10min`-th in it refuses its new calls until the window ends.
     pub fn evicted(&self, session_id: &str, now: tokio::time::Instant) {
@@ -423,9 +462,16 @@ impl Sessions {
         }
     }
 
-    /// Drops sessions idle for 600 s with nothing in flight and no eviction window open (R-58, R-112).
+    /// Drops sessions idle for 600 s with nothing in flight and no eviction window open (R-58, R-112), each signer's share
+    /// with them (R-136).
     pub fn sweep(&self, now: tokio::time::Instant) {
-        self.map.retain(|_, s| s.in_flight.load(Ordering::SeqCst) > 0 || now.saturating_duration_since(s.last_used) < SESSION_IDLE || s.window_open(now));
+        self.map.retain(|_, s| {
+            let keep = s.in_flight.load(Ordering::SeqCst) > 0 || now.saturating_duration_since(s.last_used) < SESSION_IDLE || s.window_open(now);
+            if !keep {
+                self.count_gone(&s.signer);
+            }
+            keep
+        });
     }
 
     /// How many sessions are kept (the status line).
@@ -702,28 +748,28 @@ mod tests {
         assert_eq!(l.session_evictions_per_10min, 3);
         let s = Sessions::new(&l);
         let t0 = Instant::now();
-        drop(s.enter("s1", true, t0).unwrap());
+        drop(s.enter("s1", "mac", true, t0).unwrap());
         s.evicted("s1", t0);
         s.evicted("s1", t0 + Duration::from_secs(100));
-        drop(s.enter("s1", true, t0 + Duration::from_secs(101)).expect("two evictions: calls go on"));
+        drop(s.enter("s1", "mac", true, t0 + Duration::from_secs(101)).expect("two evictions: calls go on"));
         s.evicted("s1", t0 + Duration::from_secs(200));
-        assert_eq!(s.enter("s1", true, t0 + Duration::from_secs(201)).err(), Some(Refusal::RateLimited), "the third: calls refused");
-        assert!(s.enter("s1", false, t0 + Duration::from_secs(202)).is_ok(), "a list is not refused");
-        assert!(s.enter("s2", true, t0 + Duration::from_secs(203)).is_ok(), "another session unaffected");
-        assert_eq!(s.enter("s1", true, t0 + Duration::from_secs(599)).err(), Some(Refusal::RateLimited), "until the window ends");
-        drop(s.enter("s1", true, t0 + Duration::from_secs(600)).expect("600 s after the first eviction"));
+        assert_eq!(s.enter("s1", "mac", true, t0 + Duration::from_secs(201)).err(), Some(Refusal::RateLimited), "the third: calls refused");
+        assert!(s.enter("s1", "mac", false, t0 + Duration::from_secs(202)).is_ok(), "a list is not refused");
+        assert!(s.enter("s2", "mac", true, t0 + Duration::from_secs(203)).is_ok(), "another session unaffected");
+        assert_eq!(s.enter("s1", "mac", true, t0 + Duration::from_secs(599)).err(), Some(Refusal::RateLimited), "until the window ends");
+        drop(s.enter("s1", "mac", true, t0 + Duration::from_secs(600)).expect("600 s after the first eviction"));
         // A new window opens at the next eviction.
         s.evicted("s1", t0 + Duration::from_secs(700));
-        drop(s.enter("s1", true, t0 + Duration::from_secs(701)).expect("one eviction in the new window"));
+        drop(s.enter("s1", "mac", true, t0 + Duration::from_secs(701)).expect("one eviction in the new window"));
         // A session idle past 600 s whose eviction window is still open keeps its count through the sweep.
         let w = Sessions::new(&l);
-        drop(w.enter("s3", true, t0).unwrap());
+        drop(w.enter("s3", "mac", true, t0).unwrap());
         for i in 0..3 {
             w.evicted("s3", t0 + Duration::from_secs(100 + i));
         }
         w.sweep(t0 + Duration::from_secs(650));
         assert_eq!(w.len(), 1, "idle 650 s, its window open until 700 s: kept");
-        assert_eq!(w.enter("s3", true, t0 + Duration::from_secs(650)).err(), Some(Refusal::RateLimited));
+        assert_eq!(w.enter("s3", "mac", true, t0 + Duration::from_secs(650)).err(), Some(Refusal::RateLimited));
         w.sweep(t0 + Duration::from_secs(650) + SESSION_IDLE);
         assert_eq!(w.len(), 0, "idle again and its window over: dropped");
     }
@@ -733,16 +779,89 @@ mod tests {
         let l = Limits { calls_per_session: 2, session_burst: 5, sessions_max: 2, ..Limits::default() };
         let s = Sessions::new(&l);
         let now = Instant::now();
-        let p1 = s.enter("s1", true, now).unwrap().expect("a pass");
-        let _p2 = s.enter("s1", true, now).unwrap().expect("a pass");
-        assert_eq!(s.enter("s1", true, now).err(), Some(Refusal::TooManyInFlight));
+        let p1 = s.enter("s1", "mac", true, now).unwrap().expect("a pass");
+        let _p2 = s.enter("s1", "mac", true, now).unwrap().expect("a pass");
+        assert_eq!(s.enter("s1", "mac", true, now).err(), Some(Refusal::TooManyInFlight));
         drop(p1);
-        assert!(s.enter("s1", true, now).is_ok());
-        assert!(s.enter("s1", false, now).is_ok(), "the fifth request of the burst");
-        assert_eq!(s.enter("s1", false, now).err(), Some(Refusal::RateLimited), "the sixth");
-        assert!(s.enter("s2", false, now).is_ok());
-        assert_eq!(s.enter("s3", false, now).err(), Some(Refusal::TooManySessions));
+        assert!(s.enter("s1", "mac", true, now).is_ok());
+        assert!(s.enter("s1", "mac", false, now).is_ok(), "the fifth request of the burst");
+        assert_eq!(s.enter("s1", "mac", false, now).err(), Some(Refusal::RateLimited), "the sixth");
+        assert!(s.enter("s2", "mac", false, now).is_ok());
+        assert_eq!(s.enter("s3", "mac", false, now).err(), Some(Refusal::TooManySessions));
         s.sweep(now + SESSION_IDLE);
         assert_eq!(s.len(), 1, "s2 idle with nothing in flight is dropped; s1 keeps its calls");
+    }
+
+    /// Unit 47 (R-136): a new session of a signer that holds its share is refused, before it holds any state; its own
+    /// sessions go on, another signer's are admitted, `sessions_max` still binds them all, another signer's token enters
+    /// no session it did not make, and the sweep gives the share back.
+    #[test]
+    fn one_signer_holds_at_most_its_share_of_the_sessions() {
+        assert_eq!(Limits::default().sessions_per_signer, 256);
+        let l = Limits { sessions_per_signer: 2, sessions_max: 5, ..Limits::default() };
+        let s = Sessions::new(&l);
+        let now = Instant::now();
+        assert!(s.enter("a1", "mac-a", false, now).is_ok() && s.enter("a2", "mac-a", true, now).is_ok());
+        assert_eq!(s.enter("a3", "mac-a", false, now).err(), Some(Refusal::TooManySessions), "the third, a list");
+        assert_eq!(s.enter("a3", "mac-a", true, now).err(), Some(Refusal::TooManySessions), "the third, a call");
+        assert_eq!(s.len(), 2, "a refused session holds no state");
+        assert!(s.enter("a1", "mac-a", false, now).is_ok(), "a session it holds goes on");
+        assert!(s.enter("a2", "mac-a", false, now).is_ok());
+        assert!(s.enter("b1", "mac-b", false, now).is_ok() && s.enter("b2", "mac-b", false, now).is_ok(), "another signer's share is its own");
+        assert_eq!(s.enter("b3", "mac-b", false, now).err(), Some(Refusal::TooManySessions));
+        assert!(s.enter("c1", "mac-c", false, now).is_ok());
+        assert_eq!(s.enter("c2", "mac-c", false, now).err(), Some(Refusal::TooManySessions), "sessions_max, whatever the share");
+        assert_eq!(s.len(), 5);
+        // A session is the signer's that made it: another's token in it is refused, on both calls, and makes nothing new.
+        assert_eq!(s.enter("c1", "mac-a", false, now).err(), Some(Refusal::TooManySessions), "another's session, a list");
+        assert_eq!(s.enter("c1", "mac-a", true, now).err(), Some(Refusal::TooManySessions), "another's session, a call");
+        assert_eq!(s.per_signer.get("mac-a").map(|n| *n), Some(2));
+        assert_eq!(s.per_signer.get("mac-c").map(|n| *n), Some(1));
+        // It takes nothing from that session's bucket and keeps it no longer.
+        let one = Sessions::new(&Limits { session_burst: 2, ..Limits::default() });
+        assert!(one.enter("b1", "mac-b", false, now).is_ok());
+        for _ in 0..5 {
+            assert_eq!(one.enter("b1", "mac-a", false, now).err(), Some(Refusal::TooManySessions));
+        }
+        assert!(one.enter("b1", "mac-b", false, now).is_ok(), "the second of its burst is still its own");
+        assert_eq!(one.enter("b1", "mac-b", false, now).err(), Some(Refusal::RateLimited));
+        assert_eq!(one.enter("b1", "mac-a", false, now + SESSION_IDLE - Duration::from_secs(1)).err(), Some(Refusal::TooManySessions));
+        one.sweep(now + SESSION_IDLE);
+        assert_eq!(one.len(), 0, "idle since its own signer's last request");
+        // The sweep gives a share back, and only what it dropped: a call in flight keeps its session, and its count.
+        let later = now + SESSION_IDLE;
+        let held = s.enter("a2", "mac-a", true, now).unwrap().expect("a pass");
+        s.sweep(later);
+        assert_eq!(s.len(), 1, "a2 alone, its call in flight");
+        assert_eq!(s.per_signer.get("mac-a").map(|n| *n), Some(1));
+        assert!(s.per_signer.get("mac-b").is_none() && s.per_signer.get("mac-c").is_none(), "a signer with no session is forgotten");
+        assert!(s.enter("a3", "mac-a", false, later).is_ok(), "room again");
+        assert_eq!(s.enter("a4", "mac-a", false, later).err(), Some(Refusal::TooManySessions), "a2 and a3");
+        drop(held);
+        let last = later + SESSION_IDLE;
+        s.sweep(last);
+        assert_eq!(s.len(), 0);
+        assert!(s.per_signer.is_empty(), "nothing is left of any signer");
+        assert!(s.enter("a5", "mac-a", false, last).is_ok() && s.enter("a6", "mac-a", false, last).is_ok());
+
+        // Threads racing for one signer's share get exactly it, and the count stays the map's with a sweep racing them.
+        let racing = Sessions::new(&Limits { sessions_per_signer: 10, sessions_max: 4096, ..Limits::default() });
+        let attempts = |t: u32| (0..100).filter(|i| racing.enter(&format!("r{t}-{i}"), "mac-r", false, now).is_ok()).count();
+        let admitted: usize = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8).map(|t| scope.spawn(move || attempts(t))).collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(admitted, 10, "exactly its share");
+        let swept = Sessions::new(&Limits { sessions_per_signer: 2000, sessions_max: 4096, ..Limits::default() });
+        std::thread::scope(|scope| {
+            for t in 0..4u32 {
+                let swept = &swept;
+                scope.spawn(move || (0..200).for_each(|i| drop(swept.enter(&format!("s{t}-{i}"), "mac-s", false, now))));
+            }
+            let swept = &swept;
+            scope.spawn(move || (0..50).for_each(|_| swept.sweep(now + SESSION_IDLE)));
+        });
+        let held = swept.per_signer.get("mac-s").map_or(0, |n| *n) as usize;
+        assert_eq!(held, swept.len(), "the count is the map's");
     }
 }

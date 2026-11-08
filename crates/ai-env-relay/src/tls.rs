@@ -1,9 +1,10 @@
 //! The relay's TLS (R-1 to R-3): the server config, `Peered`, `PeerInfo`, `Face`. Production builds a
 //! `Peered` only here, in `RelayApp::admit` through `accept` (R-76).
 //!
-//! One `rustls::ServerConfig` from `tls.pem` serves both faces (R-3, R-3a): TLS 1.3 only on aws-lc-rs, ALPN `h2`,
-//! no resumption and no early data, no client certificate. The relay's own graph has no rustls `tls12`, so its
-//! release binary cannot speak TLS 1.2 at all (`make check-features`).
+//! `tls.pem` gives each face its `rustls::ServerConfig` (`TlsConfigs`, R-3, R-3a, R-124): TLS 1.3 only on aws-lc-rs,
+//! ALPN `h2`, no resumption and no early data; the public face requires a client certificate under the CA, the private
+//! face asks for none. The relay's own graph has no rustls `tls12`, so its release binary cannot speak TLS 1.2 at all
+//! (`make check-features`).
 //!
 //! A public connection's use (R-2a, R-6) is kept here too: `ConnUse` is its state from the accept to the close,
 //! `Conns` finds it by `conn_seq` for `open()`, and the cut it carries ends the connection under hyper's feet.
@@ -54,6 +55,9 @@ pub struct PeerInfo {
     pub ip: std::net::IpAddr,
     /// The connection's sequence number.
     pub conn_seq: u64,
+    /// The SHA-256 of the client's leaf certificate (R-125): the public face requires one, the private face asks for
+    /// none, so there it is `None`.
+    pub cert_fp: Option<[u8; 32]>,
 }
 
 /// A byte stream with its peer and its connection slot.
@@ -71,10 +75,11 @@ pub struct Peered<IO> {
 }
 
 impl<IO> Peered<IO> {
-    /// A stream from `ip` (public for the tests and the lead's integration test, which serve plaintext duplex
-    /// streams in-process; production goes through `admit`).
-    pub fn new(io: IO, ip: std::net::IpAddr) -> Peered<IO> {
-        Peered { io, info: PeerInfo { ip, conn_seq: CONN_SEQ.fetch_add(1, Ordering::SeqCst) }, slot: None, accepted: Instant::now(), cut: None }
+    /// A stream from `ip` whose client presented the certificate of `cert_fp` (public for the tests and the lead's
+    /// integration test, which serve plaintext duplex streams in-process, so there a fingerprint is only a label;
+    /// production goes through `admit`).
+    pub fn new(io: IO, ip: std::net::IpAddr, cert_fp: Option<[u8; 32]>) -> Peered<IO> {
+        Peered { io, info: PeerInfo { ip, conn_seq: CONN_SEQ.fetch_add(1, Ordering::SeqCst), cert_fp }, slot: None, accepted: Instant::now(), cut: None }
     }
 
     /// Its peer.
@@ -211,7 +216,7 @@ pub(crate) struct ConnUse {
     cut: CancellationToken,
     /// The connection's stream was dropped.
     gone: CancellationToken,
-    /// Its tunnel ended: the tunnel's task or its response stream went, whichever first.
+    /// Its tunnel ended: the tunnel's task or its response stream went, whichever first, or `open()` refused it (R-126).
     ended: CancellationToken,
 }
 
@@ -284,7 +289,7 @@ impl ConnUse {
 }
 
 /// Ends its connection's tunnel when dropped (R-2a): the tunnel's task and its response stream each hold one, and
-/// the first to go starts the connection's grace.
+/// the first to go starts the connection's grace; `open()`'s refusal (R-126) drops one at once.
 pub(crate) struct TunnelEnd(Arc<ConnUse>);
 
 impl TunnelEnd {
@@ -693,7 +698,8 @@ pub(crate) struct TlsRefused {
     pub(crate) fault: bool,
 }
 
-/// R-2's last step: TLS on an admitted connection within `within`, its slot kept for the connection's life.
+/// R-2's last step: TLS on an admitted connection within `within`, its slot kept for the connection's life, and the
+/// fingerprint of the client's leaf in its `PeerInfo` (R-125).
 pub(crate) async fn accept<IO>(
     config: Arc<rustls::ServerConfig>,
     io: IO,
@@ -709,7 +715,8 @@ where
         Ok(Err(sent)) => Err(TlsRefused { reason: "tls_failed", fault: sent }),
         Ok(Ok(stream)) => {
             let conn_seq = CONN_SEQ.fetch_add(1, Ordering::SeqCst);
-            Ok(Peered { io: stream, info: PeerInfo { ip, conn_seq }, slot: Some(slot), accepted: Instant::now(), cut: None })
+            let cert_fp = stream.get_ref().1.peer_certificates().and_then(<[_]>::first).map(|leaf| sha256(leaf));
+            Ok(Peered { io: stream, info: PeerInfo { ip, conn_seq, cert_fp }, slot: Some(slot), accepted: Instant::now(), cut: None })
         }
     }
 }
@@ -732,8 +739,88 @@ where
     start.into_stream(config).await.map_err(|_| true)
 }
 
-/// R-3: TLS 1.3 only, aws-lc-rs, ALPN h2, no resumption, no early data; refuses a key that does not match its leaf.
-pub fn server_config(pem: &[u8]) -> Result<rustls::ServerConfig, String> {
+/// A certificate's SHA-256.
+fn sha256(der: &[u8]) -> [u8; 32] {
+    let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
+/// The public face's verifier, given a client's leaf alone (R-124, LD-R61). webpki's path search parses every intermediate of
+/// the client's chain at every node it visits, and only a candidate whose subject matches costs it budget, so one
+/// `Certificate` message of 64 KiB from any allowed address, before any signature is looked at (a leaf, nine self-issued
+/// certificates of its issuer's name, 1968 minimal others), cost 9 s of one core on an M-series Mac, against 0.3 ms
+/// here. rustls runs that inside one poll, so `accept`'s timeout cannot interrupt it, and two of them stop the runtime's
+/// two threads. The CA signs every leaf itself (pathlen:0), so a worker needs no intermediate: `[leaf, CA]` passes, a
+/// chain through a sub-CA does not, and whatever else follows the leaf is never parsed. All the rest is
+/// `WebPkiClientVerifier`'s; this narrows what it reads and accepts nothing it would refuse.
+#[derive(Debug)]
+struct LeafOnly(Arc<dyn rustls::server::danger::ClientCertVerifier>);
+
+impl rustls::server::danger::ClientCertVerifier for LeafOnly {
+    fn offer_client_auth(&self) -> bool {
+        self.0.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        leaf: &CertificateDer<'_>,
+        _rest: &[CertificateDer<'_>],
+        now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.0.verify_client_cert(leaf, &[], now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.0.requires_raw_public_keys()
+    }
+}
+
+/// `tls.pem`'s two server configs, one per face (R-124): `admit` hands `accept` its face's.
+pub struct TlsConfigs {
+    /// 443: a client certificate under the CA is mandatory.
+    pub public: Arc<rustls::ServerConfig>,
+    /// 7443: no client certificate (the VM client has none; the security group, `private_peers` and the token gate it).
+    pub private: Arc<rustls::ServerConfig>,
+}
+
+/// R-3 and R-124: both faces TLS 1.3 only on aws-lc-rs, ALPN h2, no resumption, no early data, the one chain and key;
+/// refuses a key that does not match its leaf. The one certificate after the leaf (the CA, WM-R60's order) is the root
+/// of the public face's client certificates, with no CRL and no intermediates (`LeafOnly`); the private face asks for
+/// none. A second is refused: webpki takes any certificate it is given as an anchor, so one more in the parameter would
+/// be a CA of its writer's own, and a refused file keeps the loaded config (`keeping_on_refusal`).
+pub fn server_config(pem: &[u8]) -> Result<TlsConfigs, String> {
     let chain: Vec<CertificateDer<'static>> =
         CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>().map_err(|e| format!("tls.pem: a certificate does not parse ({e})"))?;
     if chain.is_empty() {
@@ -741,17 +828,33 @@ pub fn server_config(pem: &[u8]) -> Result<rustls::ServerConfig, String> {
     }
     let key = PrivateKeyDer::from_pem_slice(pem).map_err(|_| "tls.pem: no private key".to_string())?;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("tls: {e}"))?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|e| format!("tls.pem: the key does not serve the chain ({e})"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in chain.iter().skip(1) {
+        roots.add(ca.clone()).map_err(|e| format!("tls.pem: a CA certificate rustls refuses ({e})"))?;
+    }
+    if roots.is_empty() {
+        return Err("tls.pem: no issuer for client certificates".into());
+    }
+    if chain.len() > 2 {
+        return Err("tls.pem: more than one issuer for client certificates".into());
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+        .build()
+        .map_err(|e| format!("tls.pem: the client verifier: {e}"))?;
+    let tls13 = || rustls::ServerConfig::builder_with_provider(Arc::clone(&provider)).with_protocol_versions(&[&rustls::version::TLS13]).map_err(|e| format!("tls: {e}"));
+    let serves = |e: rustls::Error| format!("tls.pem: the key does not serve the chain ({e})");
+    let public = tls13()?.with_client_cert_verifier(Arc::new(LeafOnly(verifier))).with_single_cert(chain.clone(), key.clone_key()).map_err(serves)?;
+    let private = tls13()?.with_no_client_auth().with_single_cert(chain, key).map_err(serves)?;
+    Ok(TlsConfigs { public: r3(public), private: r3(private) })
+}
+
+/// R-3's settings on a built config.
+fn r3(mut config: rustls::ServerConfig) -> Arc<rustls::ServerConfig> {
     config.alpn_protocols = vec![b"h2".to_vec()];
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    Ok(config)
+    Arc::new(config)
 }
 
 #[cfg(test)]
@@ -850,7 +953,7 @@ mod tests {
     async fn the_cut_ends_a_watched_stream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(1024);
-        let mut peered = Peered::new(server, "198.51.100.7".parse().unwrap());
+        let mut peered = Peered::new(server, "198.51.100.7".parse().unwrap(), None);
         let conn = Arc::new(ConnUse::new(peered.accepted()));
         peered.watch(&conn);
         client.write_all(b"ab").await.unwrap();
@@ -872,5 +975,106 @@ mod tests {
         assert!(!conn.gone.is_cancelled());
         drop(peered);
         assert!(conn.gone.is_cancelled(), "the drop ends the watch");
+    }
+
+    /// One handshake in memory between a client presenting `identity` (a leaf and its key, or none) and `server`; the
+    /// server's error, if it refused, and the fingerprint of what the client presented.
+    fn handshake_with(server: Arc<rustls::ServerConfig>, ca: &crate::test_certs::Ca, identity: Option<&crate::test_certs::Leaf>) -> Result<Option<[u8; 32]>, rustls::Error> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.cert_der.clone())).unwrap();
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots);
+        let client = match identity {
+            Some(leaf) => {
+                let key = rustls_pki_types::PrivatePkcs8KeyDer::from(leaf.key_pkcs8.clone());
+                builder.with_client_auth_cert(vec![CertificateDer::from(leaf.cert_der.clone())], key.into()).unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let name = rustls_pki_types::ServerName::try_from("ai-env-relay").unwrap();
+        let mut client = rustls::ClientConnection::new(Arc::new(client), name).unwrap();
+        let mut server = rustls::ServerConnection::new(server).unwrap();
+        for _ in 0..8 {
+            let mut flight = Vec::new();
+            client.write_tls(&mut flight).unwrap();
+            server.read_tls(&mut flight.as_slice()).unwrap();
+            server.process_new_packets()?;
+            let mut flight = Vec::new();
+            server.write_tls(&mut flight).unwrap();
+            client.read_tls(&mut flight.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        assert!(!server.is_handshaking(), "the handshake ended");
+        Ok(server.peer_certificates().and_then(<[_]>::first).map(|leaf| sha256(leaf)))
+    }
+
+    /// Unit 45 (R-124): each face has its own config, from one `tls.pem`. A client with no certificate is refused by
+    /// the public one and served by the private one; a client certificate under the CA passes the public one, which
+    /// sees its fingerprint, and the private one never asks for it. Both are R-3's. A `tls.pem` with nothing after its
+    /// leaf has no issuer; one with two certificates after it has more than one; a block after its leaf that is no
+    /// certificate is one rustls refuses, even after the CA.
+    #[test]
+    fn server_config_builds_a_config_for_each_face() {
+        use crate::test_certs::{pem, tls_pem, Ca};
+        let ca = Ca::new("test relay CA", [11; 32]);
+        let leaf = ca.leaf(1, &["ai-env-relay"], &[[10, 42, 0, 20]], [12; 32]);
+        let client = ca.client_leaf(2, "worker-a", [31; 32]);
+        let configs = server_config(tls_pem(&leaf, &ca).as_bytes()).expect("both configs");
+        assert!(matches!(handshake_with(Arc::clone(&configs.public), &ca, None), Err(rustls::Error::NoCertificatesPresented)));
+        assert_eq!(handshake_with(Arc::clone(&configs.public), &ca, Some(&client)).unwrap(), Some(client.sha256()));
+        assert_eq!(handshake_with(Arc::clone(&configs.private), &ca, None).unwrap(), None, "the private face asks for none");
+        assert_eq!(handshake_with(Arc::clone(&configs.private), &ca, Some(&client)).unwrap(), None, "nor reads one");
+        for config in [&configs.public, &configs.private] {
+            assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+            assert_eq!((config.max_early_data_size, config.send_tls13_tickets, config.session_storage.can_cache()), (0, 0, false));
+        }
+
+        let refused = |text: String| server_config(text.as_bytes()).err();
+        let private_key = ["PRIVATE", "KEY"].join(" ");
+        let (cert, key) = (pem("CERTIFICATE", &leaf.cert_der), pem(&private_key, &leaf.key_pkcs8));
+        assert_eq!(refused(format!("{cert}{key}")).as_deref(), Some("tls.pem: no issuer for client certificates"));
+        let (real, added) = (pem("CERTIFICATE", &ca.cert_der), pem("CERTIFICATE", &Ca::new("another CA", [13; 32]).cert_der));
+        assert_eq!(refused(format!("{cert}{real}{added}{key}")).as_deref(), Some("tls.pem: more than one issuer for client certificates"));
+        assert_eq!(refused(key.clone()).as_deref(), Some("tls.pem: no certificate"));
+        assert_eq!(refused(cert.clone()).as_deref(), Some("tls.pem: no private key"));
+        let not_a_ca = refused(format!("{cert}{}{key}", pem("CERTIFICATE", b"not a certificate"))).expect("refused");
+        assert!(not_a_ca.starts_with("tls.pem: a CA certificate rustls refuses ("), "{not_a_ca}");
+        let third = refused(format!("{cert}{real}{}{key}", pem("CERTIFICATE", b"not a certificate"))).expect("refused");
+        assert!(third.starts_with("tls.pem: a CA certificate rustls refuses ("), "a block rustls refuses keeps its own text: {third}");
+    }
+
+    /// Unit 45, the public face's verifier (LD-R61): `LeafOnly` reads no intermediate. A chain through a sub-CA, which the verifier
+    /// it wraps accepts, is refused; a leaf under the CA passes, whatever follows it; and it asks for what that verifier
+    /// asks for.
+    #[test]
+    fn the_client_verifier_reads_the_leaf_alone() {
+        use rustls::server::danger::ClientCertVerifier as _;
+        use crate::test_certs::Ca;
+        let ca = Ca::new("test relay CA", [11; 32]);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.cert_der.clone())).unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let whole = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider).build().unwrap();
+        let only = LeafOnly(Arc::clone(&whole));
+        let now = rustls_pki_types::UnixTime::since_unix_epoch(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap());
+
+        let sub = ca.sub_ca(2, "a sub-CA", [13; 32]);
+        let (under_sub, sub_der) = (CertificateDer::from(sub.client_leaf(3, "worker-a", [31; 32]).cert_der), CertificateDer::from(sub.cert_der.clone()));
+        whole.verify_client_cert(&under_sub, std::slice::from_ref(&sub_der), now).expect("a sound chain to the CA, for a verifier that reads it");
+        let refused = only.verify_client_cert(&under_sub, std::slice::from_ref(&sub_der), now).expect_err("the leaf alone has no path");
+        assert!(matches!(refused, rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)), "{refused:?}");
+
+        let leaf = CertificateDer::from(ca.client_leaf(4, "worker-a", [31; 32]).cert_der);
+        let ca_der = CertificateDer::from(ca.cert_der.clone());
+        only.verify_client_cert(&leaf, &[], now).expect("a leaf under the CA");
+        only.verify_client_cert(&leaf, std::slice::from_ref(&ca_der), now).expect("whatever follows it");
+
+        assert_eq!((only.offer_client_auth(), only.client_auth_mandatory(), only.requires_raw_public_keys()), (true, true, false));
+        let names = |hints: &[rustls::DistinguishedName]| hints.iter().map(|n| n.as_ref().to_vec()).collect::<Vec<_>>();
+        assert_eq!(names(only.root_hint_subjects()), names(whole.root_hint_subjects()));
+        assert_eq!(names(only.root_hint_subjects()).len(), 1, "it names the CA");
+        assert_eq!(only.supported_verify_schemes(), whole.supported_verify_schemes());
     }
 }

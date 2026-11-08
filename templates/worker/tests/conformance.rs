@@ -81,7 +81,7 @@ fn stderr(out: &Output) -> String {
 
 /// WM-T57: `tls-keygen` writes the worker's 0600 P-256 key and prints its point and the next command; a config
 /// takes the client certificate and its key together or not at all, the key read as the worker key is (R-119),
-/// and `check` presents the pair.
+/// refuses a misspelt key, and `check` presents the pair.
 #[test]
 fn tls_keygen_writes_its_key_and_the_config_takes_both_files() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tls-keygen");
@@ -151,8 +151,11 @@ fn tls_keygen_writes_its_key_and_the_config_takes_both_files() {
     let out = run(&["check", "--config", &both, "--offline"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).starts_with("config ok: worker example-worker, 1 source(s), key fp "), "{}", stdout(&out));
+    // The certificate in the file, by what `ai-env relay status` shows of the entry's tls_fp (RO-4).
+    assert!(stdout(&out).ends_with(&format!(", cert fp {}\n", &certs::tls_fp(&cert_der)[..16])), "{}", stdout(&out));
     let neither = config("neither.toml", "");
-    assert!(run(&["check", "--config", &neither, "--offline"]).status.success());
+    let out = run(&["check", "--config", &neither, "--offline"]);
+    assert!(out.status.success() && !stdout(&out).contains("cert fp"), "no certificate, no fingerprint: {}", stdout(&out));
 
     // The binary reads relay_client_key as it reads the worker key (R-119's one reader): a key file with group or
     // other bits, or a symlink to the key, is refused at build.
@@ -168,6 +171,12 @@ fn tls_keygen_writes_its_key_and_the_config_takes_both_files() {
     let refused = format!("my-worker: {link}: is a symlink: point the config at the key file itself");
     assert!(!out.status.success() && stderr(&out).contains(&refused), "{}", stderr(&out));
     assert!(run(&["check", "--config", &both, "--offline"]).status.success(), "the key file itself, 0600");
+
+    // A misspelt key is refused (R-122's `deny_unknown_fields`): ignored, neither real key would be set, `check` would
+    // say ok, and a relay that requires a client certificate would refuse the worker at TLS.
+    let typo = config("typo.toml", "relay_client_crt = \"x\"\n");
+    let out = run(&["check", "--config", &typo, "--offline"]);
+    assert!(!out.status.success() && stderr(&out).contains("unknown field `relay_client_crt`"), "{}", stderr(&out));
 
     // A certificate of another key is refused at build.
     let other_key = certs::client_key().expect("another key");

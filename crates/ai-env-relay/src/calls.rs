@@ -853,8 +853,8 @@ mod tests {
         let table = CallTable::new(8);
         let call = state("r");
         let mut rx = table.insert(Arc::clone(&call), Caps { max_bytes: 1 << 20, max_chunks: 16 }, 1).expect("room");
-        call.hold(Permits { _session: sessions.enter("s", true, t0).unwrap(), ..Permits::default() });
-        assert!(sessions.enter("s", true, t0).is_err(), "the pass is held");
+        call.hold(Permits { _session: sessions.enter("s", "mac", true, t0).unwrap(), ..Permits::default() });
+        assert!(sessions.enter("s", "mac", true, t0).is_err(), "the pass is held");
         // The buffer of one: the first chunk is handed, the second finds it full, with no wait.
         let Delivery::Forward { to, chunk: c0, state, .. } = table.on_chunk(chunk("r", 0, 10, false)) else { panic!("forward") };
         assert!(matches!(state.hand(&to, c0, t0), Handoff::Buffered));
@@ -863,7 +863,7 @@ mod tests {
         assert!(matches!(state.hand(&to, c1, later), Handoff::Full(_)));
         assert_eq!(state.oldest_buffered(), Some(t0), "the full hand-off kept no instant");
         assert!(table.finish("r", Outcome::Evicted));
-        assert!(sessions.enter("s", true, t0).is_ok(), "concluded: the pass went, the stream unread");
+        assert!(sessions.enter("s", "mac", true, t0).is_ok(), "concluded: the pass went, the stream unread");
         assert!(rx.try_recv().is_ok());
         drop(rx);
         let Delivery::Late = table.on_chunk(chunk("r", 2, 10, false)) else { panic!("late") };
@@ -874,8 +874,8 @@ mod tests {
         assert_eq!(gone.oldest_buffered(), None);
 
         let early = state_with_outcome();
-        early.hold(Permits { _session: sessions.enter("t", true, t0).unwrap(), ..Permits::default() });
-        assert!(sessions.enter("t", true, t0).is_ok(), "held after its conclusion: released at once");
+        early.hold(Permits { _session: sessions.enter("t", "mac", true, t0).unwrap(), ..Permits::default() });
+        assert!(sessions.enter("t", "mac", true, t0).is_ok(), "held after its conclusion: released at once");
     }
 
     fn state_with_outcome() -> Arc<CallState> {

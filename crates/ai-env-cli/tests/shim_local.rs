@@ -4434,6 +4434,39 @@ fn the_image_gates_the_claude_strings_and_bakes_no_seed_record() {
     assert!(ai_env_cli::shim::claudebin::INDEX_PATH.starts_with("/var/lib/ai-env/"), "the cache's index under the record's directory, which the image keeps empty");
 }
 
+/// The chat's tools in image/Dockerfile: `jq` and `python3.14` on the packages' line; after that RUN's clean-up and
+/// before the http-backend gate, a RUN of their own links `/usr/local/bin/python3` to `/usr/bin/python3.14` and
+/// gates, on the shim's child PATH, `python3 -I -B` at 3.14 and jq's `.a | add` of `{"a":[1,2]}` at 3, each a build
+/// failure naming it, then says both versions (`l2_python3_and_jq_for_the_agent` checks the built image).
+#[test]
+fn the_image_gates_python3_and_jq() {
+    let df = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../image/Dockerfile")).unwrap();
+    let at = |what: &str| df.find(what).unwrap_or_else(|| panic!("{what} missing from image/Dockerfile"));
+    let packages = df.lines().find(|l| l.starts_with("RUN microdnf ")).expect("the packages' RUN");
+    for want in ["jq", "python3.14"] {
+        assert!(packages.split_whitespace().any(|w| w == want), "{want} in {packages}");
+    }
+    let cleanup = at(" && rm -f /etc/machine-id /var/lib/systemd/random-seed\n");
+    let link = at("ln -s /usr/bin/python3.14 /usr/local/bin/python3;");
+    let run = df[..link].rfind("\nRUN ").expect("the tools gate's RUN");
+    let gates = [
+        r#"v=$(env -i PATH=/usr/local/bin:/usr/bin:/bin python3 -I -B -c 'import json, sys; print("%d.%d" % sys.version_info[:2])');"#,
+        r#"test "$v" = 3.14 || { echo "python3 is $v, not 3.14"; exit 1; };"#,
+        r#"j=$(printf '{"a":[1,2]}' | env -i PATH=/usr/local/bin:/usr/bin:/bin jq -c '.a | add');"#,
+        r#"test "$j" = 3 || { echo "jq printed $j, not 3"; exit 1; };"#,
+        r#"echo "tools gate: $(/usr/local/bin/python3 -V), $(jq --version)""#,
+    ];
+    let mut last = link;
+    for want in gates {
+        let i = at(want);
+        assert!(i > last, "{want}: in order, after the link");
+        last = i;
+    }
+    let backend = at("test -x \"$(git --exec-path)/git-http-backend\"");
+    assert!(cleanup < run && run < link && last < backend, "the tools gate after the packages' clean-up, before the http-backend gate");
+    assert!(!df[run + 1..last].contains("\nRUN "), "one RUN of its own");
+}
+
 // ---- S11 phase 0 (part C): curl decodes gzip, the fake curl's encoding, the encoded-part refusal ----
 
 /// S11 (C.3.8): the curl gate in the block that makes `ai-env-net` also

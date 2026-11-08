@@ -81,6 +81,10 @@
 //! starting that server from the baked `--mcp-config` (a recorded check in
 //! `make claude-admit-docker`, LD-V11); the relay files root's and no
 //! `/run/ai-env` baked.
+//! L2, the chat's tools: through `/agent`, `python3` is 3.14 (a root link in
+//! `/usr/local/bin` the agent cannot change) and `jq` works, and an import in
+//! a spawn's working directory writes no `__pycache__` (the shim's
+//! `PYTHONDONTWRITEBYTECODE=1`).
 #[path = "common/curl.rs"]
 mod curl;
 
@@ -1412,7 +1416,7 @@ fn l1_spawns_run_as_the_agent_with_no_new_privs_and_clean_fds() {
     let env = a.out(&Spec { env: BTreeMap::from([("S6_DOCKER".to_string(), "on".to_string())]), ..Spec::argv(&["env"]) });
     let mut env: Vec<&str> = env.lines().collect();
     env.sort_unstable();
-    assert_eq!(env, ["CLAUDE_CONFIG_DIR=/Users/mike/.claude", "DISABLE_AUTOUPDATER=1", "HOME=/Users/mike", "PATH=/usr/local/bin:/usr/bin:/bin", "S6_DOCKER=on"]);
+    assert_eq!(env, ["CLAUDE_CONFIG_DIR=/Users/mike/.claude", "DISABLE_AUTOUPDATER=1", "HOME=/Users/mike", "PATH=/usr/local/bin:/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE=1", "S6_DOCKER=on"]);
     // The shell's own fds, listed by a child: `; true` keeps sh from exec'ing
     // ls, which would list its own directory fd.
     let fds = |text: String| text.split_whitespace().map(str::to_string).collect::<Vec<_>>();
@@ -2763,6 +2767,37 @@ fn l2_dig_for_the_egress_check() {
     let v = c.sh("dig -v 2>&1");
     assert!(v.starts_with("DiG 9."), "{v}");
     assert_eq!(c.sh("command -v curl"), "/usr/bin/curl", "curl too");
+}
+
+/// The chat's tools in the real image (the Dockerfile's tools gate), through `/agent`: as the agent, on the
+/// shim's child PATH, `python3` is `/usr/local/bin/python3`, reports 3.14 and runs with `-I -B`, and `jq`
+/// turns `{"a":[1,2]}` with `.a | add` into 3. The link is root's (0:0) and names `/usr/bin/python3.14`;
+/// the agent can neither replace, remove nor move it, nor write through it. An import in a spawn's working
+/// directory leaves no `__pycache__` (the shim's `PYTHONDONTWRITEBYTECODE=1`), and leaves one when the
+/// frame sets the variable empty (a default the frame's env may replace, as `DISABLE_AUTOUPDATER`).
+#[test]
+#[ignore = "Docker: make test-docker"]
+fn l2_python3_and_jq_for_the_agent() {
+    let vm = Vm::started(l2(), None, 120);
+    let c = &vm.c;
+    let mut a = vm.agent();
+    assert_eq!(a.out(&Spec::argv(&["sh", "-c", "command -v python3"])), "/usr/local/bin/python3\n", "the link, ahead of /usr/bin");
+    let version = r#"import json, sys; print("%d.%d" % sys.version_info[:2])"#;
+    assert_eq!(a.out(&Spec::argv(&["python3", "-I", "-B", "-c", version])), "3.14\n");
+    assert_eq!(a.run(&Spec::argv(&["jq", "-c", ".a | add"]), br#"{"a":[1,2]}"#).ok("jq"), "3\n");
+    assert_eq!(c.sh("stat -c '%F %u:%g' /usr/local/bin/python3; readlink /usr/local/bin/python3"), "symbolic link 0:0\n/usr/bin/python3.14");
+    for script in ["ln -sf /bin/sh /usr/local/bin/python3", "rm -f /usr/local/bin/python3", "mv /usr/local/bin/python3 /tmp/python3", "printf x > /usr/local/bin/python3"] {
+        let out = c.exec_as("1000", &["sh", "-c", script]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("Permission denied"), "the agent changed the link: {script}");
+    }
+    assert_eq!(c.sh("readlink /usr/local/bin/python3"), "/usr/bin/python3.14", "the link as the image made it");
+    let import = |dir: &str, env: &[(&str, &str)]| Spec {
+        cwd: Some(format!("/Users/mike/w/{dir}")),
+        env: env.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+        ..Spec::argv(&["sh", "-c", "printf 'X = 3\\n' > m.py && python3 -c 'import m; print(m.X)' && ls -A"])
+    };
+    assert_eq!(a.out(&import("py", &[])), "3\nm.py\n", "PYTHONDONTWRITEBYTECODE=1: no __pycache__");
+    assert_eq!(a.out(&import("py-cache", &[("PYTHONDONTWRITEBYTECODE", "")])), "3\n__pycache__\nm.py\n", "set empty by the frame: the cache is written");
 }
 
 /// The hooks' children (the probes, `/validate`'s claude and curl) are all

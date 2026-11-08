@@ -4,7 +4,7 @@
 //!
 //! Seeds: workers A `[1u8; 32]` (`worker-a`, `example.alpha*`), B `[2u8; 32]` (`worker-b`, `example.beta*`),
 //! C `[5u8; 32]` (`worker-c`, `example.gamma*`); the token signer `mac` `[7u8; 32]` (WM-T6's session key). The
-//! lists are rendered with W/M's `policy::render_*` and every token is minted with W/M's `session::mint`.
+//! lists are rendered with W/M's `policy::render_*` and every token is minted with W/M's `session::mint_for`.
 #![allow(dead_code)]
 
 pub mod certs;

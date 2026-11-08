@@ -44,7 +44,7 @@ pub(crate) trait Entries {
     fn entries(&self) -> usize;
 }
 
-impl Entries for rustls::ServerConfig {
+impl Entries for crate::tls::TlsConfigs {
     fn entries(&self) -> usize {
         0
     }
@@ -250,8 +250,8 @@ pub struct Live {
     pub signers: Watched<Signers>,
     /// `grants.json`.
     pub grants: Watched<Grants>,
-    /// `tls.pem`.
-    pub tls: Watched<rustls::ServerConfig>,
+    /// `tls.pem`: a server config per face (R-124).
+    pub tls: Watched<crate::tls::TlsConfigs>,
     /// `peers.json`, the public face's allowlist: a JSON list under R-15 to R-17, like the other three (R-88).
     pub peers: Watched<crate::lists::Peers>,
     /// `access.json`, the grants a chat holds beyond its token's own: a JSON list under R-15 to R-17 (R-144), and
@@ -374,6 +374,12 @@ mod tests {
         std::fs::write(dir.path().join(TLS_FILE), mismatched).unwrap();
         assert!(matches!(live.poll(at(t2), max)[3].1, Poll::Refused(_)));
         assert!(live.tls.loaded().is_some(), "a refused tls.pem keeps the loaded config");
+        // R-124: a tls.pem with no CA after its leaf can verify no client certificate: refused the same way.
+        let private_key = ["PRIVATE", "KEY"].join(" ");
+        let no_issuer = [test_certs::pem("CERTIFICATE", &leaf.cert_der), test_certs::pem(&private_key, &leaf.key_pkcs8)].concat();
+        std::fs::write(dir.path().join(TLS_FILE), no_issuer).unwrap();
+        assert_eq!(live.poll(at(t2), max)[3].1, Poll::Refused("tls.pem: no issuer for client certificates".into()));
+        assert!(live.tls.loaded().is_some(), "and keeps the loaded config");
         std::fs::remove_file(dir.path().join(TLS_FILE)).unwrap();
         assert_eq!(live.poll(at(t2), max)[3].1, Poll::Missing);
         assert!(live.tls.loaded().is_none(), "a missing tls.pem is unloaded");

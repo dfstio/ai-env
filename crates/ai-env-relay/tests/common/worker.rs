@@ -63,6 +63,14 @@ impl TestWorker {
         w
     }
 
+    /// Opens a tunnel on a new connection presenting this seed's certificate (R-129) and reads the Challenge.
+    pub async fn open_as(rig: &Rig, seed: u8) -> TestWorker {
+        let (channel, link) = rig.public_channel_as(seed).await;
+        let mut w = TestWorker::open_on(channel).await.expect("the relay answers Open");
+        w.link = Some(link);
+        w
+    }
+
     /// Opens a tunnel on `channel` and reads its first frame, which must be the Challenge.
     pub async fn open_on(channel: Channel) -> Result<TestWorker, tonic::Status> {
         let (out, rx) = mpsc::channel(256);
@@ -137,7 +145,7 @@ impl TestWorker {
     pub async fn connect(rig: &Rig, worker_id: &str, seed: u8, sources: Vec<SourceDescriptor>) -> TestWorker {
         let before = rig.app.snapshot().sources_live;
         let n = sources.len() as u64;
-        let mut w = TestWorker::open(rig).await;
+        let mut w = TestWorker::open_as(rig, seed).await;
         w.authenticate(worker_id, seed).await.expect("authenticated");
         w.register(sources).await;
         rig.until(PATIENCE, "the catalog installed", |r| r.app.snapshot().sources_live >= before + n).await;

@@ -23,6 +23,10 @@
 //!   to the entry's `not_after`, prints it on stdout and writes its SHA-256 as the entry's `tls_fp`; stdout holds the
 //!   only copy, so a failed print is a failed run. `allow` without it keeps the entry's `tls_fp`, and that certificate
 //!   keeps the end it was issued with.
+//! - A token signer's grants (§RS.4.2, R-134): `allow --token-signer --grants` makes the entry's `grants` exactly the
+//!   sorted set; without `--grants` the entry keeps its own, so a key rotation narrows and widens nothing, and a new
+//!   entry has none, which reaches every grant. A relay older than wave 4 refuses a list with `grants`, and every token
+//!   then fails: `--grants` is written only after that relay runs (RO-6), which its note says.
 //! - One network, one label (§RS.4.2, R-86): `allow-ip` is an upsert by label, `revoke-ip` a removal by network or
 //!   by label. A prefix under 16 needs `--wide`: a typo such as `/0` must not lift the allowlist (Q-R22). `--mine`
 //!   asks checkip.amazonaws.com for this Mac's address and writes it as the `/32` of the label `mac`.
@@ -44,9 +48,9 @@ use crate::errors::{CliError, Result};
 use crate::store::Keystore;
 use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc, unix_now};
 use ai_env_worker::certs::{self, ClientPoint};
-use ai_env_worker::globs::{valid_glob, valid_id, valid_rule};
+use ai_env_worker::globs::{glob_match, valid_glob, valid_id, valid_rule};
 use ai_env_worker::keys::PublicKey;
-use ai_env_worker::policy::{self, AccessEntry, Grant, PeerEntry, SignerEntry, WorkerEntry, ACCESS, ENTRIES_MAX, GRANTS, PARAMETER_MAX, PEERS, RULES_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
+use ai_env_worker::policy::{self, AccessEntry, Grant, PeerEntry, SignerEntry, WorkerEntry, ACCESS, ENTRIES_MAX, GRANTS, PARAMETER_MAX, PEERS, RULES_MAX, SIGNER_GRANTS_MAX, SOURCES_MAX, TOKEN_SIGNERS, WORKERS};
 use serde_json::Value;
 use std::io::Write as _;
 use std::net::Ipv4Addr;
@@ -607,6 +611,7 @@ pub struct AllowArgs<'a> {
     pub token_signer: bool,
     pub not_after: Option<&'a str>,
     pub tls_key: Option<&'a str>,
+    pub grants: &'a [String],
 }
 
 impl AllowArgs<'_> {
@@ -623,6 +628,9 @@ impl AllowArgs<'_> {
         }
         if let Some(point) = self.tls_key {
             args.extend(["--tls-key".to_string(), point.to_string()]);
+        }
+        if !self.grants.is_empty() {
+            args.extend(["--grants".to_string(), self.grants.join(",")]);
         }
         args
     }
@@ -649,11 +657,11 @@ fn side_note(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "note: {line}");
 }
 
-/// `ai-env relay allow <id> --key <text> (--sources <globs> [--tls-key <p256:…>] | --token-signer)
+/// `ai-env relay allow <id> --key <text> (--sources <globs> [--tls-key <p256:…>] | --token-signer [--grants <globs>])
 /// [--not-after <YYYY-MM-DD>]` (WM-R43, §RS.4.2): the arguments checked first (exit 2), then the gate (exit 9), then
 /// the lists; `--tls-key`'s one Touch ID comes after the read and WM-R43's checks and before the write.
 pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
-    let AllowArgs { id, key, sources, token_signer, not_after, tls_key } = *args;
+    let AllowArgs { id, key, sources, token_signer, not_after, tls_key, grants } = *args;
     let usage = |why: String| CliError::Usage(format!("relay allow: {why}"));
     if !valid_id(id) {
         return Err(usage(format!("{id:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
@@ -664,6 +672,9 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
     }
     if token_signer && tls_key.is_some() {
         return Err(usage("--tls-key and --token-signer: a token signer has no client certificate".into()));
+    }
+    if !token_signer && !grants.is_empty() {
+        return Err(usage("--grants without --token-signer: a worker mints no token".into()));
     }
     let point = tls_key
         .map(|text| ClientPoint::parse_text(text).map_err(|_| usage("--tls-key is not a P-256 public point's text, p256:<base64 of 65 bytes> (93 characters), as tls-keygen prints it".into())))
@@ -678,6 +689,13 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
         if let Some(bad) = globs.iter().find(|g| !valid_glob(g)) {
             return Err(usage(format!("--sources {bad:?} is not a glob (1 to 64 of [a-z0-9._-*], starting with [a-z0-9*], at most 4 *)")));
         }
+    }
+    let grant_set = normalized(grants);
+    if grant_set.len() > SIGNER_GRANTS_MAX {
+        return Err(usage(format!("--grants names {} glob(s): 1 to {SIGNER_GRANTS_MAX}", grant_set.len())));
+    }
+    if let Some(bad) = grant_set.iter().find(|g| !valid_glob(g)) {
+        return Err(usage(format!("--grants {bad:?} is not a glob (1 to 64 of [a-z0-9._-*], starting with [a-z0-9*], at most 4 *)")));
     }
     let day = not_after_day(not_after, unix_now()).map_err(usage)?;
     let until = policy::not_after_of_day(&day).map_err(|e| usage(format!("--not-after {day}: {e}")))?;
@@ -702,7 +720,7 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
             return Err(CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {} {other}: one key, one role", kind.other().noun())));
         }
         let one_id = |other: String| CliError::Policy(format!("relay allow: the key fp {fp} is already allowed as {other}: one key, one id"));
-        let (outcome, value, count, cert) = match kind {
+        let (outcome, value, count, cert, signer_grants) = match kind {
             Kind::Worker => {
                 let mut list = policy::parse_workers(&mine.value).map_err(|e| unparsed("allow", mine.name, &e))?;
                 let old = list.iter().find(|w| w.worker_id == id);
@@ -723,18 +741,20 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
                     None => held.map_or(WorkerCert::None, |t| WorkerCert::Kept { fp: fp16(&t).to_string(), outrun: old_end.is_some_and(|end| entry.not_after_unix() > end) }),
                 };
                 let outcome = upsert(&mut list, entry).map_err(one_id)?;
-                (outcome, rendered("allow", mine.name, &list, policy::render_workers)?, list.len(), cert)
+                (outcome, rendered("allow", mine.name, &list, policy::render_workers)?, list.len(), cert, None)
             }
             Kind::TokenSigner => {
                 let mut list = policy::parse_signers(&mine.value).map_err(|e| unparsed("allow", mine.name, &e))?;
-                let entry = SignerEntry { signer_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), not_after: until.clone() };
+                // `--grants` is the whole set; without it the entry keeps its own (a key rotation).
+                let set = if grant_set.is_empty() { list.iter().find(|s| s.signer_id == id).and_then(|s| s.grants.clone()) } else { Some(grant_set.clone()) };
+                let entry = SignerEntry { signer_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), not_after: until.clone(), grants: set.clone() };
                 let outcome = upsert(&mut list, entry).map_err(one_id)?;
-                (outcome, rendered("allow", mine.name, &list, policy::render_signers)?, list.len(), WorkerCert::None)
+                (outcome, rendered("allow", mine.name, &list, policy::render_signers)?, list.len(), WorkerCert::None, set)
             }
         };
         let scope = match kind {
             Kind::Worker => format!(" for sources {}", globs.join(",")),
-            Kind::TokenSigner => String::new(),
+            Kind::TokenSigner => signer_grants.as_ref().map_or_else(|| " for every grant".to_string(), |set| format!(" for grants {}", set.join(","))),
         };
         // `(key fp <fp>)`, or with the certificate: issued, or kept.
         let shown = match &cert {
@@ -755,6 +775,9 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
         pairs.push(("not_after", day.clone()));
         if let WorkerCert::Issued { der, .. } = &cert {
             pairs.push(("tls_fp", certs::fingerprint(der)));
+        }
+        if let Some(set) = &signer_grants {
+            pairs.push(("grants", set.len().to_string()));
         }
         if outcome == Allowed::Unchanged {
             say(&format!("{} {id} ({shown}) is already allowed{scope} until {day} ({} v{}); nothing written", kind.noun(), mine.name, mine.version));
@@ -785,6 +808,10 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
             if any_source {
                 note("this worker may register any source name");
             }
+            // LD-R61: a tunnel already passed its proof, so a new `tls_fp` closes nothing; a new key does, by itself (R-18).
+            if old.is_some() && !matches!(outcome, Allowed::Replaced { old_key: Some(_) }) {
+                side_note(&format!("worker {id}: a live tunnel stays up on the old certificate until it next connects (LD-R61): if its keys may be stolen, rotate --key too, or revoke"));
+            }
             // The only copy, its serial random, and the list already names it. Never `?`: `From<io::Error>` makes a
             // closed pipe exit 0.
             let mut out = std::io::stdout().lock();
@@ -797,6 +824,9 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
                 say("this worker may register any source name");
             }
             cert_note();
+            if !grant_set.is_empty() {
+                side_note("a relay before part H refuses this list whole and every token then fails (RO-6): ai-env relay status's relay row must end client certificates required first");
+            }
         }
         Ok(())
     })
@@ -1249,9 +1279,10 @@ fn access_target(paths: &Paths, sid: &str, allowing: bool) -> Result<(String, Op
 
 /// `ai-env relay access <SESSION> (--allow G [--days N] | --remove G)`, `ai-env relay access --list [--json]` (R-150). No
 /// gate: IAM decides. In this order: the arguments (exit 2); `G` in `[relay].offer`, for `--allow` only (exit 9); the
-/// row; the context and the operator, then the lock; one read of `access` and `grants`, `G` in `grants` for `--allow`
-/// (exit 9); the lapsed entries pruned; the edit, `render_access`, the write with its version check; audit; cache. An edit
-/// that changes nothing writes nothing; a write that fails is [`access_outcome_unknown`].
+/// row; the context and the operator, then the lock; one read of `access` and `grants`, with `token-signers` for `--allow`,
+/// `G` in `grants` for `--allow` (exit 9); the lapsed entries pruned; the edit, `render_access`, the write with its version
+/// check; audit; cache. An edit that changes nothing writes nothing; a write that fails is [`access_outcome_unknown`]. An
+/// allow whose grant this Mac's token signer leaves out says so (R-135, R-145): the relay gives the chat nothing through it.
 pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
     if args.from_panel {
         crate::bridge::audit::set_actor(crate::bridge::audit::Actor::Panel);
@@ -1279,18 +1310,27 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         return Err(usage(format!("--days {days}: 1 to {ACCESS_DAYS_MAX}")));
     }
     let paths = Paths::resolve()?;
+    // This Mac's token signer, for an allow: its id.
+    let mut signer_id = String::new();
     if allowing {
         let relay = BridgeConfig::load(&paths)?.unwrap_or_default().relay;
         relay.validate()?;
         if !relay.offer.iter().any(|g| g == grant) {
             return Err(CliError::Policy(format!("relay access: grant {grant} is not in [relay].offer of {}: the chats' approvals name only what it offers", paths.config.display())));
         }
+        signer_id = relay.worker_id;
     }
     let (access, relay_word) = access_target(&paths, sid, allowing)?;
     let ctx = RelayCtx::load()?;
     let op = ctx.operator("relay access")?;
     locked(&ctx, || {
-        let mut lists = read("access", &[ACCESS, GRANTS])?;
+        let mut lists = read("access", if allowing { &[ACCESS, GRANTS, TOKEN_SIGNERS] } else { &[ACCESS, GRANTS] })?;
+        let left_out = allowing && signer_leaves_out(&lists[2].value, &signer_id, grant);
+        let left_out_note = || {
+            if left_out {
+                side_note(&format!("token signer {signer_id}'s grants leave out {grant}: this chat reaches nothing through it"));
+            }
+        };
         let grants = lists.remove(1);
         let held = lists.remove(0);
         let mut list = policy::parse_access(&held.value).map_err(|e| unparsed("access", held.name, &e))?;
@@ -1323,6 +1363,7 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
                 Some(until) => say(&format!("{chat} holds grant {grant} until {until} ({} v{}); nothing written", held.name, held.version)),
                 None => say(&format!("{chat} does not hold grant {grant} ({} v{}); nothing written", held.name, held.version)),
             }
+            left_out_note();
             return Ok(());
         }
         let value = rendered("access", held.name, &list, policy::render_access)?;
@@ -1341,6 +1382,7 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         match until.filter(|_| allowing) {
             Some(until) => {
                 say(&format!("allowed {chat} grant {grant} until {until} ({} v{version}, {} chat(s)){swept}; the relay applies it within about 70 s, with no restart", held.name, list.len()));
+                left_out_note();
                 let others: Vec<&str> = list.iter().find(|a| a.chat == access).map_or_else(Vec::new, |a| a.grants.iter().map(String::as_str).filter(|g| *g != grant).collect());
                 if !others.is_empty() {
                     side_note(&format!("chat {access}'s entry holds {} too: one end, {until}, covers them all", others.join(",")));
@@ -1355,6 +1397,15 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Whether `signer_id`'s entry in the token signers' `value` holds `grants` none of which matches `grant`: the relay's
+/// filter then takes that grant from every chat this Mac's tokens name (R-135, R-145). A list that does not parse or an
+/// entry with no `grants` says nothing: this only explains, and the relay remains the gate.
+fn signer_leaves_out(value: &str, signer_id: &str, grant: &str) -> bool {
+    let entries = policy::parse_signers(value).unwrap_or_default();
+    let globs = entries.iter().find(|s| s.signer_id == signer_id).and_then(|s| s.grants.as_ref());
+    globs.is_some_and(|globs| !globs.iter().any(|glob| glob_match(glob, grant)))
 }
 
 /// `relay access --list [--json]`: the list as one read finds it, each chat with the sessions on this Mac whose row
@@ -1403,7 +1454,7 @@ mod tests {
     }
 
     fn signer(id: &str, seed: u8) -> SignerEntry {
-        SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key(seed).b64(), not_after: "2027-10-29T23:59:59Z".into() }
+        SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key(seed).b64(), not_after: "2027-10-29T23:59:59Z".into(), grants: None }
     }
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1434,6 +1485,11 @@ mod tests {
         assert_eq!(holder(&signers, &key(3).b64()), None);
         let mut signers = signers;
         assert_eq!(upsert(&mut signers, signer("mac", 7)), Ok(Allowed::Unchanged));
+        // R-134: a signer's grants are part of its entry: another set, the same key, is a replacement.
+        let bound = SignerEntry { grants: Some(s(&["g-a"])), ..signer("mac", 7) };
+        assert_eq!(upsert(&mut signers, bound.clone()), Ok(Allowed::Replaced { old_key: None }));
+        assert_eq!(upsert(&mut signers, bound), Ok(Allowed::Unchanged));
+        assert_eq!(upsert(&mut signers, signer("mac", 7)), Ok(Allowed::Replaced { old_key: None }));
         assert!(remove(&mut workers, "worker-a"));
         assert!(!remove(&mut workers, "worker-a"), "absent the second time");
         assert_eq!(workers, [worker("worker-b", 3, &["example-*"])]);

@@ -13,7 +13,8 @@
 //!   secret; at most [`MAX_SPAWNS`] live), resolve argv[0] (`claude` →
 //!   `--claude`, else the child PATH), start as `--uid`/`--gid` (when root)
 //!   with a cleared environment (`HOME`, `PATH=/usr/local/bin:/usr/bin:/bin`,
-//!   `CLAUDE_CONFIG_DIR=<home>/.claude`, `DISABLE_AUTOUPDATER=1`, then the
+//!   `CLAUDE_CONFIG_DIR=<home>/.claude`, `DISABLE_AUTOUPDATER=1`,
+//!   `PYTHONDONTWRITEBYTECODE=1` (Python writes no `__pycache__`), then the
 //!   frame's env), piped stdio, and in `pre_exec` (`childproc`, shared with
 //!   the workspace helper; async-signal-safe, nothing allocated after the
 //!   fork): `setsid`, `PR_SET_NO_NEW_PRIVS` (Linux), the
@@ -221,7 +222,9 @@ impl std::fmt::Debug for SpawnRequest {
 /// PATH of every spawn (the environment is otherwise cleared); also where a
 /// bare argv[0] is looked up.
 const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-/// Names the shim sets itself.
+/// Names the shim sets itself and a frame may not (its
+/// `DISABLE_AUTOUPDATER=1` and `PYTHONDONTWRITEBYTECODE=1` come before the
+/// frame's env, which may replace them).
 const RESERVED_ENV: [&str; 3] = ["HOME", "PATH", "CLAUDE_CONFIG_DIR"];
 /// Largest secret delivered on fd 3: it is written into the pipe before the
 /// child exists, so it must fit the pipe buffer (≥ 16 KiB everywhere).
@@ -1050,6 +1053,8 @@ impl SpawnManager {
             .env("PATH", child_path(cached.as_deref()))
             .env("CLAUDE_CONFIG_DIR", opts.home.join(".claude"))
             .env("DISABLE_AUTOUPDATER", "1")
+            // No `__pycache__` from a chat's Python in its workspace: each turn's snapshot would carry it to the Mac.
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .envs(&req.env);
         if let Some((name, value)) = secret {
             match req.deliver {

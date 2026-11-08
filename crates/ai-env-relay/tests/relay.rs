@@ -1,4 +1,4 @@
-//! The relay in-process (§R-relay.7, relay 1 to 44 and 49 to 54): tonic over `tokio::io::duplex` with the rig of
+//! The relay in-process (§R-relay.7, relay 1 to 54): tonic over `tokio::io::duplex` with the rig of
 //! `tests/common`. Tests marked "paused" run on tokio's paused clock and assert virtual time.
 
 mod common;
@@ -63,8 +63,9 @@ async fn a_worker_authenticates_and_its_catalog_is_listed() {
 #[tokio::test]
 async fn each_auth_fault_is_the_same_authentication_failed() {
     let rig = Rig::start().await;
+    // B's entry lapsed, and A's certificate in force: this one reaches the Challenge and its proof, so `expired` stands.
     let expired = Rig::start().await;
-    expired.write_workers(&[worker_entry("worker-a", 1, &["example.alpha*"], "2027-01-15T07:00:00Z")]);
+    expired.write_workers(&[worker_entry("worker-a", 1, &["example.alpha*"], NOT_AFTER), worker_entry("worker-b", 2, &["example.beta*"], "2027-01-15T07:00:00Z")]);
     expired.poll();
     type Case = (&'static str, bool, Box<dyn Fn(&Challenge) -> Vec<worker_frame::Msg>>);
     use ai_env_relay_proto::v1::Challenge;
@@ -101,8 +102,8 @@ async fn each_auth_fault_is_the_same_authentication_failed() {
             "expired",
             true,
             Box::new(|c| {
-                let h = hello("worker-a", 1);
-                let p = proof(c, &h, 1);
+                let h = hello("worker-b", 2);
+                let p = proof(c, &h, 2);
                 vec![worker_frame::Msg::Hello(h), worker_frame::Msg::AuthProof(p)]
             }),
         ),
@@ -177,6 +178,13 @@ async fn each_auth_fault_is_the_same_authentication_failed() {
     assert_eq!((status.code(), status.message()), (Code::Unauthenticated, "authentication failed"));
     assert_eq!(rig.lines("tunnel").pop().unwrap()["reason"], "eof");
     assert_eq!(rig.app.snapshot().tunnels, 0);
+
+    // R-126: A's `not_after` passed: no entry in force holds its certificate, so `open()` refuses it, before the Challenge.
+    let lapsed = Rig::start().await;
+    lapsed.write_workers(&[worker_entry("worker-a", 1, &["example.alpha*"], "2027-01-15T07:00:00Z")]);
+    lapsed.poll();
+    assert_eq!(refused_reason(&lapsed, 1).await, "unknown_cert");
+    assert_eq!(lapsed.app.snapshot().tunnels, 0);
 }
 
 /// Relay 3 (paused).
@@ -254,13 +262,7 @@ async fn every_challenge_has_its_own_nonce() {
 #[tokio::test]
 async fn the_whitelist_fails_closed_until_first_loaded() {
     let rig = Rig::start_without(limits(), &[WORKERS_FILE]).await;
-    let mut a = TestWorker::open(&rig).await;
-    let h = hello("worker-a", 1);
-    let p = proof(&a.challenge, &h, 1);
-    a.send(worker_frame::Msg::Hello(h)).await;
-    a.send(worker_frame::Msg::AuthProof(p)).await;
-    assert_eq!(a.end().await.expect_err("never loaded").code(), Code::Unauthenticated);
-    assert_eq!(rig.lines("tunnel").pop().unwrap()["reason"], "not_loaded");
+    assert_eq!(refused_reason(&rig, 1).await, "not_loaded");
     rig.write_workers(&default_workers());
     rig.write_fetched(rig.clock.unix());
     rig.poll();
@@ -271,15 +273,17 @@ fn reloads(rig: &Rig, file: &str) -> Vec<serde_json::Value> {
     rig.lines("reload").into_iter().filter(|l| l["file"] == file).collect()
 }
 
-async fn refused_reason(rig: &Rig, worker_id: &str, seed: u8) -> String {
-    let mut w = TestWorker::open(rig).await;
-    let h = hello(worker_id, seed);
-    let p = proof(&w.challenge, &h, seed);
-    w.send(worker_frame::Msg::Hello(h)).await;
-    w.send(worker_frame::Msg::AuthProof(p)).await;
-    let status = w.end().await.expect_err("refused");
-    assert_eq!(status.code(), Code::Unauthenticated);
-    rig.lines("tunnel").pop().unwrap()["reason"].as_str().unwrap().to_string()
+/// R-126 (LD-R33): a connection presenting this seed's certificate, refused at `open()`: 16 `authentication failed`
+/// with no Challenge and no frame (`open_on` takes the first frame or status), and one tunnel line with no worker and
+/// no sdk; its reason.
+async fn refused_reason(rig: &Rig, seed: u8) -> String {
+    let (channel, _link) = rig.public_channel_as(seed).await;
+    let status = TestWorker::open_on(channel).await.err().expect("refused before the Challenge");
+    assert_eq!((status.code(), status.message()), (Code::Unauthenticated, "authentication failed"));
+    let line = rig.lines("tunnel").pop().unwrap();
+    assert_eq!((line["phase"].as_str(), line["outcome"].as_str()), (Some("auth"), Some("refused")), "{line}");
+    assert_eq!((line["worker"].as_str(), line["sdk"].as_str(), line["peer"].as_str()), (Some(""), Some(""), Some(WORKER_IP)), "{line}");
+    line["reason"].as_str().unwrap().to_string()
 }
 
 /// Relay 6.
@@ -287,6 +291,7 @@ async fn refused_reason(rig: &Rig, worker_id: &str, seed: u8) -> String {
 async fn a_stale_whitelist_closes_tunnels_and_refuses_handshakes() {
     let rig = Rig::start().await;
     let mut a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await;
+    let mut challenged = TestWorker::open(&rig).await;
     let before = reloads(&rig, "workers").len();
     rig.clock.set(T0 + 901);
     assert_eq!(rig.poll()[0].1, Poll::Stale);
@@ -295,7 +300,14 @@ async fn a_stale_whitelist_closes_tunnels_and_refuses_handshakes() {
     let lines = reloads(&rig, "workers");
     assert_eq!(lines.len(), before + 1);
     assert_eq!(lines.last().unwrap()["outcome"], "stale");
-    assert_eq!(refused_reason(&rig, "worker-a", 1).await, "stale");
+    assert_eq!(refused_reason(&rig, 1).await, "stale");
+    // R-10's own step stays (LD-R33), for a Challenge taken while the file was fresh.
+    let h = hello("worker-a", 1);
+    let p = proof(&challenged.challenge, &h, 1);
+    challenged.send(worker_frame::Msg::Hello(h)).await;
+    challenged.send(worker_frame::Msg::AuthProof(p)).await;
+    assert_eq!(challenged.end().await.expect_err("stale").code(), Code::Unauthenticated);
+    assert_eq!(rig.lines("tunnel").pop().unwrap()["reason"], "stale");
     rig.write_fetched(rig.clock.unix());
     rig.poll();
     TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await;
@@ -307,12 +319,20 @@ async fn a_missing_or_refused_whitelist_fails_closed_at_once() {
     let rig = Rig::start().await;
     let good = rig.read(WORKERS_FILE);
     let mut a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await;
+    let mut challenged = TestWorker::open(&rig).await;
     rig.remove(WORKERS_FILE);
     assert_eq!(rig.poll()[0].1, Poll::Missing);
     let close = a.close().await;
     assert_eq!((close.code, close.reason.as_str()), (6, "the whitelist is not loaded"));
     assert_eq!(reloads(&rig, "workers").last().unwrap()["outcome"], "missing");
-    assert_eq!(refused_reason(&rig, "worker-a", 1).await, "not_loaded");
+    assert_eq!(refused_reason(&rig, 1).await, "not_loaded");
+    // R-10's own step stays (LD-R33), for a Challenge taken while the file was loaded.
+    let h = hello("worker-a", 1);
+    let p = proof(&challenged.challenge, &h, 1);
+    challenged.send(worker_frame::Msg::Hello(h)).await;
+    challenged.send(worker_frame::Msg::AuthProof(p)).await;
+    assert_eq!(challenged.end().await.expect_err("not loaded").code(), Code::Unauthenticated);
+    assert_eq!(rig.lines("tunnel").pop().unwrap()["reason"], "not_loaded");
 
     rig.write(WORKERS_FILE, &good);
     rig.poll();
@@ -322,7 +342,7 @@ async fn a_missing_or_refused_whitelist_fails_closed_at_once() {
     let close = a.close().await;
     assert_eq!((close.code, close.reason.as_str()), (6, "the whitelist is not loaded"));
     assert_eq!(reloads(&rig, "workers").last().unwrap()["outcome"], "refused");
-    assert_eq!(refused_reason(&rig, "worker-a", 1).await, "not_loaded");
+    assert_eq!(refused_reason(&rig, 1).await, "not_loaded");
 
     rig.write(WORKERS_FILE, &good);
     rig.poll();
@@ -352,7 +372,8 @@ async fn revocation_closes_the_live_tunnel() {
     assert_eq!(final_code(&last), Some(14));
     let listed = list(&mut client, &token).await.unwrap();
     assert!(names(&listed).iter().all(|(n, _)| !n.starts_with("example.alpha")), "removed, not offline: {:?}", names(&listed));
-    assert_eq!(refused_reason(&rig, "worker-a", 1).await, "unknown_worker");
+    // R-126: no entry in force holds A's certificate any more: refused at `open()`, before the Challenge.
+    assert_eq!(refused_reason(&rig, 1).await, "unknown_cert");
     assert_eq!(rig.lines("tunnel").iter().rfind(|l| l["phase"] == "close").unwrap()["reason"], "revoked");
 }
 
@@ -397,7 +418,7 @@ async fn not_after_passing_closes_the_tunnel() {
 }
 
 async fn refused_catalog(rig: &Rig, worker_id: &str, seed: u8, sources: Vec<ai_env_relay_proto::v1::SourceDescriptor>) -> (u32, String) {
-    let mut w = TestWorker::open(rig).await;
+    let mut w = TestWorker::open_as(rig, seed).await;
     w.authenticate(worker_id, seed).await.expect("authenticated");
     w.register(sources).await;
     let close = w.close().await;
@@ -577,11 +598,11 @@ async fn a_stopped_worker_past_its_not_after_is_listed_no_more() {
     assert_eq!((s.tunnels, s.sources_live, s.sources_offline), (0, 0, 1));
 }
 
-/// `TestWorker::connect` over a connection from `ip` (`Rig::public_channel_from`), once no tunnel is live.
+/// `TestWorker::connect` over a connection from `ip` (`Rig::public_channel_from_as`), once no tunnel is live.
 async fn connect_from(rig: &Rig, ip: &str, worker_id: &str, seed: u8, sources: Vec<ai_env_relay_proto::v1::SourceDescriptor>) -> TestWorker {
     let before = rig.app.snapshot().sources_live;
     let n = sources.len() as u64;
-    let (channel, link) = rig.public_channel_from(ip.parse().unwrap()).await;
+    let (channel, link) = rig.public_channel_from_as(ip.parse().unwrap(), seed).await;
     let mut w = TestWorker::open_on(channel).await.expect("the Challenge");
     w.link = Some(link);
     w.authenticate(worker_id, seed).await.expect("authenticated");
@@ -944,11 +965,11 @@ async fn session_tokens_gate_the_private_face_alike() {
     let mut client = rig.client().await;
     let now = rig.clock.unix();
     let past = SessionClaims { iat: now - 7200, exp: now - 3600, ..rig.claims("g-all") };
-    let other_kid = SessionClaims { kid: "mac-9".into(), ..rig.claims("g-all") };
+    let other_kid = SessionClaims { kid: "mac-9".into(), caller_id: "mac-9".into(), ..rig.claims("g-all") };
     let changed = {
         let t = rig.token("g-all");
         let parts: Vec<&str> = t.split('.').collect();
-        let json = String::from_utf8(b64url_decode(parts[1])).unwrap().replace("ai-env-relay", "ai-env-other");
+        let json = String::from_utf8(b64url_decode(parts[1])).unwrap().replace(RELAY_ID, "ai-env-other");
         format!("v1.{}.{}", b64url_encode(json.as_bytes()), parts[2])
     };
     let bad = vec![mint(4, &rig.claims("g-all")), mint(7, &other_kid), mint(7, &past), changed];
@@ -1019,13 +1040,28 @@ fn b64url_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Relay 20.
+/// A token of these exact claims, signed by a seed's key: what W/M's `session::mint` would refuse to make.
+fn signed(seed: u8, claims: &SessionClaims) -> String {
+    let json = serde_json::to_vec(claims).unwrap();
+    let signature = ai_env_worker::keys::SigningKey::from_seed(&[seed; 32]).unwrap().sign(&ai_env_worker::session::signing_input(&json));
+    format!("v1.{}.{}", b64url_encode(&json), b64url_encode(&signature))
+}
+
+/// Relay 20, inverted (R-133): a token with `kid` `mac` and `caller_id` `mac-desk`, its signature good, is refused 16 and
+/// reaches no worker; with both `mac` the caller is the token's, whatever the metadata says.
 #[tokio::test]
 async fn the_caller_is_the_tokens_never_the_requests() {
     let rig = Rig::start().await;
     let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
     let mut client = rig.client().await;
-    let claims = SessionClaims { caller_id: "mac-desk".into(), ..rig.claims("g-all") };
+    let desk = signed(7, &SessionClaims { caller_id: "mac-desk".into(), ..rig.claims("g-all") });
+    let s = call(&mut client, &desk, "example.alpha", "get", b"{}").await.expect_err("another caller under this signer");
+    assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"));
+    let s = list(&mut client, &desk).await.expect_err("another caller under this signer");
+    assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"));
+    assert!(a.invokes().is_empty(), "nothing reached the worker");
+    assert_eq!(rig.app.snapshot().sessions, 0, "no session made");
+    let claims = rig.claims("g-all");
     let token = mint(7, &claims);
     let params = format!("{{\"session_id\":\"{}\",\"caller_id\":\"forged\"}}", rig.session_id());
     let mut req = with_token(request("example.alpha", "get", params.as_bytes()), &token);
@@ -1036,7 +1072,7 @@ async fn the_caller_is_the_tokens_never_the_requests() {
     let caller = inv.caller.clone().unwrap();
     assert_eq!(
         (caller.caller_id.as_str(), caller.session_id.as_str(), caller.grant_id.as_str(), caller.vm_id.as_str()),
-        ("mac-desk", claims.session_id.as_str(), "g-all", VM_ID)
+        ("mac", claims.session_id.as_str(), "g-all", VM_ID)
     );
     let printed = format!("{inv:?}");
     assert!(!printed.contains(&token) && !printed.contains(token.split('.').nth(2).unwrap()), "no Invoke field holds the token");
@@ -1429,7 +1465,7 @@ async fn ping_keeps_a_tunnel_and_silence_closes_it() {
     assert!(pings.windows(2).all(|w| w[1] == w[0] + 1) && pings[0] == 1);
     assert!(a.closes().is_empty());
 
-    let mut b = TestWorker::open(&rig).await;
+    let mut b = TestWorker::open_as(&rig, 2).await;
     b.authenticate("worker-b", 2).await.unwrap();
     b.register(catalog_b()).await;
     let last_frame = Instant::now();
@@ -2817,7 +2853,7 @@ async fn identical_catalogs_touch_no_lock_and_catalogs_are_budgeted() {
 
     // The refill: 6 a minute, a token every 10 s exactly.
     let narrower = || vec![source("example.beta", &["get"])];
-    let mut b = TestWorker::open(&rig).await;
+    let mut b = TestWorker::open_as(&rig, 2).await;
     b.authenticate("worker-b", 2).await.expect("authenticated");
     for _ in 0..3 {
         b.register(catalog_b()).await;
@@ -2965,6 +3001,76 @@ async fn a_caller_that_stops_reading_never_stalls_its_tunnel() {
     let last = &chunks[5];
     assert!(last.r#final && last.error.is_none() && last.data.len() == 65_536, "the worker's own final: {:?}", (last.r#final, &last.error, last.data.len()));
     assert!(chunks[..5].iter().all(|c| !c.r#final && c.error.is_none()));
+}
+
+/// One public connection through `admit` from the rig's worker address, whose ban is the subject: refused before any TLS
+/// byte, with a peer line `banned`.
+async fn banned_at_admit(rig: &Rig) {
+    let (_client, server) = tokio::io::duplex(1 << 16);
+    assert!(rig.app.admit(ai_env_relay::Face::Public, server, WORKER_IP.parse().unwrap()).await.is_none(), "refused");
+    let line = rig.lines("peer").pop().expect("a peer line");
+    assert_eq!((line["reason"].as_str(), line["peer"].as_str()), (Some("banned"), Some(WORKER_IP)), "{line}");
+}
+
+/// Relay 45 (R-125 to R-128): a certificate serves its own worker only. A's fingerprint with B's key, B's proof sound:
+/// 16 `authentication failed` with no frame after the Challenge, its tunnel line `cert_mismatch` (R-127's fault, after
+/// the signature). A's fingerprint with A's key, and B's with B's, each authenticate. `public_channel_bare()`: 16 with no
+/// Challenge, `no_cert` (R-126). A list entry without `tls_fp` is refused both ways: `unknown_cert` at `open()` for a
+/// certificate nobody holds, `cert_mismatch` for a proof of that entry on another's certificate. Each of the three words
+/// is one fault of its address (R-102): with `ban_faults` 1 the address's next connection is `banned`.
+#[tokio::test]
+async fn a_certificate_serves_its_own_worker_only() {
+    let one_fault = || Limits { ban_faults: 1, ..limits() };
+    let rig = Rig::start_with(one_fault()).await;
+    let mut w = TestWorker::open(&rig).await;
+    let h = hello("worker-b", 2);
+    let p = proof(&w.challenge, &h, 2);
+    w.send(worker_frame::Msg::Hello(h)).await;
+    w.send(worker_frame::Msg::AuthProof(p)).await;
+    let (after, end) = w.rest().await;
+    assert!(after.is_empty(), "no frame after the Challenge: {after:?}");
+    let status = end.expect_err("A's certificate never serves B's key");
+    assert_eq!((status.code(), status.message()), (Code::Unauthenticated, "authentication failed"));
+    let line = rig.lines("tunnel").pop().unwrap();
+    assert_eq!((line["phase"].as_str(), line["outcome"].as_str(), line["reason"].as_str()), (Some("auth"), Some("refused"), Some("cert_mismatch")), "{line}");
+    assert_eq!((line["worker"].as_str(), line["peer"].as_str()), (Some("worker-b"), Some(WORKER_IP)), "{line}");
+    assert_eq!(rig.app.snapshot().tunnels, 0);
+    banned_at_admit(&rig).await;
+
+    // Each certificate with its own worker.
+    let rig = Rig::start().await;
+    let _a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::silent());
+    let _b = TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(Script::silent());
+    rig.tunnels(2).await;
+
+    let rig = Rig::start_with(one_fault()).await;
+    assert_eq!(refused_reason(&rig, 9).await, "unknown_cert", "a certificate no entry holds");
+    banned_at_admit(&rig).await;
+
+    let rig = Rig::start_with(one_fault()).await;
+    let (channel, _link) = rig.public_channel_bare().await;
+    let status = TestWorker::open_on(channel).await.err().expect("no certificate, no Challenge");
+    assert_eq!((status.code(), status.message()), (Code::Unauthenticated, "authentication failed"));
+    let line = rig.lines("tunnel").pop().unwrap();
+    assert_eq!((line["phase"].as_str(), line["outcome"].as_str(), line["reason"].as_str()), (Some("auth"), Some("refused"), Some("no_cert")), "{line}");
+    assert_eq!((line["worker"].as_str(), line["sdk"].as_str()), (Some(""), Some("")), "{line}");
+    assert_eq!(rig.lines("tunnel").len(), 1, "one line");
+    banned_at_admit(&rig).await;
+
+    // No client certificate on an entry: its worker cannot connect, whichever certificate it presents.
+    let rig = Rig::start().await;
+    let mut workers = default_workers();
+    workers[0].tls_fp = None;
+    rig.write_workers(&workers);
+    rig.poll();
+    assert_eq!(refused_reason(&rig, 1).await, "unknown_cert", "A's certificate is nobody's now");
+    let mut w = TestWorker::open_as(&rig, 2).await;
+    let h = hello("worker-a", 1);
+    let p = proof(&w.challenge, &h, 1);
+    w.send(worker_frame::Msg::Hello(h)).await;
+    w.send(worker_frame::Msg::AuthProof(p)).await;
+    assert_eq!(w.end().await.expect_err("an entry without tls_fp").code(), Code::Unauthenticated);
+    assert_eq!(rig.lines("tunnel").pop().unwrap()["reason"], "cert_mismatch");
 }
 
 /// Relay 49 (R-49): an answer over `list_max_bytes` is refused 8 `catalog too large`, with its list line, and the bound
@@ -3347,4 +3453,202 @@ async fn a_token_without_a_chat_matches_no_entry() {
     let chat = rig.chat_token("no-grant", CHAT);
     answered(call(&mut client, &chat, "example.alpha", "list", b"{}").await).await;
     assert_eq!(a.invoke(0).await.caller.unwrap().grant_id, "g-all", "the entry's chat, with any session");
+}
+
+/// A token signer of a seed's key, with these grants.
+fn signer_of(id: &str, seed: u8, grants: Option<&[&str]>) -> ai_env_relay::lists::SignerEntry {
+    ai_env_relay::lists::SignerEntry {
+        signer_id: id.into(),
+        public_key: ai_env_worker::keys::SigningKey::from_seed(&[seed; 32]).unwrap().public_key().b64(),
+        grants: grants.map(|g| g.iter().map(|s| (*s).to_string()).collect()),
+        ..mac_signer(NOT_AFTER)
+    }
+}
+
+/// A fresh session's claims of the signer `id` for `grant_id`: it is its own caller (R-133).
+fn claims_of(rig: &Rig, id: &str, grant_id: &str) -> SessionClaims {
+    SessionClaims { kid: id.into(), caller_id: id.into(), ..rig.claims(grant_id) }
+}
+
+/// Relay 46 (R-135, R-145): `kid` `mac-a` for a grant only `mac-b` holds: `ListSources` and `Call` 7 `not granted` (outcome
+/// `denied`), its line naming the caller, no session made and nothing at a worker; its own grant passes, on both, by the
+/// one glob of its set that matches, neither the first nor the last; a signer without `grants` reaches every grant.
+/// An access entry takes a signer no further than its set, on both calls alike: a set matching a token's `no-grant` and
+/// one grant of the entry's two lists that grant's ops and calls through it, the worker's `Caller.grant_id` and the call
+/// line's `grant` naming it, while the other, which the entry sorts first, reaches nothing; a set matching only the
+/// token's own grant gets nothing from the entry; a set matching the entry but not the token's own grant is refused
+/// as above, entry or no entry; a signer without `grants` reaches all the entry holds; and a running token loses what
+/// the entry gave it when its signer's set narrows.
+#[tokio::test]
+async fn a_signer_mints_for_its_own_grants_only() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let mut client = rig.client().await;
+    rig.write_signers(&[signer_of("mac-a", 7, Some(&["a-nothing", "g-alpha-*", "z-nothing"])), signer_of("mac-b", 8, Some(&["g-example"])), signer_of("mac-c", 9, None)]);
+    rig.poll();
+    let denied = |s: tonic::Status| {
+        assert_eq!((s.code(), s.message()), (Code::PermissionDenied, "not granted"));
+    };
+    // Every grant the list holds but its own, whichever rules that grant has: `g-all` would reach everything.
+    for grant in ["g-example", "g-all"] {
+        let token = mint(7, &claims_of(&rig, "mac-a", grant));
+        denied(list(&mut client, &token).await.expect_err("ListSources under another signer's grant"));
+        denied(call(&mut client, &token, "example.alpha", "get", b"{}").await.expect_err("Call under another signer's grant"));
+    }
+    assert_eq!(rig.app.snapshot().sessions, 0, "no session made");
+    assert!(a.invokes().is_empty(), "nothing reached a worker");
+    let line = rig.lines("list").pop().expect("a list line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["grant"].as_str(), line["code"].as_i64()), (Some("denied"), Some("mac-a"), Some("g-all"), Some(7)));
+    let line = rig.lines("call").pop().expect("a call line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["grant"].as_str(), line["code"].as_i64()), (Some("denied"), Some("mac-a"), Some("g-all"), Some(7)));
+
+    // Its own grant, by its glob, on both.
+    let own = mint(7, &claims_of(&rig, "mac-a", "g-alpha-get"));
+    assert_eq!(names(&list(&mut client, &own).await.expect("its own grant")), [("example.alpha".to_string(), true)]);
+    let (chunks, _) = drain(call(&mut client, &own, "example.alpha", "get", b"{}").await.expect("its own grant")).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(rig.app.snapshot().sessions, 1, "its session");
+    // The grant's own rules still bind what the signer may name.
+    denied(call(&mut client, &own, "example.alpha", "list", b"{}").await.expect_err("g-alpha-get holds no list"));
+    // mac-b holds the grant mac-a could not name; its token for mac-a's grant is refused the same.
+    let theirs = mint(8, &claims_of(&rig, "mac-b", "g-example"));
+    list(&mut client, &theirs).await.expect("mac-b's own grant");
+    denied(list(&mut client, &mint(8, &claims_of(&rig, "mac-b", "g-alpha-get"))).await.expect_err("mac-a's grant"));
+    // A signer without `grants` reaches every grant: today's reach.
+    for grant in ["g-all", "g-example", "g-alpha-get"] {
+        let token = mint(9, &claims_of(&rig, "mac-c", grant));
+        list(&mut client, &token).await.unwrap_or_else(|e| panic!("{grant}: {e}"));
+        let (chunks, _) = drain(call(&mut client, &token, "example.alpha", "get", b"{}").await.unwrap_or_else(|e| panic!("{grant}: {e}"))).await;
+        assert_eq!(chunks.len(), 1, "{grant}");
+    }
+    assert_eq!(a.invokes().len(), 4, "its one call, then the three of mac-c");
+
+    // R-145: through an access entry. `g-all` sorts first in it and allows everything; `g-alpha-get` allows one op.
+    rig.write_signers(&[
+        signer_of("mac-a", 7, Some(&["a-nothing", "g-alpha-*", "z-nothing"])),
+        signer_of("mac-c", 9, None),
+        signer_of("mac-d", 10, Some(&["no-grant", "g-alpha-*"])),
+        signer_of("mac-e", 11, Some(&["g-alpha-*"])),
+        signer_of("mac-f", 12, Some(&["no-grant"])),
+    ]);
+    rig.write_access(&[access_entry(CHAT, &["g-alpha-get", "g-all"])]);
+    rig.poll();
+    let chat_of = |seed: u8, id: &str, grant: &str| mint(seed, &SessionClaims { chat_id: Some(CHAT.into()), ..claims_of(&rig, id, grant) });
+    let every = [ops_row("example.alpha", &["get", "list"]), ops_row("example.alpha.logs", &["get", "list"])];
+
+    // The one grant of the two its set matches, on a list and a call alike, and it alone names the call.
+    let one_of_two = chat_of(10, "mac-d", "no-grant");
+    assert_eq!(listed_ops(&list(&mut client, &one_of_two).await.expect("its own grant")), [ops_row("example.alpha", &["get"])], "g-alpha-get's one op, not g-all's");
+    let line = rig.lines("list").pop().expect("a list line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["grant"].as_str()), (Some("ok"), Some("mac-d"), Some("no-grant")), "the list line keeps the token's");
+    answered(call(&mut client, &one_of_two, "example.alpha", "get", b"{}").await).await;
+    let invoke = a.invoke(4).await;
+    assert_eq!(invoke.caller.as_ref().unwrap().grant_id, "g-alpha-get", "the grant that allowed it, though g-all comes first");
+    rig.until(Duration::from_secs(10), "its call line", |r| r.lines("call").iter().any(|l| l["request_id"] == invoke.request_id.as_str())).await;
+    let line = rig.lines("call").into_iter().find(|l| l["request_id"] == invoke.request_id.as_str()).unwrap();
+    assert_eq!((line["outcome"].as_str(), line["grant"].as_str()), (Some("ok"), Some("g-alpha-get")), "so does its line");
+    denied(call(&mut client, &one_of_two, "example.alpha", "list", b"{}").await.expect_err("only g-all allows it"));
+    let line = rig.lines("call").pop().expect("a call line");
+    assert_eq!((line["outcome"].as_str(), line["grant"].as_str()), (Some("denied"), Some("no-grant")), "a denied call's line keeps the token's");
+
+    // A token's own grant under a set that leaves out the entry's other: the same, its own grant named once.
+    let own_named = chat_of(7, "mac-a", "g-alpha-get");
+    assert_eq!(listed_ops(&list(&mut client, &own_named).await.expect("its own grant")), [ops_row("example.alpha", &["get"])]);
+    denied(call(&mut client, &own_named, "example.alpha", "list", b"{}").await.expect_err("only g-all allows it"));
+
+    // A set matching the token's own grant and none of the entry's: an empty catalog and 7, a session made.
+    let sessions = rig.app.snapshot().sessions;
+    let none_of_two = chat_of(12, "mac-f", "no-grant");
+    assert!(list(&mut client, &none_of_two).await.expect("its own grant").sources.is_empty(), "the entry adds nothing");
+    denied(call(&mut client, &none_of_two, "example.alpha", "get", b"{}").await.expect_err("the entry adds nothing"));
+    assert_eq!(rig.app.snapshot().sessions, sessions + 1, "its own grant let it in");
+
+    // A set matching the entry but not the token's own grant: R-135 first, so the entry never counts and no session is made.
+    let not_its_own = chat_of(11, "mac-e", "no-grant");
+    denied(list(&mut client, &not_its_own).await.expect_err("no-grant is not its own"));
+    denied(call(&mut client, &not_its_own, "example.alpha", "get", b"{}").await.expect_err("no-grant is not its own"));
+    assert_eq!(rig.app.snapshot().sessions, sessions + 1, "no session made");
+    let line = rig.lines("call").pop().expect("a call line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["grant"].as_str()), (Some("denied"), Some("mac-e"), Some("no-grant")));
+
+    // A signer with no set: all the entry holds, and each call through the first of its grants that allows it.
+    assert_eq!(a.invokes().len(), 5, "the one call above");
+    let no_set = chat_of(9, "mac-c", "no-grant");
+    assert_eq!(listed_ops(&list(&mut client, &no_set).await.expect("today's reach")), every, "both grants");
+    answered(call(&mut client, &no_set, "example.alpha", "list", b"{}").await).await;
+    assert_eq!(a.invoke(5).await.caller.unwrap().grant_id, "g-all");
+    answered(call(&mut client, &no_set, "example.alpha.logs", "get", b"{}").await).await;
+    assert_eq!(a.invoke(6).await.caller.unwrap().grant_id, "g-all");
+    assert_eq!(a.invokes().len(), 7);
+
+    // Per request, with no cache: the running token of a signer whose set narrows loses what the entry gave it.
+    rig.write_signers(&[signer_of("mac-d", 10, Some(&["no-grant"]))]);
+    rig.poll();
+    assert!(list(&mut client, &one_of_two).await.expect("its own grant").sources.is_empty(), "the set narrowed");
+    denied(call(&mut client, &one_of_two, "example.alpha", "get", b"{}").await.expect_err("the set narrowed"));
+    assert_eq!(a.invokes().len(), 7);
+}
+
+/// Relay 47 (R-136): with `sessions_per_signer` 2, a third session of one signer is 8 `too many sessions` (outcome
+/// `too_many`), on both calls; its two go on, another signer's session is admitted, and another signer's token naming a
+/// session this one made is refused the same.
+#[tokio::test]
+async fn one_signer_cannot_fill_the_sessions() {
+    let rig = Rig::start_with(Limits { sessions_per_signer: 2, ..limits() }).await;
+    let _a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let mut client = rig.client().await;
+    rig.write_signers(&[signer_of("mac", 7, None), signer_of("mac-b", 8, None)]);
+    rig.poll();
+    let first = rig.claims("g-all");
+    let (one, two) = (mint(7, &first), rig.token("g-all"));
+    list(&mut client, &one).await.expect("the first");
+    let (chunks, _) = drain(call(&mut client, &two, "example.alpha", "get", b"{}").await.expect("the second")).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(rig.app.snapshot().sessions, 2);
+    let third = rig.token("g-all");
+    let s = list(&mut client, &third).await.expect_err("the third, a list");
+    assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "too many sessions"));
+    let s = call(&mut client, &third, "example.alpha", "get", b"{}").await.expect_err("the third, a call");
+    assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "too many sessions"));
+    assert_eq!(rig.app.snapshot().sessions, 2, "a refused session holds nothing");
+    let line = rig.lines("list").pop().expect("a list line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["code"].as_i64()), (Some("too_many"), Some("mac"), Some(8)));
+    let line = rig.lines("call").pop().expect("a call line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["code"].as_i64()), (Some("too_many"), Some("mac"), Some(8)));
+    list(&mut client, &one).await.expect("a session it holds goes on");
+    list(&mut client, &mint(8, &claims_of(&rig, "mac-b", "g-all"))).await.expect("another signer's session");
+    assert_eq!(rig.app.snapshot().sessions, 3);
+    // A session is its signer's: mac-b's good token naming mac's session enters nothing.
+    let across = mint(8, &SessionClaims { session_id: first.session_id.clone(), ..claims_of(&rig, "mac-b", "g-all") });
+    let s = list(&mut client, &across).await.expect_err("mac's session, a list");
+    assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "too many sessions"));
+    let s = call(&mut client, &across, "example.alpha", "get", b"{}").await.expect_err("mac's session, a call");
+    assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "too many sessions"));
+    let line = rig.lines("call").pop().expect("a call line");
+    assert_eq!((line["outcome"].as_str(), line["caller"].as_str(), line["code"].as_i64()), (Some("too_many"), Some("mac-b"), Some(8)));
+    assert_eq!(rig.app.snapshot().sessions, 3, "nothing new");
+    list(&mut client, &one).await.expect("mac's own token still enters it");
+}
+
+/// Relay 48 (R-137): this rig's relay is `relay-test`, not the default id, and the tokens of every other test here are
+/// minted for it. A token for the default relay, or for any other, is refused 16 on both calls: no session, nothing at a
+/// worker; and its signature is good, so nothing but `aud` refused it.
+#[tokio::test]
+async fn a_relay_refuses_a_token_minted_for_another() {
+    assert_ne!(RELAY_ID, ai_env_worker::session::SESSION_AUD, "this relay is not the default one");
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let mut client = rig.client().await;
+    for aud in [ai_env_worker::session::SESSION_AUD, "relay-other"] {
+        let token = mint(7, &SessionClaims { aud: aud.into(), ..rig.claims("g-all") });
+        let s = list(&mut client, &token).await.expect_err("minted for another relay");
+        assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"), "{aud}");
+        let s = call(&mut client, &token, "example.alpha", "get", b"{}").await.expect_err("minted for another relay");
+        assert_eq!((s.code(), s.message()), (Code::Unauthenticated, "authentication failed"), "{aud}");
+    }
+    assert_eq!(rig.app.snapshot().sessions, 0, "no session made");
+    assert!(a.invokes().is_empty(), "nothing reached a worker");
+    let (chunks, _) = drain(call(&mut client, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("minted for this relay")).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(a.invokes().len(), 1);
 }

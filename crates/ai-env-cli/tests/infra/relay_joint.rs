@@ -3,10 +3,11 @@
 //! `revoke` and `grant` render (M's `params.rs`) parses with the relay's loader (R's `lists.rs`) into the entries it
 //! was given. WM-J4 (also WM-T49, B-8): the CA and the `tls` value `relay tls init` issues (W's `certs`, the
 //! production profile) are served by the relay's `run` on both faces; the VM's client (V) verifies `10.42.0.20` under
-//! `state/relay-ca.der`, a worker (W) verifies `ai-env-relay` under `state/relay-ca.pem`, and another CA or another
-//! name fails. No key, token or certificate is committed: each comes from a low-entropy seed at run time or from the
+//! `state/relay-ca.der`, a worker (W) verifies `ai-env-relay` under `state/relay-ca.pem` and presents the client
+//! certificate `relay allow … --tls-key …` issued under that CA (R-124 to R-127), and another CA or another name
+//! fails. No key, token or certificate is committed: each comes from a low-entropy seed at run time or from the
 //! run itself; every name is generic.
-use super::common::stderr;
+use super::common::{stderr, stdout};
 use super::relay_mac::{Who, World};
 use ai_env_cli::bridge::relay::tls::ca_der_b64;
 use ai_env_cli::wire::redact::Secret;
@@ -90,7 +91,7 @@ fn worker(id: &str, seed: u8, globs: &[&str], day: &str) -> WorkerEntry {
 }
 
 fn signer(id: &str, seed: u8, day: &str) -> SignerEntry {
-    SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), not_after: format!("{day}T23:59:59Z") }
+    SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), not_after: format!("{day}T23:59:59Z"), grants: None }
 }
 
 fn grant(id: &str, rules: &[&str]) -> Grant {
@@ -202,10 +203,20 @@ impl DataSource for Example {
     }
 }
 
+/// A worker's client certificate: the PEM `relay allow … --tls-key` printed for its point, and the key `tls-keygen`
+/// would have kept on the worker (R-120, R-122).
+struct ClientCert {
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+}
+
 /// `worker-a` (seed 1, the key `allow` whitelisted) serving [`Example`], dialing `public` pinning `ca_pem`, checking
-/// the certificate against `name`.
-fn worker_a(public: std::net::SocketAddr, ca_pem: &[u8], name: &str) -> Worker {
-    let endpoint = RelayEndpoint::new(&public.to_string()).expect("the public face").ca_pem(ca_pem).expect("a CA").server_name(name).expect("a name");
+/// the certificate against `name`, presenting `client` if any.
+fn worker_a(public: std::net::SocketAddr, ca_pem: &[u8], name: &str, client: Option<&ClientCert>) -> Worker {
+    let mut endpoint = RelayEndpoint::new(&public.to_string()).expect("the public face").ca_pem(ca_pem).expect("a CA").server_name(name).expect("a name");
+    if let Some(c) = client {
+        endpoint = endpoint.client_identity(&c.cert_pem, &c.key_pem).expect("the key is the certificate's");
+    }
     let signer = Arc::new(FileSigner::from_key(SigningKey::from_seed(&[1; 32]).unwrap()));
     Worker::builder().worker_id("worker-a").relay(endpoint).signer(signer).source(Arc::new(Example)).build().expect("a worker")
 }
@@ -248,14 +259,22 @@ async fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 
 /// WM-J4, also WM-T49 (with R, V and W; B-8): the CA and the `tls` value `relay tls init` issues, published with
 /// the lists `allow` and `grant` wrote, are R's `tls::server_config` and serve both faces of R's `run` on
-/// `127.0.0.1:0`. A worker pinning `state/relay-ca.pem` verifies `ai-env-relay` and authenticates; the VM's client on
-/// a spawn's session naming the private face, `10.42.0.20` and `state/relay-ca.der` lists the worker's source and
-/// calls it; either client pinned to another CA, or asking for `relay.example.test`, fails its handshake.
+/// `127.0.0.1:0`. A worker pinning `state/relay-ca.pem` verifies `ai-env-relay`, presents the client certificate
+/// `allow --tls-key` issued under that CA (M's unseal, W's profile, R's verifier and binding) and authenticates; the
+/// VM's client on a spawn's session naming the private face, `10.42.0.20` and `state/relay-ca.der` lists the worker's
+/// source and calls it; either client pinned to another CA, or asking for `relay.example.test`, fails its handshake.
+/// So does a worker with no client certificate, or one under another CA, each with R-121's words.
 #[test]
 fn the_tls_value_m_writes_serves_both_faces() {
     let w = World::new();
     deployer(&w, &["tls", "init"]);
-    deployer(&w, &["allow", "worker-a", "--key", &key_of(1).text(), "--sources", "example-*"]);
+    // The worker's key as `tls-keygen` makes it, and the certificate `allow` prints for its point (R-122, WM-T59).
+    let client_key = certs::client_key().expect("a P-256 key");
+    let point = certs::client_point(&client_key).expect("its point");
+    let o = w.run(&["allow", "worker-a", "--key", &key_of(1).text(), "--sources", "example-*", "--tls-key", &point.text()], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let client = ClientCert { cert_pem: stdout(&o).into_bytes(), key_pem: certs::pem("PRIVATE KEY", &client_key).into_bytes() };
+    assert!(workers(&w)[0].tls_fp.is_some(), "allow wrote the certificate's fingerprint");
     deployer(&w, &["allow", "mac", "--token-signer", "--key", &key_of(7).text()]);
     deployer(&w, &["grant", "default", "example-*/get"]);
     let tls_name = tls_param();
@@ -268,10 +287,10 @@ fn the_tls_value_m_writes_serves_both_faces() {
     fs::write(live.path().join(lists::PEERS_FILE), peers_json()).unwrap();
     fs::write(live.path().join(FETCHED_FILE), format!("{}\n", unix_now())).unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-    rt.block_on(serve_both_faces(&w, live.path()));
+    rt.block_on(serve_both_faces(&w, live.path(), &client, &point));
 }
 
-async fn serve_both_faces(w: &World, live: &Path) {
+async fn serve_both_faces(w: &World, live: &Path, client: &ClientCert, point: &certs::ClientPoint) {
     let ca_pem = fs::read(w.bridge().join("state").join("relay-ca.pem")).unwrap();
     let ca_der = fs::read(w.bridge().join("state").join("relay-ca.der")).unwrap();
     let sink = Arc::new(MemorySink::default());
@@ -297,12 +316,13 @@ async fn serve_both_faces(w: &World, live: &Path) {
     assert!(status.tls_loaded, "run loaded M's tls value");
     assert_eq!(status.workers_version, format!("{workers_version:016x}"), "run loaded M's workers");
 
-    // W: a worker pinning state/relay-ca.pem, for ai-env-relay, on the public face: TLS, then its whitelisted key.
-    let report = worker_a(public, &ca_pem, "ai-env-relay").check().await.expect("W verifies ai-env-relay under M's CA and authenticates");
+    // W: a worker pinning state/relay-ca.pem, for ai-env-relay, on the public face: TLS with the client certificate M
+    // issued, then its whitelisted key.
+    let report = worker_a(public, &ca_pem, "ai-env-relay", Some(client)).check().await.expect("W verifies ai-env-relay under M's CA, presents M's certificate and authenticates");
     assert_eq!((report.relay_id.as_str(), report.sources, report.whitelist_version), ("ai-env-relay", 1, workers_version));
     until("the check's tunnel to end", || (app.snapshot().tunnels == 0).then_some(())).await;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let serving = tokio::spawn(worker_a(public, &ca_pem, "ai-env-relay").run_until(async move {
+    let serving = tokio::spawn(worker_a(public, &ca_pem, "ai-env-relay", Some(client)).run_until(async move {
         let _ = stopped.await;
     }));
     until("worker-a's tunnel and source", || {
@@ -338,16 +358,27 @@ async fn serve_both_faces(w: &World, live: &Path) {
         Err(WorkerError::Tls(text)) => text,
         other => panic!("not a TLS failure: {other:?}"),
     };
-    let text = tls_failure(worker_a(public, certs::pem("CERTIFICATE", &other.cert_der).as_bytes(), "ai-env-relay").check().await);
+    let text = tls_failure(worker_a(public, certs::pem("CERTIFICATE", &other.cert_der).as_bytes(), "ai-env-relay", Some(client)).check().await);
     assert!(text.contains("invalid peer certificate: BadSignature"), "W pinned to another CA: {text}");
-    let text = tls_failure(worker_a(public, &ca_pem, "relay.example.test").check().await);
+    let text = tls_failure(worker_a(public, &ca_pem, "relay.example.test", Some(client)).check().await);
     assert!(text.contains("not valid for name"), "W asking for relay.example.test: {text}");
+    // The relay's own refusals (R-124, R-121): no certificate; one under another CA of W's profile, as after `tls init
+    // --force` (R-131, LD-R49).
+    let text = tls_failure(worker_a(public, &ca_pem, "ai-env-relay", None).check().await);
+    assert_eq!(text, "the relay requires a client certificate");
+    let now = unix_now();
+    let stranded = ClientCert {
+        cert_pem: certs::pem("CERTIFICATE", &certs::client_leaf(&other, "worker-a", point, now, now + 3600).expect("a leaf under the other CA")).into_bytes(),
+        key_pem: client.key_pem.clone(),
+    };
+    let text = tls_failure(worker_a(public, &ca_pem, "ai-env-relay", Some(&stranded)).check().await);
+    assert_eq!(text, "the relay refused this worker's client certificate (DecryptError)");
     let other_b64 = base64::engine::general_purpose::STANDARD.encode(&other.cert_der);
     let failure = vm_link(&spawn(&other_b64, VM_SERVER_NAME)).catalog(None).await.expect_err("V pinned to another CA");
     assert!(failure.code == Code::Unavailable && failure.message.contains("invalid peer certificate: BadSignature"), "{failure:?}");
     let failure = vm_link(&spawn(&ca_b64, "relay.example.test")).catalog(None).await.expect_err("V asking for relay.example.test");
     assert!(failure.code == Code::Unavailable && failure.message.contains("not valid for name"), "{failure:?}");
-    // R saw each of the four handshakes fail, two on each face.
+    // R saw each of the six handshakes fail, four on the public face and two on the private.
     let failed = |face: &str| {
         sink.lines()
             .iter()
@@ -355,7 +386,7 @@ async fn serve_both_faces(w: &World, live: &Path) {
             .filter(|v| v["ev"] == "peer" && v["face"] == face && v["reason"] == "tls_failed")
             .count()
     };
-    until("the relay's two tls_failed lines on each face", || (failed("public") == 2 && failed("private") == 2).then_some(())).await;
+    until("the relay's tls_failed lines on each face", || (failed("public") == 4 && failed("private") == 2).then_some(())).await;
 
     let _ = stop.send(());
     serving.await.unwrap().expect("the worker stops");

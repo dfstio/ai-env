@@ -1,4 +1,4 @@
-//! The relay's TLS and process (§R-relay.7, tls 1 to 16 and 19 to 24): real loopback sockets through `run`, or
+//! The relay's TLS and process (§R-relay.7, tls 1 to 24): real loopback sockets through `run`, or
 //! `tokio::io::duplex` through `admit`; certificates from `tests/common/certs.rs`, built at run time.
 
 mod common;
@@ -23,7 +23,7 @@ use common::certs::{self, Ca, Leaf};
 use common::clock::ManualClock;
 use common::rig::{catalog_a, default_grants, default_workers, mac_signer, mint, with_token, NOT_AFTER, T0};
 use common::worker::{hello, proof, Script, TestWorker};
-use rustls_pki_types::{CertificateDer, ServerName};
+use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -70,10 +70,36 @@ fn leaf(ca: &Ca, serial: u64, seed: u8) -> Leaf {
     ca.leaf(serial, &["ai-env-relay"], &[[10, 42, 0, 20]], [seed; 32])
 }
 
+/// The rig's worker of a key seed: 1 is `worker-a`, 2 `worker-b`, 5 `worker-c`.
+fn worker_of(seed: u8) -> &'static str {
+    match seed {
+        1 => "worker-a",
+        2 => "worker-b",
+        5 => "worker-c",
+        other => panic!("no worker of seed {other}"),
+    }
+}
+
+/// That worker's client certificate under `ca` (R-129), its TLS key from a seed of its own. `Ca::client_leaf` makes the
+/// same bytes each time, so this is the certificate whose `tls_fp` `relay()` wrote.
+fn client_leaf(ca: &Ca, seed: u8) -> Leaf {
+    ca.client_leaf(100 + u64::from(seed), worker_of(seed), [seed + 30; 32])
+}
+
+/// A `tls_fp`, as a list holds it.
+fn tls_fp(leaf: &Leaf) -> Option<String> {
+    Some(hex::encode(leaf.sha256()))
+}
+
+/// The rig's workers A, B and C, each holding its real client certificate under `ca` (R-129).
+fn workers_under(ca: &Ca) -> Vec<policy::WorkerEntry> {
+    default_workers().into_iter().zip([1, 2, 5]).map(|(entry, seed)| policy::WorkerEntry { tls_fp: tls_fp(&client_leaf(ca, seed)), ..entry }).collect()
+}
+
 fn relay(limits: Limits, peers: &[&str], with_tls: bool, notifier: Notifier) -> Box_ {
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new("test relay CA", [11; 32]);
-    write(dir.path(), WORKERS_FILE, policy::render_workers(&default_workers()).unwrap().as_bytes());
+    write(dir.path(), WORKERS_FILE, policy::render_workers(&workers_under(&ca)).unwrap().as_bytes());
     write(dir.path(), SIGNERS_FILE, policy::render_signers(&[mac_signer(NOT_AFTER)]).unwrap().as_bytes());
     write(dir.path(), GRANTS_FILE, policy::render_grants(&default_grants()).unwrap().as_bytes());
     // The rig's peers (R-89): loopback and the two documentation ranges every test of this file dials from.
@@ -114,18 +140,60 @@ async fn running(b: &Box_) -> (tokio::task::JoinHandle<Result<(), ai_env_relay::
     panic!("run never bound its faces");
 }
 
-fn client_config(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<rustls::ClientConfig> {
+/// A client under `roots`, about to say which certificate it presents.
+fn client_builder(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion]) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert> {
     let mut store = rustls::RootCertStore::empty();
     for ca in roots {
         store.add(CertificateDer::from(ca.cert_der.clone())).unwrap();
     }
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-        .with_protocol_versions(versions)
-        .unwrap()
-        .with_root_certificates(store)
-        .with_no_client_auth();
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider())).with_protocol_versions(versions).unwrap().with_root_certificates(store)
+}
+
+fn h2_client(mut cfg: rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
     cfg.alpn_protocols = vec![b"h2".to_vec()];
     Arc::new(cfg)
+}
+
+/// A client with `worker-a`'s certificate under the first of `roots` (R-129): the public face requires one, and the
+/// private face never asks for it.
+fn client_config(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<rustls::ClientConfig> {
+    let identity = client_leaf(roots[0], 1);
+    client_presenting(roots, versions, &[&identity.cert_der], &identity)
+}
+
+/// A client presenting `chain`, its leaf first, with `key_of`'s key.
+fn client_presenting(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion], chain: &[&[u8]], key_of: &Leaf) -> Arc<rustls::ClientConfig> {
+    let chain = chain.iter().map(|der| CertificateDer::from(der.to_vec())).collect();
+    let key = PrivatePkcs8KeyDer::from(key_of.key_pkcs8.clone());
+    h2_client(client_builder(roots, versions).with_client_auth_cert(chain, key.into()).unwrap())
+}
+
+/// A client with no certificate.
+fn client_bare(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion]) -> Arc<rustls::ClientConfig> {
+    h2_client(client_builder(roots, versions).with_no_client_auth())
+}
+
+/// Presents one certificate with whatever key it was given.
+#[derive(Debug)]
+struct Presents(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for Presents {
+    fn resolve(&self, _hints: &[&[u8]], _schemes: &[rustls::SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// A client presenting `holder`'s certificate, which is no secret, and signing with `key_of`'s key: rustls's builder
+/// refuses that pair, a resolver does not.
+fn client_without_its_key(roots: &[&Ca], versions: &[&'static rustls::SupportedProtocolVersion], holder: &Leaf, key_of: &Leaf) -> Arc<rustls::ClientConfig> {
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let key = provider.key_provider.load_private_key(PrivatePkcs8KeyDer::from(key_of.key_pkcs8.clone()).into()).unwrap();
+    let presented = rustls::sign::CertifiedKey::new(vec![CertificateDer::from(holder.cert_der.clone())], key);
+    h2_client(client_builder(roots, versions).with_client_cert_resolver(Arc::new(Presents(Arc::new(presented)))))
 }
 
 async fn tls_connect(addr: SocketAddr, cfg: Arc<rustls::ClientConfig>) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
@@ -146,7 +214,7 @@ async fn channel(addr: SocketAddr, cfg: Arc<rustls::ClientConfig>) -> Channel {
 fn token() -> String {
     let claims = ai_env_worker::session::SessionClaims {
         kid: "mac".into(),
-        aud: ai_env_worker::session::SESSION_AUD.into(),
+        aud: "relay-test".into(),
         caller_id: "mac".into(),
         session_id: "0199a1b2-0000-7000-8000-000000000002".into(),
         chat_id: None,
@@ -174,26 +242,32 @@ async fn read_to_close(mut s: TcpStream, within: Duration) -> Vec<u8> {
 async fn the_relay_speaks_tls13_only() {
     let _serial = SERIAL.lock().await;
     let b = relay(limits(), &["127.0.0.0/8"], true, Notifier::disabled());
-    let (task, _public, private) = running(&b).await;
+    let (task, public, private) = running(&b).await;
     let mut client = RelayClient::new(channel(private, client_config(&[&b.ca], &[&rustls::version::TLS13])).await);
     let listed = client.list_sources(with_token(ListSourcesRequest {}, &token())).await.expect("ListSources over TLS 1.3");
     assert!(listed.into_inner().sources.is_empty());
+    let worker = TestWorker::open_on(channel(public, client_config(&[&b.ca], &[&rustls::version::TLS13])).await).await.expect("the Challenge over TLS 1.3");
+    drop(worker);
 
-    let old = tls_connect(private, client_config(&[&b.ca], &[&rustls::version::TLS12])).await.expect_err("TLS 1.2 refused");
-    assert!(matches!(rustls_error(&old), Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))), "{old:?}");
-
+    // Both faces, each client with its certificate (R-124).
     let other = Ca::new("another CA", [21; 32]);
-    let refused = tls_connect(private, client_config(&[&other], &[&rustls::version::TLS13])).await.expect_err("another CA");
-    assert!(
-        matches!(rustls_error(&refused), Some(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))),
-        "{refused:?}"
-    );
+    for face in [public, private] {
+        let old = tls_connect(face, client_config(&[&b.ca], &[&rustls::version::TLS12])).await.expect_err("TLS 1.2 refused");
+        assert!(matches!(rustls_error(&old), Some(rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion))), "{old:?}");
+        let refused = tls_connect(face, client_config(&[&other], &[&rustls::version::TLS13])).await.expect_err("another CA");
+        assert!(
+            matches!(rustls_error(&refused), Some(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))),
+            "{refused:?}"
+        );
+    }
 
     let mismatched = certs::tls_pem_with_key(&leaf(&b.ca, 2, 12), &b.ca, &leaf(&b.ca, 3, 13));
     assert!(ai_env_relay::tls::server_config(mismatched.as_bytes()).is_err());
-    let config = ai_env_relay::tls::server_config(certs::tls_pem(&leaf(&b.ca, 4, 14), &b.ca).as_bytes()).unwrap();
-    assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
-    assert_eq!((config.max_early_data_size, config.send_tls13_tickets), (0, 0));
+    let configs = ai_env_relay::tls::server_config(certs::tls_pem(&leaf(&b.ca, 4, 14), &b.ca).as_bytes()).unwrap();
+    for config in [&configs.public, &configs.private] {
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+        assert_eq!((config.max_early_data_size, config.send_tls13_tickets), (0, 0));
+    }
     b.app.shutdown();
     task.await.unwrap().unwrap();
 }
@@ -921,7 +995,7 @@ async fn handshake(app: &RelayApp, face: &PublicFace, cfg: Arc<rustls::ClientCon
 /// (`bad_signature`) from one address, then its next connection is refused `banned` before any TLS byte, with a peer
 /// line `banned`; another address authenticates; `ban_s` later the first authenticates. An `open_timeout` counts.
 /// Never a fault, 25 times each from an address of its own: a refusal while the workers file is not loaded
-/// (`not_loaded`) or stale (`no_peers` at admission, `stale` for a connection admitted before), a client's end of
+/// (`not_loaded`, at `open()`, R-126) or stale (`no_peers` at admission, `stale` for a connection admitted before), a client's end of
 /// stream after its `Hello` (`eof`), and a TCP connection closed before any byte (a peer line `tls_failed`). R-102's TLS faults ban too (review B finding 6), each set from
 /// an address of its own: 20 connections that send one byte and fail TLS (`tls_failed`), and 20 that send nothing
 /// until the TLS timeout (`tls_timeout`). R-98's exemption, through `Tunnel::run`: an address holding a live tunnel takes 25
@@ -970,8 +1044,11 @@ async fn twenty_faults_ban_an_address_for_ban_s() {
     std::fs::remove_file(b.dir.path().join(WORKERS_FILE)).unwrap();
     b.app.poll_files();
     for _ in 0..25 {
-        assert_eq!(handshake(&b.app, &face, Arc::clone(&cfg), d, false).await.err(), Some(Code::Unauthenticated), "not_loaded");
+        let (channel, _closed) = worker_channel(&b.app, &face, Arc::clone(&cfg), d).await;
+        assert_eq!(TestWorker::open_on(channel).await.err().map(|s| s.code()), Some(Code::Unauthenticated), "not_loaded");
     }
+    let lines = tunnel_lines(&b, d);
+    assert!(!lines.is_empty() && lines.iter().all(|l| l["reason"] == "not_loaded" && l["worker"] == ""), "refused at `open()`: {lines:?}");
     write(b.dir.path(), WORKERS_FILE, &workers);
     b.app.poll_files();
     // Stale: `fetched` is the peers file's too, so nobody new is admitted (R-89's `no_peers`) ...
@@ -995,6 +1072,8 @@ async fn twenty_faults_ban_an_address_for_ban_s() {
         w.send(worker_frame::Msg::AuthProof(p)).await;
         assert_eq!(w.next().await.expect_err("stale").code(), Code::Unauthenticated);
     }
+    let lines = tunnel_lines(&b, e);
+    assert!(!lines.is_empty() && lines.iter().all(|l| l["reason"] == "stale" && l["worker"] == "worker-a"), "`open()` ran while fresh, so each Hello met `stale`: {lines:?}");
     write(b.dir.path(), "fetched", format!("{}\n", T0 + 901).as_bytes());
     b.app.poll_files();
     // A client's end of stream after its Hello.
@@ -1225,6 +1304,234 @@ async fn the_thirty_third_private_connection_waits_for_a_cut() {
     assert!(admitted_private(&b.app, cfg, vm).await.is_some(), "a VM is admitted after them");
 }
 
+/// One public connection through `admit` from `ip` whose certificate the relay must refuse: `admit` gives nothing, and
+/// the client reads no byte, only the alert. TLS 1.3 ends the client's handshake with its Finished, before the relay's
+/// verdict on its certificate, so the verdict is the first thing it reads; no byte before it, so no HTTP/2 and no
+/// `Challenge`.
+async fn refused_by_tls(app: &RelayApp, cfg: Arc<rustls::ClientConfig>, ip: &str) -> rustls::AlertDescription {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let connector = tokio_rustls::TlsConnector::from(cfg);
+    let (served, client) = tokio::join!(app.admit(Face::Public, server, ip.parse().unwrap()), connector.connect(ServerName::try_from("ai-env-relay").unwrap(), client));
+    assert!(served.is_none(), "{ip}: refused");
+    let mut client = client.expect("the client's own handshake ends first");
+    let mut first = [0u8; 1];
+    let refused = client.read(&mut first).await.expect_err("an alert, and no byte");
+    match rustls_error(&refused) {
+        Some(rustls::Error::AlertReceived(alert)) => *alert,
+        other => panic!("{ip}: {other:?}"),
+    }
+}
+
+/// The next public connection from `ip` is refused `banned` before any TLS byte: its faults so far started a ban.
+async fn banned_before_tls(b: &Box_, ip: &str) {
+    let lines = |b: &Box_| peer_lines(b, "banned").iter().filter(|l| l["peer"] == ip && l["face"] == "public").count();
+    let before = lines(b);
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    assert!(b.app.admit(Face::Public, server, ip.parse().unwrap()).await.is_none(), "{ip}: refused");
+    let mut got = Vec::new();
+    client.read_to_end(&mut got).await.ok();
+    assert!(got.is_empty(), "{ip}: refused before any TLS byte");
+    assert_eq!(lines(b), before + 1, "{ip}: banned");
+}
+
+/// TLS 17 (R-124, R-125, R-132, LD-R61; `run`'s faces and `admit`): the public face requires a client certificate under the CA.
+/// A client with none, one under another CA, one with EKU serverAuth only (the relay's own leaf), a leaf under a sub-CA
+/// of the CA sent with that sub-CA (the leaf alone is read, `LeafOnly`), and a worker's certificate without its key each
+/// fail the handshake and get no `Challenge`: one peer line `tls_failed` from its address, no tunnel line, and one fault
+/// (with `ban_faults` 1, its next connection is refused `banned`). A certificate under the CA is admitted with its
+/// leaf's SHA-256 in `PeerInfo` and is served on `run`'s public face (TLS 1's other cases hold with identities). The
+/// private face serves a client without a certificate, and asks for none from one that has it (`cert_fp` none).
+/// `client_certs` follows the loaded config, and a first `tls.pem` that is refused loads none: both faces refuse `no_tls`
+/// (R-124). The public face's reload: a `tls.pem` under a new CA refuses the old CA's client and admits the new one's; a
+/// refused `tls.pem` leaves the loaded config, still requiring a certificate; a missing one closes the connection (`no_tls`).
+#[tokio::test]
+async fn the_public_face_requires_a_client_certificate_under_the_ca() {
+    let _serial = SERIAL.lock().await;
+    let b = relay(Limits { ban_faults: 1, ..limits() }, &["127.0.0.0/8"], true, Notifier::disabled());
+    b.app.poll_files();
+    let tls13: &[&'static rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+    let other = Ca::new("another CA", [21; 32]);
+    let foreign = client_leaf(&other, 1);
+    let own = leaf(&b.ca, 1, 12);
+    let sub = b.ca.sub_ca(50, "a sub-CA", [22; 32]);
+    let under_sub = sub.client_leaf(51, "worker-a", [31; 32]);
+    let cases = [
+        ("198.51.100.7", client_bare(&[&b.ca], tls13), rustls::AlertDescription::CertificateRequired),
+        ("198.51.100.8", client_presenting(&[&b.ca], tls13, &[&foreign.cert_der], &foreign), rustls::AlertDescription::UnknownCA),
+        ("198.51.100.9", client_presenting(&[&b.ca], tls13, &[&own.cert_der], &own), rustls::AlertDescription::UnsupportedCertificate),
+        ("198.51.100.11", client_presenting(&[&b.ca], tls13, &[&under_sub.cert_der, &sub.cert_der], &under_sub), rustls::AlertDescription::UnknownCA),
+        ("198.51.100.12", client_without_its_key(&[&b.ca], tls13, &client_leaf(&b.ca, 1), &own), rustls::AlertDescription::DecryptError),
+    ];
+    for (ip, cfg, alert) in cases {
+        assert_eq!(refused_by_tls(&b.app, cfg, ip).await, alert, "{ip}");
+        let failed = peer_lines(&b, "tls_failed");
+        assert_eq!(failed.iter().filter(|l| l["peer"] == ip && l["face"] == "public").count(), 1, "{ip}: {failed:?}");
+        banned_before_tls(&b, ip).await;
+    }
+    assert!(!b.sink.lines().iter().any(|l| l.contains("\"ev\":\"tunnel\"")), "nothing reached `open()`");
+
+    let identity = client_leaf(&b.ca, 1);
+    let (served, _client) = admitted(&b.app, client_config(&[&b.ca], tls13), "198.51.100.10".parse().unwrap()).await.expect("a certificate under the CA");
+    assert_eq!(served.info().cert_fp, Some(identity.sha256()), "the SHA-256 of its leaf");
+    let local: IpAddr = "127.0.0.1".parse().unwrap();
+    let (served, _client) = admitted_private(&b.app, client_bare(&[&b.ca], tls13), local).await.expect("the private face asks for no certificate");
+    assert_eq!(served.info().cert_fp, None);
+    let (served, _client) = admitted_private(&b.app, client_config(&[&b.ca], tls13), local).await.expect("nor minds one the client holds");
+    assert_eq!(served.info().cert_fp, None, "never asked, never presented");
+
+    let (task, public, private) = running(&b).await;
+    let mut w = TestWorker::open_on(channel(public, client_config(&[&b.ca], tls13)).await).await.expect("the Challenge");
+    w.authenticate("worker-a", 1).await.expect("its own certificate, its own key");
+    let mut vm = RelayClient::new(channel(private, client_bare(&[&b.ca], tls13)).await);
+    vm.list_sources(with_token(ListSourcesRequest {}, &token())).await.expect("a VM's client has no certificate");
+    let status = b.app.snapshot();
+    assert_eq!((status.tls_loaded, status.client_certs), (true, true));
+    drop((w, vm));
+    b.app.shutdown();
+    task.await.unwrap().unwrap();
+
+    let none = relay(limits(), &["127.0.0.0/8"], false, Notifier::disabled());
+    none.app.poll_files();
+    let status = none.app.snapshot();
+    assert_eq!((status.tls_loaded, status.client_certs), (false, false), "no TLS config, no client certificates");
+
+    // A first `tls.pem` that is refused: nothing to keep, so no TLS config, and each face closes its connection with no byte.
+    let first = relay(limits(), &["127.0.0.0/8"], false, Notifier::disabled());
+    let served = leaf(&first.ca, 2, 14);
+    let no_issuer = [certs::pem("CERTIFICATE", &served.cert_der), certs::pem(&["PRIVATE", "KEY"].join(" "), &served.key_pkcs8)].concat();
+    write(first.dir.path(), TLS_FILE, no_issuer.as_bytes());
+    assert_eq!(first.app.poll_files()[3].1, ai_env_relay::files::Poll::Refused("tls.pem: no issuer for client certificates".into()));
+    let status = first.app.snapshot();
+    assert_eq!((status.tls_loaded, status.client_certs), (false, false), "a refused first file loads nothing");
+    for (face, ip, word) in [(Face::Public, "198.51.100.17", "public"), (Face::Private, "127.0.0.1", "private")] {
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        assert!(first.app.admit(face, server, ip.parse().unwrap()).await.is_none(), "{word}: no TLS material, no service");
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.ok();
+        assert!(got.is_empty(), "{word}: closed with no byte written");
+        assert_eq!(peer_lines(&first, "no_tls").iter().filter(|l| l["face"] == word).count(), 1, "{word}");
+    }
+
+    // The reload, on the public face.
+    let r = relay(limits(), &["127.0.0.0/8"], true, Notifier::disabled());
+    r.app.poll_files();
+    let new_ca = Ca::new("the replacing CA", [23; 32]);
+    let new_leaf = leaf(&new_ca, 2, 13);
+    write(r.dir.path(), TLS_FILE, certs::tls_pem(&new_leaf, &new_ca).as_bytes());
+    assert!(matches!(r.app.poll_files()[3].1, ai_env_relay::files::Poll::Loaded { .. }));
+    let under_old = client_leaf(&r.ca, 1);
+    let old_client = client_presenting(&[&new_ca], tls13, &[&under_old.cert_der], &under_old);
+    assert_eq!(refused_by_tls(&r.app, old_client, "198.51.100.13").await, rustls::AlertDescription::UnknownCA, "the old CA's client");
+    let (served, _client) = admitted(&r.app, client_config(&[&new_ca], tls13), "198.51.100.14".parse().unwrap()).await.expect("the new CA's client");
+    assert_eq!(served.info().cert_fp, Some(client_leaf(&new_ca, 1).sha256()));
+
+    let private_key = ["PRIVATE", "KEY"].join(" ");
+    let no_issuer = [certs::pem("CERTIFICATE", &new_leaf.cert_der), certs::pem(&private_key, &new_leaf.key_pkcs8)].concat();
+    write(r.dir.path(), TLS_FILE, no_issuer.as_bytes());
+    assert_eq!(r.app.poll_files()[3].1, ai_env_relay::files::Poll::Refused("tls.pem: no issuer for client certificates".into()));
+    assert_eq!(refused_by_tls(&r.app, client_bare(&[&new_ca], tls13), "198.51.100.15").await, rustls::AlertDescription::CertificateRequired, "the loaded config stands");
+    let status = r.app.snapshot();
+    assert_eq!((status.tls_loaded, status.client_certs), (true, true), "the loaded config stands");
+
+    std::fs::remove_file(r.dir.path().join(TLS_FILE)).unwrap();
+    assert_eq!(r.app.poll_files()[3].1, ai_env_relay::files::Poll::Missing);
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    assert!(r.app.admit(Face::Public, server, "198.51.100.16".parse().unwrap()).await.is_none(), "no TLS material, no service");
+    let mut got = Vec::new();
+    client.read_to_end(&mut got).await.ok();
+    assert!(got.is_empty(), "closed with no byte written");
+    assert_eq!(peer_lines(&r, "no_tls").iter().filter(|l| l["face"] == "public").count(), 1);
+    let status = r.app.snapshot();
+    assert_eq!((status.tls_loaded, status.client_certs), (false, false), "no TLS config now");
+}
+
+/// One public connection from `ip` presenting `cfg`'s certificate, refused at `open()` (R-126): 16 `authentication
+/// failed` with no `Challenge` and no frame (`open_on` panics at any other first frame), its tunnel line (phase `auth`,
+/// outcome `refused`, reason `reason`, no worker, no sdk), and the connection closed 1 s later.
+async fn refused_at_open(b: &Box_, face: &PublicFace, cfg: Arc<rustls::ClientConfig>, ip: &str, reason: &str) {
+    let (channel, closed) = worker_channel(&b.app, face, cfg, ip).await;
+    let status = TestWorker::open_on(channel.clone()).await.err().unwrap_or_else(|| panic!("{ip}: a Challenge, not {reason}"));
+    let refused = tokio::time::Instant::now();
+    assert_eq!((status.code(), status.message()), (Code::Unauthenticated, "authentication failed"), "{ip}: {reason}");
+    let lines = b.sink.lines();
+    let line = lines.iter().rfind(|l| l.contains("\"ev\":\"tunnel\"")).expect("a tunnel line");
+    let line: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!((line["phase"].as_str(), line["outcome"].as_str(), line["reason"].as_str()), (Some("auth"), Some("refused"), Some(reason)), "{line}");
+    assert_eq!((line["peer"].as_str(), line["worker"].as_str(), line["sdk"].as_str()), (Some(ip), Some(""), Some("")), "{line}");
+    assert_eq!(closed_at(&closed).await - refused, Duration::from_secs(1), "{ip}: {reason}: closed 1 s after the refusal");
+    drop(channel);
+}
+
+/// TLS 18 (paused, through `admit`; `ban_faults` 2): a certificate under the CA gets a `Challenge` only when an entry in
+/// force holds its fingerprint (R-126). One that no entry holds: refused at `open()`, `unknown_cert`, one fault (its
+/// address is admitted again, and the second refusal bans it). A lapsed entry's certificate the same, while an entry at
+/// its `not_after` second is in force. With the workers file unloaded, and then stale (the peers list staying fresh, so
+/// `admit` lets the connection through), each `not_loaded` and `stale` at `open()`, and no fault however many (LD-R33).
+/// A client presenting `[leaf, CA]` is served under its leaf's `tls_fp`.
+#[tokio::test(start_paused = true)]
+async fn an_unknown_certificate_gets_no_challenge() {
+    let _serial = SERIAL.lock().await;
+    let b = relay(Limits { ban_faults: 2, ..limits() }, &["127.0.0.0/8"], true, Notifier::disabled());
+    b.app.poll_files();
+    let face = public_face(&b.app);
+    let tls13: &[&'static rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
+    let stranger = b.ca.client_leaf(200, "worker-x", [41; 32]);
+    let unknown = client_presenting(&[&b.ca], tls13, &[&stranger.cert_der], &stranger);
+    let ip = "198.51.100.7";
+    refused_at_open(&b, &face, Arc::clone(&unknown), ip, "unknown_cert").await;
+    refused_at_open(&b, &face, unknown, ip, "unknown_cert").await;
+    banned_before_tls(&b, ip).await;
+    assert_eq!(b.app.public_conns(), 0, "each watch ended with its cut");
+
+    // B's entry lapsed before T0, C's lapsing at T0 itself: in force through that second.
+    let mut list = workers_under(&b.ca);
+    list[1].not_after = "2027-01-15T07:59:59Z".into();
+    list[2].not_after = "2027-01-15T08:00:00Z".into();
+    write(b.dir.path(), WORKERS_FILE, policy::render_workers(&list).unwrap().as_bytes());
+    b.app.poll_files();
+    let (lapsed, at_not_after) = (client_leaf(&b.ca, 2), client_leaf(&b.ca, 5));
+    refused_at_open(&b, &face, client_presenting(&[&b.ca], tls13, &[&lapsed.cert_der], &lapsed), "198.51.100.8", "unknown_cert").await;
+    let (channel, _closed) = worker_channel(&b.app, &face, client_presenting(&[&b.ca], tls13, &[&at_not_after.cert_der], &at_not_after), "198.51.100.9").await;
+    let mut c = TestWorker::open_on(channel).await.expect("in force through its not_after second");
+    c.authenticate("worker-c", 5).await.expect("authenticated");
+    drop(c);
+
+    // The workers file unloaded: the relay's own refusal, no fault of the peer's.
+    let a = client_config(&[&b.ca], tls13);
+    let (d, e) = ("198.51.100.20", "198.51.100.21");
+    std::fs::remove_file(b.dir.path().join(WORKERS_FILE)).unwrap();
+    b.app.poll_files();
+    for _ in 0..3 {
+        refused_at_open(&b, &face, Arc::clone(&a), d, "not_loaded").await;
+    }
+    // Stale alone: every list fresh as of T0 + 1000, then the workers file loaded as of a fetch 901 s older (LD-R47).
+    b.clock.set(T0 + 1000);
+    write(b.dir.path(), "fetched", format!("{}\n", T0 + 1000).as_bytes());
+    b.app.poll_files();
+    write(b.dir.path(), "fetched", format!("{}\n", T0 + 99).as_bytes());
+    write(b.dir.path(), WORKERS_FILE, policy::render_workers(&workers_under(&b.ca)).unwrap().as_bytes());
+    b.app.poll_files();
+    for _ in 0..3 {
+        refused_at_open(&b, &face, Arc::clone(&a), e, "stale").await;
+    }
+    assert_eq!(peer_lines(&b, "banned").len(), 1, "neither word is a fault");
+
+    // Fresh again, and the same addresses, never banned, get their Challenge. Then a client presenting its chain: the
+    // first certificate is its leaf.
+    write(b.dir.path(), "fetched", format!("{}\n", T0 + 1000).as_bytes());
+    b.app.poll_files();
+    for ip in [d, e] {
+        let (channel, _closed) = worker_channel(&b.app, &face, Arc::clone(&a), ip).await;
+        drop(TestWorker::open_on(channel).await.expect("the Challenge"));
+    }
+    let identity = client_leaf(&b.ca, 1);
+    let chain = client_presenting(&[&b.ca], tls13, &[&identity.cert_der, &b.ca.cert_der], &identity);
+    let (channel, _closed) = worker_channel(&b.app, &face, chain, "198.51.100.22").await;
+    let mut w = TestWorker::open_on(channel).await.expect("served under its leaf's tls_fp");
+    w.authenticate("worker-a", 1).await.expect("authenticated");
+}
+
 /// A bare HTTP/2 client over an admitted connection (relay.rs's `h2raw`, over TLS): it writes what it likes and reads
 /// what the relay answers (RFC 9113 §4, RFC 7541).
 mod h2bare {
@@ -1428,7 +1735,7 @@ const UNAUTHENTICATED_READS: usize = 557_056;
 /// answered, and the next PING not; a raw client that sends a PING (answered) and then 1 MiB of PING ACKs before any
 /// `Open` has the PING after them never answered. Each is cut at its 5 s deadline, with one peer line `open_timeout` and
 /// one fault. The budget's entry lasts as long as the connection, however it ends: the deadline's cut, a client that
-/// leaves first, a refused handshake's cut, or a tunnel's end after its `AuthOk`.
+/// leaves first, a refused handshake's cut, `open()`'s refusal's (R-126), or a tunnel's end after its `AuthOk`.
 #[tokio::test(start_paused = true)]
 async fn a_flood_before_auth_meets_its_read_budget() {
     use ai_env_relay::tls::is_metered;
@@ -1534,6 +1841,19 @@ async fn a_flood_before_auth_meets_its_read_budget() {
     watching(&b.app, 0).await;
     assert!(!is_metered(seq), "the refused handshake's cut forgets it");
 
+    // A refusal at `open()` (R-126): the same cut, and no Challenge.
+    let stranger = b.ca.client_leaf(200, "worker-x", [41; 32]);
+    let unknown = client_presenting(&[&b.ca], &[&rustls::version::TLS13], &[&stranger.cert_der], &stranger);
+    let (served, client) = admitted(&b.app, unknown, "198.51.100.12".parse().unwrap()).await.expect("admitted");
+    let seq = served.info().conn_seq;
+    let (channel, closed) = served_channel(&face, served, client).await;
+    assert!(TestWorker::open_on(channel.clone()).await.is_err(), "unknown_cert at `open()`");
+    assert!(is_metered(seq), "metered through its grace");
+    closed_at(&closed).await;
+    drop(channel);
+    watching(&b.app, 0).await;
+    assert!(!is_metered(seq), "the refusal's cut forgets it");
+
     // A tunnel: its own budget replaces this one at its AuthOk, and goes at its end.
     let (served, client) = admitted(&b.app, Arc::clone(&cfg), "198.51.100.11".parse().unwrap()).await.expect("admitted");
     let seq = served.info().conn_seq;
@@ -1565,10 +1885,12 @@ async fn too_many_tunnels_is_refused_and_no_fault() {
     a.register(catalog_a()).await;
     installed(&b.app, 1).await;
 
-    // A different address, so worker-a's exemption (R-98) hides no fault.
+    // A different address, so worker-a's exemption (R-98) hides no fault, with worker-b's own certificate (R-127).
     let other = "203.0.113.9";
+    let holder_b = client_leaf(&b.ca, 2);
+    let worker_b = client_presenting(&[&b.ca], &[&rustls::version::TLS13], &[&holder_b.cert_der], &holder_b);
     for i in 0..25 {
-        let (channel, _closed) = worker_channel(&b.app, &face, Arc::clone(&cfg), other).await;
+        let (channel, _closed) = worker_channel(&b.app, &face, Arc::clone(&worker_b), other).await;
         let mut w = TestWorker::open_on(channel).await.expect("the Challenge");
         let s = w.authenticate("worker-b", 2).await.expect_err("the one tunnel is worker-a's");
         assert_eq!((s.code(), s.message()), (Code::ResourceExhausted, "too many tunnels"), "attempt {i}");

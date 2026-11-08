@@ -314,7 +314,12 @@ impl RelayApp {
         let Some(tls) = st.live.tls.loaded() else {
             return refuse("no_tls");
         };
-        match crate::tls::accept(tls.value, io, ip, slot, ms(st.cfg.limits.tls_handshake_timeout_ms)).await {
+        // R-124: the public face requires a client certificate under the CA; the private face asks for none.
+        let config = match face {
+            Face::Public => Arc::clone(&tls.value.public),
+            Face::Private => Arc::clone(&tls.value.private),
+        };
+        match crate::tls::accept(config, io, ip, slot, ms(st.cfg.limits.tls_handshake_timeout_ms)).await {
             Ok(peered) => Some(peered),
             Err(refused) => {
                 // R-102: on the public face a TLS timeout is a fault, and a failed handshake once the client sent a
@@ -601,6 +606,8 @@ impl RelayApp {
             access_version,
             access_age_s,
             tls_loaded: st.live.tls.loaded().is_some(),
+            // R-132: every config `tls::server_config` builds requires client certificates on the public face.
+            client_certs: st.live.tls.loaded().is_some(),
             unknown_frames: st.unknown_frames.load(Ordering::SeqCst),
             log_dropped: reqlog::dropped(),
             log_suppressed: reqlog::log_suppressed(),
@@ -622,8 +629,8 @@ fn watch_public<IO>(st: &Arc<RelayState>, peered: &mut Peered<IO>) {
 
 /// R-2a: one public connection from its accept to its close. No `Open` by `deadline` (or the relay stops first):
 /// the cut, and a peer line `open_timeout`. Else its tunnel's end (its task or its response stream, whichever goes
-/// first), `TUNNEL_END_GRACE` for the last frames, then the cut. The connection's own end stops the watch. Whatever
-/// ended it, its read budget goes with it (LD-R60), so no entry outlives its connection.
+/// first, or `open()`'s refusal, R-126), `TUNNEL_END_GRACE` for the last frames, then the cut. The connection's own end
+/// stops the watch. Whatever ended it, its read budget goes with it (LD-R60), so no entry outlives its connection.
 async fn watch(st: Arc<RelayState>, conn: Arc<ConnUse>, info: PeerInfo, deadline: Instant) {
     let (gone, ended) = (conn.gone(), conn.ended());
     let expired = tokio::select! {

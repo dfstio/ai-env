@@ -6,8 +6,9 @@
 //! - `ai-env relay tls init [--force]` (as ai-env-deployer: no marker, an ops, a root and an ambient marker are
 //!   refused, exit 9, `params::tls_gate`): a new CA, its key sealed with no Touch ID (sealing is public-key only),
 //!   its certificate (public) written to `state/relay-ca.pem` and `state/relay-ca.der`, then a leaf for both names
-//!   a client verifies: DNS `ai-env-relay` (workers) and IP `10.42.0.20` (VMs). An existing CA is replaced only
-//!   with `--force`: a new CA strands every worker's pinned `relay_ca` file and client certificate (R-131).
+//!   a client verifies: DNS `ai-env-relay` (workers) and IP `10.42.0.20` (VMs). An existing CA, on this Mac or
+//!   behind a live `/ai-env/relay/tls` this Mac has no file of, is replaced only with `--force`: a new CA strands every
+//!   worker's pinned `relay_ca` file and client certificate (R-131).
 //! - `ai-env relay tls rotate` (as ai-env-deployer): one unseal of the CA key (one Touch ID), the CA rebuilt from
 //!   it and `state/relay-ca.der` (a mismatch is exit 9), a new leaf.
 //! - `ai-env relay allow … --tls-key` ([`client_certificate`], R-131): one unseal of the CA key (one Touch ID), a
@@ -46,6 +47,12 @@ const KIND: &str = "relay-ca";
 const TLS_MAX: usize = 4096;
 /// The container, as messages name it.
 const CA_FILE: &str = "credentials/relay-ca.env";
+/// What a new CA strands, as each of its messages says it (R-131).
+const STRANDS: &str = "every worker's relay_ca file and client certificate must then be replaced";
+/// The CA's DER, as messages name it.
+const CA_DER_FILE: &str = "state/relay-ca.der";
+/// `tls init`'s refusal when `tls rotate` lacks a file it reads: until both are here it answers exit 5, naming `tls init`.
+const ROTATE_NEEDS: &str = ", once credentials/relay-ca.env and state/relay-ca.der are back on this Mac";
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -108,18 +115,32 @@ fn tls_value(ca: &Issued, now: u64) -> Result<(Zeroizing<String>, String)> {
     Ok((value, certs::fingerprint(&leaf.cert_der)))
 }
 
-/// Write the `tls` value as `op` (WM-R60): created as a SecureString under `alias/aws/ssm` when absent (no
-/// `--overwrite`), else overwritten with the same `--type SecureString --key-id alias/aws/ssm` (a `tls` of another
-/// type is refused by SSM, exit 7, never given the key); either way on the aws child's stdin, never through a
-/// file (§Q.8 F5: I's `egress::ops::put_parameter`, which writes a temp file, is not used here). The new version.
-fn write_tls(op: &crate::bridge::identity::Operator, what: &str, value: &str) -> Result<u64> {
+/// Whether `/ai-env/relay/tls` exists, read with no decryption; a failed read is exit 7.
+fn tls_is_live(what: &str) -> Result<bool> {
     let name = tls_param();
     let (held, _) = ops::get_parameters(std::slice::from_ref(&name)).map_err(|e| CliError::Aws(format!("relay {what}: {e}")))?;
-    if held.contains_key(&name) {
+    Ok(held.contains_key(&name))
+}
+
+/// Write the `tls` value as `op` (WM-R60): unless `live`, created as a SecureString under `alias/aws/ssm` (no
+/// `--overwrite`, so a parameter made since the read is refused, never overwritten); if `live`, overwritten with the same
+/// `--type SecureString --key-id alias/aws/ssm` (a `tls` of another type is refused by SSM, exit 7, never given the key);
+/// either way on the aws child's stdin, never through a file (§Q.8 F5: I's `egress::ops::put_parameter`, which writes a
+/// temp file, is not used here). The new version.
+fn write_tls(op: &crate::bridge::identity::Operator, what: &str, value: &str, live: bool) -> Result<u64> {
+    let name = tls_param();
+    if live {
         put_secure(op, &name, value, true).map_err(|e| CliError::Aws(format!("relay {what}: {e}")))
     } else {
         create_parameter(op, &name, value, ParamType::SecureString).map_err(|e| CliError::Aws(format!("relay {what}: {e}")))
     }
+}
+
+/// `tls init` with no `--force` against a CA that exists: `held` is where, `rotate` what `tls rotate` needs first (exit 1).
+fn ca_exists(held: &str, rotate: &str) -> CliError {
+    CliError::Msg(format!(
+        "relay tls init: a relay CA exists ({held}): ai-env relay tls init --force makes a new one, and {STRANDS} (ai-env relay tls rotate issues a new certificate under this one{rotate})"
+    ))
 }
 
 /// `ai-env relay tls init [--force]` (WM-R59, WM-R60). `--force` is also `creds::seal_file`'s, as in every creds
@@ -127,19 +148,26 @@ fn write_tls(op: &crate::bridge::identity::Operator, what: &str, value: &str) ->
 pub fn cmd_tls_init(store: &Keystore, force: bool) -> Result<()> {
     tls_gate("tls init", &if force { vec!["--force".to_string()] } else { Vec::new() })?;
     let paths = Paths::resolve()?;
-    let existing: Vec<String> = [(ca_env(&paths), CA_FILE), (ca_pem_path(&paths), "state/relay-ca.pem"), (ca_der_path(&paths), "state/relay-ca.der")]
+    let existing: Vec<String> = [(ca_env(&paths), CA_FILE), (ca_pem_path(&paths), "state/relay-ca.pem"), (ca_der_path(&paths), CA_DER_FILE)]
         .into_iter()
         .filter(|(p, _)| std::fs::symlink_metadata(p).is_ok())
         .map(|(_, name)| name.to_string())
         .collect();
     if !existing.is_empty() && !force {
-        return Err(CliError::Msg(format!(
-            "relay tls init: a relay CA exists ({}): ai-env relay tls init --force makes a new one, and every worker's relay_ca file and client certificate must then be replaced (ai-env relay tls rotate issues a new certificate under this one)",
-            existing.join(", ")
-        )));
+        let rotates = [CA_FILE, CA_DER_FILE].iter().all(|name| existing.iter().any(|held| held == name));
+        return Err(ca_exists(&existing.join(", "), if rotates { "" } else { ROTATE_NEEDS }));
     }
     let ctx = RelayCtx::load()?;
     let op = ctx.operator("relay tls init")?;
+    // A live CA leaves no file on a rebuilt Mac or under another AI_ENV_BRIDGE_DIR, and every absent-file refusal sends the
+    // operator here: the parameter is read before anything is made or sealed, with no decryption, and `write_tls` takes the
+    // answer.
+    let tls = tls_param();
+    let live = tls_is_live("tls init")?;
+    if live && !force {
+        // No file here (the check above), and `tls rotate` answers exit 5 naming this command until they are back.
+        return Err(ca_exists(&tls, ROTATE_NEEDS));
+    }
     let now = unix_now();
     let ca = certs::relay_ca(now).map_err(|e| CliError::Msg(format!("relay tls init: the relay CA: {e}")))?;
     let ca_fp = certs::fingerprint(&ca.cert_der);
@@ -154,14 +182,20 @@ pub fn cmd_tls_init(store: &Keystore, force: bool) -> Result<()> {
     ensure_private_dir(&paths.root.join("state"))?;
     write_atomic_mode(&ca_pem_path(&paths), certs::pem("CERTIFICATE", &ca.cert_der).as_bytes(), 0o644)?;
     write_atomic_mode(&ca_der_path(&paths), &ca.cert_der, 0o644)?;
-    // The CA stands from here on: a failed write of the value is recovered under it, with no new CA.
-    let tls = tls_param();
-    let version = write_tls(&op, "tls init", &value).map_err(|e| CliError::Aws(format!("{e}; the relay CA fp {ca_fp} is made and sealed: ai-env relay tls rotate writes {tls} under it")))?;
+    // R-131: a sealed file moved away first (`unseal_ca`'s text) leaves no backup, and says it too; only a first init, with
+    // nothing here and nothing live, strands nobody.
+    let replaces = live || !existing.is_empty() || sealed.backup.is_some();
+    // The CA stands from here on: a failed write of the value is recovered under it, with no new CA. `tls rotate`, which this
+    // names, says nothing of what the new CA strands, so this does.
+    let version = write_tls(&op, "tls init", &value, live).map_err(|e| {
+        let strands = if replaces { format!(": {STRANDS}") } else { String::new() };
+        CliError::Aws(format!("{e}; the relay CA fp {ca_fp} is made and sealed: ai-env relay tls rotate writes {tls} under it{strands}"))
+    })?;
     drop(value);
     say(&format!("relay CA fp {ca_fp} until {not_after}: its key sealed in {CA_FILE}, its certificate in state/relay-ca.pem and state/relay-ca.der"));
     say(&format!("relay certificate fp {leaf_fp} (ai-env-relay, {RELAY_IP}) in {tls} v{version}: the relay serves it within a minute"));
-    if sealed.backup.is_some() {
-        say("a new CA: every worker's relay_ca file and client certificate must then be replaced (ai-env relay ca prints the CA, ai-env relay allow --tls-key issues a certificate)");
+    if replaces {
+        say(&format!("a new CA: {STRANDS} (ai-env relay ca prints the CA, ai-env relay allow --tls-key issues a certificate)"));
     }
     Ok(())
 }
@@ -175,7 +209,8 @@ pub fn cmd_tls_rotate(store: &Keystore) -> Result<()> {
     let op = ctx.operator("relay tls rotate")?;
     let ca = unsealed_ca(store, &paths, &cert, "tls rotate")?;
     let (value, leaf_fp) = tls_value(&ca, unix_now())?;
-    let version = write_tls(&op, "tls rotate", &value)?;
+    let live = tls_is_live("tls rotate")?;
+    let version = write_tls(&op, "tls rotate", &value, live)?;
     drop(value);
     say(&format!("relay certificate fp {leaf_fp} (ai-env-relay, {RELAY_IP}) under the relay CA fp {} in {} v{version}: the relay serves it to new connections within a minute", certs::fingerprint(&ca.cert_der), tls_param()));
     Ok(())

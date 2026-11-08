@@ -5,7 +5,7 @@
 //! never the request's (R-54). A refusal before the stream is a gRPC status (R-31, LD-R14); once the stream starts,
 //! the call ends with exactly one final chunk (R-42). Each call gets one call line (R-61), each list one list line.
 //! What a token reaches is worked out per request, with no cache: its own grant, and what the access list adds for its
-//! chat as the list is now (R-145).
+//! chat as the list is now, within its signer's grants (R-145).
 //!
 //! Each request is one of its connection's (R-103): pending from its handler's start to its answer or its call's
 //! conclusion, so the connection's watch knows when it is idle; its refused tokens count against the connection,
@@ -28,7 +28,7 @@ use crate::lists::{Access, Grant, Grants};
 use crate::registry::Route;
 use crate::reqlog::{CallFields, CallLog, ListFields};
 use crate::serve::RelayState;
-use crate::session::{self, SessionClaims, SessionFault};
+use crate::session::{self, SessionClaims, SessionFault, VerifiedSession};
 use crate::tls::{PeerInfo, PrivateConn};
 
 /// The response metadata key of the relay's id of a call (one definition in ai-env-source's `wire`, review A-L11).
@@ -84,6 +84,15 @@ fn unauthenticated() -> Box<Refused> {
     Refused::new(tonic::Code::Unauthenticated, "authentication failed", "unauthenticated")
 }
 
+/// R-135: a signer with `grants` (R-134) reaches the grants they match, and is refused before any session state is
+/// made: its key mints no session it may not use. `None` keeps today's reach.
+fn signer_may(signer_grants: Option<&[String]>, grant_id: &str) -> Result<(), Box<Refused>> {
+    match signer_grants {
+        Some(globs) if !globs.iter().any(|glob| ai_env_worker::globs::glob_match(glob, grant_id)) => Err(Refused::new(tonic::Code::PermissionDenied, "not granted", "denied")),
+        _ => Ok(()),
+    }
+}
+
 fn session_refusal(r: Refusal) -> Box<Refused> {
     match r {
         Refusal::RateLimited => Refused::new(tonic::Code::ResourceExhausted, "rate limited", "rate_limited"),
@@ -96,20 +105,21 @@ fn session_refusal(r: Refusal) -> Box<Refused> {
 }
 
 impl RelayState {
-    /// R-51 to R-53 on a request's metadata: exactly one token, the signers fresh, W/M's verifier. R-105: a faulted
+    /// R-51 to R-53 on a request's metadata: exactly one token for this relay (R-137), the signers fresh, W/M's verifier,
+    /// the claims back with their signer's grants (R-134). R-105: a faulted
     /// connection's request is refused before anything is verified; a refused token (`Missing` or `Token`, never
     /// `NotLoaded`, the relay's own) counts against the connection; a verified one meets its deadline (R-103).
-    fn caller_of(&self, metadata: &MetadataMap, conn: &PrivateConn) -> Result<SessionClaims, Box<Refused>> {
+    fn caller_of(&self, metadata: &MetadataMap, conn: &PrivateConn) -> Result<VerifiedSession, Box<Refused>> {
         if conn.faulted() {
             return Err(unauthenticated());
         }
         // A value that is not visible ASCII is still a value: it fails the verifier as malformed.
         let values: Vec<&str> = metadata.get_all(session::SESSION_HEADER).iter().map(|v| v.to_str().unwrap_or("")).collect();
         let signers = self.live.signers.fresh(self.now(), self.max_stale());
-        match session::verify_request(&values, signers.as_deref(), self.now_unix()) {
-            Ok(claims) => {
+        match session::verify_request(&values, &self.cfg.relay_id, signers.as_deref(), self.now_unix()) {
+            Ok(verified) => {
                 conn.verified();
-                Ok(claims)
+                Ok(verified)
             }
             Err(fault) => {
                 // R-53: the variant to relay.log (the caller and the request log see only `unauthenticated`).
@@ -185,22 +195,23 @@ impl relay_server::Relay for PrivateSvc {
     }
 }
 
-/// R-32: the token, the session's bucket, the grants, then R-49.
+/// R-32: the token, its signer's grants (R-135), the session's bucket, the grants, then R-49.
 fn list(st: &RelayState, request: &tonic::Request<ListSourcesRequest>, conn: Option<&PrivateConn>, line: &mut ListFields) -> Result<ListSourcesResponse, Box<Refused>> {
     if request.extensions().get::<PeerInfo>().is_none() {
         return Err(Refused::new(tonic::Code::Internal, "no peer", "invalid"));
     }
     // A request whose connection is no longer watched is cut with it: refused unverified.
-    let claims = st.caller_of(request.metadata(), conn.ok_or_else(unauthenticated)?)?;
+    let VerifiedSession { claims, signer_grants } = st.caller_of(request.metadata(), conn.ok_or_else(unauthenticated)?)?;
     line.caller = claims.caller_id.clone();
     line.session = claims.session_id.clone();
     line.vm = claims.vm_id.clone();
     line.grant = claims.grant_id.clone();
-    st.sessions.enter(&claims.session_id, false, Instant::now()).map_err(session_refusal)?;
+    signer_may(signer_grants.as_deref(), &claims.grant_id)?;
+    st.sessions.enter(&claims.session_id, &claims.kid, false, Instant::now()).map_err(session_refusal)?;
     let grants = st.live.grants.fresh(st.now(), st.max_stale()).ok_or_else(|| Refused::new(tonic::Code::Unavailable, "grants not loaded", "not_ready"))?;
     // R-145: through `fresh`, so a list that is absent, refused or stale adds nothing. The list line keeps the token's.
     let access = st.live.access.fresh(st.now(), st.max_stale());
-    let sources = filter_catalog(st.registry.statuses(), &effective(&grants, access.as_deref(), &claims, st.now_unix()));
+    let sources = filter_catalog(st.registry.statuses(), &effective(&grants, access.as_deref(), &claims, signer_grants.as_deref(), st.now_unix()));
     let response = ListSourcesResponse { sources };
     if response.encoded_len() > st.cfg.limits.list_max_bytes as usize {
         return Err(Refused::new(tonic::Code::ResourceExhausted, "catalog too large", "too_large"));
@@ -224,7 +235,7 @@ async fn call(
     }
     // A request whose connection is no longer watched is cut with it: refused unverified.
     let Some(conn) = conn else { return Err(unauthenticated()) };
-    let claims = st.caller_of(request.metadata(), &conn)?;
+    let VerifiedSession { claims, signer_grants } = st.caller_of(request.metadata(), &conn)?;
     let req = request.into_inner();
     let valid = |s: &str| ai_env_worker::globs::valid_id(s);
     // R-62: names reach the log only when they are ids.
@@ -241,7 +252,8 @@ async fn call(
     fields.params_hmac = st.log.digest(&req.params_json);
     fields.params_bytes = req.params_json.len() as u64;
 
-    let session_pass = st.sessions.enter(&claims.session_id, true, Instant::now()).map_err(session_refusal)?;
+    signer_may(signer_grants.as_deref(), &claims.grant_id)?;
+    let session_pass = st.sessions.enter(&claims.session_id, &claims.kid, true, Instant::now()).map_err(session_refusal)?;
     if !valid(&req.source) || !valid(&req.op) {
         return Err(Refused::new(tonic::Code::InvalidArgument, "invalid source or op name", "invalid"));
     }
@@ -249,7 +261,7 @@ async fn call(
     // R-145: through `fresh`, so a list that is absent, refused or stale adds nothing.
     let access = st.live.access.fresh(st.now(), st.max_stale());
     // R-48: the grant before the lookup, so a caller learns nothing of sources it may not use.
-    let Some(granted) = effective(&grants, access.as_deref(), &claims, st.now_unix()).into_iter().find(|g| g.allows(&req.source, &req.op)) else {
+    let Some(granted) = effective(&grants, access.as_deref(), &claims, signer_grants.as_deref(), st.now_unix()).into_iter().find(|g| g.allows(&req.source, &req.op)) else {
         return Err(Refused::new(tonic::Code::PermissionDenied, "not granted", "denied"));
     };
     // R-145: the line and the worker name the grant the call went through, from here on.
@@ -418,11 +430,14 @@ pub fn effective_deadline_ms(requested: u32, cfg: &config::Limits) -> u32 {
     want.clamp(cfg.deadline_min_ms, cfg.deadline_max_ms)
 }
 
-/// R-145: what a token reaches, in the order a call tries them: its own grant, then the grants of the entry in force that
-/// names its chat. A token with no `chat_id` matches no entry, and a name `grants` does not hold adds nothing.
-fn effective<'a>(grants: &'a Grants, access: Option<&Access>, c: &SessionClaims, now: u64) -> Vec<&'a Grant> {
+/// R-145: what a token reaches, in the order a call tries them: its own grant, which `signer_may` has let through already,
+/// then the grants of the entry in force that names its chat, each only if `signer_may` lets it through too: an entry
+/// never takes a signer past its `signer_grants` (R-135), and `None` keeps every grant. A token with no `chat_id` matches
+/// no entry, and a name `grants` does not hold adds nothing.
+fn effective<'a>(grants: &'a Grants, access: Option<&Access>, c: &SessionClaims, signer_grants: Option<&[String]>, now: u64) -> Vec<&'a Grant> {
     let more = c.chat_id.as_deref().and_then(|chat| access?.grants_of(chat, now)).unwrap_or_default();
-    grants.get(&c.grant_id).into_iter().chain(more.iter().filter(|g| **g != c.grant_id).filter_map(|g| grants.get(g))).collect()
+    let more = more.iter().filter(|g| **g != c.grant_id && signer_may(signer_grants, g).is_ok());
+    grants.get(&c.grant_id).into_iter().chain(more.filter_map(|g| grants.get(g))).collect()
 }
 
 /// R-49: the ops any of `grants` allows, in the catalog's order; with none, nothing.
@@ -538,6 +553,8 @@ mod tests {
 
     /// R-145: the token's own grant first, then its entry's in the entry's order; its own grant named again by the entry
     /// comes once; a name no grant holds adds nothing; no chat, no list, another chat's entry or a lapsed one, nothing more.
+    /// What the entry adds passes the signer's globs, in the entry's order: no list keeps every one, a set keeps what it
+    /// matches, and one that matches none of them adds nothing.
     #[test]
     fn a_token_reaches_its_own_grant_then_its_entrys() {
         const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
@@ -560,7 +577,14 @@ mod tests {
         let access = Access {
             entries: vec![ai_env_worker::policy::AccessEntry { chat: CHAT.into(), grants: vec!["g-a".into(), "g-gone".into(), "g-own".into(), "g-b".into()], not_after: NOT_AFTER.into() }],
         };
-        let reach = |c: &SessionClaims, access: Option<&Access>, now: u64| -> Vec<String> { effective(&grants, access, c, now).iter().map(|g| g.grant_id.clone()).collect() };
+        let reach_of = |c: &SessionClaims, access: Option<&Access>, signer: Option<&[String]>, now: u64| -> Vec<String> { effective(&grants, access, c, signer, now).iter().map(|g| g.grant_id.clone()).collect() };
+        let reach = |c: &SessionClaims, access: Option<&Access>, now: u64| reach_of(c, access, None, now);
+        let through = |globs: &[&str], own: &str| reach_of(&claims(own, Some(CHAT)), Some(&access), Some(&globs.iter().map(|g| g.to_string()).collect::<Vec<String>>()), until);
+        assert_eq!(through(&["no-grant", "g-*"], "no-grant"), ["g-a", "g-own", "g-b"], "every one of the entry's, in its order");
+        assert_eq!(through(&["no-grant", "g-a"], "no-grant"), ["g-a"], "one of the entry's");
+        assert_eq!(through(&["no-grant", "g-b*"], "no-grant"), ["g-b"], "by glob");
+        assert!(through(&["no-grant"], "no-grant").is_empty(), "none of the entry's");
+        assert_eq!(through(&["g-own", "g-b"], "g-own"), ["g-own", "g-b"], "own first, once");
         assert_eq!(reach(&claims("g-own", Some(CHAT)), Some(&access), until), ["g-own", "g-a", "g-b"], "own first, once");
         assert_eq!(reach(&claims("g-b", Some(CHAT)), Some(&access), until), ["g-b", "g-a", "g-own"]);
         assert_eq!(reach(&claims("no-grant", Some(CHAT)), Some(&access), until), ["g-a", "g-own", "g-b"], "a token's name in no list adds nothing, and costs nothing");

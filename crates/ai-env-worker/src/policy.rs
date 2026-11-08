@@ -25,6 +25,8 @@ pub const ENTRIES_MAX: usize = 64;
 pub const SOURCES_MAX: usize = 16;
 /// The most rules of one grant.
 pub const RULES_MAX: usize = 32;
+/// The most grant globs of one token signer (R-134).
+pub const SIGNER_GRANTS_MAX: usize = 16;
 
 /// One whitelisted worker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -58,6 +60,10 @@ pub struct SignerEntry {
     pub public_key: String,
     /// `YYYY-MM-DDTHH:MM:SSZ`.
     pub not_after: String,
+    /// The grant ids it may mint tokens for (R-134): 1 to 16 globs, sorted, no duplicate. Absent parses, and renders
+    /// without the key, so a list without them is today's: such a signer reaches every grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<String>>,
 }
 
 /// One grant: source and op rules.
@@ -99,11 +105,16 @@ pub fn render_workers(list: &[WorkerEntry]) -> Result<String, PolicyError> {
     render("workers", &sorted)
 }
 
-/// Sorted by id, compact.
+/// Sorted by id (each signer's grant globs sorted too), compact.
 pub fn render_signers(list: &[SignerEntry]) -> Result<String, PolicyError> {
     check_signers(list)?;
     let mut sorted = list.to_vec();
     sorted.sort_by(|a, b| a.signer_id.cmp(&b.signer_id));
+    for signer in &mut sorted {
+        if let Some(grants) = &mut signer.grants {
+            grants.sort();
+        }
+    }
     render("token-signers", &sorted)
 }
 
@@ -770,9 +781,29 @@ fn check_signers(list: &[SignerEntry]) -> Result<(), PolicyError> {
     let mut checked = Vec::with_capacity(list.len());
     for (i, s) in list.iter().enumerate() {
         let key = check_key_entry("token-signers", i, "signer_id", &s.signer_id, &s.alg, &s.public_key, &s.not_after)?;
+        if let Some(grants) = &s.grants {
+            check_signer_grants(i, grants)?;
+        }
         checked.push((s.signer_id.as_str(), Some(key)));
     }
     unique("token-signers", "signer_id", checked.into_iter())
+}
+
+/// R-134: a signer's grant globs, 1 to 16, each a glob, none twice; a text names the entry and the index, never a value.
+fn check_signer_grants(i: usize, grants: &[String]) -> Result<(), PolicyError> {
+    if grants.is_empty() || grants.len() > SIGNER_GRANTS_MAX {
+        return Err(PolicyError(format!("token-signers: entry {i}: {} grant globs, not 1 to {SIGNER_GRANTS_MAX}", grants.len())));
+    }
+    if let Some(j) = grants.iter().position(|g| !valid_glob(g)) {
+        return Err(PolicyError(format!("token-signers: entry {i}: grants[{j}] is not a glob")));
+    }
+    let mut seen = HashMap::new();
+    for (j, glob) in grants.iter().enumerate() {
+        if let Some(k) = seen.insert(glob.as_str(), j) {
+            return Err(PolicyError(format!("token-signers: entry {i}: grants[{j}] repeats grants[{k}]")));
+        }
+    }
+    Ok(())
 }
 
 fn check_grants(list: &[Grant]) -> Result<(), PolicyError> {
@@ -987,5 +1018,71 @@ mod tests {
         assert_eq!(parse_workers(&unknown).expect_err("an unknown field").to_string(), "workers: entry 0: an unknown field");
         let typed = render_workers(std::slice::from_ref(&with)).expect("renders").replacen(&format!(r#""{}""#, fp(1)), "1", 1);
         assert_eq!(parse_workers(&typed).expect_err("a number").to_string(), "workers: entry 0: a field of another type");
+    }
+
+    /// WM-T62 (R-134). The relay parses the token signers with this module's `parse_signers` (LD-R5).
+    #[test]
+    fn a_signer_entry_carries_optional_grant_globs() {
+        let signer = |id: &str, seed: u8, grants: Option<&[&str]>| SignerEntry {
+            signer_id: id.into(),
+            alg: "ed25519".into(),
+            public_key: key_b64(seed),
+            not_after: "2027-10-29T23:59:59Z".into(),
+            grants: grants.map(|g| g.iter().map(|s| (*s).to_string()).collect()),
+        };
+        // Absent: parses to None, and renders without the key, today's text byte for byte.
+        let plain = signer("mac", 7, None);
+        let text = render_signers(std::slice::from_ref(&plain)).expect("renders");
+        assert_eq!(text, format!(r#"[{{"signer_id":"mac","alg":"ed25519","public_key":"{}","not_after":"2027-10-29T23:59:59Z"}}]"#, key_b64(7)));
+        assert_eq!(parse_signers(&text).expect("parses"), vec![plain.clone()]);
+
+        // Present: after not_after, sorted by the render, and it parses back to itself.
+        let bound = signer("mac-b", 8, Some(&["g-z", "g-a", "default"]));
+        let text = render_signers(std::slice::from_ref(&bound)).expect("renders");
+        assert!(text.ends_with(r#","not_after":"2027-10-29T23:59:59Z","grants":["default","g-a","g-z"]}]"#), "{text}");
+        let back = parse_signers(&text).expect("parses");
+        assert_eq!(back, vec![signer("mac-b", 8, Some(&["default", "g-a", "g-z"]))]);
+        assert_eq!(render_signers(&back).expect("renders"), text, "a rendered list parses back to itself");
+        // One entry's globs and another's absence side by side; the 16 and the `*` are allowed.
+        let sixteen: Vec<String> = (0..16).map(|i| format!("g{i:02}")).collect();
+        let many: Vec<&str> = sixteen.iter().map(String::as_str).collect();
+        let mixed = vec![signer("mac-c", 9, Some(&many)), plain.clone(), signer("mac-b", 8, Some(&["*"]))];
+        let text = render_signers(&mixed).expect("renders");
+        let back = parse_signers(&text).expect("parses");
+        assert_eq!(back.iter().map(|s| s.grants.as_ref().map(Vec::len)).collect::<Vec<_>>(), [None, Some(1), Some(16)], "by id: {text}");
+
+        // Refused on both sides, with one text: the count, a glob out of WM-R1's grammar, a repeat.
+        let refused = |entries: &[SignerEntry]| {
+            let rendered = render_signers(entries).expect_err("render refuses").to_string();
+            let parsed = parse_signers(&serde_json::to_string(entries).expect("json")).expect_err("parse refuses").to_string();
+            assert_eq!(rendered, parsed, "one check on both sides");
+            rendered
+        };
+        assert_eq!(refused(&[signer("mac", 7, Some(&[]))]), "token-signers: entry 0: 0 grant globs, not 1 to 16");
+        let seventeen: Vec<String> = (0..17).map(|i| format!("g{i:02}")).collect();
+        let over: Vec<&str> = seventeen.iter().map(String::as_str).collect();
+        assert_eq!(refused(&[plain.clone(), signer("mac-b", 8, Some(&over))]), "token-signers: entry 1: 17 grant globs, not 1 to 16");
+        let planted = "zz-planted";
+        for bad in ["ZZ-PLANTED", "zz-planted/x", "", "-zz-planted", "zz-planted*****"] {
+            let text = refused(&[signer("mac", 7, Some(&["g-a", bad]))]);
+            assert_eq!(text, "token-signers: entry 0: grants[1] is not a glob", "{bad:?}");
+            assert!(!text.to_lowercase().contains(planted), "no value in {text}");
+        }
+        assert_eq!(refused(&[signer("mac", 7, Some(&["g-a", "g-b", "g-a"]))]), "token-signers: entry 0: grants[2] repeats grants[0]");
+        assert_eq!(refused(&[signer("mac", 7, Some(&["g-a", "g-b", "g-b"]))]), "token-signers: entry 0: grants[2] repeats grants[1]");
+        // The field's own type; an unknown field beside it stays refused; `null` is the absent field.
+        let good = serde_json::to_value(&plain).expect("json");
+        let with = |value: serde_json::Value| {
+            let mut entry = good.clone();
+            entry["grants"] = value;
+            serde_json::to_string(&[entry]).expect("json")
+        };
+        assert_eq!(parse_signers(&with(serde_json::json!(planted))).expect_err("a string").to_string(), "token-signers: entry 0: a field of another type");
+        assert_eq!(parse_signers(&with(serde_json::json!([1]))).expect_err("a number").to_string(), "token-signers: entry 0: a field of another type");
+        assert_eq!(parse_signers(&with(serde_json::Value::Null)).expect("null").first().map(|s| s.grants.clone()), Some(None));
+        let unknown = with(serde_json::json!(["g-a"])).replacen(r#""grants""#, r#""grants2""#, 1);
+        assert_eq!(parse_signers(&unknown).expect_err("an unknown field").to_string(), "token-signers: entry 0: an unknown field");
+        // Each glob matches a grant id as the relay asks it (R-135).
+        assert!(glob_match("g-*", "g-a") && glob_match("default", "default") && glob_match("*", "any") && !glob_match("g-*", "default"));
     }
 }

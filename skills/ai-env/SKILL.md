@@ -109,11 +109,11 @@ an escape.
   a source listed with empty `ops` lost them (ask for it by `source`, which returns them unless they
   alone are too large), and the last sources are gone only if their names alone did not fit. Call it first.
 - `relay_call` (`source`, `op`, `params`, and optionally `max_bytes`, 1 to 262144, 65536 by default,
-  and `deadline_ms`, 1 to 300000): `params` must match the op's `params_schema`. The result holds
-  `source`, `op`, `request_id`, `content_type`, `truncated`, `bytes`, `limit` and the output as one of
-  `json`, `text` or `b64` (base64). `truncated: true` means the output was cut at `limit` bytes (a cut
-  JSON comes back as `text`): ask a narrower question (a filter, a smaller page) before a larger
-  `max_bytes`.
+  and `deadline_ms`, 1 to 300000, 30000 by default): `params` must match the op's `params_schema`. The
+  result holds `source`, `op`, `request_id`, `content_type`, `truncated`, `bytes`, `limit` and the
+  output as one of `json`, `text` or `b64` (base64). `truncated: true` means the output was cut at
+  `limit` bytes (a cut JSON comes back as `text`): ask a narrower question (a filter, a smaller page)
+  before a larger `max_bytes`.
 - An error is a tool result marked as an error, `{"error":{"code":…,"message":…}}` (after `source`
   and `op` for `relay_call`). Its code: `no_session`
   (`this chat has no relay session (it was not started with one)`), `bad_request` (an argument the
@@ -257,7 +257,8 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   are the deployer's (`ai-env as deployer -- ai-env relay …`): they decide who reaches private data,
   so give the user the command and never start one yourself. `allow --tls-key` costs one more Touch ID
   (the relay CA's key), and `allow-ip --wide` opens the public face to much of the internet: the user's
-  call. `ai-env relay status`, `start` and
+  call. `allow --token-signer --grants` sets which grants a Mac's tokens and its chats' approvals can reach, and
+  a set that leaves out `[relay].grant` refuses every token: the user's call too. `ai-env relay status`, `start` and
   `stop`, and `make relay-logs`, are ops' (one Touch ID). `ai-env relay access` is ops' too, and it approves a
   chat for a grant: the user's decision, in the panel or by that command, so never start it yourself.
   `ai-env relay agent` (one Touch ID, then it
@@ -272,9 +273,12 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   ended one in those 10 minutes) or a relay with no fresh list (`no_peers`, which refuses everyone). Read
   `ai-env relay status`'s probe, `refused in the last hour` and peers rows, give the user the `allow-ip`
   command if that is the cure, and never retry a dial in a loop: failed handshakes count toward the ban.
-  `[warn] worker … has no client certificate yet` is expected, since this relay asks for none: the order
-  is certificates first, then the relay that requires them. While that row says `not yet`, a relay from
-  before the allowlist runs, and `--tls-key` would unload its whole whitelist.
+  `[NO ] worker … has no client certificate` means the relay refuses that worker: give the user the row's
+  command. `[warn] worker … has no client certificate yet` means the running relay asks for none, or its status
+  line was not read: the order is certificates first, then the relay that requires them. While that row says
+  `not yet`, a relay from before the allowlist runs, and `--tls-key` would unload its whole whitelist. A
+  `[warn] refused in the last hour` whose top reason is `tls_failed` is a worker refused at TLS (no certificate, an
+  expired one, or not restarted since its install): it never reaches a ban alone, so read the worker's own `check`.
 - No `ai-env-relay-reload:` line from the new instance in `make relay-logs` 15 minutes after a deploy is a stopped bootstrap: the
   first of the relay's two boot scripts gave up, and `make deploy` sees no diff. Its reason is in the
   instance's system log, which only the account root can read: report what you see and stop, since that

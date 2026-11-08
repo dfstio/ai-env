@@ -187,7 +187,7 @@ impl RelayLink {
         Ok((entries, truncated))
     }
 
-    /// `Call` (V-R23): `params` compact (at most [`PARAMS_MAX`] bytes), `deadline_ms` (0: the op's own), the byte cap
+    /// `Call` (V-R23): `params` compact (at most [`PARAMS_MAX`] bytes), `deadline_ms` (0: the relay's 30 s), the byte cap
     /// `max_bytes` clamped to 1 to [`MAX_BYTES_CAP`] as the call's limit; the stream read in order, cut at the limit
     /// (the stream dropped, which cancels the call at the relay). Past `min(deadline_ms + 5 s, DEADLINE_CAP_MS + 5 s)`
     /// (300 s without a deadline): `deadline_exceeded`. `cancel` resolving drops the call (V-R24). A failure once the

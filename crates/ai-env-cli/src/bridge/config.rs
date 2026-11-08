@@ -1261,11 +1261,13 @@ pub struct RelayCfg {
     /// The grants the panel offers each remote chat, and the only ones `ai-env relay access --allow` takes (R-149):
     /// at most [`RelayCfg::OFFER_MAX`] ids, none holding a `.` (a panel form's value refuses one), none twice.
     pub offer: Vec<String>,
+    /// The relay this Mac's tokens are for, their `aud`: the relay's own `AI_ENV_RELAY_ID` (R-137).
+    pub relay_id: String,
 }
 
 impl Default for RelayCfg {
     fn default() -> Self {
-        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12, offer: Vec::new() }
+        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12, offer: Vec::new(), relay_id: ai_env_worker::session::SESSION_AUD.into() }
     }
 }
 
@@ -1275,7 +1277,7 @@ impl RelayCfg {
     /// The most grants `offer` names (R-149): as many as an access entry holds.
     pub const OFFER_MAX: usize = ai_env_worker::policy::ACCESS_GRANTS_MAX;
 
-    /// `worker_id` an id, `grant` empty or an id (WM-R1: 1 to 64 of `[a-z0-9._-]`, starting with `[a-z0-9]`),
+    /// `worker_id` and `relay_id` ids, `grant` empty or an id (WM-R1: 1 to 64 of `[a-z0-9._-]`, starting with `[a-z0-9]`),
     /// `agent_hours` 1 to 24, `offer` at most 16 ids with no `.`, none twice (R-149); else `Config` naming the key
     /// (exit 1).
     pub fn validate(&self) -> Result<(), BridgeError> {
@@ -1289,6 +1291,9 @@ impl RelayCfg {
         }
         if !(1..=Self::AGENT_HOURS_MAX).contains(&self.agent_hours) {
             return Err(BridgeError::Config(format!("[relay].agent_hours = {} is outside 1..={}", self.agent_hours, Self::AGENT_HOURS_MAX)));
+        }
+        if !valid_id(&self.relay_id) {
+            return Err(BridgeError::Config(format!("[relay].relay_id = {:?} is not an id ({rule})", crate::wire::redact::scrub(&self.relay_id))));
         }
         if self.offer.len() > Self::OFFER_MAX {
             return Err(BridgeError::Config(format!("[relay].offer names {} grants, over {}", self.offer.len(), Self::OFFER_MAX)));
@@ -1481,6 +1486,8 @@ mod tests {
     fn the_relay_section_parses_and_validates() {
         let d = BridgeConfig::parse("").unwrap().relay;
         assert_eq!((d.worker_id.as_str(), d.grant.as_str(), d.agent_hours), ("mac", "", 12));
+        assert_eq!(d.relay_id, "ai-env-relay", "R-137: the relay's own default");
+        assert_eq!(BridgeConfig::parse("[relay]\nrelay_id = \"relay-b\"\n").unwrap().relay.relay_id, "relay-b");
         assert_eq!(d, RelayCfg::default());
         d.validate().unwrap();
         let cfg = BridgeConfig::parse("[relay]\nworker_id = \"mac-b\"\ngrant = \"default\"\n\n[[workspace]]\npath = \"/w\"\nrelay_grant = \"\"\n").unwrap();
@@ -1489,13 +1496,13 @@ mod tests {
         cfg.relay.validate().unwrap();
         assert_eq!(BridgeConfig::parse("[[workspace]]\npath = \"/w\"\n").unwrap().workspace_overrides[0].relay_grant, None);
         assert!(BridgeConfig::parse("[relay]\nworker = \"mac\"\n").is_err(), "an unknown [relay] key");
-        for (body, key) in [("worker_id = \"A\"", "[relay].worker_id"), ("grant = \"a b\"", "[relay].grant"), ("agent_hours = 0", "[relay].agent_hours"), ("agent_hours = 25", "[relay].agent_hours")] {
+        for (body, key) in [("worker_id = \"A\"", "[relay].worker_id"), ("grant = \"a b\"", "[relay].grant"), ("agent_hours = 0", "[relay].agent_hours"), ("agent_hours = 25", "[relay].agent_hours"), ("relay_id = \"Relay B\"", "[relay].relay_id"), ("relay_id = \"\"", "[relay].relay_id")] {
             let r = BridgeConfig::parse(&format!("[relay]\n{body}\n")).unwrap_or_else(|e| panic!("{body}: the parse never validates [relay]: {e}")).relay;
             let e = r.validate().unwrap_err();
             assert!(matches!(&e, BridgeError::Config(m) if m.starts_with(key)), "{body}: {e}");
             assert_eq!(crate::errors::CliError::from(e).exit_code(), 1, "{body}");
         }
-        for ok in ["agent_hours = 1", "agent_hours = 24", "grant = \"example-grant\"", "worker_id = \"w1\"", "offer = []", "offer = [\"g-a\", \"g_b\"]", "grant = \"no-grant\""] {
+        for ok in ["agent_hours = 1", "agent_hours = 24", "grant = \"example-grant\"", "worker_id = \"w1\"", "relay_id = \"relay-b\"", "offer = []", "offer = [\"g-a\", \"g_b\"]", "grant = \"no-grant\""] {
             BridgeConfig::parse(&format!("[relay]\n{ok}\n")).unwrap().relay.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
         // R-149: `offer` defaults to none and names at most 16 ids, each once, none with a `.`.
