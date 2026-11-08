@@ -2,7 +2,7 @@
 set -euo pipefail
 
 getent passwd ai-env-relay >/dev/null || useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /sbin/nologin ai-env-relay
-install -d -m 0755 -o root -g root /etc/ai-env-relay /usr/local/libexec/ai-env-relay /var/log/ai-env-relay /etc/systemd/system/logrotate.timer.d
+install -d -m 0755 -o root -g root /etc/ai-env-relay /usr/local/libexec/ai-env-relay /var/log/ai-env-relay /etc/systemd/system/logrotate.timer.d /etc/systemd/system/amazon-cloudwatch-agent.service.d
 install -d -m 0750 -o root -g ai-env-relay /var/lib/ai-env-relay /var/lib/ai-env-relay/live
 install -d -m 0700 -o root -g root /var/lib/ai-env-relay/stage
 install -d -m 0750 -o ai-env-relay -g ai-env-relay /var/log/ai-env-relay/requests
@@ -90,6 +90,10 @@ OnCalendar=
 OnCalendar=*:0/5
 AccuracySec=1min
 RandomizedDelaySec=0
+AIENV_RELAY_UNIT_EOF
+cat > /etc/systemd/system/amazon-cloudwatch-agent.service.d/ai-env.conf <<'AIENV_RELAY_UNIT_EOF'
+[Service]
+SupplementaryGroups=ai-env-relay
 AIENV_RELAY_UNIT_EOF
 chmod 0644 /etc/ai-env-relay/guard.nft
 systemctl daemon-reload

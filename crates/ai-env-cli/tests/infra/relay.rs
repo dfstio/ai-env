@@ -518,7 +518,9 @@ fn rendered_relay() -> Value {
 /// `AccuracySec=1min` and `RandomizedDelaySec=0` over the package's timer) with `size 20M` and `nodateext` in both
 /// stanzas (no interval, no `maxsize`, no `dateext`: AL2023's logrotate.conf sets it, and a dated name rotates a log once
 /// a day at most), the CloudWatch agent as `cwagent` and `cwagent` in the relay's group after the packages and before the
-/// agent starts, never fatal, relay.log made 0644 root when missing before the units start, and no comment line in
+/// agent starts, never fatal, the agent's unit given that group by its own drop-in before its start (its start sets the
+/// groups of one thread alone, agent issue 1140: the first deploy's agent ran without it and never read requests.log),
+/// relay.log made 0644 root when missing before the units start, and no comment line in
 /// either script. Copies are refused with I-R25's texts, each on the file that holds it: over the limit (user-data.sh's),
 /// a stale .gz, a placeholder in reload.py, boot.sh or user-data.sh, a token gone from either, boot.sh missing, a required
 /// line of R's missing (the guard's IPv4, SYN or non-TCP rule, the unit's D-Bus and resolved blocks and its swap allowance
@@ -663,8 +665,15 @@ fn the_relay_files_render_small_whole_and_hardened() {
         at("rpm -q amazon-cloudwatch-agent logrotate nftables dnf-plugins-core > /dev/null") < usermod && usermod < ctl,
         "cwagent joins the relay's group after the packages, before the agent starts, never fatal (I-R26 step 10)"
     );
+    let groups = at("cat > /etc/systemd/system/amazon-cloudwatch-agent.service.d/ai-env.conf <<'AIENV_RELAY_UNIT_EOF'");
+    assert_eq!(
+        lines[groups + 1..groups + 4],
+        ["[Service]", "SupplementaryGroups=ai-env-relay", "AIENV_RELAY_UNIT_EOF"],
+        "the agent holds the relay's group on every thread: its start sets cwagent's groups on one thread alone and execs from any (agent issue 1140)"
+    );
+    assert!(groups < at("systemctl daemon-reload") && groups < ctl, "the drop-in is in place before the agent's start reloads and starts it");
     let relay_log = at("[ -e /var/log/ai-env-relay/relay.log ] || install -m 0644 -o root -g root /dev/null /var/log/ai-env-relay/relay.log");
-    let dirs = at("install -d -m 0755 -o root -g root /etc/ai-env-relay /usr/local/libexec/ai-env-relay /var/log/ai-env-relay /etc/systemd/system/logrotate.timer.d");
+    let dirs = at("install -d -m 0755 -o root -g root /etc/ai-env-relay /usr/local/libexec/ai-env-relay /var/log/ai-env-relay /etc/systemd/system/logrotate.timer.d /etc/systemd/system/amazon-cloudwatch-agent.service.d");
     assert!(
         dirs < relay_log && relay_log < at("systemctl enable ai-env-relay-guard.service ai-env-relay.service"),
         "relay.log 0644 root before the units start, made only when missing (install unlinks the file it replaces: safe to run twice)"

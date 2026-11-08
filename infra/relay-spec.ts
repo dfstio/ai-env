@@ -60,7 +60,11 @@ import { BUCKET_PREFIX, RELAY_KEY_PREFIX } from "./policies";
  * - the units enabled: the reload unit starts the relay once tls.pem exists, and its Requires= starts the guard first;
  * - last, so nothing in it stops the relay: cwagent joins the relay's group (requests.log is 0640
  *   ai-env-relay:ai-env-relay), then the CloudWatch agent's config and start, as cwagent, never root (R-96, F21);
- *   none of it fatal (I-R26 step 10).
+ *   none of it fatal (I-R26 step 10). The agent's unit holds that group itself, by a drop-in written with the other
+ *   units (SupplementaryGroups=ai-env-relay): the agent's start sets cwagent's groups on one thread alone
+ *   (unix.Setgroups) and then execs from whichever thread it runs on, so cwagent's membership alone left the agent, now
+ *   and then, without the group: it shipped the 0644 logs and never read requests.log (agent issue 1140; the first
+ *   deploy's agent, 8 Nov). With the drop-in every thread holds it, whichever one execs.
  */
 export const RELAY_DIR = path.join(__dirname, "relay");
 
