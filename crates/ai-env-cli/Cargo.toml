@@ -3,7 +3,7 @@ name = "ai-env-cli"
 description = "ai-env: encrypted .env files that stay .env, unlocked by Touch ID"
 version.workspace = true
 edition.workspace = true
-# Literal on purpose: aws-sdk-lambdamicrovms 1.8.0 needs 1.94.1; ai-env-age
+# Literal on purpose: aws-sdk-lambdamicrovms 1.19.0 needs 1.94.1; ai-env-age
 # keeps the workspace 1.88.
 rust-version = "1.94.1"
 license.workspace = true

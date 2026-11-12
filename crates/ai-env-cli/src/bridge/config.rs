@@ -82,6 +82,13 @@ impl Paths {
         self.root.join("state").join("gc.lock")
     }
 
+    /// `state/sessions.lock` (R-154, 0600): held for microseconds around each session row's write
+    /// (`registry::write`, which keeps a chat's sole mark) and `registry::mark_sole`'s.
+    #[must_use]
+    pub fn sessions_lock(&self) -> PathBuf {
+        self.root.join("state").join("sessions.lock")
+    }
+
     /// `state/gc.stamp` (S10, 0600): the last gc reconcile's unix seconds.
     #[must_use]
     pub fn gc_stamp(&self) -> PathBuf {
@@ -287,8 +294,9 @@ impl Paths {
         self.root.join("state").join("egress.lock")
     }
 
-    /// `credentials/relay-worker.env` (S13, LD-WM1): this Mac's two relay keys, its worker key and its session
-    /// key, in one container (`ai-env relay keygen`; one unseal, one Touch ID, for `ai-env relay agent`).
+    /// `credentials/relay-worker.env` (S13, LD-WM1): this Mac's relay keys, its worker key and its session key, and
+    /// R-155's sole key once `ai-env relay keygen --sole` adds it, in one container (`ai-env relay keygen`; one unseal,
+    /// one Touch ID, for `ai-env relay agent`).
     #[must_use]
     pub fn relay_worker_env(&self) -> PathBuf {
         self.credentials().join("relay-worker.env")
@@ -862,8 +870,12 @@ pub struct WorkspaceCfg {
     /// overrides it for one seed.
     pub seed_wip: bool,
     /// S13 (WM-R46): the grant a remote chat's relay session token names in this workspace, over
-    /// `[relay].grant`; `""` gives its chats no token.
+    /// `[relay].grant`; `""` gives its chats no token. Never a `[relay].restricted` one ([`BridgeConfig::validate_relay`]).
     pub relay_grant: Option<String>,
+    /// R-154: each chat of this workspace runs alone, on a VM placed for it (`VmRow.sole`, its access id), the only
+    /// VMs a `[relay].restricted` grant reaches. Each chat costs a VM of its own, which counts toward
+    /// `[vm].max_concurrent`, and no prewarm warms one.
+    pub sole_vm: bool,
 }
 
 impl Default for WorkspaceCfg {
@@ -877,6 +889,7 @@ impl Default for WorkspaceCfg {
             trust_repo_settings: false,
             seed_wip: true,
             relay_grant: None,
+            sole_vm: false,
         }
     }
 }
@@ -1246,9 +1259,10 @@ pub struct BridgeConfig {
     pub relay: RelayCfg,
 }
 
-/// `[relay]` (S13): this Mac's side of the relay. Checked by [`RelayCfg::validate`] where it is used (`ai-env
-/// relay keygen|pubkey|agent`, the spawn's token), never by [`BridgeConfig::parse`], as [`TranscriptCfg`] is
-/// (WM-R46).
+/// `[relay]` (S13): this Mac's side of the relay. Checked by [`BridgeConfig::validate_relay`] where it is used (`ai-env
+/// relay keygen|pubkey|agent|access`, the panel; the spawn's token checks its two ids), never by
+/// [`BridgeConfig::parse`], as [`TranscriptCfg`] is (WM-R46). An older build refuses a file that sets a key it does
+/// not know (`restricted`, R-153; `[[workspace]].sole_vm`, R-154).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelayCfg {
@@ -1263,11 +1277,15 @@ pub struct RelayCfg {
     pub offer: Vec<String>,
     /// The relay this Mac's tokens are for, their `aud`: the relay's own `AI_ENV_RELAY_ID` (R-137).
     pub relay_id: String,
+    /// R-153: the offered grants a chat reaches only from a VM placed for it alone (`[[workspace]].sole_vm`), through
+    /// this Mac's second token signer, [`RelayCfg::sole_id`]: each in `offer`, none twice, never `grant` nor a
+    /// `[[workspace]].relay_grant` (a token's own grant is every chat's of its workspace).
+    pub restricted: Vec<String>,
 }
 
 impl Default for RelayCfg {
     fn default() -> Self {
-        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12, offer: Vec::new(), relay_id: ai_env_worker::session::SESSION_AUD.into() }
+        RelayCfg { worker_id: "mac".into(), grant: String::new(), agent_hours: 12, offer: Vec::new(), relay_id: ai_env_worker::session::SESSION_AUD.into(), restricted: Vec::new() }
     }
 }
 
@@ -1276,15 +1294,41 @@ impl RelayCfg {
     pub const AGENT_HOURS_MAX: u32 = 24;
     /// The most grants `offer` names (R-149): as many as an access entry holds.
     pub const OFFER_MAX: usize = ai_env_worker::policy::ACCESS_GRANTS_MAX;
+    /// R-153: what [`RelayCfg::sole_id`] adds to `worker_id`.
+    pub const SOLE_SUFFIX: &'static str = "-sole";
+    /// R-153: the longest `worker_id` (59): one that leaves room for [`RelayCfg::SOLE_SUFFIX`] in an id of 64 characters.
+    pub const WORKER_ID_MAX: usize = ai_env_worker::ai_env_source::names::NAME_MAX - Self::SOLE_SUFFIX.len();
+
+    /// R-153: the id of this Mac's second token signer, `<worker_id>-sole`: the only one bound to the `restricted`
+    /// grants, which the relay agent signs with only for a chat on a VM placed for it alone.
+    #[must_use]
+    pub fn sole_id(&self) -> String {
+        Self::sole_id_of(&self.worker_id)
+    }
+
+    /// R-155: [`RelayCfg::sole_id`] of the worker id `worker_id` (the one a container's notes or an agent's keys name).
+    #[must_use]
+    pub fn sole_id_of(worker_id: &str) -> String {
+        format!("{worker_id}{}", Self::SOLE_SUFFIX)
+    }
 
     /// `worker_id` and `relay_id` ids, `grant` empty or an id (WM-R1: 1 to 64 of `[a-z0-9._-]`, starting with `[a-z0-9]`),
-    /// `agent_hours` 1 to 24, `offer` at most 16 ids with no `.`, none twice (R-149); else `Config` naming the key
-    /// (exit 1).
+    /// `agent_hours` 1 to 24, `offer` at most 16 ids with no `.`, none twice (R-149); R-153: `worker_id` at most 59
+    /// characters (its sole signer's id is an id too), and each `restricted` grant in `offer`, never twice, never `grant`;
+    /// else `Config` naming the key (exit 1). [`BridgeConfig::validate_relay`] adds the workspaces' own grants.
     pub fn validate(&self) -> Result<(), BridgeError> {
         use ai_env_worker::globs::valid_id;
         let rule = ai_env_worker::ai_env_source::names::NAME_RULE;
         if !valid_id(&self.worker_id) {
             return Err(BridgeError::Config(format!("[relay].worker_id = {:?} is not an id ({rule})", crate::wire::redact::scrub(&self.worker_id))));
+        }
+        if self.worker_id.len() > Self::WORKER_ID_MAX {
+            return Err(BridgeError::Config(format!(
+                "[relay].worker_id = {:?} leaves no room for its sole signer's id {:?}: at most {} characters",
+                crate::wire::redact::scrub(&self.worker_id),
+                crate::wire::redact::scrub(&self.sole_id()),
+                Self::WORKER_ID_MAX
+            )));
         }
         if !self.grant.is_empty() && !valid_id(&self.grant) {
             return Err(BridgeError::Config(format!("[relay].grant = {:?} is not an id ({rule}; empty: no token)", crate::wire::redact::scrub(&self.grant))));
@@ -1310,7 +1354,25 @@ impl RelayCfg {
                 return Err(BridgeError::Config(format!("[relay].offer[{i}] = {shown:?} is named twice")));
             }
         }
+        for (i, grant) in self.restricted.iter().enumerate() {
+            let shown = crate::wire::redact::scrub(grant);
+            if !self.offer.contains(grant) {
+                return Err(BridgeError::Config(format!("[relay].restricted[{i}] = {shown:?} is not in [relay].offer: a restricted grant is one the chats' approvals name")));
+            }
+            if self.restricted[..i].contains(grant) {
+                return Err(BridgeError::Config(format!("[relay].restricted[{i}] = {shown:?} is named twice")));
+            }
+            if *grant == self.grant {
+                return Err(BridgeError::Config(format!("[relay].restricted[{i}] = {shown:?} is [relay].grant, which every chat's token names: a restricted grant reaches a chat only through its approval")));
+            }
+        }
         Ok(())
+    }
+
+    /// R-153: whether `grant` is one of `restricted`.
+    #[must_use]
+    pub fn is_restricted(&self, grant: &str) -> bool {
+        self.restricted.iter().any(|g| g == grant)
     }
 }
 
@@ -1407,6 +1469,48 @@ impl BridgeConfig {
     pub fn under_roots(&self, path: &Path) -> bool {
         self.workspaces.roots.iter().any(|r| path.starts_with(r))
     }
+
+    /// R-153: `[relay]` as [`RelayCfg::validate`] checks it, and no `[[workspace]].relay_grant` that is
+    /// `[relay].restricted` (a workspace's own grant is the one every token of its chats names, on any VM);
+    /// else `Config` naming the key, the workspace by its path (exit 1). Every user of `[relay]` checks it this way
+    /// (`ai-env relay keygen|pubkey|agent|access`, the panel), never [`BridgeConfig::parse`].
+    pub fn validate_relay(&self) -> Result<(), BridgeError> {
+        self.relay.validate()?;
+        for w in &self.workspace_overrides {
+            if let Some(grant) = w.relay_grant.as_deref().filter(|g| self.relay.is_restricted(g)) {
+                return Err(BridgeError::Config(format!(
+                    "[[workspace]] {}: relay_grant = {:?} is in [relay].restricted: a restricted grant is never a token's own, it reaches a chat only through its approval",
+                    w.path.display(),
+                    crate::wire::redact::scrub(grant)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// R-155: the grants this Mac's sole signer ([`RelayCfg::sole_id`]) is bound to, sorted, each once, as `ai-env relay
+    /// allow --grants` writes them: `[relay].grant` and every `sole_vm` workspace's own `relay_grant` (a sole-signed token
+    /// names one of these, and the relay refuses a token whose own grant its signer does not hold, R-135), and every
+    /// `[relay].offer` id, the restricted ones among them (what an approval adds, R-145). A name that is no id mints
+    /// nothing and is left out. `ai-env relay keygen` prints them in the sole signer's command.
+    #[must_use]
+    pub fn sole_signer_grants(&self) -> Vec<String> {
+        let own = self.workspace_overrides.iter().filter(|w| w.sole_vm).filter_map(|w| w.relay_grant.as_deref());
+        let named: std::collections::BTreeSet<&str> = std::iter::once(self.relay.grant.as_str()).chain(own).chain(self.relay.offer.iter().map(String::as_str)).filter(|g| ai_env_worker::globs::valid_id(g)).collect();
+        named.into_iter().map(str::to_string).collect()
+    }
+
+    /// R-157: [`BridgeConfig::sole_signer_grants`]' twin for this Mac's session key's signer (`[relay].worker_id`), sorted,
+    /// each once: `[relay].grant` and every workspace's own `relay_grant` (its tokens name one of these on any VM a chat
+    /// shares), and every `[relay].offer` id but the restricted ones, which it must never reach. A name that is no id is
+    /// left out. `ai-env relay allow --token-signer` names them in its refusal of a set that reaches a restricted grant.
+    #[must_use]
+    pub fn session_signer_grants(&self) -> Vec<String> {
+        let own = self.workspace_overrides.iter().filter_map(|w| w.relay_grant.as_deref());
+        let offered = self.relay.offer.iter().map(String::as_str).filter(|g| !self.relay.is_restricted(g));
+        let named: std::collections::BTreeSet<&str> = std::iter::once(self.relay.grant.as_str()).chain(own).chain(offered).filter(|g| ai_env_worker::globs::valid_id(g)).collect();
+        named.into_iter().map(str::to_string).collect()
+    }
 }
 
 /// A note when `AWS_REGION`/`AWS_DEFAULT_REGION` disagree with the pin.
@@ -1453,6 +1557,8 @@ mod tests {
         assert_eq!(p.session_migrate_request(sid), PathBuf::from(format!("/r/state/sessions/{sid}.migrate.json")));
         assert_eq!(p.gc_lock(), PathBuf::from("/r/state/gc.lock"));
         assert_eq!(p.gc_stamp(), PathBuf::from("/r/state/gc.stamp"));
+        // R-154: beside the session rows, never among them (a row's name is its uuid).
+        assert_eq!(p.sessions_lock(), PathBuf::from("/r/state/sessions.lock"));
         // S11: the gzip spool (part C), the claude records and binaries, the argv markers (part A).
         assert_eq!(p.transcript_spool(sid), PathBuf::from(format!("/r/state/transcripts/{sid}/spool")));
         assert_eq!(p.claude_dir(), PathBuf::from("/r/state/claude"));
@@ -1525,6 +1631,74 @@ mod tests {
         assert_eq!(p.relay_agent_socket(), PathBuf::from("/r/state/relay-agent.sock"));
         assert_eq!(p.relay_agent_lock(), PathBuf::from("/r/state/relay-agent.lock"));
         assert_eq!(p.relay_lock(), PathBuf::from("/r/state/relay.lock"));
+    }
+
+    /// R-153: `[relay].restricted` names none by default and reads back; `validate` (and
+    /// `validate_relay` with it) refuses a restricted grant not in `offer`, one named twice, one that is
+    /// `[relay].grant`, and a worker id over 59 characters (no room for its sole signer's id), each naming the key
+    /// (exit 1); `[[workspace]].sole_vm` is off by default; `validate_relay` also refuses a workspace's own grant that
+    /// is restricted, naming the workspace's path (exit 1), and passes a restricted grant no token names.
+    #[test]
+    fn restricted_grants_are_offered_ones_never_a_tokens_own() {
+        let d = BridgeConfig::parse("").unwrap();
+        assert!(d.relay.restricted.is_empty() && !d.relay.is_restricted("g-a"));
+        assert_eq!((d.relay.sole_id(), RelayCfg::WORKER_ID_MAX), ("mac-sole".to_string(), 59));
+        d.validate_relay().unwrap();
+        assert!(!BridgeConfig::parse("[[workspace]]\npath = \"/w\"\n").unwrap().workspace_overrides[0].sole_vm, "off by default");
+        assert!(!WorkspaceCfg::default().sole_vm);
+        let ok = BridgeConfig::parse("[relay]\ngrant = \"no-grant\"\noffer = [\"g-a\", \"g-b\"]\nrestricted = [\"g-b\"]\n\n[[workspace]]\npath = \"/w\"\nsole_vm = true\nrelay_grant = \"g-a\"\n").unwrap();
+        assert_eq!(ok.relay.restricted, ["g-b"]);
+        assert!(ok.relay.is_restricted("g-b") && !ok.relay.is_restricted("g-a") && ok.workspace_overrides[0].sole_vm);
+        ok.validate_relay().unwrap();
+        assert!(BridgeConfig::parse("[relay]\nrestricted = \"g-b\"\n").is_err(), "a list of ids");
+        assert!(BridgeConfig::parse("[[workspace]]\npath = \"/w\"\nsole_vm = \"yes\"\n").is_err());
+        let id = |n: usize| "w".repeat(n);
+        BridgeConfig::parse(&format!("[relay]\nworker_id = {:?}\n", id(59))).unwrap().validate_relay().unwrap();
+        for (body, want) in [
+            (format!("worker_id = {:?}", id(60)), format!("[relay].worker_id = {:?} leaves no room for its sole signer's id {:?}: at most 59 characters", id(60), format!("{}-sole", id(60)))),
+            ("offer = [\"g-a\"]\nrestricted = [\"g-b\"]".to_string(), "[relay].restricted[0] = \"g-b\" is not in [relay].offer: a restricted grant is one the chats' approvals name".to_string()),
+            ("offer = [\"g-a\", \"g-b\"]\nrestricted = [\"g-b\", \"g-b\"]".to_string(), "[relay].restricted[1] = \"g-b\" is named twice".to_string()),
+            (
+                "grant = \"g-a\"\noffer = [\"g-a\"]\nrestricted = [\"g-a\"]".to_string(),
+                "[relay].restricted[0] = \"g-a\" is [relay].grant, which every chat's token names: a restricted grant reaches a chat only through its approval".to_string(),
+            ),
+        ] {
+            let cfg = BridgeConfig::parse(&format!("[relay]\n{body}\n")).unwrap_or_else(|e| panic!("{body}: the parse never validates [relay]: {e}"));
+            for e in [cfg.relay.validate().unwrap_err(), cfg.validate_relay().unwrap_err()] {
+                assert!(matches!(&e, BridgeError::Config(m) if *m == want), "{body}: {e}");
+                assert_eq!(crate::errors::CliError::from(e).exit_code(), 1, "{body}");
+            }
+        }
+        // A workspace's own grant is every one of its chats' token's: never a restricted one, named by its path.
+        let text = "[relay]\noffer = [\"g-a\", \"g-b\"]\nrestricted = [\"g-b\"]\n\n[[workspace]]\npath = \"/w/a\"\nrelay_grant = \"g-a\"\n\n[[workspace]]\npath = \"/w/b\"\nsole_vm = true\nrelay_grant = \"g-b\"\n";
+        let cfg = BridgeConfig::parse(text).unwrap();
+        cfg.relay.validate().unwrap();
+        let e = cfg.validate_relay().unwrap_err();
+        assert!(matches!(&e, BridgeError::Config(m) if m == "[[workspace]] /w/b: relay_grant = \"g-b\" is in [relay].restricted: a restricted grant is never a token's own, it reaches a chat only through its approval"), "{e}");
+        assert_eq!(crate::errors::CliError::from(e).exit_code(), 1);
+        // `[relay]`'s own refusal comes first.
+        let bad = BridgeConfig::parse("[relay]\nagent_hours = 0\noffer = [\"g-b\"]\nrestricted = [\"g-b\"]\n\n[[workspace]]\npath = \"/w\"\nrelay_grant = \"g-b\"\n").unwrap();
+        assert!(bad.validate_relay().unwrap_err().to_string().contains("[relay].agent_hours = 0"));
+    }
+
+    /// R-155: the sole signer's id is `<worker_id>-sole`, and its grants, sorted and each once, are `[relay].grant`, the
+    /// own grant of each `sole_vm` workspace (never another's, and `""` none) and every offered id, the restricted ones
+    /// among them; a name that is no id is left out, and with none of them the set is empty. R-157: the session key's
+    /// signer's are `[relay].grant`, every workspace's own grant and the offered ids but the restricted ones.
+    #[test]
+    fn the_sole_signer_reaches_the_sole_workspaces_and_the_offered_grants() {
+        assert_eq!((RelayCfg::sole_id_of("mac-b"), BridgeConfig::default().relay.sole_id()), ("mac-b-sole".to_string(), "mac-sole".to_string()));
+        assert!(BridgeConfig::default().sole_signer_grants().is_empty(), "nothing named");
+        let text = "[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\", \"g-a\"]\nrestricted = [\"g-r\"]\n\n[[workspace]]\npath = \"/w/shared\"\nrelay_grant = \"g-shared\"\n\n[[workspace]]\npath = \"/w/sole\"\nsole_vm = true\nrelay_grant = \"g-w\"\n\n[[workspace]]\npath = \"/w/off\"\nsole_vm = true\nrelay_grant = \"\"\n\n[[workspace]]\npath = \"/w/again\"\nsole_vm = true\nrelay_grant = \"g-o\"\n";
+        let cfg = BridgeConfig::parse(text).unwrap();
+        cfg.validate_relay().unwrap();
+        assert_eq!(cfg.sole_signer_grants(), ["g-a", "g-o", "g-r", "g-w", "no-grant"]);
+        // R-157: the session key's signer, its twin: every workspace's own grant, the shared one's too, and never a
+        // restricted id.
+        assert_eq!(cfg.session_signer_grants(), ["g-a", "g-o", "g-shared", "g-w", "no-grant"]);
+        let cfg = BridgeConfig::parse("[relay]\ngrant = \"Not An Id\"\n\n[[workspace]]\npath = \"/w\"\nsole_vm = true\n").unwrap();
+        assert!(cfg.sole_signer_grants().is_empty(), "{:?}", cfg.sole_signer_grants());
+        assert!(cfg.session_signer_grants().is_empty(), "{:?}", cfg.session_signer_grants());
     }
 
     /// S10 (§5): `max_readdress` (3), `park` (on) and `park_after_s` (unset:

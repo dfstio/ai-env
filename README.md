@@ -148,7 +148,8 @@ ai-env wrapper uninstall [--write]                        # take claudeProcessWr
 ai-env wrapper census [--last N] [--json] [--record-probes]  # invocation shapes the wrapper recorded (bridge feature)
 ai-env wrapper settings-sync UUID [--rule R]… [--all-safe] [--write] [--image-dir DIR]   # a remote chat's approved rules → the image (S8)
 ai-env session list [--json] [--title TEXT] | show UUID [--json] [--settings-diff] | forget UUID... [--purge] | drop-transport UUID   # sessions the wrapper registered (bridge feature); drop-transport: the reattach check (S8);
-                                                          #   forget: several ids, every one checked first, one Touch ID for --purge (S10);
+                                                          #   forget: several ids, every one checked first (a chat approved a restricted
+                                                          #   grant only with --purge, S13), one Touch ID for --purge (S10);
                                                           #   list: each chat's name last, --title only the chats whose name holds TEXT (S12)
 ai-env session migrate UUID [--json]                      # a remote chat to a new VM now: its running wrapper moves it between turns,
                                                           #   else this command does (S10; one Touch ID either way)
@@ -209,8 +210,9 @@ ai-env egress check [--vm ID] [--keep] [--json] [--if-needed]          # from a 
                                                           #   the transcripts bucket alone (S9), the relay's internet face closed (S13)
                                                           #   → state/egress-verified.toml
 ai-env proxy  stop [--yes] | start | patch                             # the squid instance (stopped: no vpc VM has egress), as ai-env-ops
-ai-env relay  keygen [--force] | pubkey [--worker|--session] [--verify] | ca [--der]   # this Mac's two relay keys, sealed with no Touch ID /
-                                                          #   printed (--verify: one Touch ID) / the relay CA's certificate, for a worker (S13; no AWS)
+ai-env relay  keygen [--force] [--sole] | pubkey [--worker|--session|--sole] [--verify] | ca [--der]   # this Mac's relay keys, sealed with
+                                                          #   no Touch ID (--sole adds the sole key: one Touch ID) / printed (--verify: one Touch ID)
+                                                          #   / the relay CA's certificate, for a worker (S13; no AWS)
 ai-env relay  allow ID --key KEY --sources GLOBS [--tls-key P256]|--token-signer [--grants GLOBS] [--not-after YYYY-MM-DD] | revoke ID [--token-signer]   # the relay's
                                                           #   whitelist and token signers, as ai-env-deployer only (S13); --tls-key also issues
                                                           #   the worker's client certificate, printed on stdout (one Touch ID); --grants binds a
@@ -222,7 +224,8 @@ ai-env relay  grant GRANT RULE… | grant GRANT --remove | tls init [--force] | 
 ai-env relay  status [--json] [--local] | start | stop    # the relay instance, as ai-env-ops (--local: this Mac's keys and agent only,
                                                           #   no AWS, no Touch ID; S13)
 ai-env relay  access SESSION --allow G [--days N] | access SESSION --remove G | access --list [--json]   # a chat's grants in the relay, as
-                                                          #   ai-env-ops: applied within about 70 s, with no restart (S13)
+                                                          #   ai-env-ops: applied within about 70 s, with no restart (S13); a [relay].restricted
+                                                          #   grant only to a chat of a sole_vm workspace, for 7 days (at most 30)
 ai-env relay  agent [--hours N]                           # one Touch ID, then it signs worker handshakes and mints VM session tokens
                                                           #   until Ctrl-C or N hours (default 12, at most 24; S13)
 ai-env as     deployer|ops|root|ambient [--account ACCOUNT] -- CMD ARGS...   # run CMD as one AWS identity, the marker AI_ENV_BRIDGE_AS set (Identities)
@@ -1033,13 +1036,15 @@ When Cursor opens a window it runs `auth status --json`; under the roots the wra
 `[vm] prewarm_on_auth_status` is `"auto"` (the default: only when the workspace has no VM to reuse),
 `"always"` or `"never"`; the prewarm needs the `touchid-gui` probe's `prompted` (a detached process can
 show the dialog) and costs a Touch ID of its own. Every setting skips a working directory in no git work
-tree (`prewarm:skipped(not_git)` in the census), a pinned VM (`AI_ENV_BRIDGE_VM`: `pinned`) and
-`[vm] reuse_per_workspace = false` (`reuse_off`), and starts none within 120 s of the last one (`recent`);
+tree (`prewarm:skipped(not_git)` in the census), a pinned VM (`AI_ENV_BRIDGE_VM`: `pinned`),
+`[vm] reuse_per_workspace = false` (`reuse_off`) and a `[[workspace]]` with `sole_vm`, whose chats each get a VM of
+their own (`sole_vm`), and starts none within 120 s of the last one (`recent`);
 a prewarm refused at its prechecks (a workspace a session would refuse) logs `no prewarm: …` in
 `logs/ai-env.log`. Fewer prompts: `prewarm_on_auth_status = "never"`, or
 `[aws] credentials = "profile:NAME"`, which reads the runtime key from an AWS profile without a prompt
 (weaker custody: the key sits in a plain file); a session on a VM that holds the token already then asks
-for none. `vm warm` by hand takes the VM's start and the seed out of Cursor's window.
+for none. `vm warm` by hand takes the VM's start and the seed out of Cursor's window (in a `[[workspace]]` with
+`sole_vm`, stage S13, it is refused: there `ai-env session stage UUID --warm` warms a chat's own VM).
 
 ```sh doc-test
 ai-env vm warm WORKSPACE   # start or reuse the workspace's VM, seed it, deliver the token (one Touch ID)
@@ -1271,15 +1276,27 @@ ai-env vm gc --yes   # terminate expired VMs and clear stale rows (without --yes
   expired VMs), the credential gate, a refused environment name, and since S9 a transcript over the
   64 MiB a reopen carries or pulls (run what the line names in a terminal:
   `ai-env session stage UUID --warm`, after `ai-env session migrate-s9 --yes` for an S8 mirror, and
-  with `[vm] reuse_per_workspace` set to true first when it is off) or a local resume of a remote
-  chat's view), 143 (stopped before the session started).
+  with `[vm] reuse_per_workspace` set to true first when it is off), a local resume of a remote
+  chat's view, or a `--resume` of a chat this Mac has no record of and no copy of (Cursor then shows
+  its banner, below)), 143 (stopped before the session started).
 - `Subprocess initialization did not complete within 60000ms`: nothing answered `initialize` within
   60 s. The wrapper gives up at 50 s, with an exit and
   `did not start within Cursor's 60 s window (stuck at STEP)`, so this means it hung: the census end
   row's `legs` show the slow step, and `ai-env vm warm WORKSPACE` before the chat takes the VM's start
-  and the seed out of the window. An egress that refuses or cannot reach api.anthropic.com adds about
+  and the seed out of the window (`ai-env session stage UUID --warm` in a `sole_vm` workspace, S13). An egress that refuses or cannot reach api.anthropic.com adds about
   20 s to every chat's `initialize`, whatever the legs say (claude retries its managed-settings and
   policy-limits fetches before it answers): `ai-env egress status`.
+- `Couldn't load this conversation's saved history, so it can't be continued.`, with a
+  `Start a new conversation` link (which opens a new chat holding the last prompt): claude found no
+  transcript of the chat it was asked to resume. When the wrapper's stderr ends with
+  `refused before any Touch ID: no chat UUID on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat`
+  (exit 9), this Mac has no record of that chat and no copy of it, so nothing was started: the
+  wrapper prints claude's own `No conversation found with session ID: UUID` line first, which is what
+  Cursor shows the banner for, and its own line stays the last. Otherwise the VM's claude found no
+  transcript of a chat this Mac knows (it has a row or a manifest) that neither S3 nor this Mac
+  holds, or the chat's file here is a placeholder view (`Remote chat`) that no record names, of a
+  chat no VM or tail holds: one that never had a turn, so there is nothing to send up. See
+  `ai-env session show UUID` and the wrapper's log.
 - `Nothing to resume for session UUID on channel N; starting a new conversation` (Cursor's Output
   panel): the Mac holds no view of that chat (since S9 its file here is the view: none was written yet,
   or `session gc --remote --yes` or `session forget --purge` removed it): see
@@ -1478,6 +1495,8 @@ where it ended; the model, resumed in a VM, has it all.
 the remote one (passthrough, a session outside the roots, the local pump modes), and under the kill
 switch too, which reads the first 4 KiB of that one file and nothing else (no config, no census):
 `this chat's transcript is kept in S3; the file here is its view (the last messages only) and cannot be resumed on this Mac: reopen it with remote mode on, or start a new chat`.
+Cursor's fork of a remote chat is a view too, refused the same way off the remote route; on the
+remote route its first start sends it up (forks made in Cursor, below).
 Two runs never pass through the wrapper and would load a view as if it were the chat: a terminal's
 `claude -c` or `claude --resume`, and Cursor's own claude while the wrapper is off. A window reload with
 the wrapper off (`wrapper uninstall --write`, the reload, `install --write`, as under "No wrapper at
@@ -1504,6 +1523,25 @@ repository, which could never reopen once its file is a view (and exit 1 when it
 that went on here after a cut stage is refused (exit 1)
 and left as it is, the message naming the way out. The original stays under `origin/` until
 `session forget UUID --purge`; there is no way back to a local chat, which would lose the VM's turns.
+
+**Forks made in Cursor.** Cursor's `Fork conversation from here` builds the fork on this Mac from the
+lines this Mac holds of the chat, and opens it as a `--resume` of a new id that no registry row names.
+For a remote chat those lines are its view, so the fork is a copy of the view, and its lines keep the
+view's mark. Its first start asks the VM and S3 first: a view no record names goes up only when
+neither holds the chat it stands for, so the view of a chat forgotten before its first sync
+(`session forget` without `--purge`) never replaces the VM's transcript, and a placeholder view
+(`Remote chat`, a chat that never had a turn) stands for no chat at all. Then it sends the fork's
+copy up as a chat begun here (the tripwires, the 64 MiB cap, `transcript:staged`, its view left in
+its place, keeping the fork's name) and restores it into the VM. There it goes on as a new chat,
+with its own access id and none of the forked chat's relay approvals. Its context is what the fork's
+tab shows: the view's last messages (`[transcript] view_messages`), as text, with tools as
+`[tool: NAME]` and no tool output. The extension forks only from a message the view holds. A
+`--resume` of a chat this Mac has no record of (no registry row, no S3 manifest) and no copy of is
+refused before any Touch ID, with exit 9:
+`refused before any Touch ID: no chat UUID on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat`.
+Before that line the wrapper prints claude's own `No conversation found with session ID: UUID`, so
+Cursor shows its `Couldn't load this conversation's saved history` banner, whose
+`Start a new conversation` link opens a new chat.
 
 **Big chats.** Inside Cursor's window a reopen pulls at most 64 MiB of a chat's transcript from S3, its
 parts and its last tail together: at the proxy's 4 to 16 MB/s a GiB takes minutes. A larger chat reopens
@@ -2393,7 +2431,8 @@ grant or an offered id, and `relay access --allow` says so in a `note:` when it 
 Each chat has one access id, a uuid this Mac chooses at its first start and keeps in its registry row
 (`access_id`), which every token of the chat names as its `chat_id`. So approval survives a respawn, a move,
 a wall's migration and `/clear`, whose new row holds the same id; a later `--resume` takes it from the row; a
-fork started with `--fork-session`, or an argv with two `--resume` flags, gets its own and inherits nothing; and no
+fork started with `--fork-session`, a fork Cursor made on this Mac (a `--resume` of an id no row names), or an argv
+with two `--resume` flags, gets its own and inherits no approval (a restricted grant's mark aside: below); and no
 init from a VM chooses it. A process's token cannot change, so a session switch inside one, as `/clear` or an
 in-process `/branch`, stays the same chat and keeps its access. A `--no-session-persistence` spawn has
 no row to approve, so it gets no token. An approval lasts `--days` (1 to 90, 30 by default, the entry's last
@@ -2413,6 +2452,86 @@ a workspace share a VM by default (`reuse_per_workspace`), and a process there c
 each confirm page names those chats, and for a grant that matters set `reuse_per_workspace = false`. A stolen ops key
 can widen a chat already listed, though it reads nothing without a process inside that chat. Edit `bridge.toml`
 only after `make install`: an older binary refuses the `offer` key.
+
+**Restricted grants: one chat, one VM.** A grant `[relay].restricted` names (an offered one, never `[relay].grant` nor
+a workspace's own `relay_grant`) reaches a chat only on a VM placed for that chat alone. A `[[workspace]]` with
+`sole_vm = true` gives each of its chats such a VM: its start places one for the chat's access id, which no other chat
+reuses, a pinned VM of the other kind is refused (`refused before any Touch ID: the pinned VM … (AI_ENV_BRIDGE_VM): it
+runs one chat alone (sole_vm); unset AI_ENV_BRIDGE_VM`), and no prewarm warms one. Nor does `ai-env vm warm WORKSPACE`
+there (exit 9 before any Touch ID: no chat would take that VM, which would still count toward `[vm].max_concurrent`
+until it idles out), though the `… ai-env vm warm prepares the VM ahead` lines name it: `ai-env session stage UUID --warm`
+warms a chat's own once the chat has run remote, and refuses one that never has (exit 9: no access id yet, so its first
+start places a VM of its own). The relay holds the line through a
+second token signer of this Mac, `<worker_id>-sole`: `ai-env relay keygen --sole` adds its key to
+`credentials/relay-worker.env`, and the agent signs a chat's token with it only while `[relay].restricted` names a grant
+and the chat's VM was placed for it alone; every other token it signs as `<worker_id>` (an agent that holds no sole key
+while `[relay].restricted` names a grant says so in one line at its start). Since the relay passes an
+approval's grants only through the `--grants` of the signer whose token names the chat, the grants of `<worker_id>`
+must match no restricted id, and `<worker_id>-sole` is bound to `[relay].grant`, the `sole_vm` workspaces' own grants and
+every offered id. `keygen --sole` prints that command (later, `relay status` names it); `relay allow --token-signer`
+refuses (exit 9, naming the command with the set `bridge.toml` names) any other signer whose grants reach a restricted
+id (none, `*`, a glob that matches one) and a sole signer with no grants or `*`. The relay serves a grant by its rules,
+not its id, so `relay status` also says `[NO ]` for an ordinary grant that a signer other than `<worker_id>-sole`
+reaches, one of whose rules meets one of a restricted grant's (`*/*` meets every rule), naming the grant to narrow with
+`relay grant`.
+
+`ai-env relay access SESSION --allow G` of a restricted grant, and the panel's Allow, take only a chat whose recorded
+folder is in a `sole_vm` workspace (exit 9 otherwise; the panel shows `[ ] G (restricted: its workspace is not sole_vm)`
+with no link), for 7 days by default and 30 at most (`--days 31` is exit 2). Its approval sets the entry's one end,
+earlier or later (`outcome=shortened` or `extended` for an entry that held it already, `added` for one it joins; a
+`note:` says when the end moved earlier), so the chat's other grants end with it, and no other approval moves the end
+of an entry that holds one.
+Before it writes, it marks every row of the chat to run alone from then on (a mark that cannot be written refuses the
+approval): the chat starts on a VM of its own wherever it reopens, and a reopen from a folder in no `sole_vm` workspace
+is refused before any Touch ID (`refused before any Touch ID: session … was approved a restricted
+grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)`). Nothing takes the mark off, and
+since the row alone holds it, `ai-env session forget UUID` refuses a marked row (exit 1) unless `--purge` deletes the
+chat's transcript with it: a reopen with no row would restore it onto a VM other chats share. A fork Cursor makes of
+such a chat is marked too, from its first start: nothing in it names its parent, but its copy is the chat's view, beside
+it, so a `--resume` that no row or manifest names, whose copy is a view in the folder of a marked chat, takes that
+chat's mark (`refused before any Touch ID: fork … of a chat approved a restricted grant: …` outside a `sole_vm`
+workspace); purge it with the chat (one that never started is a copy alone, which `--purge` deletes as well).
+`--purge` deletes the chat's view under every project folder, and `session forget` names each VM placed for the chat
+alone that no row names now (`note: VM … was placed for chat … alone and still holds its transcript, …: ai-env vm
+terminate ID`): none takes it again, and it counts toward `[vm].max_concurrent` until it idles out. A chat open on a VM
+chats share (it started before its workspace was `sole_vm`) reaches the grant from its next start: the CLI and the
+confirm page say to reopen it, and neither says `no restart` then. `relay access --list` and `relay status` mark the
+grant, `(restricted: G)`.
+
+Three more things stay true. A stolen ops key can give a restricted grant only to chats on VMs of their own: an entry
+naming a restricted grant gives a token signed as `<worker_id>` nothing. A process of your user on this Mac can still
+ask the agent for a token, as for any grant. Each chat of a `sole_vm` workspace, forks included, costs a VM of its own,
+which counts toward `[vm].max_concurrent` (3 by default), parked ones too. Install first: `make install`, then restart
+`ai-env relay agent` and the panel (one still running the older binary reloads `bridge.toml` at each mint and, once the
+file holds a key that binary does not know, refuses every token), and close or reopen every chat of a workspace that is
+to be `sole_vm` that was open before the install (its wrapper runs the older binary, whose next move may take a VM
+placed for another chat alone), then edit `bridge.toml`, which an older binary refuses with `restricted` or `sole_vm` in
+it:
+
+```sh
+make install                                   # then stop ai-env relay agent and the panel, and start them again
+ai-env relay keygen --sole                     # one Touch ID; it prints the sole signer's command for the grants bridge.toml names
+ai-env as deployer -- ai-env relay allow mac-sole --token-signer --key 'ed25519:…' --grants no-grant,example-a,example-r   # (one paste)
+                                               #   [relay].grant first (no-grant, as above), then every offered id: the
+                                               #   restricted one named by hand when bridge.toml does not name it yet
+ai-env relay agent                             # restarted (one Touch ID): it holds the sole key from now on
+ai-env relay status                            # (ops: one Touch ID) after bridge.toml names example-r in offer and restricted,
+                                               #   and sole_vm = true in its workspace: no [NO ] row
+ai-env relay access SESSION --allow example-r  # (ops: one Touch ID) a chat of that workspace, for 7 days
+```
+
+Back to an older build, in this order and with this build still installed, since an older build neither shows nor keeps
+`sole` or `sole_since` (it drops them when it rewrites a row): terminate the VMs placed for one chat (`ai-env vm list
+--json`, those whose `row.sole` is set: `ai-env vm terminate ID`), which an older build reuses for any chat of the workspace;
+purge the chats approved a restricted grant and their forks (`ai-env session list --json`, the rows whose `sole_since` is
+set: `ai-env session forget UUID --purge`), which an older build would reopen on a VM other chats share; take
+`restricted` and `sole_vm` out of `bridge.toml`, and the restricted ids out of `offer` (an older build offers them to
+every chat, and its `relay status` asks `<worker_id>` to cover them: never widen it); and revoke `<worker_id>-sole`. Then
+install the older build and put back the container `keygen --sole` kept, `credentials/relay-worker.env.<unix>.bak`,
+which holds the same two keys: an older build's agent refuses a container of three keys (`… holds something else:
+re-seal it with ai-env relay keygen --force`, exit 5). With no such backup (a later `keygen --force`, or a
+`keygen --sole` that made the container), run the older build's `ai-env relay keygen --force` and allow its session key
+instead.
 
 **What the VM holds.** The session (the token, the relay's address and name, and the relay CA) rides
 the spawn's credential delivery to its own VM only, behind the credential gate. The shim hands it on
@@ -2569,9 +2688,13 @@ minute and 8 at once. One SDK worker per address never bans itself: a wrong key 
 **This Mac's keys and the agent.** `ai-env relay keygen` seals this Mac's two Ed25519 keys into
 `credentials/relay-worker.env` with no Touch ID: its worker key (for a worker on this Mac) and its
 session key (which signs the VM session tokens); it prints the public keys and the commands that allow
-them. `ai-env relay agent` unseals them once (one Touch ID) and, like ssh-agent, answers this user only,
+them. `keygen --sole` adds a third, the sole key, which signs as `<worker_id>-sole` (restricted grants, above): one
+Touch ID unseals the two, which are sealed again beside it, and with no container yet it makes all three with none.
+`--force` replaces them all, the sole key too when the container holds one, and prints each signer's command;
+`ai-env relay pubkey --sole` prints the sole key. `ai-env relay agent` unseals them once (one Touch ID) and, like ssh-agent, answers this user only,
 on the 0600 socket `state/relay-agent.sock`: it signs the handshakes of a worker on this Mac, and mints
-tokens only for this Mac's live vpc VMs whose egress gate passed and for grants bridge.toml names,
+tokens only for this Mac's live vpc VMs whose egress gate passed and for grants bridge.toml names, as
+`<worker_id>`, or as `<worker_id>-sole` for a chat on a VM placed for it alone while `[relay].restricted` names a grant,
 until Ctrl-C or `--hours` (12 by default, at most 24), then drops the keys.
 `ai-env relay stop` stops the instance: VM relay calls then answer `unavailable`, and workers keep
 dialing until `ai-env relay start`.
@@ -2581,8 +2704,8 @@ then, as ai-env-ops, the instance, SSM's ping, a TCP probe of port 443, the rela
 it refused in the last hour, the workers, the token signers, the grants, the peers list and the access list. `[NO ]` is exit
 1: this Mac's session key is no token signer in force, a list does not parse, the instance is not running,
 the peers list is absent or holds no entry in force, a worker in force has no client certificate under a relay that
-requires one, the token-signers list holds grants under a relay that refuses them, or this Mac's token signer
-holds grants that leave out `[relay].grant`. `[?? ]` is a read that failed, exit 7 unless a finding
+requires one, the token-signers list holds grants under a relay that refuses them, this Mac's token signer
+holds grants that leave out `[relay].grant`, or a restricted grant's row below says so. `[?? ]` is a read that failed, exit 7 unless a finding
 came first. `[warn]` and `[-  ]` never change the exit. `--json` holds the same under `instance` (with its
 `refused` and `disk_full`), `workers`, `token_signers`, `grants`, `peers`, `access`, `status` and `mac`. The rows that
 speak of the allowlist, the bans, the certificates and the chats:
@@ -2617,7 +2740,17 @@ speak of the allowlist, the bans, the certificates and the chats:
   (token signer …), but this relay refuses such a list, so every token fails (RO-6): …`. This Mac's own entry, in force,
   is read against `bridge.toml`: `[NO ] token signer … holds grants …, none of which matches [relay].grant …: every
   token this Mac mints is refused 7 not granted (R-135) (…)`, and `[warn] token signer … holds grants …, none of which
-  matches …: a chat reaches nothing through it` for a workspace's grant or an offered id.
+  matches …: a chat reaches nothing through it` for a workspace's grant or an offered id but a restricted one.
+- With `[relay].restricted` naming a grant: `[NO ] token signer … reaches the [relay].restricted grant … (…), which only
+  <worker_id>-sole may: …` for any other signer in force whose grants reach one, naming the command (this Mac's own
+  set); `[ok ] this Mac's sole key (fp …) is an in-force token signer as <worker_id>-sole`, else `[NO ]` naming its
+  command, or `ai-env relay keygen --sole` when this Mac has none; and `<worker_id>-sole`'s grants read against
+  `bridge.toml`: `[NO ]` for each of `[relay].grant`, a `sole_vm` workspace's own grant and a restricted id they leave
+  out, naming the command that adds them all, `[warn]` for another offered id. The keys row names the sole key's fp, and
+  `--json`'s `mac` holds `sole_fp`. An ordinary grant that a signer in force other than `<worker_id>-sole` reaches, one
+  of whose rules meets one of a restricted grant's (each half's globs match a name in common), is `[NO ] grant …
+  (rule …) reaches the sources of the [relay].restricted grant … (rule …), and token signer … reaches …: …`, naming
+  `relay grant` to set its rules anew.
 - The peers list is read in a call of its own: `[ok ] /ai-env/relay/peers v2: 3 peer(s), 2 in force`, then one
   `[-  ]   peer … until …` per entry, a lapsed one's ending `EXPIRED`. It is `[NO ]` when absent or with none in
   force (`the relay admits no worker`) or when it does not parse, and `[?? ] /ai-env/relay/peers could not be
@@ -2626,7 +2759,9 @@ speak of the allowlist, the bans, the certificates and the chats:
 - The access list too: `[ok ] /ai-env/relay/access v3: 2 chat(s), 1 in force`, then one `[-  ]   chat … grants …
   until …` per entry, a lapsed one's ending `EXPIRED`. Absent is `[-  ] /ai-env/relay/access: absent: no chat has more
   than its token's grant`, never a finding; it is `[NO ]` when it does not parse, and `[?? ] /ai-env/relay/access could
-  not be read (…)` alone when that call fails. A `relay status` that reads and parses the list, and a `relay access` that
+  not be read (…)` alone when that call fails. An entry's row ends `(restricted: …)` for the restricted grants it holds
+  (`restricted` in its JSON), and one in force past the 30 days their approval writes is `[warn]`, never the exit. A
+  `relay status` that reads and parses the list, and a `relay access` that
   ends with exit 0, leave what they read in `state/relay-access.json` (0600), which the panel shows as `as of v3, TIME`, for
   display only: the relay remains the gate. A `relay access` that ends otherwise leaves it as it was, unless its write
   reported failure or the panel killed its child: that write may have landed (its answer lost, another writer's version in
@@ -2655,11 +2790,13 @@ grant = "default"       # the grant a remote chat's token names; "" (the default
                         #   a name in no grant list ("no-grant"): a token and the tools, an empty catalog until approved
 agent_hours = 12        # ai-env relay agent's life, 1 to 24
 offer = ["example-a"]   # what the panel offers each chat and relay access --allow takes: at most 16 ids with no `.`; none by default
+restricted = []         # offered grants a chat reaches only on a VM of its own (sole_vm), through <worker_id>-sole; none by default
 relay_id = "ai-env-relay"  # the relay these tokens are for: it must equal the relay's AI_ENV_RELAY_ID, and both default to this
 
 [[workspace]]
 path = "/path/to/a/repo"
-relay_grant = ""        # this workspace's own grant, over [relay].grant; "" gives its chats none
+relay_grant = ""        # this workspace's own grant, over [relay].grant; "" gives its chats none; never a restricted one
+sole_vm = false         # true: each chat here runs on a VM of its own, the only chats a restricted grant reaches
 ```
 
 **S13's deploy, then the relay's setup**, in this order (only the first S13 deploy needs `ONLY=`: ops'
@@ -2678,9 +2815,11 @@ ai-env egress status                            # (ops: one Touch ID) relay-sg a
 ai-env egress check                             # (two Touch IDs) before any remote chat: 36 cases, a pass of rule 2
 ai-env as deployer -- ai-env relay tls init     # (one paste) the relay CA, sealed here, and the relay's certificate
 make relay-logs SINCE=10m                       # (ops: one Touch ID) within two minutes, the reload's ok line
-ai-env relay keygen                             # no Touch ID; prints the allow commands with this Mac's keys
+ai-env relay keygen                             # no Touch ID; prints the allow commands with this Mac's keys (--sole: a third key,
+                                                #   for restricted grants, above)
 ai-env as deployer -- ai-env relay allow mac --token-signer --key 'ed25519:…' --grants default,example-a   # (one paste) the relay takes this Mac's tokens,
-                                                #   for [relay].grant and each offered grant: a set without the first refuses every token
+                                                #   for [relay].grant and each offered grant but a restricted one: a set without the first
+                                                #   refuses every token
 ai-env as deployer -- ai-env relay grant default 'example-*/*'                  # (one paste) every op of the sources example-*
 ai-env relay agent                              # one Touch ID; leave it running, and name the grant in bridge.toml (above)
 ai-env as deployer -- ai-env relay allow example-worker --key 'ed25519:…' --sources 'example-*'   # (one paste) a server's worker

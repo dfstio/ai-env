@@ -541,8 +541,11 @@ pub fn cmd_gc(store: &Keystore, older_than: u32, yes: bool, json: bool) -> Resul
 /// manifest, an upload or a first sync cut before it), every current
 /// object under `v1/<sid>/` is deleted with the runtime key (a Touch ID),
 /// then `state/transcripts/<sid>/` whole (`origin/` included) and the lock
-/// file, then the view (only a view: never a transcript). Whether anything
-/// went. [`forget_purge_many`] of the one session.
+/// file, then the view (only a view: never a transcript), and, R-154, for a
+/// chat with a view or a trace, or an id no row names (a fork Cursor made
+/// that never started), its view under any project directory
+/// ([`remove_views`]). Whether anything went. [`forget_purge_many`] of the
+/// one session.
 pub fn forget_purge(store: &Keystore, paths: &Paths, sid: &str) -> std::result::Result<bool, BridgeError> {
     Ok(forget_purge_many(store, paths, &[sid.to_string()])?.first().copied().unwrap_or(false))
 }
@@ -562,6 +565,7 @@ pub fn forget_purge_many(store: &Keystore, paths: &Paths, sids: &[String]) -> st
     }
     let rels: Vec<Option<String>> = sids.iter().map(|sid| manifest::read(paths, sid).ok().flatten().map(|m| m.rel).or_else(|| registry::read(paths, sid).ok().flatten().and_then(|r| r.view))).collect();
     let traced: Vec<bool> = sids.iter().map(|sid| s3_traces(paths, sid)).collect();
+    let rowless: Vec<bool> = sids.iter().map(|sid| matches!(registry::read(paths, sid), Ok(None))).collect();
     let mut removed = vec![false; sids.len()];
     if traced.contains(&true) {
         let ctx = Ctx::load().map_err(BridgeError::Cli)?;
@@ -580,13 +584,31 @@ pub fn forget_purge_many(store: &Keystore, paths: &Paths, sids: &[String]) -> st
         })?;
     }
     if let Ok(p) = projects() {
-        for (removed, rel) in removed.iter_mut().zip(rels) {
-            if let Some(rel) = rel {
-                *removed |= remove_view(&p, &rel);
+        for ((((removed, rel), sid), traced), rowless) in removed.iter_mut().zip(rels).zip(sids).zip(&traced).zip(&rowless) {
+            if let Some(rel) = &rel {
+                *removed |= remove_view(&p, rel);
+            }
+            // R-154: a chat S3 knew may have left a view under another project directory too (a reopen from another
+            // folder writes its view there): its picker would reopen it as a view no record names, which goes up as a
+            // chat begun here (the fork gap), the purged transcript's last messages with it. An id no row names is
+            // swept too: a fork Cursor made that never started is a view-shaped copy and nothing else.
+            if rel.is_some() || *traced || *rowless {
+                *removed |= remove_views(&p, sid);
             }
         }
     }
     Ok(removed)
+}
+
+/// R-154: every view of `sid` under `projects` (its `<sid>.jsonl` in any project directory, `seed::candidates`'s: a
+/// symlink is none), only a view, never a transcript ([`remove_view`]): whether one went.
+pub fn remove_views(projects: &Path, sid: &str) -> bool {
+    let mut gone = false;
+    for dir in crate::bridge::seed::candidates(projects, &[], sid) {
+        let path = dir.join(format!("{sid}.jsonl"));
+        gone |= crate::bridge::view::is_view_file(&path) && std::fs::remove_file(&path).is_ok();
+    }
+    gone
 }
 
 /// Whether this Mac keeps a trace of `sid` in the transcript store, so

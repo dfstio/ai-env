@@ -459,6 +459,7 @@ mod tests {
             leaving_since: Some(AT + 8),
             mem_total_mib: Some(1980),
             claude_bad: vec![plant(format!("bad-{nonce}"))],
+            sole: Some(plant(uuid::Uuid::now_v7().to_string())),
         }
     }
 

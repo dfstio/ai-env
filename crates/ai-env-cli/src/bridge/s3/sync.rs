@@ -730,6 +730,30 @@ pub fn write_placeholder_view(sync: &TranscriptSync, sid: &str, rules: &Rules) -
     crate::bridge::view::write_view(&target, &reply, sync.view_messages, rules).map(Some)
 }
 
+/// The orphan-view guard (the fork gap): whether `path` is a placeholder
+/// view ([`write_placeholder_view`]'s), or Cursor's fork of one (its lines
+/// re-keyed under another id): read as `bridge::view::existing` reads a
+/// view (never through a symlink, at most `view::EXISTING_MAX`; a
+/// transcript is none), every line as JSON, its message lines (marked, of
+/// `type` `user` or `assistant`; title lines are none) exactly one: a
+/// user's whose content is one text block of [`PLACEHOLDER_TEXT`]. Such a
+/// view stands for a chat that never had a turn: one no record names and no
+/// VM or tail holds is nothing to send up
+/// (`workspace::transcript::restore`).
+#[must_use]
+pub fn is_placeholder_view(path: &std::path::Path) -> bool {
+    let Ok(Some(file)) = crate::bridge::view::existing(path) else { return false };
+    let mark = crate::wire::view::VIEW_MARK_PREFIX.as_bytes();
+    let mut messages = file
+        .split(|b| *b == b'\n')
+        .filter(|l| l.starts_with(mark))
+        .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+        .filter(|v| matches!(v["type"].as_str(), Some("user" | "assistant")));
+    let (Some(only), None) = (messages.next(), messages.next()) else { return false };
+    let blocks = only["message"]["content"].as_array();
+    only["type"] == "user" && blocks.is_some_and(|b| b.len() == 1 && b[0]["type"] == "text" && b[0]["text"] == PLACEHOLDER_TEXT)
+}
+
 /// `key` among the manifest's superseded keys (once; never one of its parts).
 fn supersede(man: &mut Manifest, key: String) {
     man.supersede(key);
@@ -877,5 +901,88 @@ mod c2_tests {
         let chain = tail_chain(&long, S, 1, 0, 5);
         assert_eq!((chain.links.len(), chain.end, chain.full, chain.more, chain.blocked()), (5, 50, true, false, true), "full: no restore follows a sixth");
         assert!(!tail_chain(&long, S, 1, 0, 6).blocked(), "five links of six: the sixth may be handed");
+    }
+}
+
+#[cfg(test)]
+mod fork_gap_tests {
+    use super::*;
+    use crate::wire::view::{TranscriptViewReply, ViewEntry, ViewRole, VIEW_MARK_PREFIX, VIEW_V};
+
+    const PARENT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+    const FORK: &str = "0199a1b2-0000-7000-8000-0000000012b4";
+    /// The fork's own uuid for the one message line it copies.
+    const FORK_LINE: &str = "0199a1b2-0000-7000-8000-0000000012c5";
+
+    /// The fork gap's orphan-view guard: the placeholder view the trigger
+    /// writes, and Cursor's fork of it (the title line dropped, the message
+    /// line re-keyed: its own uuid, the fork's `sessionId`, the mark still
+    /// first; its `custom-title` line `… (fork)` last), are placeholders. The
+    /// same view with a reply after its line, a view of a chat that had a
+    /// turn, a transcript holding the placeholder's text, a symlink to a
+    /// placeholder, Cursor's `custom-title` lines alone and no file at all
+    /// are not.
+    #[test]
+    fn a_placeholder_view_is_told_from_a_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let target = super::super::S3Target { bucket: super::super::LAB_BUCKET.into(), owner: super::super::LAB_OWNER.into(), endpoint: super::super::S3Endpoint::Aws };
+        let sync = TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: projects.clone(), proxy: None, view_messages: 10 };
+        let rules = Rules::defaults();
+        let dir = projects.join("-w");
+        let file = |name: &str| dir.join(format!("{name}.jsonl"));
+        assert!(write_placeholder_view(&sync, PARENT, &rules).unwrap().is_some());
+        assert!(is_placeholder_view(&file(PARENT)), "the trigger's placeholder");
+        // Cursor's fork of it, as extension 2.1.319 builds one from the Mac's file.
+        let text = std::fs::read_to_string(file(PARENT)).unwrap();
+        let line = text.lines().find(|l| l.contains("\"type\":\"user\"")).expect("its message line");
+        let uuid = serde_json::from_str::<serde_json::Value>(line).unwrap()["uuid"].as_str().expect("its uuid").to_string();
+        let forked = format!("{}\n{{\"type\":\"custom-title\",\"sessionId\":\"{FORK}\",\"customTitle\":\"{PLACEHOLDER_TITLE} (fork)\"}}\n", line.replace(&uuid, FORK_LINE).replace(PARENT, FORK));
+        assert!(forked.starts_with(VIEW_MARK_PREFIX) && !forked.contains(PARENT), "{forked}");
+        std::fs::write(file(FORK), &forked).unwrap();
+        assert!(is_placeholder_view(&file(FORK)), "its fork: {forked}");
+        // Views of more than the placeholder's one line, or of other text.
+        let view = |sid: &str, entries: &[(ViewRole, &str)]| {
+            let entries = entries.iter().map(|(role, text)| ViewEntry { role: *role, uuid: String::new(), timestamp: String::new(), blocks: vec![(*text).to_string()] }).collect();
+            let reply = TranscriptViewReply { v: VIEW_V, present: true, title: Some(PLACEHOLDER_TITLE.into()), version: None, git_branch: None, entries, first_parent: None };
+            crate::bridge::view::write_view(&ViewTarget { mac_projects: &projects, slug: "-w", session_id: sid, mac_cwd: "/w" }, &reply, 10, &rules).unwrap();
+            file(sid)
+        };
+        let replied = view("0199a1b2-0000-7000-8000-0000000012d6", &[(ViewRole::User, PLACEHOLDER_TEXT), (ViewRole::Assistant, "an answer")]);
+        assert!(!is_placeholder_view(&replied), "a reply after it: {}", std::fs::read_to_string(&replied).unwrap());
+        assert!(!is_placeholder_view(&view("0199a1b2-0000-7000-8000-0000000012e7", &[(ViewRole::User, "show me the plan")])), "a chat that had a turn");
+        // Not views at all.
+        let transcript = file("0199a1b2-0000-7000-8000-0000000012f8");
+        std::fs::write(&transcript, format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": PLACEHOLDER_TEXT}]}}))).unwrap();
+        assert!(!is_placeholder_view(&transcript), "a transcript");
+        let link = file("0199a1b2-0000-7000-8000-0000000012a9");
+        std::os::unix::fs::symlink(file(PARENT), &link).unwrap();
+        assert!(!is_placeholder_view(&link), "a symlink is never read through");
+        let titles = file("0199a1b2-0000-7000-8000-0000000012ba");
+        std::fs::write(&titles, format!("{{\"type\":\"custom-title\",\"sessionId\":\"{FORK}\",\"customTitle\":\"x\"}}\n")).unwrap();
+        assert!(!is_placeholder_view(&titles), "Cursor's lines alone");
+        assert!(!is_placeholder_view(&file("0199a1b2-0000-7000-8000-0000000012cb")), "no file");
+    }
+
+    /// The orphan-view guard reads ai-env's own lines alone (the mark first): message lines a terminal claude appended to
+    /// a placeholder view, unmarked (a user's turn and its answer), leave it a placeholder, which P3 never sends up (the
+    /// file stays on disk as it is); the same turn written as ai-env writes a view's lines makes it a chat. The design's
+    /// choice: only ai-env's lines say what the view stands for.
+    #[test]
+    fn unmarked_lines_after_a_placeholder_leave_it_a_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let target = super::super::S3Target { bucket: super::super::LAB_BUCKET.into(), owner: super::super::LAB_OWNER.into(), endpoint: super::super::S3Endpoint::Aws };
+        let sync = TranscriptSync { target, slug: "-w".into(), mac_cwd: "/w".into(), mac_projects: projects.clone(), proxy: None, view_messages: 10 };
+        let path = projects.join("-w").join(format!("{PARENT}.jsonl"));
+        assert!(write_placeholder_view(&sync, PARENT, &Rules::defaults()).unwrap().is_some());
+        let placeholder = std::fs::read_to_string(&path).unwrap();
+        let turn = |text: &str, role: &str| serde_json::json!({"parentUuid": null, "type": role, "sessionId": PARENT, "message": {"role": role, "content": [{"type": "text", "text": text}]}}).to_string();
+        let appended = format!("{placeholder}{}\n{}\n", turn("a turn run in a terminal", "user"), turn("its answer", "assistant"));
+        std::fs::write(&path, &appended).unwrap();
+        assert!(is_placeholder_view(&path), "unmarked lines are none of the view's: {appended}");
+        let marked = format!("{placeholder}{VIEW_MARK_PREFIX}{}\n", turn("its answer", "assistant").trim_start_matches('{'));
+        std::fs::write(&path, &marked).unwrap();
+        assert!(!is_placeholder_view(&path), "a second message of the view's own: {marked}");
     }
 }

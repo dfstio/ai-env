@@ -408,11 +408,18 @@ on_links!(
 on_links!(
     /// A resume miss with no transcript on the Mac to seed (or, on the remote
     /// link, none in S3 or on the Mac to restore) from: the miss is the
-    /// host's, and no generation 2 is started for nothing.
+    /// host's, and no generation 2 is started for nothing. On the remote link
+    /// this Mac knows the chat (its row: begun on a VM, kept in S3), or P0
+    /// would refuse it before any spawn (the fork gap: nothing to resume).
     resume_miss_without_source_propagates,
     |link| {
         let p = Harness::prepare();
         let sid = uuid(0x5e55_0004);
+        if link.is_remote() {
+            let paths = ai_env_cli::bridge::config::Paths::from_root_and_env(p.root.join("bridge"), None);
+            let row = registry::SessionRow { session_id: sid.clone(), mode: "remote".into(), transcript_home: Some(ai_env_cli::bridge::s3::manifest::HOME_S3.into()), ..registry::SessionRow::default() };
+            registry::write(&paths, &row).expect("the chat's row");
+        }
         let marker = p.root.join("resume.marker");
         let resume = format!("--resume={sid}");
         let mut h = p.spawn_on(link, "local-scratch", &[&resume], &[("FAKE_RESUME_FAIL_ONCE", path_str(&marker))]);

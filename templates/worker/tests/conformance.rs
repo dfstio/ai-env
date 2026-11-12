@@ -1,6 +1,7 @@
 //! The template's sources against ai-env-source's conformance checks (P-R85): offline, so the
 //! `HttpJsonSource` below never reaches its address. And its binary's `tls-keygen` and client certificate
-//! config (WM-T57), offline too.
+//! config (WM-T57), offline too; and `run`'s stop on SIGINT and SIGTERM though its parent blocked both (R-162),
+//! against a relay address that refuses every dial.
 
 #[allow(dead_code)]
 #[path = "../src/config.rs"]
@@ -9,17 +10,20 @@ mod config;
 #[path = "../src/sources.rs"]
 mod sources;
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_env_source::testkit::{assert_conforms, context};
 use ai_env_source::{CallRequest, DataSource, Limits, SourceError};
 use ai_env_worker::certs::{self, ClientPoint};
 use ai_env_worker::keys;
 use ai_env_worker::RelayEndpoint;
+use nix::sys::signal::{kill, SigSet, Signal};
+use nix::unistd::Pid;
 use serde_json::json;
 
 /// This package's binary, as cargo built it for its tests (its name follows the package's).
@@ -184,5 +188,100 @@ fn tls_keygen_writes_its_key_and_the_config_takes_both_files() {
     std::fs::write(path("relay-client.pem"), certs::pem("CERTIFICATE", &other)).expect("another certificate");
     let out = run(&["check", "--config", &both, "--offline"]);
     assert!(!out.status.success() && stderr(&out).contains("the client key does not match the client certificate"), "{}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What `run` logs each time a dial ends (the SDK's line).
+const DIAL_ENDED: &str = "the relay tunnel ended; the next dial waits";
+
+/// A worker process, killed (SIGKILL) and reaped when the test ends before it does.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Each line of a child's stderr, as it comes; the channel closes with the stream.
+fn lines_of(stream: ChildStderr) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// R-162: `run` stops on SIGINT and on SIGTERM though the thread that started it had both blocked, as a shell that
+/// blocked them would: std passes that mask to the child, and `main` unblocks both. The worker logs `stopping` and
+/// exits 0 within 10 s of the signal; one still running then is killed. Its relay, 127.0.0.1:1, refuses every dial
+/// at once, so it waits between dials when the signal comes.
+#[test]
+fn run_stops_on_sigint_and_sigterm_started_with_both_blocked() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stop-signals");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let path = |name: &str| dir.join(name).display().to_string();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("after 1970").as_secs();
+    std::fs::write(path("relay-ca.pem"), certs::pem("CERTIFICATE", &certs::relay_ca(now).expect("a CA").cert_der)).expect("the CA");
+    let key = path("worker.key");
+    assert!(run(&["keygen", "--out", &key]).status.success());
+    let config = path("worker.toml");
+    let text = format!(
+        "worker_id = \"example-worker\"\nrelay = \"127.0.0.1:1\"\nserver_name = \"ai-env-relay\"\nrelay_ca = {:?}\nsigner = \"file\"\nkey_file = {key:?}\n\n[[source]]\nkind = \"echo\"\nname = \"example-echo\"\n",
+        path("relay-ca.pem"),
+    );
+    std::fs::write(&config, text).expect("a config");
+
+    for signal in [Signal::SIGINT, Signal::SIGTERM] {
+        // A thread of its own blocks both (this list, not `main`'s) and starts the worker: the test's other threads
+        // keep their masks. `NO_COLOR` keeps the worker's lines plain in a failure's text.
+        let config = config.clone();
+        let started = std::thread::spawn(move || {
+            [Signal::SIGINT, Signal::SIGTERM].into_iter().collect::<SigSet>().thread_block().expect("both blocked on this thread");
+            let mut cmd = Command::new(BIN);
+            cmd.args(["run", "--config", &config]).env("RUST_LOG", "info").env("NO_COLOR", "1");
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("the binary runs")
+        });
+        let mut worker = Killed(started.join().expect("the starting thread"));
+        let pid = Pid::from_raw(i32::try_from(worker.0.id()).expect("a pid"));
+        let lines = lines_of(worker.0.stderr.take().expect("its stderr"));
+        let mut seen: Vec<String> = Vec::new();
+
+        // The second dial's end, not the first's: it comes after `run_until`'s first poll, which polls `shutdown`
+        // and so installs both handlers; the first can come out of that same poll, before them.
+        let until = Instant::now() + Duration::from_secs(30);
+        while seen.iter().filter(|line| line.contains(DIAL_ENDED)).count() < 2 {
+            match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(line) => seen.push(line),
+                Err(e) => panic!("{signal}: no second dial ended within 30 s ({e}):\n{}", seen.join("\n")),
+            }
+        }
+        kill(pid, signal).expect("the signal");
+
+        // Its stderr to the end, then its status, within 10 s of the signal.
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match lines.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(line) => seen.push(line),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("{signal}: the worker still runs 10 s after the signal (killed):\n{}", seen.join("\n")),
+            }
+        }
+        let status = loop {
+            if let Some(status) = worker.0.try_wait().expect("its status") {
+                break status;
+            }
+            assert!(Instant::now() < until, "{signal}: the worker closed its stderr but still runs 10 s after the signal (killed)");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{signal}: {status}:\n{}", seen.join("\n"));
+        assert!(seen.iter().any(|line| line.ends_with(" stopping")), "{signal}: no `stopping`:\n{}", seen.join("\n"));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

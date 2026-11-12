@@ -122,8 +122,13 @@ pub struct ManifestFile {
 /// `"vm"`, `mode = "remote"` without it `"s8_mirror"` (never written to a
 /// row); else `None`, a chat begun on this Mac when it has a local
 /// transcript. A local file `wire::view::is_view_head` takes is never a Mac
-/// copy. A manifest that cannot be read counts as none (the row decides);
-/// the row's own `origin` field is this function's output, never its input.
+/// copy while this is some. With none (no manifest, no remote row: Cursor's
+/// fork of a remote chat, extension 2.1.319, the fork gap),
+/// `workspace::transcript::scan_mac_copy` scans it, and
+/// `workspace::transcript::restore` sends it up when no VM or g1 tail holds
+/// the chat (never a placeholder view). A manifest that cannot be read
+/// counts as none (the row decides); the row's own `origin` field is this
+/// function's output, never its input.
 #[must_use]
 pub fn origin_of(paths: &Paths, sid: &str) -> Option<&'static str> {
     if !crate::bridge::registry::is_uuid(sid) {

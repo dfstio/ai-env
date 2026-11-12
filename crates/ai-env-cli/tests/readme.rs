@@ -31,11 +31,12 @@
 //! sections is doc-tested, the S10 section quotes the wrapper's notes and
 //! lines as the code writes them and shows `[vm]`'s S10 keys at their
 //! defaults, the S11 section states the code's numbers, words and lines
-//! ([`the_s11_section_states_what_the_code_does`]), and the engine refuses
-//! what it must. In `make test` (the default and bridge worlds) and
-//! `make doc-test`. Built in S8 wave 2 (W9); the S9 section and its rows in
-//! S9 wave 2 (G9); the S10 section in S10 wave 2 (D); the S11 section in S11
-//! wave 2 (D).
+//! ([`the_s11_section_states_what_the_code_does`]), the README and SKILL.md
+//! quote the fork gap's refusal and the CLI's miss before it as the wrapper
+//! prints them, and the engine refuses what it must. In `make test` (the
+//! default and bridge worlds) and `make doc-test`. Built in S8 wave 2 (W9);
+//! the S9 section and its rows in S9 wave 2 (G9); the S10 section in S10
+//! wave 2 (D); the S11 section in S11 wave 2 (D).
 //!
 //! A doc-test line is one `ai-env` command, optionally followed by two
 //! spaces and a `#` comment. Words split on whitespace, single and double
@@ -1279,6 +1280,25 @@ fn the_s10_section_quotes_the_wrappers_notes_and_lines() {
     let words = [inside(&remote::note_moving(vm, LossCause::Unreachable)), inside(&remote::note_restarting(vm, LossCause::Gap)), stayed.rsplit_once("; ").map(|(_, end)| end.to_string()).unwrap_or_default()];
     missing.extend(words.into_iter().filter(|w| w.is_empty() || !text.contains(&format!("`{w}`"))));
     assert!(missing.is_empty(), "README.md's S10 section does not quote these as the wrapper writes them:\n{}", missing.join("\n"));
+}
+
+/// The fork gap (plans/production-plan.md §1.1): the README and SKILL.md
+/// quote what a `--resume` of a chat this Mac has no record of prints, as
+/// the code writes it (whitespace aside), the chat named `UUID`: the
+/// wrapper's own line (`remote::Failure::NothingToResume`; SKILL.md quotes
+/// it up to the chat, `…` after it) and the CLI's own miss printed before
+/// it (`Failure::cli_line`), which Cursor's banner answers. A text the code
+/// changes fails here before the docs drift from it.
+#[test]
+fn the_fork_gaps_refusal_is_quoted_as_the_wrapper_prints_it() {
+    let (readme, skill) = docs();
+    let (readme, skill) = (flat(&readme), flat(&skill));
+    let refused = Failure::NothingToResume { session: "UUID".into() };
+    let (line, miss) = (refused.line(), refused.cli_line().expect("the CLI's own miss"));
+    let start = line.split_once(" (").map(|(head, _)| format!("{head} …")).expect("the line names what this Mac lacks in parentheses");
+    let mut missing: Vec<String> = [&line, &miss].into_iter().filter(|q| !readme.contains(&format!("`{}`", flat(q)))).map(|q| format!("README.md: {q}")).collect();
+    missing.extend([&start, &miss].into_iter().filter(|q| !skill.contains(&format!("`{}`", flat(q)))).map(|q| format!("skills/ai-env/SKILL.md: {q}")));
+    assert!(missing.is_empty(), "not quoted as the wrapper prints them:\n{}", missing.join("\n"));
 }
 
 /// A1's usage-limit note as the README quotes it: claude 2.1.305's result

@@ -4,7 +4,9 @@
 //! allows (`ai-env relay allow`); `tls-keygen --out <path>` makes its 0600 P-256 TLS key and prints the key's
 //! point, for which the deployer issues its client certificate (`ai-env relay allow … --tls-key`); `check
 //! --config <path>` builds the worker and, without `--offline`, dials the relay once; `run --config <path>`
-//! serves until SIGINT or SIGTERM. Logs go to stderr (`RUST_LOG`, default `info`); nothing prints a private key.
+//! serves until SIGINT or SIGTERM. A process starts with its parent's signal mask, so `main` unblocks both before
+//! any thread exists: one a shell blocked would never arrive. Logs go to stderr (`RUST_LOG`, default `info`);
+//! nothing prints a private key.
 
 mod config;
 mod sources;
@@ -19,6 +21,7 @@ use ai_env_worker::signer::{AgentSigner, FileSigner, Signer};
 use ai_env_worker::{RelayEndpoint, Worker};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nix::sys::signal::{SigSet, Signal};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::CertificateDer;
 use zeroize::Zeroizing;
@@ -71,10 +74,16 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // First, while this is the only thread: each thread starts with the mask of the one that made it, the runtime's
+    // too, so a signal the parent left blocked would stay blocked in all of them and never reach `shutdown`.
+    let unblocked = stop_signals().thread_unblock();
     // rustls's process default (reqwest's rustls has no provider of its own): aws-lc-rs, so no ring is built.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    if let Err(e) = unblocked {
+        tracing::warn!("SIGINT and SIGTERM could not be unblocked ({e}): one the parent blocked cannot stop the worker");
+    }
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -165,6 +174,11 @@ async fn build(cfg: &config::Config) -> Result<Worker> {
         builder = builder.source(source);
     }
     Ok(builder.build()?)
+}
+
+/// The signals `shutdown` waits for, which `main` unblocks first.
+fn stop_signals() -> SigSet {
+    [Signal::SIGINT, Signal::SIGTERM].into_iter().collect()
 }
 
 /// SIGINT or SIGTERM.

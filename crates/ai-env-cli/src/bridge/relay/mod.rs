@@ -1,8 +1,9 @@
 //! S13 (plans/s13-contracts.md §WM-worker-mac.6): the Mac side of the relay, an info bridge in AWS that VMs
 //! reach privately and workers dial from the internet.
 //!
-//! - `keys` (WM-R36, WM-R37): this Mac's two relay keys, its worker key and its session key, sealed into one
-//!   container, `credentials/relay-worker.env` (`ai-env relay keygen`, no Touch ID; `ai-env relay pubkey`).
+//! - `keys` (WM-R36, WM-R37, R-155): this Mac's relay keys, its worker key, its session key and, once `keygen --sole`
+//!   adds it, its sole key, sealed into one container, `credentials/relay-worker.env` (`ai-env relay keygen`, no Touch
+//!   ID; `ai-env relay pubkey`).
 //! - `agent` (WM-R38 to WM-R40): `ai-env relay agent` unseals them once (one Touch ID) and, over a 0600 Unix
 //!   socket and for at most a working day, signs worker handshakes and mints VM session tokens.
 //! - `params` (WM-R41 to WM-R45): the relay's five lists, `/ai-env/relay/{workers,token-signers,grants,peers,access}`,

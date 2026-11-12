@@ -170,7 +170,12 @@ fn the_template_builds_against_this_tree() {
     assert_eq!(checked.trim(), format!("config ok: worker example-worker, 1 source(s), key fp {fp}"));
 
     let tested = run_ok(&mut cargo(&["test", "--offline"]));
-    for test in ["the_example_sources_conform", "the_http_source_refuses_paths_outside_its_prefixes", "tls_keygen_writes_its_key_and_the_config_takes_both_files"] {
+    for test in [
+        "the_example_sources_conform",
+        "the_http_source_refuses_paths_outside_its_prefixes",
+        "tls_keygen_writes_its_key_and_the_config_takes_both_files",
+        "run_stops_on_sigint_and_sigterm_started_with_both_blocked",
+    ] {
         assert!(tested.contains(&format!("{test} ... ok")), "{tested}");
     }
 }

@@ -811,20 +811,26 @@ pub enum ProxyCmd {
 #[cfg(feature = "bridge")]
 #[derive(Subcommand)]
 pub enum RelayCmd {
-    /// Make this Mac's two relay keys (its worker key and its session key) and seal them into credentials/relay-worker.env (no Touch ID); prints the public keys only
+    /// Make this Mac's relay keys (its worker key and its session key, and with --sole its sole key) and seal them into credentials/relay-worker.env (no Touch ID); prints the public keys only
     Keygen {
-        /// Replace the keys sealed there (the old container is kept as a .bak)
+        /// Replace the keys sealed there, all three when it holds a sole key (the old container is kept as a .bak)
         #[arg(long)]
         force: bool,
+        /// Also make the sole key, which signs as <worker_id>-sole, the only token signer bound to [relay].restricted, for a chat on a VM of its own; added to keys sealed there, it keeps them (one Touch ID)
+        #[arg(long)]
+        sole: bool,
     },
     /// Print this Mac's relay public keys from the sealed container's notes (no Touch ID; --verify checks them: one Touch ID)
     Pubkey {
         /// Only the worker key's text
-        #[arg(long, conflicts_with = "session")]
+        #[arg(long, conflicts_with_all = ["session", "sole"])]
         worker: bool,
         /// Only the session key's text
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sole")]
         session: bool,
+        /// Only the sole key's text (ai-env relay keygen --sole)
+        #[arg(long)]
+        sole: bool,
         /// Unseal the keys (one Touch ID) and check the recorded public keys against them
         #[arg(long)]
         verify: bool,
@@ -848,7 +854,7 @@ pub enum RelayCmd {
         /// Issue the worker a client certificate for this P-256 point, p256:<base64>, as tls-keygen printed it (one Touch ID: the relay CA)
         #[arg(long, value_name = "P256", conflicts_with = "token_signer")]
         tls_key: Option<String>,
-        /// The grant ids this token signer may mint tokens for: globs (default: every grant)
+        /// The grant ids this token signer may mint tokens for: globs (default: the entry's own set, or every grant for a new one; <worker_id>-sole needs a set with no glob of * alone, and while [relay].restricted names a grant no other signer may reach one: exit 9)
         #[arg(long, value_name = "GLOB", value_delimiter = ',', requires = "token_signer", conflicts_with = "sources")]
         grants: Vec<String>,
     },
@@ -907,13 +913,13 @@ pub enum RelayCmd {
         /// The chat's session id, as ai-env session list shows it
         #[arg(value_name = "SESSION", required_unless_present = "list", conflicts_with = "list")]
         session: Option<String>,
-        /// The grant to allow this chat, one of [relay].offer
+        /// The grant to allow this chat, one of [relay].offer; a [relay].restricted one only to a chat of a [[workspace]] with sole_vm = true, which from then on runs alone wherever it reopens
         #[arg(long, value_name = "G", required_unless_present_any = ["remove", "list"], conflicts_with_all = ["remove", "list"])]
         allow: Option<String>,
         /// The grant to take from this chat
         #[arg(long, value_name = "G", conflicts_with = "list")]
         remove: Option<String>,
-        /// The entry's last valid day, this many days from today, UTC, 1 to 90 (default 30); one end covers all its grants, the later of the old and the new
+        /// The entry's last valid day, this many days from today, UTC, 1 to 90 (default 30), for a [relay].restricted grant 1 to 30 (default 7); one end covers all its grants, the later of the old and the new, but a restricted grant's approval sets it, and no other moves the end of an entry holding one
         // clap lets `requires` go when a present argument conflicts with what it requires, so the two are named too.
         #[arg(long, value_name = "N", requires = "allow", conflicts_with_all = ["remove", "list"])]
         days: Option<u32>,
@@ -1540,7 +1546,7 @@ pub enum SessionCmd {
         #[arg(long)]
         settings_diff: bool,
     },
-    /// Delete each session's row, its scratch config dir and its quarantine (the settings captures, diff.json and settings-sync's backups); every id is checked first, and one a wrapper still serves (active, detached, parked or migrating) or session migrate is moving refuses them all, nothing removed
+    /// Delete each session's row, its scratch config dir and its quarantine (the settings captures, diff.json and settings-sync's backups); every id is checked first, and one a wrapper still serves (active, detached, parked or migrating), session migrate is moving, or (without --purge) a chat approved a [relay].restricted grant refuses them all, nothing removed
     Forget {
         /// Session ids (uuids): every one is checked before any is removed
         #[arg(required = true, num_args = 1.., value_name = "UUID")]
@@ -1634,7 +1640,7 @@ mod d_tests {
         let (forget, migrate, list) = (long_help("session", "forget"), long_help("session", "migrate"), long_help("vm", "list"));
         let wants = [
             (&forget, "Delete each session's row, its scratch config dir and its quarantine"),
-            (&forget, "every id is checked first, and one a wrapper still serves (active, detached, parked or migrating) or session migrate is moving refuses them all, nothing removed"),
+            (&forget, "every id is checked first, and one a wrapper still serves (active, detached, parked or migrating), session migrate is moving, or (without --purge) a chat approved a [relay].restricted grant refuses them all, nothing removed"),
             (&forget, "Also delete their S3 transcripts, their manifests, the originals kept under state/transcripts and the views: one Touch ID for all of them, none when this Mac records none of them in S3"),
             (&migrate, "Session id (a uuid) of a remote chat (one on this Mac is refused, exit 9, before any Touch ID)"),
             (&migrate, "One JSON document: session, outcome, how (live or offline), from_vm, to_vm, ms and code"),
@@ -2162,8 +2168,9 @@ mod tests {
 
     /// S13 (WM-T42): each `relay` command parses with its flags: `--sources a,b --sources c` is three globs;
     /// `allow` takes exactly one of `--sources` and `--token-signer` (both, or neither, is a usage error, exit 2),
-    /// `grant` its rules or `--remove`, `pubkey` at most one of `--worker` and `--session`; `agent --hours 0`
-    /// parses (the range is the command's: exit 2 there). `relay` comes right after `proxy`. §RS.4.1: `allow
+    /// `grant` its rules or `--remove`, `pubkey` at most one of `--worker`, `--session` and `--sole` (R-155: `keygen
+    /// --sole`, with `--force` too); `agent --hours 0` parses (the range is the command's: exit 2 there). `relay` comes
+    /// right after `proxy`. §RS.4.1: `allow
     /// --tls-key` conflicts with `--token-signer`; `allow-ip` takes a network and `--label`, or `--mine` (`--hours`
     /// with it alone, `--not-after` and `--wide` with the network alone); `revoke-ip` exactly one of a network and
     /// `--label`.
@@ -2176,11 +2183,14 @@ mod tests {
                 _ => panic!("{args:?}: not relay"),
             }
         };
-        let RelayCmd::Keygen { force: false } = relay(&["keygen"]) else { panic!("keygen") };
-        let RelayCmd::Keygen { force: true } = relay(&["keygen", "--force"]) else { panic!("keygen --force") };
-        let RelayCmd::Pubkey { worker: false, session: false, verify: false } = relay(&["pubkey"]) else { panic!("pubkey") };
-        let RelayCmd::Pubkey { worker: true, session: false, verify: true } = relay(&["pubkey", "--worker", "--verify"]) else { panic!("pubkey --worker --verify") };
-        let RelayCmd::Pubkey { worker: false, session: true, verify: false } = relay(&["pubkey", "--session"]) else { panic!("pubkey --session") };
+        let RelayCmd::Keygen { force: false, sole: false } = relay(&["keygen"]) else { panic!("keygen") };
+        let RelayCmd::Keygen { force: true, sole: false } = relay(&["keygen", "--force"]) else { panic!("keygen --force") };
+        let RelayCmd::Keygen { force: false, sole: true } = relay(&["keygen", "--sole"]) else { panic!("keygen --sole") };
+        let RelayCmd::Keygen { force: true, sole: true } = relay(&["keygen", "--force", "--sole"]) else { panic!("keygen --force --sole") };
+        let RelayCmd::Pubkey { worker: false, session: false, sole: false, verify: false } = relay(&["pubkey"]) else { panic!("pubkey") };
+        let RelayCmd::Pubkey { worker: true, session: false, sole: false, verify: true } = relay(&["pubkey", "--worker", "--verify"]) else { panic!("pubkey --worker --verify") };
+        let RelayCmd::Pubkey { worker: false, session: true, sole: false, verify: false } = relay(&["pubkey", "--session"]) else { panic!("pubkey --session") };
+        let RelayCmd::Pubkey { worker: false, session: false, sole: true, verify: true } = relay(&["pubkey", "--sole", "--verify"]) else { panic!("pubkey --sole --verify") };
         let RelayCmd::Allow { id, key, sources, token_signer: false, not_after, tls_key: None, grants } = relay(&["allow", "worker-a", "--key", "ed25519:K", "--sources", "a,b", "--sources", "c", "--not-after", "2027-10-29"]) else {
             panic!("allow --sources")
         };
@@ -2265,6 +2275,9 @@ mod tests {
             &["relay", "grant", "g"],
             &["relay", "grant", "g", "a/b", "--remove"],
             &["relay", "pubkey", "--worker", "--session"],
+            &["relay", "pubkey", "--worker", "--sole"],
+            &["relay", "pubkey", "--session", "--sole"],
+            &["relay", "keygen", "--sole", "g-a"],
             &["relay", "tls"],
             &["relay", "agent", "--hours", "x"],
             &["relay", "start", "now"],

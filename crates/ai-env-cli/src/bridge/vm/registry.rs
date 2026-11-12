@@ -180,6 +180,10 @@ pub struct VmRow {
     /// VM (a `ClaudeRetry`): P4 never names them on this VM again; the row
     /// goes with the VM.
     pub claude_bad: Vec<String>,
+    /// R-154: the access id of the one chat this VM was placed for (`RunPlan.sole`, written by the placement into
+    /// the pending row): no plan of another takes it (`run::reuse_candidate`, a pin), and the relay agent signs
+    /// with `<worker_id>-sole` only for that chat on it. `None`: a VM chats share, as every row written before it.
+    pub sole: Option<String>,
 }
 
 impl std::fmt::Debug for VmRow {
@@ -704,6 +708,28 @@ mod tests {
         assert!(v.get("session_token").is_none());
         assert!(!v.to_string().contains(&"ab".repeat(32)));
         assert_eq!(v["id"], "microvm-1");
+    }
+
+    /// R-154: a row written before `sole` reads as a shared VM's (`None`); a sole VM's row keeps its chat through the
+    /// placement's pending row, its promotion and an update, and a shared one writes no `sole` key.
+    #[test]
+    fn a_row_from_before_sole_reads_as_shared_and_a_sole_one_keeps_its_chat() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+        let old: VmRow = toml::from_str("v = 1\nstatus = \"running\"\nid = \"microvm-1\"\negress = \"vpc\"\n").unwrap();
+        assert_eq!((old.status, old.sole), (RowStatus::Running, None));
+        let dir = tempfile::tempdir().unwrap();
+        let p = paths(dir.path());
+        write_row(&p, &row("microvm-shared", "2026-09-29T10:00:00.000Z")).unwrap();
+        assert!(!std::fs::read_to_string(row_path(&p, "microvm-shared").unwrap()).unwrap().contains("sole"), "a shared row names no chat");
+        assert_eq!(read_row(&p, "microvm-shared").unwrap().unwrap().sole, None);
+        let mut sole = VmRow { sole: Some(CHAT.into()), client_token: "0199a1b2-0000-7000-8000-0000000012b4".into(), ..row("", "2026-09-29T11:00:00.000Z") };
+        write_pending(&p, &sole).unwrap();
+        assert_eq!(list_rows(&p).unwrap().iter().find(|r| r.is_pending_row()).map(|r| r.sole.clone()), Some(Some(CHAT.into())), "the pending row names it");
+        sole.id = "microvm-sole".into();
+        promote_pending(&p, &sole).unwrap();
+        let back = update_row(&p, "microvm-sole", |r| r.status = RowStatus::Suspended).unwrap().unwrap();
+        assert_eq!((back.status, back.sole.as_deref()), (RowStatus::Suspended, Some(CHAT)));
+        assert_eq!(view(&back)["sole"], CHAT, "--json shows it");
     }
 
     #[test]

@@ -15,7 +15,9 @@
 //! probe); then what a chat there would do, in every setting: the cwd in a
 //! git work tree (`not_git`: a session refuses any other at its P0, D6),
 //! no `AI_ENV_BRIDGE_VM` pin (`pinned`: the chats take that VM, never the
-//! one a warm would), `[vm].reuse_per_workspace` on (`reuse_off`: no chat
+//! one a warm would), no `[[workspace]].sole_vm` (`sole_vm`, R-154: each
+//! chat there runs on a VM of its own, never a warmed one),
+//! `[vm].reuse_per_workspace` on (`reuse_off`: no chat
 //! reuses a warmed VM); for `auto` only, the workspace's VM rows (a row
 //! SELECT_VM would reuse for the chat skips it, `token_held` when a
 //! running one holds the sealed token: an `auto` prewarm is for a cold
@@ -61,7 +63,7 @@ pub const COOLDOWN: Duration = Duration::from_secs(120);
 const SIBLING: &str = "ai-env";
 
 /// Every word of [`Prewarm::Skipped`].
-pub const SKIP_WORDS: [&str; 14] = ["unconfigured", "config", "cwd", "outside_roots", "never", "touchid_gui", "not_git", "pinned", "reuse_off", "token_held", "vm_exists", "warming", "recent", "no_sibling"];
+pub const SKIP_WORDS: [&str; 15] = ["unconfigured", "config", "cwd", "outside_roots", "never", "touchid_gui", "not_git", "pinned", "sole_vm", "reuse_off", "token_held", "vm_exists", "warming", "recent", "no_sibling"];
 
 /// What [`maybe_prewarm`] did, for the census start row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +222,10 @@ fn decide_rides(paths: &Paths, cfg: &BridgeConfig, cwd: &Path, pinned: bool, uns
     }
     if pinned {
         return Err("pinned");
+    }
+    // R-154: each chat of a sole_vm workspace runs on a VM of its own, never one a warm made without it.
+    if crate::bridge::workspace::sole_vm_at(cfg, cwd) {
+        return Err("sole_vm");
     }
     // The chat's own plan (its P0's: vpc egress, the workspace routes required), as SELECT_VM reads it.
     let flags = RunFlags { workspace: Some(cwd.to_path_buf()), egress: Some(Egress::Vpc), purpose: "session", wait: true, ..RunFlags::default() };
@@ -699,6 +705,27 @@ mod tests {
         std::fs::remove_dir(w.ws.join(".git")).unwrap();
         std::fs::create_dir_all(w.ws.parent().unwrap().join(".git")).unwrap();
         assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, false), Err("not_git"));
+    }
+
+    /// R-154: a cwd of a `sole_vm` workspace is never warmed, in any setting and below its top too
+    /// (`sole_vm`): each chat there runs on a VM of its own, never one a warm made without it; with the switch off it
+    /// is warmed again.
+    #[test]
+    fn a_sole_vm_workspace_is_never_prewarmed() {
+        for (setting, mode) in [("auto", PrewarmMode::Auto), ("always", PrewarmMode::Always)] {
+            let mut w = world(setting, Some(PROMPTED));
+            let deep = w.ws.join("src");
+            std::fs::create_dir_all(&deep).unwrap();
+            assert_eq!(decide(&w.paths, &w.cfg, &deep, false, false), Ok(mode), "{setting}");
+            w.cfg.workspace_overrides.push(crate::bridge::config::WorkspaceCfg { path: w.ws.clone(), sole_vm: true, ..Default::default() });
+            for cwd in [&w.ws, &deep] {
+                assert_eq!(decide(&w.paths, &w.cfg, cwd, false, false), Err("sole_vm"), "{setting}: {}", cwd.display());
+            }
+            assert_eq!(decide(&w.paths, &w.cfg, &w.ws, false, true), Err("sole_vm"), "{setting}: an unstaged version rides no warm there either");
+            w.cfg.workspace_overrides[0].sole_vm = false;
+            assert_eq!(decide(&w.paths, &w.cfg, &deep, false, false), Ok(mode), "{setting}: sole_vm off");
+        }
+        assert!(SKIP_WORDS.contains(&"sole_vm"));
     }
 
     /// The warm lock: taken without waiting; `warming` while another holds

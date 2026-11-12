@@ -2424,6 +2424,74 @@ fn a_chat_closed_before_its_first_sync_is_kept_or_restored_from_its_tail() {
     assert_eq!(empty.restore(&builder).unwrap(), TranscriptOutcome::NothingToRestore);
 }
 
+/// The fork gap, a chat forgotten before its first sync: `session forget
+/// UUID` without `--purge` removes the row of a chat begun on a VM, and its
+/// placeholder view stays, a view no record names, as Cursor's fork of a
+/// remote chat is. Its reopen never sends that view up over what holds the
+/// chat. (i) A VM that holds the chat keeps it. (ii) A VM without it gets
+/// the tail the shim pushed from 0. Neither writes a manifest or a
+/// `v1/<sid>/mac/` object, and the view stays byte for byte. (iii) A
+/// transcript begun here at that path, no record naming it, goes up as
+/// ever, over an older copy the VM holds. (iv) The orphan-view guard: the
+/// placeholder, with no VM copy and no tail, stands for no chat: nothing to
+/// restore, nothing in S3, the view as it was. (v) Not the placeholder
+/// alone: a view of a chat that had turns, no record naming it, is kept on
+/// the VM that holds the chat too, never sent up over it.
+#[test]
+fn a_view_no_record_names_never_goes_up_over_what_a_vm_or_a_tail_holds() {
+    use ai_env_cli::bridge::s3::sync::{is_placeholder_view, write_placeholder_view};
+    use ai_env_cli::bridge::view::{write_view, ViewTarget};
+    let placed = |r: &Remote| {
+        assert!(matches!(write_placeholder_view(&r.sync, SID, &r.rules).unwrap(), Some(ViewOutcome::Written { .. })));
+        assert_eq!(manifest::origin_of(&r.w.paths, SID), None, "forgotten: no row, no manifest");
+        std::fs::read(r.w.view_path()).unwrap()
+    };
+    let in_s3 = |r: &Remote, part: &str| r.w.s3.objects().iter().filter(|o| o.key.starts_with(&format!("v1/{SID}/{part}"))).count();
+    let r = Remote::new();
+    let view = placed(&r);
+    // (i) The VM holds the chat: kept.
+    let chat = line("before the first sync", 300);
+    r.vm.set(|s| s.file = Some(chat.clone()));
+    assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::KeptOnVm);
+    assert_eq!(r.vm.file().unwrap(), chat, "the VM's copy as it was");
+    assert!(r.w.manifest().is_none() && in_s3(&r, "mac/") == 0, "nothing staged");
+    assert_eq!(std::fs::read(r.w.view_path()).unwrap(), view, "the view as it was");
+    // (ii) A new VM: the tail the shim pushed from 0 at /terminate.
+    r.w.s3.put(&r.key_of(S3Key::Tail { session: SID.into(), gen: 1, offset: 0 }), &chat);
+    r.vm.set(|s| s.file = None);
+    assert_eq!(r.restore(&builder).unwrap(), TranscriptOutcome::Restored { parts: 1, bytes: 300 });
+    assert_eq!(r.vm.file().unwrap(), chat, "the chat, from its tail");
+    assert!(r.w.manifest().is_none() && in_s3(&r, "mac/") == 0, "nothing staged");
+    assert_eq!(std::fs::read(r.w.view_path()).unwrap(), view, "the view as it was");
+    assert!(r.w.rows("transcript_stage").is_empty());
+    // (iii) A chat begun here at that path goes up as ever, over an older copy the VM holds.
+    let here = Remote::new();
+    let mac = [line("mac 0", 300), line("mac 1", 300)].concat();
+    here.w.plant(&format!("{SID}.jsonl"), &mac);
+    here.vm.set(|s| s.file = Some(line("an older copy", 200)));
+    assert_eq!(here.restore(&builder).unwrap(), TranscriptOutcome::Staged { bytes: 600 });
+    assert_eq!(here.vm.file().unwrap(), mac, "the Mac's bytes, not the VM's");
+    // (iv) The orphan-view guard: no VM copy, no tail: the placeholder stands for no chat.
+    let orphan = Remote::new();
+    let placeholder = placed(&orphan);
+    assert_eq!(orphan.restore(&builder).unwrap(), TranscriptOutcome::NothingToRestore);
+    assert!(orphan.w.manifest().is_none() && in_s3(&orphan, "") == 0, "nothing in S3: {:?}", orphan.w.s3.objects());
+    assert_eq!(std::fs::read(orphan.w.view_path()).unwrap(), placeholder, "the view as it was");
+    assert!(orphan.w.rows("transcript_stage").is_empty() && orphan.vm.file().is_none(), "nothing staged or pulled");
+    // (v) A view of a chat that had turns, no record naming it, the VM holding the chat: kept, never staged over it.
+    let turns = Remote::new();
+    let target = ViewTarget { mac_projects: &turns.w.projects, slug: SLUG, session_id: SID, mac_cwd: &turns.sync.mac_cwd };
+    assert!(matches!(write_view(&target, &example(), 10, &turns.rules).unwrap(), ViewOutcome::Written { .. }));
+    assert!(manifest::origin_of(&turns.w.paths, SID).is_none() && !is_placeholder_view(&turns.w.view_path()), "a view of turns no record names");
+    let shown = std::fs::read(turns.w.view_path()).unwrap();
+    turns.vm.set(|s| s.file = Some(chat.clone()));
+    assert_eq!(turns.restore(&builder).unwrap(), TranscriptOutcome::KeptOnVm);
+    assert_eq!(turns.vm.file().unwrap(), chat, "the VM's copy as it was");
+    assert!(turns.w.manifest().is_none() && in_s3(&turns, "") == 0, "nothing in S3: {:?}", turns.w.s3.objects());
+    assert_eq!(std::fs::read(turns.w.view_path()).unwrap(), shown, "the view as it was");
+    assert!(turns.w.rows("transcript_stage").is_empty(), "nothing staged");
+}
+
 /// T2: the placeholder view a session gets when it is first named (no file
 /// at its path yet): marked, listed by its title, one user line to reopen
 /// from; never over a file already there, and replaced by the first view.
@@ -3430,6 +3498,32 @@ mod followups {
         assert_eq!(rig.decrypts() - decrypts, 1, "the stage's own Touch ID");
     }
 
+    /// R-154: in a `sole_vm` workspace, `session stage --warm` of a chat with no access id yet (no row: it never ran
+    /// remote) is refused (exit 9) before anything is staged or asked, since its first remote start places a VM of its
+    /// own for the id it gets then, never one the warm would warm: no Touch ID, no call of the fake API, no request to
+    /// S3, the chat where it was.
+    #[test]
+    fn stage_warm_of_a_chat_with_no_access_id_in_a_sole_vm_workspace_is_refused() {
+        let mut p = common::Harness::prepare();
+        let sid = common::uuid(0xa210);
+        let bytes = rig_chat(&p, &sid, 0);
+        let main = p.mac_projects().join(p.slug()).join(format!("{sid}.jsonl"));
+        let work = p.work().display().to_string();
+        let rig = p.rig();
+        let config = rig.bridge().join("bridge.toml");
+        let mut toml = std::fs::read_to_string(&config).unwrap();
+        toml.push_str(&format!("\n[[workspace]]\npath = {work:?}\nsole_vm = true\n"));
+        std::fs::write(&config, toml).unwrap();
+        let (decrypts, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let o = rig.run(&["session", "stage", &sid, "--warm"], None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(9), "{err}");
+        assert!(err.contains(&format!("session stage --warm: session {sid} has no access id yet, and its folder {work} is in a [[workspace]] with sole_vm = true")) && err.contains("reopen the chat instead (nothing was staged or warmed)"), "{err}");
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (decrypts, calls), "no Touch ID, no AWS call");
+        assert!(rig.s3().requests().is_empty(), "nothing sent to S3");
+        assert_eq!(std::fs::read(&main).unwrap(), bytes, "the chat where it was");
+    }
+
     /// F1: `session forget A B C --purge` purges each session's objects
     /// with one Touch ID for all (S9 asked one per session): A's and B's
     /// objects (each with a manifest of this Mac's chat, its state and its
@@ -3484,6 +3578,65 @@ mod followups {
         let batches: Vec<Vec<String>> = sent.iter().filter(|r| r.method == "POST" && r.key.is_empty() && r.query_names.first().is_some_and(|n| n == "delete")).map(|r| r.delete_keys.clone()).collect();
         assert_eq!(batches, [vec![keys[0].clone()], vec![keys[1].clone()]], "{sent:?}");
         assert!(!sent.iter().any(|r| r.method == "DELETE"), "no DeleteObject: {sent:?}");
+    }
+
+    /// R-154: `session forget UUID --purge` takes every view of a chat S3 knew, under any project directory (a reopen
+    /// from another folder left one there, which its picker would otherwise reopen as a view no record names, sent up
+    /// as a chat begun here), and never a transcript or another chat's view; once no row names the chat, it names each
+    /// VM placed for that chat alone, which still holds its transcript (a `note:` naming `ai-env vm terminate`). A fork
+    /// Cursor made that never started, a copy no row or manifest names, goes the same way.
+    #[test]
+    fn forget_purge_takes_every_view_of_the_chat_and_names_its_own_vm() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012ab";
+        const ALONE: &str = "microvm-0199a1b2-0000-7000-8000-0000000012ac";
+        const EARLIER: &str = "-Users-someone-earlier";
+        let mut p = common::Harness::prepare();
+        let projects = p.mac_projects();
+        let rig = p.rig();
+        let paths = Paths::from_root_and_env(rig.bridge(), None);
+        let target = S3Target { bucket: LAB_BUCKET.into(), owner: LAB_OWNER.into(), endpoint: S3Endpoint::Lab(rig.s3().addr()) };
+        let (a, other) = (common::uuid(0xa311), common::uuid(0xa312));
+        let key = S3Key::Mac { session: a.clone(), sha256: sha(a.as_bytes()) }.render();
+        rig.s3().put(&key, a.as_bytes());
+        let mut m = Manifest::new(&a, &target, manifest::ORIGIN_MAC, &format!("{SLUG}/{a}.jsonl"), "2026-10-01T00:00:00Z");
+        m.parts.push(manifest::ManifestPart { key, version_id: "fv1".into(), from: 0, len: 36, sha256: sha(a.as_bytes()), encoding: None, stored_len: None, stored_sha256: None });
+        m.committed = 36;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let _h = manifest::lock(&paths, &a).await.unwrap();
+            manifest::write(&paths, &m).unwrap();
+        });
+        let row = ai_env_cli::bridge::registry::SessionRow { session_id: a.clone(), mode: "remote".into(), status: "closed".into(), access_id: Some(CHAT.into()), ..ai_env_cli::bridge::registry::SessionRow::default() };
+        ai_env_cli::bridge::registry::write(&paths, &row).unwrap();
+        let plant = |dir: &str, sid: &str, text: &str| {
+            let path = projects.join(dir).join(format!("{sid}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let view = format!("{VIEW_MARK_PREFIX}\"type\":\"ai-title\",\"aiTitle\":\"t\"}}\n");
+        let views = [plant(SLUG, &a, &view), plant(EARLIER, &a, &view)];
+        let kept = [plant("-Users-someone-else", &a, "{\"type\":\"user\"}\n"), plant(EARLIER, &other, &view)];
+        ai_env_cli::bridge::vm::registry::write_row(&paths, &ai_env_cli::bridge::vm::registry::VmRow { id: ALONE.into(), status: ai_env_cli::bridge::vm::registry::RowStatus::Suspended, egress: "vpc".into(), sole: Some(CHAT.into()), ..Default::default() }).unwrap();
+        let o = rig.run(&["session", "forget", &a, "--purge"], None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{}{err}", String::from_utf8_lossy(&o.stdout));
+        assert!(views.iter().all(|v| !v.exists()), "every view of the chat went: {views:?}");
+        assert!(kept.iter().all(|k| k.exists()), "a transcript, and another chat's view, stay: {kept:?}");
+        let note = format!("note: VM {ALONE} was placed for chat {CHAT} (session {a}) alone and still holds its transcript, though no start takes that VM again: ai-env vm terminate {ALONE}\n");
+        assert!(err.contains(&note), "{err}");
+        assert!(ai_env_cli::bridge::registry::read(&paths, &a).unwrap().is_none() && manifest::read(&paths, &a).unwrap().is_none(), "the row and the manifest went");
+        // A fork Cursor made that never started (no row, no manifest: a view-shaped copy alone) goes with --purge too; an id
+        // with nothing anywhere is still `no session` (exit 1).
+        let fork = common::uuid(0xa313);
+        let copy = plant(SLUG, &fork, &view);
+        let o = rig.run(&["session", "forget", &fork, "--purge"], None);
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!(String::from_utf8_lossy(&o.stdout), format!("forgot {fork} (its transcript purged)\n"));
+        assert!(!copy.exists(), "the fork's copy went");
+        let o = rig.run(&["session", "forget", &fork, "--purge"], None);
+        assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("no session {fork}")), "{}", String::from_utf8_lossy(&o.stderr));
     }
 }
 

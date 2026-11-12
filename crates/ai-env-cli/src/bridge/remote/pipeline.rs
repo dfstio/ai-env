@@ -223,6 +223,10 @@ pub struct SessionPlan {
     /// a hostile init may name it and adopt its row, and a row with no id must not take [`SessionPlan::access_id`] then,
     /// or approving that chat, and any later `--resume` of it, would reach this process.
     pub access_foreign: Option<String>,
+    /// R-154, sticky per chat: the sole mark (`SessionRow::sole_since`) a `--resume` no row names inherits as a Cursor fork
+    /// made in the folder of a chat marked sole ([`inherited_mark`]), set once here at P0: the pump marks the rows of this
+    /// process with it from the first (`RemoteSnapshot.sole_inherited`).
+    pub sole_inherited: Option<String>,
     /// The code-out trigger captures the VM's settings into the session's
     /// quarantine (T8.7): never for `--no-session-persistence` (Cursor's
     /// prompt-suggestion queries), which no registry row keeps, so nothing
@@ -626,6 +630,7 @@ impl SessionPlan {
             transcript_cap: true,
             avoid: Vec::new(),
             caps_required: Vec::new(),
+            sole: None,
         };
         SessionPlan {
             paths: Paths::from_root_and_env(root.join("bridge"), None),
@@ -636,6 +641,7 @@ impl SessionPlan {
             resume: None,
             access_id: Some(uuid::Uuid::now_v7().to_string()),
             access_foreign: None,
+            sole_inherited: None,
             capture_settings: true,
             knobs: VmKnobs::default(),
             run,
@@ -942,13 +948,18 @@ type Resolver<'a> = &'a dyn Fn(&BridgeConfig, &Path, Option<&str>) -> Result<Wor
 /// pin, the resumed session's VM preferred, or the workspace's),
 /// `workspace::resolve` (D6), the run plan (vpc egress, the caps), the
 /// sealed token's plan, the runtime key, the provisional gate, the keystore,
-/// the VM's argv, its environment, the spawn frame's size, the shared lock
+/// the VM's argv, R-154's VM of its own ([`sole_plan`]: a chat marked sole,
+/// or a Cursor fork made in the folder of one ([`inherited_mark`]), outside a
+/// `sole_vm` workspace refused; [`pinned_sole`]), its environment,
+/// the spawn frame's size, the shared lock
 /// on the workspace's `.active` (one try, no wait), S9's transcript sync,
-/// then S9's size refusals of a `--resume` ([`transcript_too_large`]). The
-/// first refusal is the failure: a chat over a size cap that an earlier
-/// check refuses gets that check's exit and line. `Err` is the failure the
-/// wrapper exits with: the pump prints its line, writes the census end row
-/// and the `session_remote_failed` audit row.
+/// the refusal of a `--resume` of a chat this Mac has no record or copy of
+/// ([`nothing_to_resume`], the fork gap), then S9's size refusals of a
+/// `--resume` ([`transcript_too_large`]). The first refusal is the failure:
+/// a chat over a size cap that an earlier check refuses gets that check's
+/// exit and line. `Err` is the failure the wrapper exits with: the pump
+/// prints its line, writes the census end row and the
+/// `session_remote_failed` audit row.
 pub fn precheck(sess: &Session) -> Result<SessionPlan, Failure> {
     precheck_with(sess, &|k| std::env::var_os(k), &workspace::resolve)
 }
@@ -1036,18 +1047,31 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
     let argv = vm_argv(cfg, &sess.args)?;
     let access_id = access_id_of(&sess.paths, resume.as_deref(), &argv, sess.session.no_session_persistence);
     let access_foreign = resume.clone().filter(|_| !keeps_chat(&argv));
+    let mac_projects = mac_config_dir(env).map(|d| d.join("projects"));
+    let registry_slug = resume.as_deref().and_then(|id| crate::bridge::registry::read(&sess.paths, id).ok().flatten()).and_then(|r| r.slug);
+    let slugs: Vec<String> = std::iter::once(ws.slug.clone()).chain(registry_slug).collect();
+    // R-154: the chat's own VM in a sole_vm workspace, or for a chat marked sole wherever it reopens, a Cursor fork made
+    // in the folder of one too ([`inherited_mark`]); such a chat outside a sole_vm workspace, and a pinned VM of the other
+    // kind, are refused here.
+    let sole_inherited = resume.as_deref().zip(mac_projects.as_deref()).and_then(|(id, projects)| inherited_mark(&sess.paths, projects, &slugs, id));
+    run.sole = sole_plan(&sess.paths, cfg, &ws, resume.as_deref(), access_id.as_deref(), sole_inherited.is_some())?;
+    if let Choice::Pin(id) = &run.choice {
+        pinned_sole(&ctx, id, &run)?;
+    }
     let session_env = crate::bridge::remote::env::session_env(cfg, env).map_err(|what| Failure::Refused { what })?;
     spawn_frame_fits(&ctx, &argv, &ws, &session_env)?;
     // One try: P0 runs before the pump reads the host or listens for a stop, so a closing session's exclusive
     // hold is waited for in generation 1's pending start ([`hold_active_at_start`]), never here.
     let active = try_lock_shared(&sess.paths.workspace_active(&ws.slug)).map_err(precheck)?;
     let elapsed = Duration::from_millis(crate::wire::time::unix_now_ms().saturating_sub(sess.start_row.start));
-    let mac_projects = mac_config_dir(env).map(|d| d.join("projects"));
-    let registry_slug = resume.as_deref().and_then(|id| crate::bridge::registry::read(&sess.paths, id).ok().flatten()).and_then(|r| r.slug);
-    let slugs: Vec<String> = std::iter::once(ws.slug.clone()).chain(registry_slug).collect();
     // S9: what the transcript syncs with, before any Touch ID: a session that keeps or resumes one never starts without it.
     let keeps = !sess.session.no_session_persistence || resume.is_some();
     let transcript_sync = transcript_sync_of(&sess.paths, cfg, &ctx.knobs, &ws, mac_projects.as_deref(), keeps).map_err(|e| config(&e))?;
+    // The fork gap: a chat this Mac has no record or copy of has nothing to resume (a resume has the projects
+    // directory: `transcript_sync_of` refused it otherwise).
+    if let (Some(id), Some(projects)) = (resume.as_deref(), mac_projects.as_deref()) {
+        nothing_to_resume(&sess.paths, projects, &slugs, id)?;
+    }
     // S9: a chat begun on this Mac over what a reopen carries inline goes through `session stage` first, and one S3
     // holds that no VM P2 could take holds, over what a reopen pulls inline, through `session stage --warm` (no Touch ID).
     transcript_too_large(&sess.paths, mac_projects.as_deref(), &slugs, resume.as_deref(), &run)?;
@@ -1073,6 +1097,7 @@ pub(crate) fn precheck_with(sess: &Session, env: &dyn Fn(&str) -> Option<OsStrin
         resume,
         access_id,
         access_foreign,
+        sole_inherited,
         capture_settings: !sess.session.no_session_persistence,
         knobs: ctx.knobs,
         run,
@@ -1172,14 +1197,36 @@ fn transcript_sync_of(paths: &Paths, cfg: &BridgeConfig, knobs: &VmKnobs, ws: &W
     crate::bridge::s3::TranscriptSync::for_workspace(paths, cfg, knobs, ws, projects).map(Some)
 }
 
+/// P0's refusal of a `--resume` of `id` this Mac has nothing of (the fork
+/// gap), from local state only, before any Touch ID: no registry row (read
+/// first: it refuses an id that is no uuid before the manifest's path is
+/// built), no S3 manifest, and no `<id>.jsonl` regular file in any project
+/// directory under `projects` (`seed::candidates`: `slugs` first, then every
+/// one; a symlink is none) is [`Failure::NothingToResume`] (exit 9), which
+/// the VM's claude would only miss, after the Touch ID and a VM's start.
+/// A row or a manifest that cannot be read is a record: P3 says what it is.
+/// A row of any mode leaves the reopen to P3 (a known chat whose transcript
+/// is nowhere gets the VM's miss, forwarded), and so does a copy of any
+/// shape: Cursor's fork of a remote chat is a view no record names, which
+/// P3 sends up as the chat. A chat `session forget UUID --purge` removed is
+/// refused here, even when a reused VM still holds its file.
+fn nothing_to_resume(paths: &Paths, projects: &Path, slugs: &[String], id: &str) -> Result<(), Failure> {
+    let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
+    if matches!(crate::bridge::registry::read(paths, id), Ok(None)) && matches!(crate::bridge::s3::manifest::read(paths, id), Ok(None)) && crate::bridge::seed::candidates(projects, &refs, id).is_empty() {
+        return Err(Failure::NothingToResume { session: id.to_string() });
+    }
+    Ok(())
+}
+
 /// P0's size refusals (S9), from local state only, before any Touch ID. A
 /// `--resume` whose chat S3 does not hold (no manifest) and whose copy on
-/// this Mac (the first of `seed::candidates`, never a view) is over
-/// `wire::s3::INLINE_MAX` in all is `Failure::TranscriptTooLarge`, from the
-/// files' sizes only: naming `ai-env session stage UUID --warm` for a chat
-/// begun here, `ai-env session migrate-s9` and then that `--warm` for an S8
-/// mirror (`s3::manifest::origin_of`). At or under the cap P3 sends it up
-/// inline. One S3 holds (a manifest) goes to [`pull_too_large`].
+/// this Mac (the first of `seed::candidates`; a view only when `origin_of`
+/// is none: Cursor's fork of a remote chat) is over `wire::s3::INLINE_MAX`
+/// in all is `Failure::TranscriptTooLarge`, from the files' sizes only:
+/// naming `ai-env session stage UUID --warm` for a chat begun here,
+/// `ai-env session migrate-s9` and then that `--warm` for an S8 mirror
+/// (`s3::manifest::origin_of`). At or under the cap P3 sends it up inline.
+/// One S3 holds (a manifest) goes to [`pull_too_large`].
 fn transcript_too_large(paths: &Paths, mac_projects: Option<&Path>, slugs: &[String], resume: Option<&str>, run: &RunPlan) -> Result<(), Failure> {
     use crate::bridge::s3::manifest::{origin_of, read, ORIGIN_S8_MIRROR, ORIGIN_VM};
     let Some(id) = resume else { return Ok(()) };
@@ -1193,7 +1240,8 @@ fn transcript_too_large(paths: &Paths, mac_projects: Option<&Path>, slugs: &[Str
     }
     let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
     let Some(dir) = crate::bridge::seed::candidates(projects, &refs, id).into_iter().next() else { return Ok(()) };
-    if crate::bridge::view::is_view_file(&dir.join(format!("{id}.jsonl"))) {
+    // Here `origin` is none or an S8 mirror: a view of a chat a remote row names is never a Mac copy.
+    if origin.is_some() && crate::bridge::view::is_view_file(&dir.join(format!("{id}.jsonl"))) {
         return Ok(());
     }
     match crate::bridge::seed::transcript_files_capped(&dir, id, crate::wire::s3::INLINE_MAX) {
@@ -1230,8 +1278,9 @@ fn pull_too_large(paths: &Paths, m: &crate::bridge::s3::manifest::Manifest, run:
     let Some((canonical, _)) = &run.workspace else { return Ok(()) };
     let key = run::workspace_key(canonical);
     let Ok(rows) = vm_registry::list_rows(paths) else { return Ok(()) };
-    // S10 §2.7: a VM the reopen's carry leaves (near its wall) holds the chat for no start.
-    if rows.iter().any(|r| r.workspace.as_deref() == Some(key.as_str()) && r.status != RowStatus::Terminated && !run.avoid.contains(&r.id)) {
+    // S10 §2.7: a VM the reopen's carry leaves (near its wall) holds the chat for no start. R-154: nor does a VM P2
+    // never gives this chat (another chat's own, or a shared one for a chat that runs alone).
+    if rows.iter().any(|r| r.workspace.as_deref() == Some(key.as_str()) && r.status != RowStatus::Terminated && !run.avoid.contains(&r.id) && r.sole == run.sole) {
         return Ok(());
     }
     refused(false)
@@ -1296,6 +1345,64 @@ fn choice_of(ctx: &Ctx, resume: Option<&str>, env: &dyn Fn(&str) -> Option<OsStr
 fn pinned_lacks(ctx: &Ctx, id: &str, caps: &[&'static str]) -> Option<&'static str> {
     let row = vm_registry::read_row(&ctx.paths, id).ok().flatten()?;
     caps.iter().copied().find(|cap| workspace::vm_capability_of(&row, cap) == Capability::No)
+}
+
+/// R-154, sticky per chat (the fork gap): the sole mark a `--resume` of `id` inherits as Cursor's fork of a chat marked
+/// sole. Extension 2.1.319's fork is the chat's view on this Mac, every line copied but its ids (its `sessionId` the
+/// fork's), written beside that view in the window's project directory: nothing in it names its parent, and no row or
+/// manifest names it until its first start. So a `--resume` with no registry row and no S3 manifest whose copy (the
+/// first of `seed::candidates`, as P3 sends it up) is view-shaped and no placeholder (`s3::sync::is_placeholder_view`,
+/// which P3 never sends up) takes the earliest `SessionRow::sole_since` of the rows marked sole whose project directory
+/// (their `slug`, or their view's) is that copy's: as such a chat, it runs alone wherever it reopens, and P0 refuses it
+/// outside a `sole_vm` workspace ([`sole_plan`]). Fail closed: any such copy there inherits it, a fork of another chat
+/// of that folder too, though each chat of a `sole_vm` workspace runs alone anyway. `None` for anything else: a row or
+/// a manifest that cannot be read is a record ([`nothing_to_resume`]), whose own mark decides.
+fn inherited_mark(paths: &Paths, projects: &Path, slugs: &[String], id: &str) -> Option<String> {
+    if !matches!(crate::bridge::registry::read(paths, id), Ok(None)) || !matches!(crate::bridge::s3::manifest::read(paths, id), Ok(None)) {
+        return None;
+    }
+    let refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
+    let dir = crate::bridge::seed::candidates(projects, &refs, id).into_iter().next()?;
+    let copy = dir.join(format!("{id}.jsonl"));
+    if !crate::bridge::view::is_view_file(&copy) || crate::bridge::s3::sync::is_placeholder_view(&copy) {
+        return None;
+    }
+    let name = dir.file_name()?.to_str()?;
+    let here = |r: &crate::bridge::registry::SessionRow| r.slug.as_deref() == Some(name) || r.view.as_deref().and_then(|v| v.split_once('/')).is_some_and(|(slug, _)| slug == name);
+    crate::bridge::registry::list(paths).ok()?.into_iter().filter(|r| r.is_sole() && here(r)).filter_map(|r| r.sole_since).min()
+}
+
+/// R-154: P0's `RunPlan.sole` (`workspace::chat_sole`): a chat of a `sole_vm` workspace runs on a VM of its own, by
+/// its access id; so does one whose `--resume` row is marked sole (sticky per chat, from its first restricted
+/// approval), wherever it reopens: a fork of it too (by its own id), and a `--no-session-persistence` spawn of it
+/// (by the row's); and so does a Cursor fork made in the folder of one (`inherited`: [`inherited_mark`]), by its
+/// spawn's id, else a fresh one. Such a chat reopened from a cwd outside a `sole_vm` workspace is refused here, before
+/// any Touch ID: its transcript, which may hold that grant's data, never lands on a VM other chats share.
+fn sole_plan(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef, resume: Option<&str>, access: Option<&str>, inherited: bool) -> Result<Option<String>, Failure> {
+    let row = resume.and_then(|sid| crate::bridge::registry::read(paths, sid).ok().flatten());
+    let marked = row.as_ref().filter(|r| r.is_sole());
+    if (marked.is_some() || inherited) && !workspace::workspace_cfg(cfg, ws).is_some_and(|w| w.sole_vm) {
+        let what = match marked {
+            Some(r) => format!("session {} was approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)", r.session_id),
+            None => format!("fork {} of a chat approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)", resume.unwrap_or_default()),
+        };
+        return Err(Failure::Refused { what });
+    }
+    if inherited && row.is_none() {
+        return Ok(Some(access.map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_string)));
+    }
+    Ok(workspace::chat_sole(cfg, ws, access, row.as_ref()))
+}
+
+/// R-154: a pinned VM placed for another chat alone, or a shared one for a chat that runs alone (`run.sole`), is
+/// refused here, before any Touch ID, naming the pin (`vm::run::select_pinned` refuses it again); a row that cannot
+/// be read is `choice_of`'s and `select_pinned`'s to judge.
+fn pinned_sole(ctx: &Ctx, id: &str, run: &RunPlan) -> Result<(), Failure> {
+    let Some(row) = vm_registry::read_row(&ctx.paths, id).ok().flatten() else { return Ok(()) };
+    match run::sole_mismatch(&row, run) {
+        Some(why) => Err(Failure::Refused { what: format!("the pinned VM {id} ({PIN_KNOB}): {why}; unset {PIN_KNOB}") }),
+        None => Ok(()),
+    }
 }
 
 /// P0 in container mode, when an unseal will happen: the runtime key is
@@ -1714,7 +1821,8 @@ async fn first(plan: &Rc<SessionPlan>, gen: u32, io: SpawnIo, progress: &Progres
     let (paths, cfg, ws) = (plan.paths.clone(), plan.cfg.clone(), plan.ws.clone());
     // A `--resume`'s transcript goes through the seed's tripwires here, before the seed's own scans: a finding starts no
     // VM and closes the dialog. Only a chat whose copy on this Mac P3 will send up inline is scanned, one begun on this
-    // Mac or an S8 mirror (`s3::manifest::origin_of`); one S3 holds is never read on this Mac.
+    // Mac or an S8 mirror (`s3::manifest::origin_of`), or a view-shaped copy no manifest or remote row names (Cursor's
+    // fork of a remote chat); one S3 holds is never read on this Mac.
     let scan_wanted = |id: &str| p1_scans(crate::bridge::s3::manifest::origin_of(&plan.paths, id));
     let transcript = plan.resume.clone().zip(plan.mac_projects.clone()).filter(|(id, _)| scan_wanted(id)).map(|(id, root)| (id, root, plan.slugs.clone()));
     // S10 §2.7: a reopen carried off a gone VM seeds from that VM's last fetch (its box record), when this Mac holds it.
@@ -3599,8 +3707,10 @@ mod g4_tests {
     /// P0's refusal: a chat S3 does not hold whose copy here is over
     /// `INLINE_MAX` is `TranscriptTooLarge` before any Touch ID, naming
     /// `session stage` for a chat begun here and `session migrate-s9` for an
-    /// S8 mirror; at or under the cap, with a manifest, a view in place or no
-    /// `--resume` it passes (P3 sends it up inline, or restores it).
+    /// S8 mirror; at or under the cap, with a manifest, a view of a chat a
+    /// remote row names in place or no `--resume` it passes (P3 sends it up
+    /// inline, or restores it). The fork gap: a view no row or manifest names
+    /// is the chat (Cursor's fork of a remote chat), so its size counts.
     #[test]
     fn transcript_too_large_names_the_way_before_any_touch_id() {
         let (_tmp, paths, projects) = world();
@@ -3631,9 +3741,16 @@ mod g4_tests {
         assert!(too_large(&paths, &projects).is_ok(), "staged already");
         std::fs::remove_file(paths.transcript_manifest(SID)).unwrap();
         assert!(too_large(&paths, &projects).is_err());
-        // A view in place of the file is never a Mac copy.
+        // A view no row or manifest names is the chat (the fork gap): over the cap, refused as one begun here.
         chat(&projects, max + 1, crate::wire::view::VIEW_MARK_PREFIX.as_bytes());
-        assert!(too_large(&paths, &projects).is_ok(), "a view");
+        match too_large(&paths, &projects) {
+            Err(Failure::TranscriptTooLarge { session, bytes, s8_mirror: false }) => assert_eq!((session.as_str(), bytes), (SID, max + 1)),
+            other => panic!("expected TranscriptTooLarge for a view no record names, got {other:?}"),
+        }
+        // A view of a chat a remote row names (no transcript_home: an S8 row) is never a Mac copy.
+        let mirror = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), ..crate::bridge::registry::SessionRow::default() };
+        crate::bridge::registry::write(&paths, &mirror).unwrap();
+        assert!(too_large(&paths, &projects).is_ok(), "a remote chat's view");
     }
 
     /// P1's scan of a `--resume`'s copy here: exactly the copies P3 sends
@@ -6048,7 +6165,210 @@ mod tests {
         drop(plan);
         let other = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
         let args: Vec<&str> = ARGS.iter().copied().chain(["--resume", other]).collect();
+        // The fork gap: no row, no manifest and no copy on this Mac: nothing to resume.
+        assert_eq!(precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).map(drop).unwrap_err().word(), "nothing_to_resume");
+        let elsewhere = w.root.join(".claude").join("projects").join("-elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(format!("{other}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).unwrap().run.choice, Choice::Workspace, "no row: the workspace's");
+    }
+
+    /// R-154: `[[workspace]] sole_vm` for the world's workspace (its cwd).
+    fn sole_vm(w: &mut World) {
+        w.text.push_str(&format!("[[workspace]]\npath = {:?}\nsole_vm = true\n", w.work));
+    }
+
+    /// R-154: P0 plans a VM of the chat's own (`run.sole`, its access id) in a `sole_vm` workspace, and a
+    /// shared one elsewhere; a `--no-session-persistence` spawn, which no approval names, shares even there.
+    #[test]
+    fn p0_plans_a_vm_of_its_own_for_a_chat_of_a_sole_vm_workspace() {
+        let mut w = World::new("");
+        let quiet: Vec<&str> = ARGS.iter().copied().chain(["--no-session-persistence"]).collect();
+        let plan = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert!(plan.access_id.is_some() && plan.run.sole.is_none(), "no sole_vm: a shared VM");
+        drop(plan);
+        sole_vm(&mut w);
+        let plan = precheck_with(&w.session(&ARGS), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert!(plan.run.sole.is_some() && plan.run.sole == plan.access_id, "its own VM, by its access id: {:?}", plan.run.sole);
+        drop(plan);
+        let plan = precheck_with(&w.session(&quiet), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!((plan.access_id.as_deref(), plan.run.sole.as_deref()), (None, None), "no access id: shared");
+        drop(plan);
+        let audit = crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap();
+        assert!(audit.is_empty() && !w.paths.unseal_lock().exists(), "no audit row, no Touch ID: {audit:?}");
+    }
+
+    /// R-154, sticky per chat: a chat whose row is marked sole (`registry::mark_sole`, its first restricted
+    /// approval) is refused before any Touch ID (exit 9) when it is reopened, or forked, from a cwd in no `sole_vm`
+    /// workspace, with a line that says why and what to do; from a `sole_vm` workspace it runs alone: by its own id,
+    /// a fork by the fork's, a `--no-session-persistence` spawn of it by the row's (the workspace alone would give it
+    /// none). The same chat unmarked reopens anywhere, on a shared VM outside a `sole_vm` workspace.
+    #[test]
+    fn a_chat_marked_sole_reopens_only_in_a_sole_vm_workspace_and_alone() {
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012c1";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012c2";
+        let mut w = World::new("");
+        let row = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), status: "closed".into(), access_id: Some(CHAT.into()), ..Default::default() };
+        crate::bridge::registry::write(&w.paths, &row).unwrap();
+        let resume: Vec<&str> = ARGS.iter().copied().chain(["--resume", SID]).collect();
+        let fork: Vec<&str> = resume.iter().copied().chain(["--fork-session"]).collect();
+        let quiet: Vec<&str> = resume.iter().copied().chain(["--no-session-persistence"]).collect();
+        let plan = precheck_with(&w.session(&resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!((plan.access_id.as_deref(), plan.run.sole.as_deref()), (Some(CHAT), None), "unmarked: shared, outside a sole_vm workspace");
+        drop(plan);
+        assert_eq!(crate::bridge::registry::mark_sole(&w.paths, SID).unwrap(), [SID]);
+        for args in [&resume, &fork, &quiet] {
+            let f = precheck_with(&w.session(args), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{args:?}: {}", f.line());
+            assert_eq!(f.line(), format!("refused before any Touch ID: session {SID} was approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)"));
+        }
+        let audit = crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap();
+        assert!(audit.is_empty() && !w.paths.unseal_lock().exists(), "no audit row, no Touch ID: {audit:?}");
+        sole_vm(&mut w);
+        let plan = precheck_with(&w.session(&resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!((plan.access_id.as_deref(), plan.run.sole.as_deref()), (Some(CHAT), Some(CHAT)), "alone, by its own id");
+        drop(plan);
+        let plan = precheck_with(&w.session(&fork), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        let own = plan.access_id.clone().expect("a fork's own id");
+        assert!(own != CHAT && plan.run.sole.as_deref() == Some(own.as_str()), "a fork alone, by its own id: {:?}", plan.run.sole);
+        drop(plan);
+        let plan = precheck_with(&w.session(&quiet), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!((plan.access_id.as_deref(), plan.run.sole.as_deref()), (None, Some(CHAT)), "alone with the row's id");
+    }
+
+    /// R-154, sticky per chat (the fork gap): Cursor's fork of a chat marked sole is a `--resume` of an id no row or
+    /// manifest names, whose copy is that chat's view under new ids, beside it in the window's project directory. Such
+    /// a view-shaped copy in the project directory of rows marked sole inherits the earliest of their marks (by a row's
+    /// `slug`, or its view's directory): from a cwd in no `sole_vm` workspace it is refused before any Touch ID (exit 9,
+    /// nothing audited, no unseal), a `--no-session-persistence` spawn of it too; from a `sole_vm` workspace it runs
+    /// alone, by its own fresh id (a fresh one without persistence), the mark handed on for its rows. The same copy under
+    /// a project directory no marked row is of (a mark of another folder counts nowhere else), a placeholder view, a
+    /// transcript, and a fork with a row of its own (whose mark decides) inherit nothing.
+    #[test]
+    fn a_cursor_fork_in_the_folder_of_a_chat_marked_sole_inherits_its_mark() {
+        use crate::bridge::registry::SessionRow;
+        const FORK: &str = "0199a1b2-0000-7000-8000-0000000012d1";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012d2";
+        const EARLY: &str = "2026-11-01T08:00:00Z";
+        const LATE: &str = "2026-11-03T08:00:00Z";
+        let resume: Vec<&str> = ARGS.iter().copied().chain(["--resume", FORK]).collect();
+        let quiet: Vec<&str> = resume.iter().copied().chain(["--no-session-persistence"]).collect();
+        let untouched = |w: &World| crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists();
+        let own = |w: &World| crate::wire::slug::project_dir_name(&w.work).unwrap();
+        // Two marked rows of the folder (one by its slug, one by its view's directory), an unmarked one, and one marked
+        // elsewhere; then the fork's copy in that folder.
+        let world = || {
+            let w = World::new("");
+            let slug = own(&w);
+            let row = |n: u32, slug: Option<&str>, view: Option<String>, since: Option<&str>| SessionRow {
+                session_id: format!("0199a1b2-0000-7000-8000-00000000{n:04x}"),
+                mode: "remote".into(),
+                status: "closed".into(),
+                access_id: Some(CHAT.into()),
+                slug: slug.map(str::to_string),
+                view,
+                sole_since: since.map(str::to_string),
+                ..SessionRow::default()
+            };
+            for r in [
+                row(0x12e1, Some(&slug), None, Some(LATE)),
+                row(0x12e2, None, Some(format!("{slug}/0199a1b2-0000-7000-8000-0000000012e2.jsonl")), Some(EARLY)),
+                row(0x12e3, Some(&slug), None, None),
+                row(0x12e4, Some("-Users-someone-elsewhere"), None, Some("2026-10-01T08:00:00Z")),
+            ] {
+                crate::bridge::registry::write(&w.paths, &r).unwrap();
+            }
+            w
+        };
+        let copy = |w: &World, slug: &str, text: &str| {
+            let dir = w.root.join(".claude").join("projects").join(slug);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{FORK}.jsonl")), text).unwrap();
+        };
+        let mark = crate::wire::view::VIEW_MARK_PREFIX;
+        let forked = format!("{mark}\"parentUuid\":null,\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"show me the rows\"}}]}}}}\n{{\"type\":\"custom-title\",\"sessionId\":\"{FORK}\",\"customTitle\":\"rows (fork)\"}}\n");
+        // Outside a sole_vm workspace: refused, persistence or not.
+        let mut w = world();
+        copy(&w, &own(&w), &forked);
+        for args in [&resume, &quiet] {
+            let f = precheck_with(&w.session(args), &w.env(&[]), &a_git_repo).map(drop).unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{args:?}: {}", f.line());
+            assert_eq!(f.line(), format!("refused before any Touch ID: fork {FORK} of a chat approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)"));
+            assert!(format!("ai-env-claude: {}", f.line()).chars().count() <= crate::bridge::remote::LINE_MAX, "{}", f.line());
+        }
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+        // In one: alone by its own fresh id, the earliest mark of the folder handed on.
+        sole_vm(&mut w);
+        let plan = precheck_with(&w.session(&resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        let access = plan.access_id.clone().expect("the fork's own id");
+        assert!(access != CHAT && plan.run.sole.as_deref() == Some(access.as_str()), "alone, by its own id: {:?}", plan.run.sole);
+        assert_eq!(plan.sole_inherited.as_deref(), Some(EARLY), "the folder's earliest mark");
+        drop(plan);
+        let plan = precheck_with(&w.session(&quiet), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert!(plan.access_id.is_none() && plan.run.sole.is_some(), "alone with a fresh id: {:?}", plan.run.sole);
+        drop(plan);
+        // The row of the earliest mark gone, the folder's next one (a row of it by its slug alone).
+        std::fs::remove_file(w.paths.sessions().join("0199a1b2-0000-7000-8000-0000000012e2.toml")).unwrap();
+        let plan = precheck_with(&w.session(&resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+        assert_eq!(plan.sole_inherited.as_deref(), Some(LATE), "a row of the folder by its slug");
+        drop(plan);
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+        // What inherits nothing (outside a sole_vm workspace: a shared VM, no mark).
+        let shared = |w: &World| {
+            let plan = precheck_with(&w.session(&resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
+            (plan.run.sole.clone(), plan.sole_inherited.clone())
+        };
+        let w = world();
+        copy(&w, "-Users-someone-else", &forked);
+        assert_eq!(shared(&w), (None, None), "under a project directory no marked row is of");
+        let w = world();
+        copy(&w, &own(&w), &format!("{mark}\"parentUuid\":null,\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}}}\n", crate::bridge::s3::sync::PLACEHOLDER_TEXT));
+        assert!(crate::bridge::s3::sync::is_placeholder_view(&w.root.join(".claude").join("projects").join(own(&w)).join(format!("{FORK}.jsonl"))), "the placeholder's shape");
+        assert_eq!(shared(&w), (None, None), "a placeholder view");
+        let w = world();
+        copy(&w, &own(&w), "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n");
+        assert_eq!(shared(&w), (None, None), "a transcript: a chat begun here");
+        let w = world();
+        copy(&w, &own(&w), &forked);
+        crate::bridge::registry::write(&w.paths, &SessionRow { session_id: FORK.into(), mode: "remote".into(), status: "closed".into(), access_id: Some(uuid::Uuid::now_v7().to_string()), ..SessionRow::default() }).unwrap();
+        assert_eq!(shared(&w), (None, None), "a fork with a row of its own: its mark decides");
+        let w = world();
+        copy(&w, &own(&w), &forked);
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let m = crate::bridge::s3::manifest::Manifest::new(FORK, &target, crate::bridge::s3::manifest::ORIGIN_MAC, &format!("{}/{FORK}.jsonl", own(&w)), "2026-11-09T10:00:00.000Z");
+        crate::bridge::s3::manifest::write(&w.paths, &m).unwrap();
+        assert_eq!(shared(&w).1, None, "a chat S3 holds (a manifest): no fork of P0's to judge");
+    }
+
+    /// R-154: `AI_ENV_BRIDGE_VM` pinning a VM of the other kind is refused before any Touch ID (exit 9) naming
+    /// the pin: another chat's own VM for any chat, a shared VM for a chat that runs alone; a chat's own VM is taken.
+    #[test]
+    fn p0_refuses_a_pinned_vm_placed_for_another_chat_or_shared_with_one_that_runs_alone() {
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012c3";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012c4";
+        let mut w = World::new("");
+        let caps = || Some(vec![CAP_WORKSPACE_V1.to_string(), crate::wire::frame::CAP_TRANSCRIPT_S3_V1.to_string()]);
+        w.vm_row("microvm-sole00001", |r| {
+            r.caps = caps();
+            r.sole = Some(CHAT.into());
+        });
+        w.vm_row("microvm-shared001", |r| r.caps = caps());
+        let pinned = |w: &World, args: &[&str], id: &str| precheck_with(&w.session(args), &w.env(&[(PIN_KNOB, id)]), &a_git_repo).map(|p| p.run.choice);
+        let refused = |r: Result<Choice, Failure>, why: &str| {
+            let f = r.unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("refused", 9), "{}", f.line());
+            assert!(f.line().starts_with("refused before any Touch ID: the pinned VM microvm-") && f.line().ends_with(&format!("{why}; unset {PIN_KNOB}")), "{}", f.line());
+        };
+        assert_eq!(pinned(&w, &ARGS, "microvm-shared001").unwrap(), Choice::Pin("microvm-shared001".into()), "a chat that shares: a shared VM");
+        refused(pinned(&w, &ARGS, "microvm-sole00001"), "it runs one chat alone (sole_vm)");
+        sole_vm(&mut w);
+        refused(pinned(&w, &ARGS, "microvm-shared001"), "it is shared, and this chat runs alone (sole_vm)");
+        refused(pinned(&w, &ARGS, "microvm-sole00001"), "it runs one chat alone (sole_vm)");
+        let row = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some(CHAT.into()), ..Default::default() };
+        crate::bridge::registry::write(&w.paths, &row).unwrap();
+        let resume: Vec<&str> = ARGS.iter().copied().chain(["--resume", SID]).collect();
+        assert_eq!(pinned(&w, &resume, "microvm-sole00001").unwrap(), Choice::Pin("microvm-sole00001".into()), "the chat's own VM");
+        assert!(crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists(), "no audit row, no Touch ID");
     }
 
     /// S9 (review CUT-2): P0 builds the session's transcript sync, before any
@@ -6094,6 +6414,10 @@ mod tests {
         assert_eq!((sync.target.bucket.as_str(), sync.target.owner.as_str()), ("ai-env-transcripts-123456789012", "123456789012"));
         assert_eq!((sync.mac_projects, sync.view_messages), (w.root.join(".claude").join("projects"), crate::wire::view::VIEW_MESSAGES_DEFAULT));
         drop(plan);
+        // A chat this Mac holds a copy of (the fork gap: one it has nothing of is refused, after the sync was built).
+        let dir = w.root.join(".claude").join("projects").join(crate::wire::slug::project_dir_name(&w.work).unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{sid}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
         let plan = precheck_with(&w.session(&quiet_resume), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
         assert!(plan.transcript_sync.is_some() && session_sync(&plan).is_none(), "the restore's sync, none after each turn");
         drop(plan);
@@ -6126,6 +6450,91 @@ mod tests {
         chat.set_len(max).unwrap();
         let plan = precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).unwrap_or_else(|f| panic!("{}", f.line()));
         assert_eq!(plan.resume.as_deref(), Some(sid), "at the cap: P3 sends it up inline");
+    }
+
+    /// The fork gap: P0 refuses a `--resume` of a chat this Mac has no
+    /// record of (no registry row, no S3 manifest) and no copy of (no
+    /// `UUID.jsonl` regular file in any project directory), before any Touch
+    /// ID: `nothing_to_resume`, exit 9, its line naming the id and saying to
+    /// start a new chat, the CLI's own miss as its raw line, nothing audited
+    /// and no unseal; so is a fork of it, a cut of it, a resume without
+    /// persistence, and a copy that is a symlink. A view-shaped copy under the
+    /// cwd's slug (Cursor's fork of a remote chat) passes and gets a fresh v7
+    /// access id, and so does a transcript under another project directory, a
+    /// manifest alone, a row of each mode alone, and a row or a manifest that
+    /// cannot be read (P3 says what it is).
+    #[test]
+    fn p0_refuses_a_resume_this_mac_has_no_record_of() {
+        use crate::bridge::registry::SessionRow;
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+        const CUT: &str = "0199a1b2-0000-7000-8000-0000000012c1";
+        let untouched = |w: &World| crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists();
+        let resume = format!("--resume={SID}");
+        let cut = format!("--resume-session-at={CUT}");
+        let argv = |extra: &[&str]| -> Vec<String> { ARGS.iter().copied().chain(extra.iter().copied()).map(str::to_string).collect() };
+        let plan = |w: &World, extra: &[&str]| {
+            let args = argv(extra);
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            precheck_with(&w.session(&refs), &w.env(&[]), &a_git_repo)
+        };
+        let projects = |w: &World| w.root.join(".claude").join("projects");
+        let own_dir = |w: &World| projects(w).join(crate::wire::slug::project_dir_name(&w.work).unwrap());
+        // Nothing anywhere: refused, whatever else the argv asks.
+        for extra in [&[resume.as_str()][..], &[resume.as_str(), "--fork-session"], &["--resume", SID, cut.as_str()], &["--no-session-persistence", "--resume", SID]] {
+            let w = World::new("");
+            let f = plan(&w, extra).map(drop).unwrap_err();
+            assert_eq!((f.word(), f.exit_code()), ("nothing_to_resume", 9), "{extra:?}: {}", f.line());
+            assert_eq!(f.line(), format!("refused before any Touch ID: no chat {SID} on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat"));
+            assert!(format!("ai-env-claude: {}", f.line()).chars().count() <= crate::bridge::remote::LINE_MAX);
+            assert_eq!(f.cli_line(), Some(format!("No conversation found with session ID: {SID}")), "the CLI's own miss");
+            assert!(untouched(&w), "{extra:?}: nothing audited, no Touch ID");
+        }
+        // A copy that is a symlink is none.
+        let w = World::new("");
+        std::fs::create_dir_all(own_dir(&w)).unwrap();
+        let real = w.root.join("elsewhere.jsonl");
+        std::fs::write(&real, "{\"type\":\"user\"}\n").unwrap();
+        std::os::unix::fs::symlink(&real, own_dir(&w).join(format!("{SID}.jsonl"))).unwrap();
+        assert_eq!(plan(&w, &[&resume]).map(drop).unwrap_err().word(), "nothing_to_resume", "a symlink");
+        // Cursor's fork of a remote chat: a view no record names, under the cwd's slug.
+        let w = World::new("");
+        std::fs::create_dir_all(own_dir(&w)).unwrap();
+        std::fs::write(own_dir(&w).join(format!("{SID}.jsonl")), format!("{}\"parentUuid\":null,\"type\":\"user\"}}\n", crate::wire::view::VIEW_MARK_PREFIX)).unwrap();
+        let p = plan(&w, &[&resume]).unwrap_or_else(|f| panic!("a fork's view: {}", f.line()));
+        assert_eq!(p.resume.as_deref(), Some(SID));
+        let access = p.access_id.clone().expect("a chat's access id");
+        assert_eq!(uuid::Uuid::parse_str(&access).map(|u| u.get_version_num()).ok(), Some(7), "a fresh v7 access id: {access}");
+        drop(p);
+        assert!(untouched(&w), "nothing audited, no Touch ID");
+        // A transcript under another project directory.
+        let w = World::new("");
+        let other = projects(&w).join("-Users-someone-elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(format!("{SID}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
+        plan(&w, &[&resume]).map(drop).unwrap_or_else(|f| panic!("another project's copy: {}", f.line()));
+        // A manifest alone: S3 holds the chat.
+        let w = World::new("");
+        let target = crate::bridge::s3::S3Target { bucket: crate::bridge::s3::LAB_BUCKET.into(), owner: crate::bridge::s3::LAB_OWNER.into(), endpoint: crate::bridge::s3::S3Endpoint::Aws };
+        let m = crate::bridge::s3::manifest::Manifest::new(SID, &target, crate::bridge::s3::manifest::ORIGIN_VM, &format!("-w/{SID}.jsonl"), "2026-11-09T10:00:00.000Z");
+        crate::bridge::s3::manifest::write(&w.paths, &m).unwrap();
+        plan(&w, &[&resume]).map(drop).unwrap_or_else(|f| panic!("a manifest: {}", f.line()));
+        // A row alone, of each mode: P3 (or the VM's claude) decides.
+        for (mode, home) in [("remote", Some(crate::bridge::s3::manifest::HOME_S3)), ("remote", None), ("local-child", None)] {
+            let w = World::new("");
+            crate::bridge::registry::write(&w.paths, &SessionRow { session_id: SID.into(), mode: mode.into(), transcript_home: home.map(str::to_string), ..SessionRow::default() }).unwrap();
+            plan(&w, &[&resume]).map(drop).unwrap_or_else(|f| panic!("a row ({mode}, {home:?}): {}", f.line()));
+        }
+        // A row or a manifest that cannot be read is a record.
+        let w = World::new("");
+        std::fs::create_dir_all(w.paths.sessions()).unwrap();
+        std::fs::write(w.paths.sessions().join(format!("{SID}.toml")), "this is [not toml\n").unwrap();
+        assert!(crate::bridge::registry::read(&w.paths, SID).is_err());
+        plan(&w, &[&resume]).map(drop).unwrap_or_else(|f| panic!("an unreadable row: {}", f.line()));
+        let w = World::new("");
+        std::fs::create_dir_all(w.paths.transcript_manifest(SID).parent().unwrap()).unwrap();
+        std::fs::write(w.paths.transcript_manifest(SID), "this is [not toml\n").unwrap();
+        assert!(crate::bridge::s3::manifest::read(&w.paths, SID).is_err());
+        plan(&w, &[&resume]).map(drop).unwrap_or_else(|f| panic!("an unreadable manifest: {}", f.line()));
     }
 
     /// A manifest of `sid` under `w`'s bridge (a chat begun on a VM): S3
@@ -6209,6 +6618,29 @@ mod tests {
         manifest_in_s3(&off, sid, &[max - 10, 10]);
         check(&[]).unwrap_or_else(|f| panic!("at the cap, reuse off: {}", f.line()));
         assert!(untouched(&off), "nothing audited, no Touch ID");
+    }
+
+    /// R-154: P0's pull cap counts only a VM P2 could give the chat: for a chat that runs alone (its workspace
+    /// `sole_vm`), its own VM; a shared VM of the workspace, or another chat's own, holds it for no start. Over what a
+    /// reopen pulls inline with none of its own, the chat is refused before any Touch ID; its own, alive, leaves it to P3.
+    #[test]
+    fn p0s_pull_cap_counts_only_the_chats_own_vm_for_a_chat_that_runs_alone() {
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012c5";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012c6";
+        let mut w = World::new("");
+        sole_vm(&mut w);
+        let row = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some(CHAT.into()), ..Default::default() };
+        crate::bridge::registry::write(&w.paths, &row).unwrap();
+        manifest_in_s3(&w, SID, &[70 << 20]);
+        let args: Vec<&str> = ARGS.iter().copied().chain(["--resume", SID]).collect();
+        let check = || precheck_with(&w.session(&args), &w.env(&[]), &a_git_repo).map(drop);
+        w.vm_row("microvm-shared001", |_| {});
+        w.vm_row("microvm-others001", |r| r.sole = Some("0199a1b2-0000-7000-8000-0000000012c7".into()));
+        let f = check().unwrap_err();
+        assert_eq!((f.word(), f.exit_code()), ("transcript_pull_too_large", 9), "no VM of its own: {}", f.line());
+        w.vm_row("microvm-itsown001", |r| r.sole = Some(CHAT.into()));
+        check().unwrap_or_else(|f| panic!("its own VM may hold it: {}", f.line()));
+        assert!(crate::bridge::audit::read_rows(&w.paths.audit(), None).unwrap().is_empty() && !w.paths.unseal_lock().exists(), "no audit row, no Touch ID");
     }
 
     /// P0's order where it decides an outcome (the docs fixer's reading of

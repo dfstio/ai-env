@@ -1457,7 +1457,8 @@ fn audit_stage(paths: &Paths, r: &StageReport, t0: std::time::Instant) {
 /// (without `--warm`), or an S8 mirror (`session migrate-s9` takes it), one
 /// whose cwd is unknown, gone or an unsupported repository, an original
 /// that is not the copy S3 holds; 2 usage; 5 no runtime key; 7 S3; the
-/// warm's own.
+/// warm's own. R-154: `--warm` of a chat with no access id yet, in a
+/// `sole_vm` workspace, is 9 before anything ([`refuse_warm_without_access`]).
 pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate::errors::Result<()> {
     use crate::bridge::vm::cmd::{backend, runtime, Backend, Ctx};
     use std::os::fd::AsFd as _;
@@ -1470,6 +1471,9 @@ pub fn cmd_stage(store: &Keystore, uuid: &str, warm: bool, json: bool) -> crate:
     }
     let projects = crate::bridge::mirror::mac_config_dir().map(|d| d.join("projects")).ok_or_else(|| CliError::Msg("neither CLAUDE_CONFIG_DIR nor HOME is set: no projects directory to stage from".into()))?;
     let workspace = if warm { Some(warm_workspace(&ctx.paths, &ctx.cfg, &projects, uuid)?) } else { None };
+    if let Some(workspace) = &workspace {
+        refuse_warm_without_access(&ctx.paths, &ctx.cfg, uuid, workspace)?;
+    }
     let target = S3Target::resolve(&ctx.paths, &ctx.knobs)?;
     // A chat begun on a VM is in S3 already: `--warm` restores it, with nothing to stage.
     let report = if warm && manifest::origin_of(&ctx.paths, uuid) == Some(manifest::ORIGIN_VM) {
@@ -1504,6 +1508,23 @@ pub fn refuse_warm_without_reuse(cfg: &BridgeConfig, uuid: &str) -> crate::error
     )))
 }
 
+/// R-154: `session stage --warm` warms the VM the chat's reopen takes (`vm::cmd::warm_sole`). In a workspace whose chats
+/// run alone (its folder `workspace`, as [`warm_workspace`] resolved it, in a `[[workspace]]` with `sole_vm`), that is a
+/// VM placed for the chat's access id, which a chat that never ran remote (no row, or a row with none) gets only at its
+/// first remote start, and that start then places a VM of its own: a warm now would start one no chat takes, which
+/// counts toward `[vm].max_concurrent` until it idles out. Refused then (`Policy`, exit 9), before anything is staged or
+/// asked, saying to reopen the chat.
+pub fn refuse_warm_without_access(paths: &Paths, cfg: &BridgeConfig, uuid: &str, workspace: &std::path::Path) -> crate::errors::Result<()> {
+    let access = crate::bridge::registry::read(paths, uuid).ok().flatten().and_then(|r| r.access().map(str::to_string));
+    if access.is_some() || !crate::bridge::workspace::sole_vm_at(cfg, workspace) {
+        return Ok(());
+    }
+    Err(CliError::Policy(format!(
+        "session stage --warm: session {uuid} has no access id yet, and its folder {} is in a [[workspace]] with sole_vm = true, so its first remote start places a VM of its own for the id it gets then, never one --warm warms: reopen the chat instead (nothing was staged or warmed)",
+        workspace.display()
+    )))
+}
+
 /// The presigner a command unsealed: the runtime key, or the fake API's lab key.
 pub enum Signer {
     Sdk(std::sync::Arc<crate::bridge::vm::client::SdkMicrovmApi>),
@@ -1522,6 +1543,35 @@ impl S3Sign for Signer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-154: `session stage --warm` of a chat with no access id yet (no row, or a row with none), in a `sole_vm` workspace
+    /// (its folder or one below it), is refused (exit 9) naming why and to reopen the chat; a chat with an access id, and
+    /// any chat elsewhere, passes.
+    #[test]
+    fn a_warm_for_a_chat_with_no_access_id_in_a_sole_vm_workspace_is_refused() {
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012ad";
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::from_root_and_env(d.path().join("bridge"), None);
+        let ws = std::fs::canonicalize(d.path()).unwrap().join("ws");
+        let below = ws.join("sub");
+        std::fs::create_dir_all(&below).unwrap();
+        let mut cfg = BridgeConfig::default();
+        assert!(refuse_warm_without_access(&paths, &cfg, SID, &ws).is_ok(), "no sole_vm workspace");
+        cfg.workspace_overrides.push(crate::bridge::config::WorkspaceCfg { path: ws.clone(), sole_vm: true, ..Default::default() });
+        for (folder, row) in [(&ws, None), (&below, Some(None)), (&ws, Some(None))] {
+            if let Some(access) = row {
+                crate::bridge::registry::write(&paths, &crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "local-child".into(), access_id: access, ..Default::default() }).unwrap();
+            }
+            let e = refuse_warm_without_access(&paths, &cfg, SID, folder).unwrap_err();
+            assert_eq!(e.exit_code(), 9, "{e}");
+            assert_eq!(
+                e.to_string(),
+                format!("session stage --warm: session {SID} has no access id yet, and its folder {} is in a [[workspace]] with sole_vm = true, so its first remote start places a VM of its own for the id it gets then, never one --warm warms: reopen the chat instead (nothing was staged or warmed)", folder.display())
+            );
+        }
+        crate::bridge::registry::write(&paths, &crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some("0199a1b2-0000-7000-8000-0000000012ae".into()), ..Default::default() }).unwrap();
+        assert!(refuse_warm_without_access(&paths, &cfg, SID, &ws).is_ok(), "an access id: its warm warms its own VM");
+    }
 
     /// plans/s9-contracts.md §5.8's sample stage file reads and writes back.
     #[test]

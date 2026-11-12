@@ -345,7 +345,7 @@ async fn reqwest_client_refuses_plaintext_before_connecting() {
 /// `bridge::logging` holds `aws_config` to ERROR, so no such event arrives (the
 /// scrubber's AKIA rule is a second layer). Offline: in-memory profile files, static keys.
 #[tokio::test]
-#[allow(deprecated)] // aws-config 1.12 re-exports ProfileFiles under deprecated aliases (plan D21)
+#[allow(deprecated)] // aws-config 1.13 re-exports ProfileFiles under deprecated aliases (plan D21)
 async fn profile_mode_never_logs_the_access_key_id() {
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     use aws_config::profile::ProfileFileCredentialsProvider;

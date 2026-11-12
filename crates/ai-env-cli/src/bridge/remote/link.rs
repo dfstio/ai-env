@@ -304,6 +304,7 @@ impl RemoteLinks {
             shared.snap.pinned = plan.pinned().map(str::to_string);
             shared.snap.access_id.clone_from(&plan.access_id);
             shared.snap.access_foreign.clone_from(&plan.access_foreign);
+            shared.snap.sole_inherited.clone_from(&plan.sole_inherited);
         }
         plan.set_quiet(links.quiet.subscribe());
         links.view = plan.view_sync();
@@ -2279,6 +2280,9 @@ pub struct RemoteSnapshot {
     pub access_id: Option<String>,
     /// R-148: the session whose row never takes it (`SessionPlan.access_foreign`). No census part.
     pub access_foreign: Option<String>,
+    /// R-154: the sole mark a Cursor fork made in the folder of a chat marked sole inherits (`SessionPlan.sole_inherited`),
+    /// set once by [`RemoteLinks::new`]: every row of this session carries it from the first. No census part.
+    pub sole_inherited: Option<String>,
     /// R-148: the word of the latest generation's session token (`PipelineEnd.relay`), for the row. No census part.
     pub relay: Option<&'static str>,
 }

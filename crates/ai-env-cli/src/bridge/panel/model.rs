@@ -5,19 +5,23 @@
 //! never writes: the settings page never writes `diff.json`, the VMs page
 //! makes no AWS call. What a chat's relay access shows comes from
 //! `[relay].offer`, `state/relay-access.json` and the agent's socket alone (R-151,
-//! R-152): no AWS call, no Touch ID, and the relay remains the gate.
+//! R-152): no AWS call, no Touch ID, and the relay remains the gate. A
+//! `[relay].restricted` grant is offered only to a chat of a `sole_vm`
+//! workspace, by its recorded folder (R-156).
 use super::actions::{relay_target, Action, NO_TARGET};
 use crate::bridge::audit::read::{self, Filter, Read};
 use crate::bridge::config::{BridgeConfig, Paths};
 use crate::bridge::cost::Estimate;
 use crate::bridge::registry::{self, ListExtra, SessionRow, SessionView};
-use crate::bridge::relay::params::{access_day, read_access_cache, AccessCache, ACCESS_DAYS_DEFAULT};
+use crate::bridge::relay::params::{access_day, on_own_vm, read_access_cache, restricted_in, AccessCache, ACCESS_DAYS_DEFAULT, RESTRICTED_DAYS_DEFAULT};
 use crate::bridge::settings_capture::{self, SettingsDiff};
 use crate::bridge::vm::ops::{self, Survey};
 use crate::bridge::vm::registry as vm_registry;
 use crate::cli::AuditFilterArgs;
 use crate::errors::CliError;
 use serde::Serialize;
+use std::collections::BTreeSet;
+use std::path::Path;
 
 /// Why a page has no model.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +46,11 @@ impl PageErr {
 pub struct AccessPanel {
     /// `[relay].offer`: a row per grant, in its order.
     pub offer: Vec<String>,
+    /// R-156: `[relay].restricted`, the offered grants a chat reaches only on a VM placed for it alone.
+    pub restricted: Vec<String>,
+    /// R-156: the page's sessions whose recorded folder is in a `[[workspace]]` with `sole_vm`, the only chats a restricted
+    /// grant is offered to (read only while `restricted` names one).
+    pub alone: BTreeSet<String>,
     /// Why `offer` is empty when `[relay]` does not validate (the first line of its error).
     pub problem: Option<String>,
     /// The list as a command last read it; `None`: none has yet.
@@ -53,14 +62,16 @@ pub struct AccessPanel {
 }
 
 impl AccessPanel {
-    /// From disk and the agent's socket, each at most a second; a `bridge.toml` that does not load offers nothing.
+    /// From disk and the agent's socket, each at most a second, for `rows`, the sessions the page shows; a `bridge.toml`
+    /// that does not load offers nothing.
     #[must_use]
-    pub fn read(paths: &Paths, now: u64) -> AccessPanel {
-        let relay = BridgeConfig::load(paths).ok().flatten().unwrap_or_default().relay;
-        let problem = relay.validate().err().map(|e| e.to_string().lines().next().unwrap_or_default().to_string());
-        let offer = if problem.is_some() { Vec::new() } else { relay.offer };
+    pub fn read(paths: &Paths, now: u64, rows: &[SessionRow]) -> AccessPanel {
+        let cfg = BridgeConfig::load(paths).ok().flatten().unwrap_or_default();
+        let problem = cfg.validate_relay().err().map(|e| e.to_string().lines().next().unwrap_or_default().to_string());
+        let (offer, restricted) = if problem.is_some() { (Vec::new(), Vec::new()) } else { (cfg.relay.offer.clone(), cfg.relay.restricted.clone()) };
+        let alone = if restricted.is_empty() { BTreeSet::new() } else { rows.iter().filter(|r| r.mode == "remote" && runs_alone(&cfg, r)).map(|r| r.session_id.clone()).collect() };
         let agent = crate::bridge::relay::ops::agent_status(paths).map(|s| (s.pid, s.until));
-        AccessPanel { offer, problem, cache: read_access_cache(paths), agent, now }
+        AccessPanel { offer, restricted, alone, problem, cache: read_access_cache(paths), agent, now }
     }
 
     /// The grants `chat` holds in force as the cache has it, and the entry's end.
@@ -69,6 +80,12 @@ impl AccessPanel {
         let entries = self.cache.as_ref().map_or(&[][..], |c| c.entries.as_slice());
         entries.iter().find(|a| a.chat == chat && self.now <= a.not_after_unix()).map(|a| (a.grants.as_slice(), a.not_after.as_str()))
     }
+}
+
+/// R-156: whether `row`'s recorded folder is in a `[[workspace]]` with `sole_vm` (`workspace::sole_vm_at`), as `relay access
+/// --allow` of a restricted grant asks.
+fn runs_alone(cfg: &BridgeConfig, row: &SessionRow) -> bool {
+    row.cwd.as_deref().is_some_and(|cwd| crate::bridge::workspace::sole_vm_at(cfg, Path::new(cwd)))
 }
 
 /// `/`: `session list`'s rows, newest first, and their S11 cells.
@@ -102,7 +119,8 @@ pub fn sessions(paths: &Paths, now: u64, q: Option<&str>) -> Result<Sessions, Pa
         rows.retain(|r| crate::bridge::title::matches(r, &needle, true));
     }
     let extras = registry::list_extras(paths, &rows, now).map_err(PageErr::failed)?;
-    Ok(Sessions { rows, extras, q: q.filter(|q| !q.is_empty()).map(str::to_string), total, access: AccessPanel::read(paths, now) })
+    let access = AccessPanel::read(paths, now, &rows);
+    Ok(Sessions { rows, extras, q: q.filter(|q| !q.is_empty()).map(str::to_string), total, access })
 }
 
 /// `/session/<sid>`'s model: its document is exactly `session show <sid> --json`'s view.
@@ -121,7 +139,8 @@ pub fn session(paths: &Paths, sid: &str, now: u64) -> Result<SessionPage, PageEr
         return Err(PageErr::Bad("bad request: not a session id"));
     }
     let view = registry::session_view(paths, sid, now).map_err(PageErr::failed)?.ok_or(PageErr::NotFound("not found: no such session row"))?;
-    Ok(SessionPage { view, access: AccessPanel::read(paths, now) })
+    let access = AccessPanel::read(paths, now, std::slice::from_ref(&view.row));
+    Ok(SessionPage { view, access })
 }
 
 /// `/vms`: the registry alone (`vm::ops::offline`, no AWS call); its document is `ops::survey_json`'s.
@@ -242,17 +261,44 @@ fn token_note(row: &SessionRow) -> String {
     }
 }
 
-/// What an allow does to the rest of a chat's entry, as the cache has it (R-150): an entry has one end for all its grants, so
-/// a day that ends later stretches what it holds, and one that ends earlier gives way to the entry's. Nothing with no entry in force.
-fn entry_note(paths: &Paths, chat: &str, now: u64) -> String {
+/// What an allow of `grant` until `day` does to the rest of a chat's entry, as the cache has it (R-150): an entry has one end for
+/// all its grants, so a day that ends later stretches what it holds, and one that ends earlier gives way to the entry's. R-156:
+/// an approval of a `restricted` grant sets the end, earlier or later, and no other moves the end of an entry holding one.
+/// Nothing with no entry in force.
+fn entry_note(paths: &Paths, chat: &str, now: u64, restricted: &[String], grant: &str, day: &str) -> String {
     let panel = AccessPanel { cache: read_access_cache(paths), now, ..AccessPanel::default() };
-    panel.held(chat).map_or_else(String::new, |(grants, end)| format!(" Its entry ends {} and holds {}: one end covers all its grants, the later of the two.", end.get(..10).unwrap_or(end), grants.join(",")))
+    let Some((grants, end)) = panel.held(chat) else {
+        return String::new();
+    };
+    let kept = restricted_in(grants, restricted);
+    let rule = if restricted.iter().any(|r| r == grant) {
+        format!("and this approval of a restricted grant sets it to {day}, earlier or later")
+    } else if !kept.is_empty() {
+        format!("and only an approval of its restricted grant {} moves it", kept.join(","))
+    } else {
+        "the later of the two".to_string()
+    };
+    format!(" Its entry ends {} and holds {}: one end covers all its grants, {rule}.", end.get(..10).unwrap_or(end), grants.join(","))
+}
+
+/// What the confirm page of a restricted grant's approval adds (R-156): the signer that carries it, that the chat runs alone
+/// from then on, and, when its VM was not placed for it alone, that it reaches the grant from its next start.
+fn sole_note(paths: &Paths, cfg: &BridgeConfig, row: &SessionRow, grant: &str) -> String {
+    let mut note = format!(
+        " {grant} is restricted: the relay agent signs the chat's tokens that reach it as {}, only on a VM placed for this chat alone, and from then on the chat runs alone wherever it reopens.",
+        cfg.relay.sole_id()
+    );
+    if on_own_vm(paths, row) == Some(false) {
+        note.push_str(&format!(" Its VM {} was not placed for it alone, so it reaches {grant} from its next start: reopen the chat.", row.microvm_id.as_deref().unwrap_or("-")));
+    }
+    note
 }
 
 /// `relay-allow`'s or `relay-remove`'s page: what will happen, and the other chats on its VM (R-151). A title is the
 /// chat's own, so the session id always sits beside it. 400 a bad target, an allow or a chat with no access id on this Mac, a
-/// chat with no access id, a grant `[relay].offer` does not name for an allow; 404 no row. A row now on this Mac that holds an
-/// id can still be taken out of the list: a later remote `--resume` takes that id.
+/// chat with no access id, a grant `[relay].offer` does not name for an allow, a restricted one for a chat outside a `sole_vm`
+/// workspace (R-156); 404 no row. A row now on this Mac that holds an id can still be taken out of the list: a later remote
+/// `--resume` takes that id.
 fn relay_confirm(paths: &Paths, action: Action, target: &str) -> Result<(String, Vec<String>), PageErr> {
     let bad = || PageErr::Bad("bad request: the target is no <session>_<grant>");
     let (sid, grant) = relay_target(target).ok_or_else(bad)?;
@@ -268,18 +314,27 @@ fn relay_confirm(paths: &Paths, action: Action, target: &str) -> Result<(String,
     };
     let named = crate::bridge::title::of_row(&row).map_or_else(String::new, |t| format!(" (\"{}\")", crate::bridge::title::inert(&t.text)));
     let what = if action == Action::RelayAllow {
-        let relay = BridgeConfig::load(paths).map_err(PageErr::failed)?.unwrap_or_default().relay;
-        relay.validate().map_err(PageErr::failed)?;
-        if !relay.offer.iter().any(|g| g == grant) {
+        let cfg = BridgeConfig::load(paths).map_err(PageErr::failed)?.unwrap_or_default();
+        cfg.validate_relay().map_err(PageErr::failed)?;
+        if !cfg.relay.offer.iter().any(|g| g == grant) {
             return Err(PageErr::Bad("bad request: [relay].offer does not name this grant"));
+        }
+        // R-156: a restricted grant to a chat of a sole_vm workspace alone, for 7 days by default, as its CLI twin.
+        let restricted = cfg.relay.is_restricted(grant);
+        if restricted && !runs_alone(&cfg, &row) {
+            return Err(PageErr::Bad("bad request: a restricted grant goes only to a chat of a [[workspace]] with sole_vm = true"));
         }
         // The clock the child's write will read, never the lab's.
         let now = crate::wire::time::unix_now();
+        let day = access_day(now, if restricted { RESTRICTED_DAYS_DEFAULT } else { ACCESS_DAYS_DEFAULT });
+        let sole = if restricted { sole_note(paths, &cfg, &row, grant) } else { String::new() };
+        // A chat that must reopen hears that alone: its next start makes a token too, and no "no restart" stands beside it.
+        let reopen = restricted && on_own_vm(paths, &row) == Some(false);
+        let token = if reopen { String::new() } else { token_note(&row) };
+        let restart = if reopen { "" } else { " and no restart" };
         format!(
-            "Allow session {sid}{named} grant {grant} until {}: chat {access} joins /ai-env/relay/access, and the relay applies it within about 70 s, with no change in the chat or its VM and no restart.{}{}",
-            access_day(now, ACCESS_DAYS_DEFAULT),
-            entry_note(paths, access, now),
-            token_note(&row)
+            "Allow session {sid}{named} grant {grant} until {day}: chat {access} joins /ai-env/relay/access, and the relay applies it within about 70 s, with no change in the chat or its VM{restart}.{}{sole}{token}",
+            entry_note(paths, access, now, &cfg.relay.restricted, grant, &day)
         )
     } else {
         format!("Take grant {grant} from session {sid}{named}: chat {access} leaves it in /ai-env/relay/access, and the relay refuses it within about 70 s; calls in flight finish.")

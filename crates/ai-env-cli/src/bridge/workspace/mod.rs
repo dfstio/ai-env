@@ -350,6 +350,35 @@ pub fn workspace_cfg<'a>(cfg: &'a BridgeConfig, ws: &WorkspaceRef) -> Option<&'a
     workspace_cfg_at(cfg, &ws.cwd, &ws.root)
 }
 
+/// R-154: the access id a chat of `ws` runs alone with (`RunPlan.sole`): `access` when its `[[workspace]]` table
+/// ([`workspace_cfg`]) says `sole_vm`; none elsewhere, and none without an access id (a `--no-session-persistence`
+/// spawn, which no approval names).
+#[must_use]
+pub fn sole_of(cfg: &BridgeConfig, ws: &WorkspaceRef, access: Option<&str>) -> Option<String> {
+    workspace_cfg(cfg, ws).filter(|w| w.sole_vm).and(access).map(str::to_string)
+}
+
+/// R-154: whether the `[[workspace]]` table that holds `cwd` (the deepest, as [`workspace_cfg`] finds it) says
+/// `sole_vm`, where no workspace was resolved (the prewarm; a chat's recorded cwd): `cwd` canonicalised when it
+/// resolves, as the tables' paths are.
+#[must_use]
+pub fn sole_vm_at(cfg: &BridgeConfig, cwd: &Path) -> bool {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    workspace_cfg_at(cfg, &cwd, &cwd).is_some_and(|w| w.sole_vm)
+}
+
+/// R-154, sticky per chat: the access id the VM of a chat of `ws` is placed for alone (`RunPlan.sole`). A chat whose
+/// session row is marked (`SessionRow::sole_since`, from its first restricted approval) runs alone wherever it is:
+/// with `access`, its spawn's id (a fork's own), else the row's, else a fresh one; any other as [`sole_of`] says.
+/// P0 refuses such a chat outside a `sole_vm` workspace before this; the offline move and `vm warm` place it alone.
+#[must_use]
+pub fn chat_sole(cfg: &BridgeConfig, ws: &WorkspaceRef, access: Option<&str>, row: Option<&crate::bridge::registry::SessionRow>) -> Option<String> {
+    match row.filter(|r| r.is_sole()) {
+        Some(r) => Some(access.or_else(|| r.access()).map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_string)),
+        None => sole_of(cfg, ws, access),
+    }
+}
+
 fn workspace_cfg_at<'a>(cfg: &'a BridgeConfig, cwd: &Path, root: &Path) -> Option<&'a WorkspaceCfg> {
     let deepest = |p: &Path| {
         cfg.workspace_overrides
@@ -1394,6 +1423,42 @@ mod tests {
             head: Head::Detached { sha: "a".repeat(40) },
             seed_branch: None,
         }
+    }
+
+    /// R-154: a chat runs alone, by its access id, in a `sole_vm` workspace (the deepest `[[workspace]]` holding its
+    /// cwd decides) and nowhere else, never without an id; a chat whose row is marked sole runs alone wherever it is,
+    /// by its spawn's id, else the row's, else a fresh one; an unmarked row changes nothing.
+    #[test]
+    fn a_chat_runs_alone_in_a_sole_vm_workspace_or_once_marked_sole() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a4";
+        const FORK: &str = "0199a1b2-0000-7000-8000-0000000012a5";
+        let d = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(d.path()).unwrap();
+        let (sole, inner, plain) = (top.join("sole"), top.join("sole").join("inner"), top.join("plain"));
+        for dir in [&inner, &plain] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let cfg = BridgeConfig::parse(&format!("[[workspace]]\npath = {sole:?}\nsole_vm = true\n\n[[workspace]]\npath = {inner:?}\n\n[[workspace]]\npath = {plain:?}\n")).unwrap();
+        let ws = |p: &Path| ws_at(&p.display().to_string());
+        assert_eq!(sole_of(&cfg, &ws(&sole), Some(CHAT)).as_deref(), Some(CHAT));
+        assert_eq!(sole_of(&cfg, &ws(&sole.join("src")), Some(CHAT)).as_deref(), Some(CHAT), "below it");
+        assert_eq!(sole_of(&cfg, &ws(&sole), None), None, "no access id: no approval names it");
+        for p in [&inner, &plain, &top] {
+            assert_eq!(sole_of(&cfg, &ws(p), Some(CHAT)), None, "{}", p.display());
+        }
+        assert!(sole_vm_at(&cfg, &sole) && sole_vm_at(&cfg, &sole.join("src")) && !sole_vm_at(&cfg, &inner) && !sole_vm_at(&cfg, &plain) && !sole_vm_at(&cfg, &top));
+        std::os::unix::fs::symlink(&sole, top.join("link")).unwrap();
+        assert!(sole_vm_at(&cfg, &top.join("link")) && sole_vm_at(&cfg, &inner.join("..")), "a recorded cwd as it resolves");
+        let row = |marked: bool| crate::bridge::registry::SessionRow { access_id: Some(CHAT.into()), sole_since: marked.then(|| "2026-11-09T10:00:00Z".to_string()), ..Default::default() };
+        let (marked, unmarked) = (row(true), row(false));
+        assert_eq!(chat_sole(&cfg, &ws(&plain), Some(CHAT), Some(&marked)).as_deref(), Some(CHAT), "marked: alone wherever it is");
+        assert_eq!(chat_sole(&cfg, &ws(&plain), Some(FORK), Some(&marked)).as_deref(), Some(FORK), "a fork by its own id");
+        assert_eq!(chat_sole(&cfg, &ws(&plain), None, Some(&marked)).as_deref(), Some(CHAT), "a quiet spawn by the row's");
+        let lost = crate::bridge::registry::SessionRow { access_id: None, ..marked.clone() };
+        assert!(chat_sole(&cfg, &ws(&plain), None, Some(&lost)).is_some_and(|id| id != CHAT && ai_env_worker::globs::valid_uuid(&id)), "no id at all: a fresh one");
+        assert_eq!(chat_sole(&cfg, &ws(&plain), Some(CHAT), Some(&unmarked)), None, "unmarked: as the workspace says");
+        assert_eq!(chat_sole(&cfg, &ws(&sole), Some(CHAT), Some(&unmarked)).as_deref(), Some(CHAT));
+        assert_eq!(chat_sole(&cfg, &ws(&sole), Some(CHAT), None).as_deref(), Some(CHAT));
     }
 
     /// A VM without `workspace_v1` is sent no seed, and one without

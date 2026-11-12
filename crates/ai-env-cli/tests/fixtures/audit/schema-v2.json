@@ -1644,7 +1644,8 @@
       "effects": [],
       "name": "relay_keygen",
       "optional": [
-        "replaced"
+        "replaced",
+        "sole_fp"
       ],
       "required": [
         "worker_id",

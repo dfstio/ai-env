@@ -4093,6 +4093,87 @@ fn vm_warm_refuses_a_seed_finding_before_any_touch_id_or_vm() {
     assert!(line.contains("seed it"), "vm --help's warm line names the seed: {line}");
 }
 
+/// R-154: in a `sole_vm` workspace each chat runs on a VM placed for it alone, so `vm warm` with no chat there (by hand,
+/// `--prewarm`, and both dry runs) is refused before any Touch ID or AWS call (exit 9), naming `session stage UUID --warm`,
+/// which warms a chat's own; no VM is started. With `sole_vm` out of bridge.toml the dry run plans the warm again.
+#[test]
+fn vm_warm_refuses_a_sole_vm_workspace_whose_chats_never_take_its_vm() {
+    let mut p = Harness::prepare();
+    let rig = p.rig();
+    let work = rig.work().display().to_string();
+    add_config(rig, &format!("[[workspace]]\npath = {work:?}\nsole_vm = true\n"));
+    let cases: [&[&str]; 4] = [&["vm", "warm", work.as_str()], &["vm", "warm", work.as_str(), "--prewarm"], &["vm", "warm", work.as_str(), "--dry-run"], &["vm", "warm", work.as_str(), "--dry-run", "--json"]];
+    for args in cases {
+        let (decrypts, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let o = rig.run(args, None);
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert_eq!(o.status.code(), Some(9), "{args:?}: {out}{err}");
+        let line = format!("vm warm: {work} is in a [[workspace]] with sole_vm = true, where each chat runs on a VM placed for it alone: a VM warmed with no chat is one none of them takes, though it counts toward [vm].max_concurrent; ai-env session stage UUID --warm warms a chat's own (nothing was started)");
+        assert!(err.contains(&line), "{args:?}: {err}");
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (decrypts, calls), "{args:?}: no Touch ID, no AWS call");
+    }
+    assert!(audit_rows(rig, "vm_run").is_empty(), "no VM was started");
+    rig.config(|doc| {
+        doc.remove("workspace");
+    });
+    let o = rig.run(&["vm", "warm", &work, "--dry-run"], None);
+    assert_eq!(o.status.code(), Some(0), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+}
+
+/// R-154: `vm warm`'s guard refuses only a warm with no chat. In a `sole_vm` workspace, `session stage UUID --warm` of a
+/// chat that has an access id (its row's: a chat begun on a VM, which S3 holds) is a warm with that chat: it passes the
+/// guard and warms the VM the chat's reopen takes, one placed for it alone (the VM row's `sole` is the chat's access
+/// id), with the chat restored into it.
+#[test]
+fn session_stage_warm_in_a_sole_vm_workspace_warms_a_vm_for_the_chat_alone() {
+    use ai_env_cli::bridge::registry::{self, SessionRow, REGISTRY_SCHEMA_V};
+    use ai_env_cli::bridge::s3::manifest::{self, Manifest, ManifestPart, ORIGIN_VM};
+    use ai_env_cli::wire::s3::S3Key;
+    const ACCESS: &str = "0199a1b2-0000-7000-8000-0000000012fa";
+    let mut p = Harness::prepare();
+    let sid = common::uuid(0x9161);
+    let slug = p.slug();
+    let rig = p.rig();
+    let work = rig.work().display().to_string();
+    add_config(rig, &format!("[[workspace]]\npath = {work:?}\nsole_vm = true\n"));
+    let paths = rig.paths();
+    let chat: Vec<u8> = (0..3).map(|i| format!("{}\n", serde_json::json!({"type": "user", "uuid": common::uuid(0x9170 + i), "sessionId": sid, "cwd": work, "message": {"role": "user", "content": format!("turn {i}")}}))).collect::<String>().into_bytes();
+    let base = S3Key::Base { session: sid.clone(), gen: 1 }.render();
+    let version = rig.s3().put(&base, &chat);
+    let sha256 = rig.s3().objects().into_iter().find(|o| o.key == base && o.version_id == version).expect("the base in S3").sha256;
+    let target = ai_env_cli::bridge::s3::S3Target { bucket: ai_env_cli::bridge::s3::LAB_BUCKET.into(), owner: ai_env_cli::bridge::s3::LAB_OWNER.into(), endpoint: ai_env_cli::bridge::s3::S3Endpoint::Lab(rig.s3().addr()) };
+    let mut m = Manifest::new(&sid, &target, ORIGIN_VM, &format!("{slug}/{sid}.jsonl"), "2026-10-18T09:00:00.000Z");
+    let len = chat.len() as u64;
+    m.parts.push(ManifestPart { key: base, version_id: version, from: 0, len, sha256, encoding: None, stored_len: None, stored_sha256: None });
+    (m.gen, m.committed, m.fp) = (1, len, manifest::fp_of(&chat));
+    manifest::write(&paths, &m).expect("the chat's manifest");
+    let now = registry::now_rfc3339();
+    let row = SessionRow {
+        v: REGISTRY_SCHEMA_V,
+        session_id: sid.clone(),
+        slug: Some(slug.clone()),
+        cwd: Some(work.clone()),
+        created: now.clone(),
+        last_seen: now,
+        status: "closed".into(),
+        mode: "remote".into(),
+        route: "remote".into(),
+        exit: Some(0),
+        transcript_home: Some(manifest::HOME_S3.into()),
+        access_id: Some(ACCESS.into()),
+        ..SessionRow::default()
+    };
+    registry::write(&paths, &row).expect("the chat's row");
+    let o = rig.run(&["session", "stage", &sid, "--warm", "--json"], None);
+    assert!(o.status.success(), "session stage --warm: {}", String::from_utf8_lossy(&o.stderr));
+    let doc: Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("one JSON document ({e}): {}", String::from_utf8_lossy(&o.stdout)));
+    let vm = doc["restore"]["vm"].as_str().unwrap_or_else(|| panic!("the warmed VM: {doc}")).to_string();
+    assert_eq!((doc["outcome"].as_str(), doc["restore"]["outcome"].as_str()), (Some("already"), Some("restored")), "{doc}");
+    let vm_row = ai_env_cli::bridge::vm::registry::read_row(&paths, &vm).unwrap().unwrap_or_else(|| panic!("the VM row of {vm}"));
+    assert_eq!(vm_row.sole.as_deref(), Some(ACCESS), "placed for the chat alone: {vm_row:?}");
+    assert_eq!(std::fs::read(rig.vm_projects().join(&slug).join(format!("{sid}.jsonl"))).expect("the VM's copy"), chat, "the chat restored into it");
+}
+
 /// `ai-env-claude <claude> auth status --json` in `cwd`, as Cursor runs it,
 /// in remote mode with the rig's environment (its sibling the real
 /// `ai-env` beside it).
@@ -4198,9 +4279,10 @@ fn a_credential_shaped_snapshot_ref_never_reaches_the_session_row() {
 /// the VM side's `knobs`), one turn to its code-out (the trigger runs a
 /// start capture due before the fetch it runs), then EOF: no registry row,
 /// no settings capture in quarantine (which no `session list` would show
-/// and nothing would remove), no `settings_capture` audit row.
-fn no_capture_without_persistence(args: &[&str], knobs: &[(&str, &str)]) {
-    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", args, knobs);
+/// and nothing would remove), no `settings_capture` audit row. `p` holds
+/// what the Mac holds before the start.
+fn no_capture_without_persistence(p: common::Prepared, args: &[&str], knobs: &[(&str, &str)]) {
+    let mut h = p.spawn_on(common::Link::Remote, "", args, knobs);
     let init = h.send_initialize();
     h.expect_out(|v| is_response_to(v, &init), T);
     let u = h.send_user("suggest something");
@@ -4217,15 +4299,19 @@ fn no_capture_without_persistence(args: &[&str], knobs: &[(&str, &str)]) {
 /// comes with its first init (the pump hands it to the trigger).
 #[test]
 fn a_session_without_persistence_leaves_no_settings_capture() {
-    no_capture_without_persistence(&["--no-session-persistence"], &[]);
+    no_capture_without_persistence(Harness::prepare(), &["--no-session-persistence"], &[]);
 }
 
 /// LIFECYCLE-4 for a `--resume`: its id is named to the trigger as its
-/// spawn goes out (P4), before the CLI says its init with the turn.
+/// spawn goes out (P4), before the CLI says its init with the turn. The
+/// chat is one begun on this Mac (P0 refuses a resume of nothing).
 #[test]
 fn a_resumed_session_without_persistence_leaves_no_settings_capture() {
-    let resume = format!("--resume={}", common::uuid(0x8860));
-    no_capture_without_persistence(&["--no-session-persistence", &resume], &[("FAKE_INIT_AT_TURN", "1")]);
+    let p = Harness::prepare();
+    let sid = common::uuid(0x8860);
+    p.plant_transcript(&sid, &[&format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8861))]);
+    let resume = format!("--resume={sid}");
+    no_capture_without_persistence(p, &["--no-session-persistence", &resume], &[("FAKE_INIT_AT_TURN", "1")]);
 }
 
 // ---- S8 wave 2, W8: settings persistence (T8.7) and session drop-transport (T8.6) ---------
@@ -4363,12 +4449,15 @@ fn drop_transport_reattaches_without_a_lost_or_doubled_line() {
 /// T8.7: a `--resume`'s id is known before its CLI says a word, so its
 /// start capture runs beside the spawn: here the CLI says its init only with
 /// a first turn that never comes, and the baseline is taken all the same,
-/// before anything the session does; no result, no turn's capture.
+/// before anything the session does; no result, no turn's capture. The chat
+/// is one begun on this Mac (P0 refuses a resume of nothing).
 #[test]
 fn a_resumed_sessions_start_capture_runs_before_its_first_init() {
     let sid = common::uuid(0x8830);
+    let p = Harness::prepare();
+    p.plant_transcript(&sid, &[&format!(r#"{{"type":"user","uuid":"{}","sessionId":"{sid}","message":{{"role":"user","content":"earlier"}}}}"#, common::uuid(0x8831))]);
     let resume = format!("--resume={sid}");
-    let mut h = Harness::prepare().spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_INIT_AT_TURN", "1")]);
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_INIT_AT_TURN", "1")]);
     let init = h.send_initialize();
     h.expect_out(|v| is_response_to(v, &init), T);
     wait_for("the resumed session's start capture", T, || capture_file(h.rig(), &sid, "start.json").is_some());
@@ -6160,7 +6249,7 @@ fn a_vm_chat_gets_its_session_token_through_the_shim() {
     assert_eq!(out.status.code(), Some(0), "ai-env relay agent: {}\n{agent_err}", out.status);
     assert!(!rig.paths().relay_agent_socket().exists(), "the agent's socket is gone");
     let mints: Vec<&str> = agent_err.lines().filter(|l| l.contains("minted a session token")).collect();
-    let mint = format!("relay agent: minted a session token for {vm} (spawn {spawn}, grant {RELAY_GRANT}, until {})", ai_env_cli::wire::time::rfc3339_utc(claims.exp));
+    let mint = format!("relay agent: minted a session token for {vm} (spawn {spawn}, grant {RELAY_GRANT}, signer {RELAY_MAC}, until {})", ai_env_cli::wire::time::rfc3339_utc(claims.exp));
     assert_eq!(mints, [mint.as_str()], "one mint, this chat's:\n{agent_err}");
     assert!(agent_err.contains("relay agent: stopped (0 signed, 1 minted)"), "{agent_err}");
     for (name, text) in [("stdout", &agent_out), ("stderr", &agent_err)] {
@@ -6397,4 +6486,209 @@ fn a_chat_keeps_its_access_id() {
     closed(&mut edited);
     assert!(valid(&replaced) && replaced != own_again, "{replaced}");
     assert_eq!(session_row(&h, &cleared).access_id.as_deref(), Some(replaced.as_str()));
+}
+
+// ---- the fork gap (plans/production-plan.md §1.1): Cursor's fork of a remote chat, and a resume of nothing ----------
+
+/// The fork gap: a view line of session `sid` as ai-env writes one, a `role` message of one text block (`serde_json`
+/// writes its keys sorted, which puts the mark, `aiEnvView`, first).
+fn view_line(sid: &str, uuid: &str, parent: Option<&str>, role: &str, text: &str) -> String {
+    serde_json::json!({
+        "aiEnvView": 1, "parentUuid": parent, "isSidechain": false, "userType": "external", "cwd": "/w", "sessionId": sid, "version": "", "gitBranch": "",
+        "entrypoint": "claude-vscode", "type": role, "message": {"role": role, "content": [{"type": "text", "text": text}]}, "uuid": uuid, "timestamp": "2026-11-09T10:00:00.000Z",
+    })
+    .to_string()
+}
+
+/// The fork gap (A.6): Cursor's `Fork conversation from here` on a remote chat builds the fork on this Mac from the
+/// chat's view (`common::fork_of_view`: its message lines re-keyed, the mark still first, a `(fork)` name last) and
+/// opens it as a `--resume` of a new id that no row names. The reopen sends that copy up as a chat begun here and
+/// restores it into the VM, whose CLI resumes it from those lines: its init names the fork and its turn gets its
+/// result, for one Touch ID (`transcript:staged`, one `transcript_stage` row, no resume miss). The fork's row is its
+/// own (remote, kept in S3, begun on this Mac, an access id of its own); the parent's row is byte for byte as it was;
+/// `No conversation found` is on neither stream; the Mac keeps ai-env's view of the fork, its name carried.
+#[test]
+fn a_cursor_fork_of_a_remote_chat_goes_on_in_the_vm() {
+    const FORK: &str = "0199a1b2-0000-7000-8000-0000000012f1";
+    let mut first = Harness::prepare().spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let parent = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
+    turn(&mut first, "Say one.");
+    synced(&mut first, &parent, 1);
+    closed(&mut first);
+    let rig = first.rig();
+    let row_file = rig.bridge().join("state").join("sessions").join(format!("{parent}.toml"));
+    let parent_row = std::fs::read(&row_file).expect("the parent's row");
+    let parent_access = session_row(&first, &parent).access_id.expect("the parent's access id");
+    // Cursor's fork, beside the parent's view.
+    let fork = common::fork_of_view(&read(&view_of(&first, &parent)), FORK);
+    assert!(fork.lines().filter(|l| !l.contains("\"custom-title\"")).all(|l| l.starts_with(ai_env_cli::wire::view::VIEW_MARK_PREFIX)), "view-shaped: {fork}");
+    std::fs::write(view_of(&first, FORK), &fork).expect("the fork's copy");
+    let touch = rig.decrypts();
+    let resume = format!("--resume={FORK}");
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_WRITE_TRANSCRIPT", "1")]));
+    let init = started(&mut second);
+    assert_eq!(init["session_id"].as_str(), Some(FORK), "the fork resumed: {init}");
+    turn(&mut second, "Reply with the word PELICAN and nothing else.");
+    let views = || audit_rows(rig, "transcript_view").iter().filter(|r| r["detail"]["session"] == FORK && r["detail"]["outcome"] == "written").count();
+    wait_for("the fork's turn synced and its view written (after the stage's own)", T, || views() >= 2);
+    closed(&mut second);
+    assert_eq!(rig.decrypts() - touch, 1, "one Touch ID");
+    let note = end_note_of(&first, second.pid());
+    assert_eq!(part_of(&note, "transcript").as_deref(), Some("staged"), "{note}");
+    let vm = part_of(&note, "vm").expect("the fork's VM");
+    let on_vm = read(&rig.vm_projects_of(&vm).join(first.slug()).join(format!("{FORK}.jsonl")));
+    assert!(on_vm.starts_with(&fork), "the VM's copy starts with the fork's bytes: {on_vm}");
+    fake_gen(&first, &format!("resumed lines={}", fork.lines().count()));
+    let staged: Vec<Value> = audit_rows(rig, "transcript_stage").into_iter().filter(|r| r["detail"]["session"] == FORK).collect();
+    assert_eq!(staged.iter().map(|r| r["detail"]["outcome"].as_str().unwrap_or_default()).collect::<Vec<_>>(), ["staged"], "{staged:?}");
+    assert!(audit_rows(rig, "resume_seed_miss").is_empty(), "no miss");
+    let row = session_row(&first, FORK);
+    assert_eq!((row.mode.as_str(), row.transcript_home.as_deref(), row.origin.as_deref()), ("remote", Some("s3"), Some("mac")), "{row:?}");
+    let access = row.access_id.clone().expect("the fork's access id");
+    assert!(uuid::Uuid::parse_str(&access).is_ok_and(|u| u.get_version_num() == 7) && access != parent_access, "an access id of its own: {access}");
+    assert_eq!(std::fs::read(&row_file).expect("the parent's row"), parent_row, "the parent's row as it was");
+    let out = second.out_lines().join("\n");
+    for text in [second.err_text(), out] {
+        assert!(!text.contains("No conversation found"), "{text}");
+    }
+    let view = read(&view_of(&first, FORK));
+    assert!(is_view(&view_of(&first, FORK)) && view.contains(" (fork)\"}"), "ai-env's view, the fork's name carried: {view}");
+}
+
+/// R-154, sticky per chat (the fork gap): a chat of a `sole_vm` workspace runs on a VM placed for it alone, and once
+/// approved a restricted grant (marked: `registry::mark_sole`) Cursor's fork of it, made from its view beside it, is
+/// marked from its first row with the chat's mark (P0 finds the copy in the folder of a marked row): the fork runs on a
+/// VM of its own, its row carries the mark, and `session forget` of it without `--purge` is refused. With `sole_vm` taken
+/// out of bridge.toml, another fork (no row names it) is refused before any Touch ID or AWS call, its line last, with no
+/// S3 request of it and nothing of it recorded, and so is the marked fork's own reopen.
+#[test]
+fn a_cursor_fork_of_a_chat_marked_sole_carries_its_mark() {
+    const FORK: &str = "0199a1b2-0000-7000-8000-0000000012f4";
+    const LATER: &str = "0199a1b2-0000-7000-8000-0000000012f5";
+    let mut p = Harness::prepare();
+    let work = p.work();
+    add_config(p.rig(), &format!("[[workspace]]\npath = {:?}\nsole_vm = true\n", work.display().to_string()));
+    let mut first = p.spawn_on(common::Link::Remote, "", &[], &[("FAKE_WRITE_TRANSCRIPT", "1")]);
+    let parent = started(&mut first)["session_id"].as_str().expect("the session id").to_string();
+    turn(&mut first, "Say one.");
+    synced(&mut first, &parent, 1);
+    closed(&mut first);
+    let rig = first.rig();
+    let paths = rig.paths();
+    let vm_row = |id: &str| ai_env_cli::bridge::vm::registry::read_row(&paths, id).unwrap().unwrap_or_else(|| panic!("the VM row of {id}"));
+    let parent_row = session_row(&first, &parent);
+    let (parent_access, parent_vm) = (parent_row.access_id.clone().expect("an access id"), parent_row.microvm_id.clone().expect("its VM"));
+    assert_eq!(vm_row(&parent_vm).sole.as_deref(), Some(parent_access.as_str()), "the chat ran on a VM of its own");
+    assert_eq!(ai_env_cli::bridge::registry::mark_sole(&paths, &parent).unwrap(), [parent.as_str()]);
+    let since = session_row(&first, &parent).sole_since.expect("the parent's mark");
+    // Cursor's fork, beside the parent's view: it runs alone, marked from its first row.
+    std::fs::write(view_of(&first, FORK), common::fork_of_view(&read(&view_of(&first, &parent)), FORK)).expect("the fork's copy");
+    let resume = format!("--resume={FORK}");
+    let mut second = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1"), ("FAKE_WRITE_TRANSCRIPT", "1")]));
+    assert_eq!(started(&mut second)["session_id"].as_str(), Some(FORK), "the fork resumed");
+    turn(&mut second, "Reply with the word PELICAN and nothing else.");
+    closed(&mut second);
+    let row = session_row(&first, FORK);
+    assert_eq!(row.sole_since.as_deref(), Some(since.as_str()), "the fork carries the chat's mark: {row:?}");
+    let (access, vm) = (row.access_id.clone().expect("the fork's access id"), row.microvm_id.clone().expect("the fork's VM"));
+    assert!(access != parent_access && vm != parent_vm, "its own chat, on a VM of its own: {access} {vm}");
+    assert_eq!(vm_row(&vm).sole.as_deref(), Some(access.as_str()), "placed for the fork alone");
+    let o = rig.run(&["session", "forget", FORK], None);
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("ai-env session forget {FORK} --purge")), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(session_row(&first, FORK).sole_since.is_some(), "the fork's row kept");
+    // With sole_vm out of bridge.toml: another fork, and the marked fork's own reopen, refused before anything.
+    rig.config(|doc| {
+        doc.remove("workspace");
+    });
+    std::fs::write(view_of(&first, LATER), common::fork_of_view(&read(&view_of(&first, &parent)), LATER)).expect("another fork's copy");
+    for (sid, line) in [
+        (LATER, format!("ai-env-claude: refused before any Touch ID: fork {LATER} of a chat approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)")),
+        (FORK, format!("ai-env-claude: refused before any Touch ID: session {FORK} was approved a restricted grant: reopen it in a [[workspace]] with sole_vm = true (this folder is in none)")),
+    ] {
+        let (touch, calls) = (rig.decrypts(), rig.fake_calls().len());
+        let resume = format!("--resume={sid}");
+        let mut h = Harness::prepare().launch_wrapper(rig.wrapper(&[&resume], &[]));
+        let (status, _) = h.wait(EXIT);
+        assert_eq!(status.code(), Some(9), "{sid}: {}", h.transcript());
+        assert_eq!(h.err_text().lines().last(), Some(line.as_str()), "{sid}: its line last: {}", h.err_text());
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (touch, calls), "{sid}: no Touch ID, no AWS call");
+    }
+    // The fork's own VM may still push its tail when it suspends; the refused one, which no VM ever ran, never reached S3.
+    assert!(!rig.s3().requests().iter().any(|r| r.key.contains(LATER)), "no S3 request of the refused fork: {:?}", rig.s3().requests());
+    assert!(ai_env_cli::bridge::registry::read(&paths, LATER).unwrap().is_none() && ai_env_cli::bridge::s3::manifest::read(&paths, LATER).unwrap().is_none(), "nothing of the refused fork recorded");
+}
+
+/// The fork gap (option B): a `--resume` of a chat this Mac has no record of (no registry row, no S3 manifest) and no
+/// copy of is refused at P0, before any Touch ID or AWS call, whatever else its argv asks (a fork of it, a cut of it,
+/// no persistence): exit 9, stderr's last two lines the CLI's own miss (Cursor shows its banner, whose link starts a
+/// new chat) and then ai-env's line; no result on stdout, no spawn, no row and no view of it; the census end row
+/// `end:spawn_failed` at `step:precheck`, and `session_remote_failed` naming `nothing_to_resume`.
+#[test]
+fn a_resume_this_mac_has_no_record_of_is_refused_before_any_touch_id() {
+    const NOWHERE: &str = "0199a1b2-0000-7000-8000-0000000012e2";
+    const CUT: &str = "0199a1b2-0000-7000-8000-0000000012e3";
+    let resume = format!("--resume={NOWHERE}");
+    let cut = format!("--resume-session-at={CUT}");
+    let miss = format!("No conversation found with session ID: {NOWHERE}");
+    let line = format!("ai-env-claude: refused before any Touch ID: no chat {NOWHERE} on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat");
+    for args in [vec![resume.as_str()], vec![resume.as_str(), "--fork-session"], vec!["--resume", NOWHERE, cut.as_str()], vec!["--no-session-persistence", resume.as_str()]] {
+        let mut p = Harness::prepare();
+        let (touch, calls) = (p.rig().decrypts(), p.rig().fake_calls().len());
+        let mut h = p.spawn_on(common::Link::Remote, "", &args, &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+        let (status, _) = h.wait(EXIT);
+        assert_eq!(status.code(), Some(9), "{args:?}\n{}", h.transcript());
+        let err = h.err_text();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines[lines.len().saturating_sub(2)..], [miss.as_str(), line.as_str()], "{args:?}: the CLI's miss, then ai-env's line, last: {err}");
+        assert!(!h.out_lines().iter().any(|l| l.contains("\"type\":\"result\"")), "{args:?}: no result: {:?}", h.out_lines());
+        assert_eq!(h.spawn_count(), 0, "{args:?}: no spawn");
+        let rig = h.rig();
+        assert_eq!((rig.decrypts(), rig.fake_calls().len()), (touch, calls), "{args:?}: no Touch ID, no AWS call");
+        assert!(rig.s3().requests().is_empty(), "{args:?}: no S3 request: {:?}", rig.s3().requests());
+        assert!(!rig.paths().transcript_dir(NOWHERE).exists(), "{args:?}: no manifest, no transcript state");
+        assert!(h.registry_files().is_empty(), "{args:?}: no row: {:?}", h.registry_files());
+        assert!(!h.prepared.mac_projects().join(h.slug()).join(format!("{NOWHERE}.jsonl")).exists(), "{args:?}: no view");
+        let note = h.end_note();
+        assert!(common::note_has(&note, "end:spawn_failed") && common::note_has(&note, "step:precheck"), "{args:?}: {note}");
+        let failed = h.audit_events("session_remote_failed");
+        assert_eq!(failed.len(), 1, "{args:?}: {failed:?}");
+        assert_eq!((failed[0]["detail"]["step"].as_str(), failed[0]["detail"]["code"].as_str(), failed[0]["detail"]["why"].as_str()), (Some("precheck"), Some("9"), Some("nothing_to_resume")), "{args:?}");
+    }
+}
+
+/// The fork gap: Cursor's fork holds the view's text, masked when the view was written, so a finding needs a rule
+/// added since (here a key shape in a reply, built at run time). The fork's copy goes up as a chat begun here, so P1
+/// scans it beside the Touch ID and refuses before any VM: exit 9, the last line naming `transcript:UUID.jsonl` line 2
+/// and the rule, never the value; no VM started or reached, nothing in S3, the copy as it was, one `seed_refused`
+/// (step `transcript`, no VM).
+#[test]
+fn a_cursor_fork_whose_text_trips_a_rule_is_refused_before_any_vm() {
+    const PARENT: &str = "0199a1b2-0000-7000-8000-0000000012d1";
+    const FORK: &str = "0199a1b2-0000-7000-8000-0000000012d2";
+    let key = format!("{}{}", "AKIA", "F".repeat(16));
+    let p = Harness::prepare();
+    let (u, a) = ("0199a1b2-0000-7000-8000-0000000012d3", "0199a1b2-0000-7000-8000-0000000012d4");
+    let view = format!("{}\n{}\n", view_line(PARENT, u, None, "user", "show me the deploy config"), view_line(PARENT, a, Some(u), "assistant", &format!("aws_access_key_id = {key}")));
+    let fork = common::fork_of_view(&view, FORK);
+    let copy = p.plant_project_file(&format!("{FORK}.jsonl"), &fork);
+    // View-shaped, as Cursor's fork of a remote chat is: P1 scans it only because no record names it.
+    assert!(is_view(&copy), "view-shaped: {fork}");
+    let resume = format!("--resume={FORK}");
+    let mut h = p.spawn_on(common::Link::Remote, "", &[&resume], &[("FAKE_RESUME_NEEDS_FILE", "1")]);
+    h.send_initialize();
+    let (status, _) = h.wait(EXIT);
+    assert_eq!(status.code(), Some(9), "{}", h.transcript());
+    let err = h.err_text();
+    assert!(last_line(&err).starts_with(&format!("ai-env-claude: the chat's transcript would carry transcript:{FORK}.jsonl line 2: rule aws-access-key-id")), "{err}");
+    assert!(!err.contains(&key), "the value on stderr: {err}");
+    let rig = h.rig();
+    assert_eq!(runs(rig), 0, "refused at P1: no VM started");
+    assert_eq!(files_under(&rig.vm_projects()), Vec::<String>::new(), "nothing in the VM's projects dir");
+    assert!(rig.s3().requests().is_empty() && h.audit_events("transcript_stage").is_empty(), "nothing went up");
+    assert_eq!(read(&copy), fork, "the fork's copy as it was");
+    let refused = h.audit_events("seed_refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!((refused[0]["detail"]["step"].as_str(), refused[0]["detail"].get("vm")), (Some("transcript"), None), "P1's: no VM chosen yet: {refused:?}");
+    assert_eq!(h.spawn_count(), 0, "no spawn");
 }

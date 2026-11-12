@@ -19,6 +19,15 @@
 //! `seed_refused` (step `transcript`). [`restore`] scans again what it sends
 //! (a finding refuses before any request), and a chat S3 holds is never read
 //! on this Mac.
+//!
+//! The fork gap: Cursor forks a remote chat on this Mac from its view, so the
+//! fork's copy is view-shaped and no row or manifest names its id
+//! (`s3::manifest::origin_of` none). Such a copy is scanned and sent up as a
+//! chat begun here, but only once no VM holds the chat and no g1 tail
+//! restores it ([`restore_unsynced`] runs first: the view of a chat forgotten
+//! before its first sync never replaces the VM's transcript), and never a
+//! placeholder view (`s3::sync::is_placeholder_view`), which stands for no
+//! chat.
 use super::blobscan::ScanSet;
 use super::{audit, blocking, EnsureCtx, TranscriptOutcome, WorkspaceRef};
 use crate::bridge::api::MicrovmApi;
@@ -46,8 +55,10 @@ fn audited(paths: &Paths, ws: &WorkspaceRef, vm: Option<&str>, e: BridgeError) -
 /// blocking thread beside the Touch ID, for a chat P3 sends up inline: one
 /// begun on this Mac, or an S8 mirror): the chat under `mirror_root` for
 /// `slugs` as the inline upload takes it (`s3::stage::locate`, at most
-/// `wire::s3::INLINE_MAX`; a view in its place is no chat), every file and
-/// name through the seed's tripwires (`ScanSet::load`: the built-ins, and
+/// `wire::s3::INLINE_MAX`; a view in its place is no chat unless
+/// `s3::manifest::origin_of` is none: no manifest, no remote row, Cursor's
+/// fork of a remote chat, which P3 sends up), every file and name through
+/// the seed's tripwires (`ScanSet::load`: the built-ins, and
 /// `[review].tripwires` when that file exists) as that upload's own scan
 /// reads them (`s3::stage::scan_chat`), nothing copied, nothing sent. Any
 /// finding refuses the session before any VM is chosen (`WorkspaceRefused
@@ -57,7 +68,8 @@ pub(crate) fn scan_mac_copy(paths: &Paths, cfg: &BridgeConfig, ws: &WorkspaceRef
     use crate::bridge::s3::stage;
     let set = ScanSet::load(paths, cfg, ws)?;
     let found = stage::locate(mirror_root, slugs, session_id, crate::wire::s3::INLINE_MAX).map_err(|e| audited(paths, ws, None, e))?;
-    let Some(chat) = found.filter(|c| !crate::bridge::view::is_view_file(&c.main_path(session_id))) else { return Ok(()) };
+    let views = crate::bridge::s3::manifest::origin_of(paths, session_id).is_none();
+    let Some(chat) = found.filter(|c| views || !crate::bridge::view::is_view_file(&c.main_path(session_id))) else { return Ok(()) };
     stage::scan_chat(&set.rules, &chat, crate::wire::s3::MULTIPART_PART).map(drop).map_err(|e| audited(paths, ws, None, e))
 }
 
@@ -215,6 +227,13 @@ pub fn digest_stream(rules: &crate::bridge::scan::Rules, input: &mut dyn Read, p
 /// audited `transcript_stage`); an S8 mirror (`s8_mirror`, a chat begun on a
 /// VM) in `session migrate-s9`'s gone-VM form (the manifest's origin `vm`,
 /// the view built here, the mirror deleted, audited `transcript_migrate`).
+/// A view in the copy's place is no chat, but for `origin_of` none (the fork
+/// gap: Cursor's fork of a remote chat, or the view of a VM-begun chat
+/// forgotten before its first sync): a VM holding the chat keeps it and the
+/// g1 tails restore it ([`restore_unsynced`] first); only when neither does
+/// is the copy sent up as a chat begun here, unless it is a placeholder
+/// view, which stands for no chat (nothing to restore: the VM's claude
+/// misses it).
 /// A stage cut after its manifest and before its view is finished first
 /// ([`finish_cut_stage`]). Then: a manifest that commits nothing restores
 /// nothing; when the VM holds the committed prefix (its size at least
@@ -274,9 +293,23 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
                 Some(p) => stage::locate(p, slugs, sid, crate::wire::s3::INLINE_MAX)?,
                 None => None,
             };
-            let (Some(chat), Some(projects)) = (found.filter(|c| !crate::bridge::view::is_view_file(&c.main_path(sid))), mac_projects) else {
+            // A view in the chat's place is the chat only when no row or manifest names it (Cursor's fork of a remote chat).
+            let view = found.as_ref().is_some_and(|c| crate::bridge::view::is_view_file(&c.main_path(sid)));
+            let (Some(chat), Some(projects)) = (found.filter(|_| origin.is_none() || !view), mac_projects) else {
                 return Ok(TranscriptOutcome::NothingToRestore);
             };
+            // Such a view is also what a VM-begun chat forgotten before its first sync leaves: a VM or a tail that holds
+            // the chat comes first, and a placeholder that stands for nothing is no chat (the orphan-view guard).
+            if view {
+                match restore_unsynced(&sctx, sid, &rel).await? {
+                    TranscriptOutcome::NothingToRestore if crate::bridge::s3::sync::is_placeholder_view(&chat.main_path(sid)) => {
+                        tracing::info!(session = sid, "transcript: a placeholder view no row or manifest names, held by no VM or tail: nothing to restore");
+                        return Ok(TranscriptOutcome::NothingToRestore);
+                    }
+                    TranscriptOutcome::NothingToRestore => tracing::info!(session = sid, "transcript: a view-shaped copy no row or manifest names, held by no VM or tail (Cursor's fork of a remote chat): it goes up as the chat"),
+                    held => return Ok(held),
+                }
+            }
             let t0 = std::time::Instant::now();
             let digests = {
                 let (rules, chat) = (std::sync::Arc::clone(&rules), chat.clone());
@@ -369,7 +402,9 @@ pub async fn restore<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T:
 /// and, S10 (R1), the chain of tails after it (each where the one before
 /// ended: a URL handed after a `/suspend`'s push), are pulled; else nothing
 /// is there to restore. The next sync pushes it as generation 1's base and
-/// supersedes those tails.
+/// supersedes those tails. The fork gap: also the first step for a view in
+/// the copy's place that no row or manifest names, before it goes up as a
+/// chat begun here (a VM or a tail that holds the chat wins).
 async fn restore_unsynced<A: MicrovmApi + crate::bridge::s3::S3Sign, D: DataPlane, T: TokenSource>(
     sctx: &crate::bridge::s3::sync::SyncCtx<'_, A, D, T>,
     sid: &str,
@@ -725,12 +760,15 @@ mod tests {
 
     /// P1's scan reads what the inline upload sends to S3, every file of the
     /// chat (a file no transcript rel names goes up too, and stays in S3
-    /// and `origin/`): a clean chat passes, and so do a session the Mac
-    /// holds no copy of and a view in the chat's place (never a Mac copy); a
-    /// hit in the transcript's second line refuses, so does one in a file
-    /// directly below the session, and a subagent file whose name trips a
-    /// rule (the name shown as `a path name`). Each audited `seed_refused`
-    /// with no VM; nothing written to `state/tmp/`.
+    /// and `origin/`): a clean chat passes, and so does a session the Mac
+    /// holds no copy of; a hit in the transcript's second line refuses, so
+    /// does one in a file directly below the session, and a subagent file
+    /// whose name trips a rule (the name shown as `a path name`). The fork
+    /// gap: a view in the chat's place that no row or manifest names is the
+    /// chat (Cursor's fork of a remote chat), scanned with what lies beside
+    /// it; under an S8 row's id it is that chat's view, never a Mac copy, and
+    /// the mirror there is scanned again once it is a transcript. Each
+    /// audited `seed_refused` with no VM; nothing written to `state/tmp/`.
     #[test]
     fn p1s_scan_refuses_what_the_inline_upload_would_send() {
         let w = World::new();
@@ -745,13 +783,22 @@ mod tests {
         let stray = w.plant(&format!("{ID}/stray.jsonl"), &lines(&format!("aws_access_key_id = {}", key())));
         assert_eq!(finding(scan(ID).unwrap_err()), format!("transcript:{ID}/stray.jsonl line 2: rule aws-access-key-id"));
         std::fs::remove_file(stray).unwrap();
-        w.plant(&format!("{ID}/subagents/agent-{}.jsonl", key()), &lines("nothing to see"));
+        let named = w.plant(&format!("{ID}/subagents/agent-{}.jsonl", key()), &lines("nothing to see"));
         assert_eq!(finding(scan(ID).unwrap_err()), "transcript:a path name: rule aws-access-key-id");
-        // A view in the chat's place is no Mac copy: nothing to scan, whatever lies beside it.
+        // The fork gap: a view in the chat's place that no row or manifest names is the chat, with what lies beside it.
         std::fs::write(&main, format!("{}\"type\":\"ai-title\",\"aiTitle\":\"t\",\"sessionId\":\"{ID}\"}}\n", crate::wire::view::VIEW_MARK_PREFIX)).unwrap();
+        assert_eq!(finding(scan(ID).unwrap_err()), "transcript:a path name: rule aws-access-key-id");
+        // Under an S8 row's id the view is that chat's, never a Mac copy: nothing to scan, whatever lies beside it.
+        let row = crate::bridge::registry::SessionRow { session_id: ID.into(), mode: "remote".into(), ..crate::bridge::registry::SessionRow::default() };
+        crate::bridge::registry::write(&w.paths, &row).unwrap();
         scan(ID).unwrap();
+        assert_eq!(w.rows("seed_refused").len(), 4);
+        // The mirror there, a transcript again: scanned.
+        std::fs::remove_file(named).unwrap();
+        std::fs::write(&main, lines(&format!("aws_access_key_id = {}", key()))).unwrap();
+        assert_eq!(finding(scan(ID).unwrap_err()), format!("transcript:{ID}.jsonl line 2: rule aws-access-key-id"));
         let rows = w.rows("seed_refused");
-        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows.len(), 5, "{rows:?}");
         assert!(rows.iter().all(|r| r["detail"]["step"] == "transcript" && r["detail"].get("vm").is_none()), "{rows:?}");
         assert!(!w.paths.tmp().exists(), "P1 copies nothing");
         assert!(!std::fs::read_to_string(w.paths.audit()).unwrap().contains(&key()), "no value in the audit");

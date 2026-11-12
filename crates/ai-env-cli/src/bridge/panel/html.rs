@@ -77,7 +77,9 @@ fn mint_word(r: &SessionRow) -> String {
 /// A chat's grants, each `[x] <grant> until <day> Remove` or `[ ] <grant> Allow`, linked to its confirm page (R-151):
 /// every offered grant, then any other it holds, which must stay removable. A held grant whose id a form refuses (a `.`,
 /// off the offer) names the CLI line instead. A row now on this Mac is offered nothing, and what it holds stays removable,
-/// since a later remote `--resume` takes its id. Each line already HTML.
+/// since a later remote `--resume` takes its id. R-156: a restricted grant says so, `<grant> (restricted)`, and a chat whose
+/// folder is in no `sole_vm` workspace gets `[ ] <grant> (restricted: its workspace is not sole_vm)`, with no link. Each line
+/// already HTML.
 fn access_lines(root: &str, r: &SessionRow, a: &AccessPanel) -> Vec<String> {
     let sid = &r.session_id;
     let remote = r.mode == "remote";
@@ -92,11 +94,16 @@ fn access_lines(root: &str, r: &SessionRow, a: &AccessPanel) -> Vec<String> {
         .chain(extra)
         .map(|grant| {
             let target = format!("{sid}_{grant}");
+            let restricted = a.restricted.contains(grant);
+            let mark = if restricted { " (restricted)" } else { "" };
             if !held.contains(grant) {
-                return format!("[ ] {} {}", esc(grant), link(&confirm_href(root, Action::RelayAllow, &target), "Allow"));
+                if restricted && !a.alone.contains(sid) {
+                    return format!("[ ] {} (restricted: its workspace is not sole_vm)", esc(grant));
+                }
+                return format!("[ ] {}{mark} {}", esc(grant), link(&confirm_href(root, Action::RelayAllow, &target), "Allow"));
             }
             let how = if grant.contains('.') { format!("<code>{}</code>", esc(&Action::RelayRemove.twin(&target))) } else { link(&confirm_href(root, Action::RelayRemove, &target), "Remove") };
-            format!("[x] {} until {} {how}", esc(grant), esc(until))
+            format!("[x] {}{mark} until {} {how}", esc(grant), esc(until))
         })
         .collect()
 }
@@ -436,7 +443,8 @@ mod tests {
     /// R-151, R-152: a chat's grants as the cache has them. Every offered grant has its line, then any other it holds, which
     /// must stay removable, by its CLI line when a form would refuse its id. An entry lapsed by the page's clock holds
     /// nothing. The mint word says when there is no token. A row with no id, or a text that is no uuid, says so where
-    /// anything is offered. A row now on this Mac is offered nothing and can still remove what it holds.
+    /// anything is offered. A row now on this Mac is offered nothing and can still remove what it holds. R-156: a restricted
+    /// grant is marked, and offered with no link to a chat outside a `sole_vm` workspace.
     #[test]
     fn a_chats_grants_and_its_token_are_shown() {
         use crate::bridge::relay::params::AccessCache;
@@ -475,6 +483,13 @@ mod tests {
         assert!(access_lines(TOP, &local(Some(CHAT)), &with(Vec::new())).is_empty());
         assert!(access_lines(TOP, &local(None), &with(Vec::new())).is_empty());
         assert_eq!((mint_word(&chat), mint_word(&row(Some(CHAT), Some("no_agent"))), mint_word(&bare)), ("minted".to_string(), "no token (no_agent)".to_string(), "-".to_string()));
+        // R-156: a restricted grant says so; outside a sole_vm workspace it has no link, and what it holds stays removable.
+        let restricted = |alone: bool, entries: Vec<AccessEntry>| AccessPanel { restricted: vec!["g-b".into()], alone: if alone { [SID.to_string()].into() } else { std::collections::BTreeSet::new() }, ..with(entries) };
+        assert_eq!(access_lines(TOP, &chat, &restricted(false, Vec::new())), [allow("g-a"), "[ ] g-b (restricted: its workspace is not sole_vm)".to_string()]);
+        assert_eq!(access_lines(TOP, &chat, &restricted(true, Vec::new()))[1], format!("[ ] g-b (restricted) <a href=\"{TOP}confirm?action=relay-allow&amp;target={SID}_g-b\">Allow</a>"));
+        for alone in [false, true] {
+            assert_eq!(access_lines(TOP, &chat, &restricted(alone, vec![entry(&["g-b"], "2026-11-01T23:59:59Z")]))[1], format!("[x] g-b (restricted) until 2026-11-01 <a href=\"{TOP}confirm?action=relay-remove&amp;target={SID}_g-b\">Remove</a>"), "alone: {alone}");
+        }
         // The note: the agent's state, `as of v<n>, <time>`, a [relay] that does not validate.
         let note = access_note(&AccessPanel { agent: Some((42, now + 3600)), problem: Some("[relay].offer[0] = \"<G>\" is not an id".into()), ..held });
         assert_eq!(note, "<p class=\"note\">Relay agent: running (pid 42, until 2026-10-23T01:00:00Z). Access list: as of v3, 2026-10-22T10:00:00Z; the relay remains the gate. [relay].offer[0] = &quot;&lt;G&gt;&quot; is not an id.</p>\n");

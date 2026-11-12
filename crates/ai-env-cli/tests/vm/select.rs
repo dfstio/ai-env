@@ -9,8 +9,8 @@ use ai_env_cli::bridge::vm::gc::{gc, GcOpts};
 use ai_env_cli::bridge::vm::owner;
 use ai_env_cli::bridge::vm::registry::{self, RowStatus, VmRow};
 use ai_env_cli::bridge::vm::run::{
-    adopt_after_ambiguous, build_payload, effective_egress, memory_warning, new_session_token, padded_payload, resolve_image_version, select_vm, select_vm_detailed, terminate_and_record, Adoption, Egress,
-    Poll, RunFlags, RunPlan, SelectFailure, Selected,
+    adopt_after_ambiguous, build_payload, effective_egress, memory_warning, new_session_token, padded_payload, resolve_image_version, select_vm, select_vm_detailed, terminate_and_record, Adoption, Choice,
+    Egress, Poll, RunFlags, RunPlan, SelectFailure, Selected,
 };
 use ai_env_cli::wire::frame::{commitment_hex, RunHookPayload};
 use ai_env_cli::wire::redact::scrub;
@@ -156,6 +156,46 @@ async fn select_never_reuses_across_egress_ingress_or_version() {
     assert!(specs[0].ingress_connectors.is_empty() && specs[0].egress_connectors.is_empty());
     assert_eq!(reused_id(&select_vm(&api, &env.paths, &env.plan(&base), fast()).await.unwrap()), a, "the newest row that matches everything");
     assert_eq!(api.run_specs().len(), 4);
+}
+
+/// R-154: a VM placed for one chat alone (`RunPlan.sole`) is that chat's: its row names the chat from the pending row
+/// on, through an ambiguous RunMicrovm's adoption too; that chat's plan reuses it and never a shared VM, while a
+/// shared plan, or another chat's, never takes it and places its own; a pin of the other kind is refused (exit 9).
+#[tokio::test]
+async fn select_keeps_a_sole_vm_to_its_chat() {
+    const CHAT_A: &str = "0199a1b2-0000-7000-8000-0000000012f1";
+    const CHAT_B: &str = "0199a1b2-0000-7000-8000-0000000012f2";
+    const CHAT_C: &str = "0199a1b2-0000-7000-8000-0000000012f3";
+    let env = Env::new();
+    let api = api();
+    let shared_plan = || env.plan(&env.flags());
+    let alone = |chat: &str| RunPlan { sole: Some(chat.to_string()), ..shared_plan() };
+    let shared = started_id(&select_vm(&api, &env.paths, &shared_plan(), fast()).await.unwrap());
+    let a = started_id(&select_vm(&api, &env.paths, &alone(CHAT_A), fast()).await.unwrap());
+    assert_eq!((env.row(&shared).sole, env.row(&a).sole.as_deref()), (None, Some(CHAT_A)), "the placement names the chat");
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &alone(CHAT_A), fast()).await.unwrap()), a, "chat A: its own");
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &shared_plan(), fast()).await.unwrap()), shared, "a shared plan: never chat A's");
+    let b = started_id(&select_vm(&api, &env.paths, &alone(CHAT_B), fast()).await.unwrap());
+    assert!(b != a && b != shared && env.row(&b).sole.as_deref() == Some(CHAT_B), "chat B: one of its own");
+    assert_eq!(runs(&api.calls()).len(), 3);
+    // A pin of the other kind is refused, as a policy, and places nothing; the chat's own is taken.
+    let pin = |plan: RunPlan, id: &str| RunPlan { choice: Choice::Pin(id.to_string()), ..plan };
+    for (plan, id) in [(shared_plan(), a.as_str()), (alone(CHAT_B), a.as_str()), (alone(CHAT_A), shared.as_str())] {
+        let e = select_vm_detailed(&api, &env.paths, &pin(plan, id), fast()).await.unwrap_err().error;
+        assert_eq!(exit(e), 9, "{id}");
+    }
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &pin(alone(CHAT_A), a.as_str()), fast()).await.unwrap()), a);
+    assert_eq!(runs(&api.calls()).len(), 3, "a pin never places a VM");
+    // An ambiguous RunMicrovm: the pending row it keeps names the chat, and so does the VM's row once adopted.
+    api.fail_on("run", ambiguous(), true);
+    api.fail_on("run", ambiguous(), true);
+    let t0 = unix_now();
+    let pending = *select_vm_detailed(&api, &env.paths, &alone(CHAT_C), fast()).await.unwrap_err().kept_pending.expect("the pending row is kept");
+    assert_eq!(pending.sole.as_deref(), Some(CHAT_C));
+    let ours = vm_of(&api, &pending.client_token);
+    assert_eq!(adopt_after_ambiguous(&api, &api, &env.paths, &pending, t0, fast()).await.unwrap(), Adoption::Adopted(ours.clone()));
+    assert_eq!(env.row(&ours).sole.as_deref(), Some(CHAT_C), "adopted with its chat");
+    assert_eq!(reused_id(&select_vm(&api, &env.paths, &alone(CHAT_C), fast()).await.unwrap()), ours, "chat C: its own");
 }
 
 #[tokio::test]

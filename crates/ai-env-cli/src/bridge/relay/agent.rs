@@ -1,5 +1,5 @@
 //! `ai-env relay agent` (S13, WM-R38 to WM-R40, WM-R58; LD-WM2, LD-WM12, LD-WM13): this Mac's signing agent,
-//! like ssh-agent. It unseals this Mac's two relay keys once (one Touch ID), then answers on a 0600 Unix socket,
+//! like ssh-agent. It unseals this Mac's relay keys once (one Touch ID), then answers on a 0600 Unix socket,
 //! `state/relay-agent.sock`, in `ai_env_worker::agent`'s line protocol (one request per connection):
 //!
 //! - `status`: its pid, its end, its worker id, both public keys and its counts;
@@ -8,12 +8,14 @@
 //!   it is handed;
 //! - `mint_session`: a VM session token for a remote spawn (`relay::mint`), only for a VM this Mac's registry
 //!   holds as a live vpc VM whose egress gate passed, only for a grant `bridge.toml` names (read at each
-//!   request), at most 8 h and never past the VM's wall, for the relay `[relay].relay_id` names (R-137).
+//!   request) and never a `[relay].restricted` one, at most 8 h and never past the VM's wall, for the relay
+//!   `[relay].relay_id` names (R-137); signed with the session key, or with the sole key for the chat a VM was
+//!   placed for alone while `[relay].restricted` names a grant (R-155).
 //!
 //! It answers only its own uid (the peer's credentials), at most 16 connections at once, one request within
 //! 5 s each. Its life is measured on the wall clock (Darwin's `Instant` stops while the Mac sleeps): 1 to 24 h,
 //! checked every 30 s and at each request; at its end, or at SIGINT, SIGTERM or SIGHUP, it stops accepting,
-//! removes the socket only if it is still the one it bound (device and inode), drops both keys and exits 0.
+//! removes the socket only if it is still the one it bound (device and inode), drops its keys and exits 0.
 //! One stderr line per signature, mint and refusal; never a nonce, a signature or a token.
 //!
 //! This file is the only place a Unix listener is bound (`make lint`).
@@ -30,7 +32,7 @@ use crate::store::Keystore;
 use crate::wire::time::{rfc3339_utc, unix_now};
 use ai_env_worker::agent::{decode_request, encode_response, AgentStatus, MintRequest, Request, Response, SignRequest, IO_TIMEOUT, REQUEST_MAX};
 use ai_env_worker::globs::{valid_relay_id, valid_uuid};
-use ai_env_worker::keys::Alg;
+use ai_env_worker::keys::{Alg, SigningKey};
 use ai_env_worker::session::{self, SessionClaims, SESSION_MAX_S};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -190,14 +192,19 @@ pub fn cmd_agent(store: &Keystore, hours: Option<u32>) -> Result<()> {
     };
     let until = unix_now() + u64::from(hours) * 3600;
     audit(&paths, RELAY_AGENT, &[("outcome", "started".to_string()), ("hours", hours.to_string())]);
+    // R-155: the sole key, when the container holds one, and the signer it signs as.
+    let sole = keys.sole.as_ref().map_or_else(String::new, |k| format!(", sole key fp {} ({})", k.public_key().fingerprint(), RelayCfg::sole_id_of(&keys.worker_id)));
     signals::say(&format!(
-        "relay agent: worker {} (fp {}), session key fp {}; socket {}; until {} ({hours} h); Ctrl-C stops it",
+        "relay agent: worker {} (fp {}), session key fp {}{sole}; socket {}; until {} ({hours} h); Ctrl-C stops it",
         keys.worker_id,
         keys.worker.public_key().fingerprint(),
         keys.session.public_key().fingerprint(),
         socket.display(),
         rfc3339_utc(until)
     ));
+    if let Some(line) = sole_key_warning(&relay, keys.sole.is_some()) {
+        signals::say(&line);
+    }
     let state = AgentState { keys, until, paths: paths.clone(), socket, bound, clock: Arc::new(WallClock), euid: euid() };
     let out = rt.block_on(serve(state, listener, async move {
         stops.next().await;
@@ -210,6 +217,19 @@ pub fn cmd_agent(store: &Keystore, hours: Option<u32>) -> Result<()> {
     signals::say(&format!("relay agent: {} ({} signed, {} minted); its keys are dropped", out.end.word(), out.signed, out.minted));
     drop(lock);
     Ok(())
+}
+
+/// R-155: the agent's one warning at its start when `[relay].restricted` (as it reads it then) names a grant and the agent
+/// holds no sole key: every token it signs is then this Mac's session key's, so a chat on a VM of its own reaches no
+/// restricted grant (fail closed), which `relay status` alone would say. `None` otherwise.
+fn sole_key_warning(relay: &RelayCfg, holds_sole: bool) -> Option<String> {
+    (!relay.restricted.is_empty() && !holds_sole).then(|| {
+        format!(
+            "relay agent: warning: [relay].restricted names {}, but credentials/relay-worker.env holds no sole key, so a chat on a VM of its own gets tokens signed as {}, which reach no restricted grant: ai-env relay keygen --sole adds the key, then start the agent again",
+            relay.restricted.join(","),
+            relay.worker_id
+        )
+    })
 }
 
 /// The agent's runtime, its stop signals, and `listener` registered with it.
@@ -283,7 +303,8 @@ impl Shared {
     }
 
     /// WM-R39's `mint_session` (LD-WM12): a live vpc VM of this Mac whose gate passed, a grant `bridge.toml`
-    /// names now, uuids, at least a minute; `exp` clamped to 8 h and to the VM's wall.
+    /// names now and that is not `[relay].restricted` (R-155: never a token's own grant, whatever the file says), uuids,
+    /// at least a minute; `exp` clamped to 8 h and to the VM's wall. Its signer ([`Shared::signer`]) is named in its line.
     fn mint(&self, m: &MintRequest) -> Response {
         const OP: &str = "mint_session";
         let now = self.clock.now_unix();
@@ -301,6 +322,9 @@ impl Shared {
         if !grants.contains(&m.grant_id.as_str()) {
             return Shared::refuse(OP, "unknown_grant", "bridge.toml names no such grant ([relay].grant, [[workspace]].relay_grant)");
         }
+        if cfg.relay.is_restricted(&m.grant_id) {
+            return Shared::refuse(OP, "restricted_grant", "a [relay].restricted grant is never a token's own: a chat reaches it only through its approval");
+        }
         if !valid_uuid(&m.session_id) || m.chat_id.as_deref().is_some_and(|c| !valid_uuid(c)) || m.exp < now + MINT_MIN_S {
             return Shared::refuse(OP, "bad_request", "session_id and chat_id are uuids, and exp is at least a minute ahead");
         }
@@ -308,16 +332,27 @@ impl Shared {
         if let Some(wall) = row.wall_deadline {
             exp = exp.min(wall);
         }
-        let worker = self.keys.worker_id.clone();
+        let (signer, key) = self.signer(&cfg.relay, row.sole.as_deref(), m.chat_id.as_deref());
         let aud = cfg.relay.relay_id.as_str();
-        let claims = SessionClaims { kid: worker.clone(), aud: aud.to_string(), caller_id: worker, session_id: m.session_id.clone(), chat_id: m.chat_id.clone(), grant_id: m.grant_id.clone(), vm_id: m.vm_id.clone(), iat: now, exp };
-        match session::mint_for(&self.keys.session, &claims, aud, now) {
+        let claims = SessionClaims { kid: signer.clone(), aud: aud.to_string(), caller_id: signer.clone(), session_id: m.session_id.clone(), chat_id: m.chat_id.clone(), grant_id: m.grant_id.clone(), vm_id: m.vm_id.clone(), iat: now, exp };
+        match session::mint_for(key, &claims, aud, now) {
             Ok(token) => {
                 self.minted.fetch_add(1, Ordering::SeqCst);
-                signals::say(&format!("relay agent: minted a session token for {} (spawn {}, grant {}, until {})", m.vm_id, m.session_id, m.grant_id, rfc3339_utc(exp)));
+                signals::say(&format!("relay agent: minted a session token for {} (spawn {}, grant {}, signer {signer}, until {})", m.vm_id, m.session_id, m.grant_id, rfc3339_utc(exp)));
                 Response::Minted { token, exp }
             }
             Err(e) => Shared::refuse(OP, "bad_request", format!("the token's claims are refused ({e})")),
+        }
+    }
+
+    /// R-155: who signs a token for the chat `chat` on a VM placed for `sole` alone (its row's `VmRow.sole`), as its `kid`
+    /// and `caller_id`, and with which key. The sole key, as `<worker_id>-sole`, only when this agent holds one,
+    /// `[relay].restricted` names a grant and the VM was placed for this very chat; otherwise the session key, as the
+    /// worker id: the signer the relay never lets reach a restricted grant.
+    fn signer(&self, relay: &RelayCfg, sole: Option<&str>, chat: Option<&str>) -> (String, &SigningKey) {
+        match (&self.keys.sole, chat) {
+            (Some(key), Some(chat)) if !relay.restricted.is_empty() && sole == Some(chat) => (RelayCfg::sole_id_of(&self.keys.worker_id), key),
+            _ => (self.keys.worker_id.clone(), &self.keys.session),
         }
     }
 
@@ -457,7 +492,7 @@ mod tests {
     }
 
     fn keys() -> MacKeys {
-        MacKeys { worker_id: "worker-a".into(), worker: SigningKey::from_seed(&[1; 32]).unwrap(), session: SigningKey::from_seed(&[7; 32]).unwrap() }
+        MacKeys { worker_id: "worker-a".into(), worker: SigningKey::from_seed(&[1; 32]).unwrap(), session: SigningKey::from_seed(&[7; 32]).unwrap(), sole: None }
     }
 
     /// The agent on `paths`' socket, its clock at `now`, its end `until`, answering this process's uid: the task,
@@ -468,12 +503,17 @@ mod tests {
 
     /// [`start`] with the uid the agent answers.
     async fn start_as(paths: &Paths, now: u64, until: u64, uid: u32) -> (tokio::task::JoinHandle<Outcome>, Arc<TestClock>, PathBuf, tokio::sync::oneshot::Sender<()>) {
+        start_with(paths, now, until, uid, keys()).await
+    }
+
+    /// [`start_as`] with the keys the agent holds.
+    async fn start_with(paths: &Paths, now: u64, until: u64, uid: u32, keys: MacKeys) -> (tokio::task::JoinHandle<Outcome>, Arc<TestClock>, PathBuf, tokio::sync::oneshot::Sender<()>) {
         let socket = paths.relay_agent_socket();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let (std_listener, bound) = bind(&socket).unwrap();
         let listener = tokio::net::UnixListener::from_std(std_listener).unwrap();
         let clock = Arc::new(TestClock(AtomicU64::new(now)));
-        let state = AgentState { keys: keys(), until, paths: paths.clone(), socket: socket.clone(), bound, clock: Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>, euid: uid };
+        let state = AgentState { keys, until, paths: paths.clone(), socket: socket.clone(), bound, clock: Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>, euid: uid };
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(serve(state, listener, async move {
             let _ = rx.await;
@@ -572,6 +612,112 @@ mod tests {
         assert_eq!(session::verify(&token, now, &lookup), Err(session::SessionError::BadClaim("aud")), "the default relay refuses it");
         std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\nrelay_id = \"Relay B\"\n").unwrap();
         assert_eq!(refused(&ask(&socket, mint_req(VM, "default", now + 3600)).await), "bad_request");
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Outcome { end: End::Stopped, signed: 0, minted: 2 });
+    }
+
+    /// Two chats' access ids, placeholders of no meaning.
+    const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+    const OTHER_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a4";
+    /// `[relay]` with a restricted grant offered beside an open one, its own grant `default`.
+    const RESTRICTED: &str = "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\noffer = [\"g-open\", \"g-closed\"]\nrestricted = [\"g-closed\"]\n";
+
+    /// [`keys`] with the sole key, seed 8.
+    fn sole_keys() -> MacKeys {
+        MacKeys { sole: Some(SigningKey::from_seed(&[8; 32]).unwrap()), ..keys() }
+    }
+
+    /// A mint of the spawn `SPAWN` on `vm` for `chat` and `grant`, an hour long.
+    fn chat_mint(vm: &str, chat: Option<&str>, grant: &str, now: u64) -> Request {
+        Request::MintSession(MintRequest { vm_id: vm.into(), session_id: SPAWN.into(), chat_id: chat.map(str::to_string), grant_id: grant.into(), exp: now + 3600 })
+    }
+
+    /// The `kid` of a minted token, which verifies with its signer's key alone (`worker-a`: seed 7, `worker-a-sole`: seed
+    /// 8) and names its signer as its caller too (R-133).
+    fn signer_of(r: Response, now: u64) -> String {
+        let Response::Minted { token, .. } = r else { panic!("no token: {r:?}") };
+        let key = |seed: u8| SigningKey::from_seed(&[seed; 32]).unwrap().public_key();
+        let entry = |seed: u8| SignerKey { public_key: key(seed), not_after: now + 86_400, grants: None };
+        let lookup = |kid: &str| match kid {
+            "worker-a" => Some(entry(7)),
+            "worker-a-sole" => Some(entry(8)),
+            _ => None,
+        };
+        let claims = session::verify(&token, now, &lookup).expect("its signer's key verifies it").claims;
+        let swapped = |kid: &str| match kid {
+            "worker-a" => Some(entry(8)),
+            "worker-a-sole" => Some(entry(7)),
+            _ => None,
+        };
+        assert!(session::verify(&token, now, &swapped).is_err(), "the other key does not");
+        assert_eq!(claims.kid, claims.caller_id, "its own caller");
+        claims.kid
+    }
+
+    /// R-155: while `[relay].restricted` names a grant and the agent holds a sole key, the token of the chat a VM was placed
+    /// for alone is the sole key's, its `kid` and `caller_id` `worker-a-sole`; every other token is the session key's, as
+    /// `worker-a`: no chat on that VM, another chat on it, the chat on a shared VM or on another chat's own, `restricted`
+    /// naming none (read at each mint), or an agent with no sole key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_agent_signs_with_the_sole_key_only_for_its_chat_on_its_own_vm() {
+        let (_t, paths) = root();
+        let now = unix_now();
+        std::fs::write(&paths.config, RESTRICTED).unwrap();
+        let (own, shared, theirs) = (VM, "microvm-0199a1b2-0000-7000-8000-00000000000d", "microvm-0199a1b2-0000-7000-8000-00000000000e");
+        for (id, sole) in [(own, Some(CHAT)), (shared, None), (theirs, Some(OTHER_CHAT))] {
+            write_row(&paths, &VmRow { sole: sole.map(str::to_string), ..row(id, "vpc", GATE_PASSED, RowStatus::Running, Some(now + 36_000)) }).unwrap();
+        }
+        let (task, _clock, socket, stop) = start_with(&paths, now, now + 3600, euid(), sole_keys()).await;
+        assert_eq!(signer_of(ask(&socket, chat_mint(own, Some(CHAT), "default", now)).await, now), "worker-a-sole", "its chat on its own VM");
+        for (vm, chat, what) in [(own, None, "no chat"), (own, Some(OTHER_CHAT), "another chat on it"), (shared, Some(CHAT), "a shared VM"), (theirs, Some(CHAT), "another chat's own VM")] {
+            assert_eq!(signer_of(ask(&socket, chat_mint(vm, chat, "default", now)).await, now), "worker-a", "{what}");
+        }
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\noffer = [\"g-open\", \"g-closed\"]\n").unwrap();
+        assert_eq!(signer_of(ask(&socket, chat_mint(own, Some(CHAT), "default", now)).await, now), "worker-a", "restricted names none");
+        std::fs::write(&paths.config, RESTRICTED).unwrap();
+        assert_eq!(signer_of(ask(&socket, chat_mint(own, Some(CHAT), "default", now)).await, now), "worker-a-sole", "read at each mint");
+        stop.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), Outcome { end: End::Stopped, signed: 0, minted: 7 });
+        let (task, _clock, socket, stop) = start(&paths, now, now + 3600).await;
+        assert_eq!(signer_of(ask(&socket, chat_mint(own, Some(CHAT), "default", now)).await, now), "worker-a", "no sole key held");
+        stop.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// R-155: the agent warns once at its start when `[relay].restricted` names a grant and it holds no sole key (its
+    /// tokens then reach no restricted grant), naming the ids, its signer and `keygen --sole`; with the key, or with
+    /// nothing restricted, it says nothing.
+    #[test]
+    fn the_agent_warns_at_its_start_without_a_sole_key_while_a_grant_is_restricted() {
+        let relay = RelayCfg { worker_id: "worker-a".into(), restricted: vec!["g-closed".into(), "g-more".into()], ..RelayCfg::default() };
+        assert_eq!(
+            sole_key_warning(&relay, false).as_deref(),
+            Some("relay agent: warning: [relay].restricted names g-closed,g-more, but credentials/relay-worker.env holds no sole key, so a chat on a VM of its own gets tokens signed as worker-a, which reach no restricted grant: ai-env relay keygen --sole adds the key, then start the agent again")
+        );
+        assert_eq!(sole_key_warning(&relay, true), None, "it holds one");
+        assert_eq!(sole_key_warning(&RelayCfg { restricted: Vec::new(), ..relay }, false), None, "nothing restricted");
+    }
+
+    /// R-155: a restricted grant is never a token's own. `[relay].grant` or a workspace's `relay_grant` that
+    /// `[relay].restricted` names too (a file `validate_relay` refuses; the agent reads it unchecked at each mint) is
+    /// `restricted_grant`, for the chat on its own VM too, and mints nothing; `unknown_grant` comes first; the same grant
+    /// once no longer restricted is minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_agent_refuses_a_restricted_grant_as_a_tokens_own() {
+        let (_t, paths) = root();
+        let now = unix_now();
+        write_row(&paths, &VmRow { sole: Some(CHAT.into()), ..row(VM, "vpc", GATE_PASSED, RowStatus::Running, Some(now + 36_000)) }).unwrap();
+        let (task, _clock, socket, stop) = start_with(&paths, now, now + 3600, euid(), sole_keys()).await;
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"g-closed\"\noffer = [\"g-closed\"]\nrestricted = [\"g-closed\"]\n").unwrap();
+        for chat in [Some(CHAT), None] {
+            assert_eq!(refused(&ask(&socket, chat_mint(VM, chat, "g-closed", now)).await), "restricted_grant", "[relay].grant, chat {chat:?}");
+        }
+        assert_eq!(refused(&ask(&socket, chat_mint(VM, Some(CHAT), "g-other", now)).await), "unknown_grant");
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\noffer = [\"g-ws\"]\nrestricted = [\"g-ws\"]\n\n[[workspace]]\npath = \"/w\"\nsole_vm = true\nrelay_grant = \"g-ws\"\n").unwrap();
+        assert_eq!(refused(&ask(&socket, chat_mint(VM, Some(CHAT), "g-ws", now)).await), "restricted_grant", "a workspace's own grant");
+        assert_eq!(signer_of(ask(&socket, chat_mint(VM, Some(CHAT), "default", now)).await, now), "worker-a-sole", "its other grant");
+        std::fs::write(&paths.config, "[relay]\nworker_id = \"worker-a\"\ngrant = \"default\"\noffer = [\"g-ws\"]\n\n[[workspace]]\npath = \"/w\"\nsole_vm = true\nrelay_grant = \"g-ws\"\n").unwrap();
+        assert_eq!(signer_of(ask(&socket, chat_mint(VM, Some(CHAT), "g-ws", now)).await, now), "worker-a", "no longer restricted, and restricted names none");
         stop.send(()).unwrap();
         assert_eq!(task.await.unwrap(), Outcome { end: End::Stopped, signed: 0, minted: 2 });
     }

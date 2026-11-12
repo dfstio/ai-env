@@ -249,6 +249,12 @@ pub struct RunPlan {
     /// reopen's P0, `vm warm` with a chat and the offline `session migrate`
     /// set it from `s3::manifest::caps_required`.
     pub caps_required: Vec<&'static str>,
+    /// R-154: the access id of the one chat this plan's VM runs (`workspace::chat_sole`: a chat of a `sole_vm`
+    /// workspace, or one marked sole). The placement writes it into the row (`VmRow.sole`); `reuse_candidate`
+    /// takes only a row of the same (`None`: a shared VM), and a pinned VM of another is refused (exit 9).
+    /// `None` from [`RunPlan::from_cfg`]; the reopen's P0, the offline `session migrate` and `vm warm` with a chat
+    /// set it; a move takes its session's plan.
+    pub sole: Option<String>,
 }
 
 /// Which VM SELECT_VM takes for a workspace (S8 plan §1, §3 P2).
@@ -378,6 +384,7 @@ impl RunPlan {
             transcript_cap: false,
             avoid: Vec::new(),
             caps_required: Vec::new(),
+            sole: None,
         })
     }
 }
@@ -1281,7 +1288,8 @@ fn record_ended(paths: &Paths, row: &VmRow, m: &str) {
 /// write the pending row with a fresh session token (its client token is
 /// `plan.client_token` when set, else a fresh uuid v7; the payload is padded
 /// to `plan.pad_payload_to` when set; `egress_connectors` the planned list,
-/// `egress_gate` pending)
+/// `egress_gate` pending; R-154: `sole` the plan's, which the promotion and an
+/// adoption keep: they turn this row into the VM's)
 /// and, for internet egress, append `vm_egress_internet`; the lock is
 /// released on return. Returns the pending row and the payload for
 /// `RunMicrovm`.
@@ -1329,6 +1337,7 @@ async fn place<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, version: &
         ingress: plan.ingress_connectors.clone(),
         shell: plan.shell,
         execution_role: plan.execution_role_arn.clone(),
+        sole: plan.sole.clone(),
         ..VmRow::default()
     };
     registry::write_pending(paths, &row)?;
@@ -1416,9 +1425,12 @@ async fn try_reuse<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wanted
 /// even when `preferred`), and none whose chat a migration moved on
 /// (`leaving_for` set while its retire counts its spawns: synced and
 /// terminated when no other chat's spawn lives there; kept otherwise, and
-/// then unmarked, an ordinary workspace VM again).
+/// then unmarked, an ordinary workspace VM again). R-154: only a row placed
+/// for the plan's chat alone when the plan's chat runs alone, and only a
+/// shared row otherwise (`sole` equal, even when `preferred`).
 pub(crate) fn reuse_candidate(r: &VmRow, plan: &RunPlan, wanted: &ExpectedEcho, workspace: &str, version: Option<&str>, preferred: Option<&str>, now: u64) -> bool {
     !r.is_pending_row()
+        && r.sole == plan.sole
         && !plan.avoid.contains(&r.id)
         && r.leaving_for.is_none()
         && r.workspace.as_deref() == Some(workspace)
@@ -1552,7 +1564,9 @@ async fn reuse_row<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, row: V
 /// VM, never another row. Its image version is taken as it is (the operator
 /// chose it), as is its wall left. Refused (the run's failure): no row or
 /// one recording the VM terminated (exit 8), another egress, a `--shell` VM
-/// or another connector than the plan's (exit 9), recorded caps lacking
+/// or another connector than the plan's (exit 9), R-154: a VM placed for
+/// another chat alone, or a shared one for a chat that runs alone (`sole`
+/// unequal, exit 9), recorded caps lacking
 /// `workspace_v1` when the plan needs them (exit 7, naming `make deploy`),
 /// and whatever [`reuse_row`] passed it over for (gone: 8; its egress
 /// failed the gate: 9; not settled: 7).
@@ -1577,6 +1591,9 @@ async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wa
     if ExpectedEcho::for_row(&row).is_some_and(|e| &e != wanted) {
         return Err(BridgeError::Policy(pinned("it was started for another egress connector than the configured one".into())).into());
     }
+    if let Some(why) = sole_mismatch(&row, plan) {
+        return Err(BridgeError::Policy(pinned(why.into())).into());
+    }
     if plan.workspace_cap && vm_capability(&row) == Capability::No {
         return Err(BridgeError::NoCapability { cap: CAP_WORKSPACE_V1, message: pinned(format!("image version {} predates the workspace routes", row.image_version)) }.into());
     }
@@ -1592,6 +1609,16 @@ async fn select_pinned<A: MicrovmApi>(api: &A, paths: &Paths, plan: &RunPlan, wa
         Ok(selected) => Ok(selected),
         Err(why) => Err(why.into()),
     }
+}
+
+/// R-154: why `plan` may not take the VM of `row`, pinned, when their `sole` differ: a VM placed for one chat alone
+/// takes no other plan, and a chat that runs alone never joins a shared VM. P0 says it first (before any Touch ID),
+/// [`select_pinned`] again.
+pub(crate) fn sole_mismatch(row: &VmRow, plan: &RunPlan) -> Option<&'static str> {
+    if row.sole == plan.sole {
+        return None;
+    }
+    Some(if row.sole.is_some() { "it runs one chat alone (sole_vm)" } else { "it is shared, and this chat runs alone (sole_vm)" })
 }
 
 // ---- terminate -------------------------------------------------------------------------
@@ -1985,6 +2012,53 @@ mod tests {
         assert_eq!(exit(w.select(&api, Choice::Pin(pinned.clone()), false).await), 8, "gone");
         assert_eq!(registry::read_row(&w.paths, &pinned).unwrap().unwrap().status, RowStatus::Terminated, "recorded");
         assert_eq!(exit(w.select(&api, Choice::Pin(pinned.clone()), false).await), 8, "its row records it terminated");
+        assert_eq!(runs(&api), before, "a pin never places a VM");
+    }
+
+    /// R-154: a plan whose chat runs alone (`sole`) places a VM of its own, its row naming the chat
+    /// from the pending row on; `reuse_candidate` gives that row to that chat's plan alone, never to a shared plan or
+    /// another chat's, and gives such a plan no shared row, even the one its session prefers; a pin of the other kind
+    /// is refused (exit 9), and nothing is placed for a pin.
+    #[tokio::test]
+    async fn a_vm_placed_for_one_chat_is_that_chats_alone() {
+        const A: &str = "0199a1b2-0000-7000-8000-0000000012d1";
+        const B: &str = "0199a1b2-0000-7000-8000-0000000012d2";
+        let w = World::new();
+        let api = fake();
+        let alone = |chat: Option<&str>, choice: Choice| RunPlan { sole: chat.map(str::to_string), ..w.plan(choice, false, false) };
+        let (fake_api, paths) = (&api, &w.paths);
+        let select = move |plan: RunPlan| async move { select_vm_detailed(fake_api, paths, &plan, Poll::RUNNING.scaled(Some(1))).await };
+        let shared = w.started(&api, |_| {}).await;
+        let Selected::Started { row, .. } = select(alone(Some(A), Choice::Workspace)).await.unwrap() else { panic!("chat A's own VM") };
+        let own = row.id.clone();
+        assert_eq!((row.sole.as_deref(), registry::read_row(&w.paths, &own).unwrap().unwrap().sole.as_deref()), (Some(A), Some(A)), "the row names chat A");
+        let spec = api.run_specs().pop().expect("its RunMicrovm");
+        assert_eq!(spec.client_token, row.client_token, "placed by this plan");
+        assert_eq!(reused(&select(alone(Some(A), Choice::Workspace)).await.unwrap()), own, "chat A again: its own");
+        assert_eq!(reused(&select(alone(Some(A), Choice::Prefer(shared.clone()))).await.unwrap()), own, "never the shared VM its session prefers");
+        assert_eq!(reused(&select(alone(None, Choice::Workspace)).await.unwrap()), shared, "a shared plan: the shared VM");
+        assert_eq!(reused(&select(alone(None, Choice::Prefer(own.clone()))).await.unwrap()), shared, "never chat A's, even preferred");
+        let before = runs(&api);
+        let Selected::Started { row: b, .. } = select(alone(Some(B), Choice::Workspace)).await.unwrap() else { panic!("chat B's own VM") };
+        assert!(b.id != own && b.id != shared && b.sole.as_deref() == Some(B) && runs(&api) == before + 1, "{b:?}");
+        // SELECT_VM's own filter, row by row.
+        let rows = registry::list_rows(&w.paths).unwrap();
+        let (now, plan_a) = (unix_now(), alone(Some(A), Choice::Workspace));
+        let wanted = ExpectedEcho::for_plan(plan_a.egress, &plan_a.egress_connectors).unwrap();
+        let key = workspace_key(&plan_a.workspace.as_ref().unwrap().0);
+        let takes = |plan: &RunPlan| rows.iter().filter(|r| reuse_candidate(r, plan, &wanted, &key, None, None, now)).map(|r| r.id.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(takes(&plan_a), BTreeSet::from([own.clone()]));
+        assert_eq!(takes(&alone(Some(B), Choice::Workspace)), BTreeSet::from([b.id.clone()]));
+        assert_eq!(takes(&alone(None, Choice::Workspace)), BTreeSet::from([shared.clone()]));
+        assert!(takes(&alone(Some("0199a1b2-0000-7000-8000-0000000012d3"), Choice::Workspace)).is_empty(), "a third chat: none");
+        // A pin of the other kind: refused, as a policy (9); its own: taken.
+        let before = runs(&api);
+        let exit = |r: Result<Selected, SelectFailure>| crate::errors::CliError::from(r.unwrap_err().error).exit_code();
+        assert_eq!(exit(select(alone(None, Choice::Pin(own.clone()))).await), 9, "a shared plan, chat A's VM");
+        assert_eq!(exit(select(alone(Some(B), Choice::Pin(own.clone()))).await), 9, "chat B, chat A's VM");
+        let e = select(alone(Some(A), Choice::Pin(shared.clone()))).await.unwrap_err().error;
+        assert!(matches!(&e, BridgeError::Policy(m) if m.ends_with("it is shared, and this chat runs alone (sole_vm)")), "{e}");
+        assert_eq!(reused(&select(alone(Some(A), Choice::Pin(own.clone()))).await.unwrap()), own);
         assert_eq!(runs(&api), before, "a pin never places a VM");
     }
 

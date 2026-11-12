@@ -9,7 +9,12 @@
 //! Cursor's own `custom-title` lines carried over byte for byte. Written
 //! atomically (a 0600 temp file, fsync, rename), never through a symlink;
 //! unchanged bytes are not rewritten. Never a transcript: the wrapper
-//! refuses a local resume of it (`wire::view::local_view_target`).
+//! refuses a local resume of it (`wire::view::local_view_target`). The fork
+//! gap: Cursor's fork of a remote chat copies these lines under a new id,
+//! the mark still first. While no manifest or remote row names that id
+//! (`s3::manifest::origin_of` is none), a remote reopen sends the copy up as
+//! that chat, once no VM or tail holds it (never a placeholder view, which
+//! stands for no chat: `s3::sync::is_placeholder_view`).
 //!
 //! The file a view replaces is a view (`wire::view::is_view_head`), or
 //! nothing: a transcript at the path (a chat begun on this Mac, an S8

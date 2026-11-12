@@ -309,11 +309,14 @@ pub(crate) fn main_with(store: &Keystore, cmd: VmCmd, chat: Option<crate::bridge
     crate::bridge::signals::note_dispositions();
     let ctx = Ctx::load()?;
     // Everything that can be refused without AWS is refused before the Touch ID.
-    let mut pre = Pre::check(&ctx, &cmd)?;
+    let mut pre = Pre::check(&ctx, &cmd, chat.is_some())?;
     if let Pre::Warm(w) = &mut pre {
         // S11 (L5): a gzip-staged chat goes only to a VM that decodes it (`RunPlan.caps_required`).
         if let Some(chat) = &chat {
             w.plan.caps_required = crate::bridge::s3::manifest::caps_required(&ctx.paths, &chat.session);
+            // R-154: the VM the chat's reopen takes.
+            let sole = warm_sole(&ctx, w, &chat.session);
+            w.plan.sole = sole;
         }
         w.chat = chat;
     }
@@ -389,7 +392,8 @@ impl Pre {
         }
     }
 
-    fn check(ctx: &Ctx, cmd: &VmCmd) -> Result<Pre> {
+    /// `chat`: a warm that restores a chat (`session stage --warm`), whose VM is the one that chat's reopen takes.
+    fn check(ctx: &Ctx, cmd: &VmCmd, chat: bool) -> Result<Pre> {
         Ok(match cmd {
             VmCmd::Run { image, version, max_duration, idle, suspended, no_auto_resume, egress, workspace, new, label, shell, no_execution_role, no_wait, .. } => {
                 let flags = run::RunFlags {
@@ -457,7 +461,7 @@ impl Pre {
             }
             VmCmd::Attach { id, spawn, from_seq } => Pre::Attach(Box::new(crate::bridge::agent::exec::check_attach(ctx, id, spawn, *from_seq)?)),
             VmCmd::Warm { workspace, prewarm, claude_version, .. } => {
-                let warm = warm_check(ctx, workspace, *prewarm, claude_version.as_deref());
+                let warm = warm_check(ctx, workspace, *prewarm, claude_version.as_deref(), chat);
                 if let (true, Err(e)) = (*prewarm, &warm) {
                     // The prewarm's stderr is /dev/null (S8 §11): why nothing was warmed goes to its log.
                     crate::bridge::voice::note(&format!("no prewarm: {e}"));
@@ -775,18 +779,22 @@ struct Warm {
 
 /// `vm warm`'s prechecks (S7, S8), all before the Touch ID: the run plan;
 /// then, as the session's P0 orders them, the workspace ([`warm_seed`]: the
-/// prewarm refuses one no remote session takes), the setup-token's seal and
-/// the gate's local half; then the seed's snapshot and every scan
+/// prewarm refuses one no remote session takes; R-154: a warm with no `chat`
+/// refuses a `sole_vm` workspace, [`sole_warm_refused`]), the setup-token's
+/// seal and the gate's local half; then the seed's snapshot and every scan
 /// (`workspace::prepare` with the CLI's caps, as `box seed` takes them): a
 /// finding or uncommitted changes over a `[seed]` cap are exit 9 here,
 /// nothing unsealed or started.
-fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool, claude_version: Option<&str>) -> Result<Warm> {
+fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool, claude_version: Option<&str>, chat: bool) -> Result<Warm> {
     let purpose = if prewarm { "prewarm" } else { "operator" };
     let flags = run::RunFlags { workspace: Some(workspace.to_path_buf()), egress: Some(run::Egress::Vpc), purpose, wait: true, ..run::RunFlags::default() };
     let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags)?;
     // Its own client token, as the smoke's: a stop while `select` runs still finds the VM it started.
     plan.client_token = Some(uuid::Uuid::now_v7().to_string());
     let seed = warm_seed(ctx, workspace, prewarm)?;
+    if let (false, Ok(ws)) = (chat, &seed) {
+        sole_warm_refused(&ctx.cfg, ws)?;
+    }
     let cred = sealed_token_plan(ctx)?;
     provisional_gate(ctx, &plan)?;
     let prepared = match &seed {
@@ -798,6 +806,31 @@ fn warm_check(ctx: &Ctx, workspace: &std::path::Path, prewarm: bool, claude_vers
     // S9: and the transcript store's (a session's restore pulls its chat from S3 there).
     plan.transcript_cap = seed.is_ok();
     Ok(Warm { plan, cred, seed, prepared: std::cell::Cell::new(prepared), chat: None, claude: warm_claude_version(claude_version) })
+}
+
+/// R-154: a warm with no chat of a workspace whose chats run alone (its `[[workspace]]` says `sole_vm`, as P0's
+/// `workspace::sole_of` reads it) is refused (`Policy`, exit 9) before any Touch ID: each chat there takes only a VM
+/// placed for it alone, so a VM warmed without one is taken by none, while it counts toward `[vm].max_concurrent` until
+/// it idles out (the prewarm skips such a workspace too, `sole_vm`). The line names `session stage UUID --warm`, which
+/// warms a chat's own.
+fn sole_warm_refused(cfg: &BridgeConfig, ws: &crate::bridge::workspace::WorkspaceRef) -> Result<()> {
+    if !crate::bridge::workspace::workspace_cfg(cfg, ws).is_some_and(|w| w.sole_vm) {
+        return Ok(());
+    }
+    Err(CliError::Policy(format!(
+        "vm warm: {} is in a [[workspace]] with sole_vm = true, where each chat runs on a VM placed for it alone: a VM warmed with no chat is one none of them takes, though it counts toward [vm].max_concurrent; ai-env session stage UUID --warm warms a chat's own (nothing was started)",
+        ws.cwd.display()
+    )))
+}
+
+/// R-154: the chat a warm with a chat (`session stage --warm`) makes ready runs on the VM its reopen takes: a VM of
+/// its own when it runs alone (`workspace::chat_sole`, by its row's access id: its workspace `sole_vm`, or its row
+/// marked sole); a shared one otherwise, and for a warm with no seed (its workspace unresolved: no chat reopens
+/// there). A chat with no access id yet gets one at its first remote start, so its own VM is that start's.
+fn warm_sole(ctx: &Ctx, w: &Warm, session: &str) -> Option<String> {
+    let ws = w.seed.as_ref().ok()?;
+    let row = crate::bridge::registry::read(&ctx.paths, session).ok().flatten();
+    crate::bridge::workspace::chat_sole(&ctx.cfg, ws, row.as_ref().and_then(crate::bridge::registry::SessionRow::access), row.as_ref())
 }
 
 /// `vm warm`'s claude version (S11, LD-9): `flag`, else the installed Cursor bundle's (`doctor::pick_bundle` of
@@ -2633,6 +2666,54 @@ mod tests {
         let mut plan = run::RunPlan::from_cfg(&ctx.cfg, &flags).unwrap_or_else(|e| panic!("plan: {e}"));
         plan.client_token = Some(uuid::Uuid::now_v7().to_string());
         plan
+    }
+
+    /// R-154: a warm with a chat (`session stage --warm`) plans the VM the chat's reopen takes: its own, by its row's
+    /// access id, in a `sole_vm` workspace or once the row is marked sole (wherever it is); a shared one for a chat
+    /// with no row or no access id, outside a `sole_vm` workspace, and for a warm with no seed. A warm with no chat
+    /// refuses a `sole_vm` workspace, whose chats take none but their own.
+    #[test]
+    fn a_warm_with_a_chat_plans_the_vm_its_reopen_takes() {
+        use crate::bridge::workspace::{Head, WorkspaceRef, WsKind};
+        const SID: &str = "0199a1b2-0000-7000-8000-0000000012a9";
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012aa";
+        let d = tempfile::tempdir().unwrap();
+        let mut ctx = warm_ctx(d.path(), None);
+        let cwd = std::fs::canonicalize(d.path().join("work").join("ws")).unwrap();
+        let ws = WorkspaceRef {
+            cwd: cwd.clone(),
+            root: cwd.clone(),
+            vm_cwd: cwd.display().to_string(),
+            vm_root: cwd.display().to_string(),
+            slug: "-ws".into(),
+            kind: WsKind::Git { git_dir: cwd.join(".git"), common_dir: cwd.join(".git"), object_format: crate::wire::workspace::ObjectFormat::Sha1 },
+            head: Head::Detached { sha: "a".repeat(40) },
+            seed_branch: None,
+        };
+        let cred = crate::bridge::agent::credential::CredentialPlan { deliver: crate::wire::frame::Deliver::Fd, file: None, tag: "0".repeat(16), account: None };
+        let plan = warm_plan(&ctx, d.path());
+        let warm = |seed: std::result::Result<WorkspaceRef, String>| Warm { plan: plan.clone(), cred: cred.clone(), seed, prepared: std::cell::Cell::new(None), chat: None, claude: None };
+        let row = crate::bridge::registry::SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some(CHAT.into()), ..Default::default() };
+        assert_eq!(warm_sole(&ctx, &warm(Ok(ws.clone())), SID), None, "no row: no access id yet");
+        crate::bridge::registry::write(&ctx.paths, &row).unwrap();
+        assert_eq!(warm_sole(&ctx, &warm(Ok(ws.clone())), SID), None, "not sole_vm: a shared VM");
+        ctx.cfg.workspace_overrides.push(crate::bridge::config::WorkspaceCfg { path: cwd.clone(), sole_vm: true, ..Default::default() });
+        assert_eq!(warm_sole(&ctx, &warm(Ok(ws.clone())), SID).as_deref(), Some(CHAT), "sole_vm: its own");
+        assert_eq!(warm_sole(&ctx, &warm(Err("no seed".into())), SID), None, "no seed: no chat reopens there");
+        ctx.cfg.workspace_overrides.clear();
+        crate::bridge::registry::mark_sole(&ctx.paths, SID).unwrap();
+        assert_eq!(warm_sole(&ctx, &warm(Ok(ws.clone())), SID).as_deref(), Some(CHAT), "marked: its own wherever it is");
+        // R-154: a warm with no chat refuses a sole_vm workspace (exit 9, naming the warm of a chat's own), and only one.
+        assert!(sole_warm_refused(&ctx.cfg, &ws).is_ok(), "no sole_vm");
+        ctx.cfg.workspace_overrides.push(crate::bridge::config::WorkspaceCfg { path: cwd.clone(), sole_vm: true, ..Default::default() });
+        let e = sole_warm_refused(&ctx.cfg, &ws).unwrap_err();
+        assert_eq!(e.exit_code(), 9, "{e}");
+        assert_eq!(
+            e.to_string(),
+            format!("vm warm: {} is in a [[workspace]] with sole_vm = true, where each chat runs on a VM placed for it alone: a VM warmed with no chat is one none of them takes, though it counts toward [vm].max_concurrent; ai-env session stage UUID --warm warms a chat's own (nothing was started)", cwd.display())
+        );
+        ctx.cfg.workspace_overrides[0].sole_vm = false;
+        assert!(sole_warm_refused(&ctx.cfg, &ws).is_ok(), "sole_vm off");
     }
 
     /// `select` for `plan` until its RunMicrovm made the VM, then dropped as

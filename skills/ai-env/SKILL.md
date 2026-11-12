@@ -133,7 +133,9 @@ into the repository unless asked. A source or op the chat lacks is the user's to
 never look for another way to reach it (the relay's address, the client's socket under
 `/run/ai-env/relay`, a credential). An empty catalog or `not granted` means the user has not approved this
 chat: say so plainly and do not retry. An approval, in the panel on the Mac, reaches this chat within about
-70 s with no restart.
+70 s with no restart. A grant the user keeps restricted reaches a chat only on a VM of its own, in a workspace set
+up for that: approved while the chat shares its VM, it reaches the chat from its next start, so the user reopens
+the chat; say so, and never look for another way to it.
 
 **On the Mac**, these show and bring back what a VM did (each `ai-env` command that reaches
 AWS asks for one Touch ID):
@@ -201,7 +203,10 @@ would a Cursor reload with the wrapper off while such a chat's tab is open. `ai-
 `session sync`, `session gc --remote --yes`, `session migrate-s9 --yes` and
 `session forget UUID... --purge` (one Touch ID for all the ids) move or delete transcripts in S3
 and ask for Touch IDs: they are the user's to run, never yours (without `--yes`,
-`session gc --remote` and `session migrate-s9` only list, with no AWS call).
+`session gc --remote` and `session migrate-s9` only list, with no AWS call). A chat forked in
+Cursor from a remote chat starts from that chat's view: its history is the last messages as text,
+with tools shown as `[tool: NAME]` and no tool output. Read any file or output you need again
+rather than trusting what the history implies.
 
 **Exits Cursor shows** as `Claude Code process exited with code N`, the last stderr line
 (`ai-env-claude: …`) naming the fix: `3` the Touch ID dialog was dismissed, a move's too
@@ -221,7 +226,12 @@ transcript over the 64 MiB a reopen carries or pulls inline (the user runs the c
 names in a terminal:
 `ai-env session stage UUID --warm`, which restores the chat into its workspace's VM, after
 `ai-env session migrate-s9 --yes` for a chat from before S9, and with `[vm] reuse_per_workspace`
-set back to true when the line says it is off), or a local resume of a remote chat's view.
+set back to true when the line says it is off), a local resume of a remote chat's view, or a
+`--resume` of a chat this Mac has no record of
+(`refused before any Touch ID: no chat UUID on this Mac …`: start a new chat). For that one
+Cursor shows its `Couldn't load this conversation's saved history` banner instead, whose
+`Start a new conversation` link starts one; the line is in the wrapper's stderr, after the CLI's
+own `No conversation found with session ID: UUID`.
 
 ## Deploying and operating the AWS side
 
@@ -262,8 +272,14 @@ the VMs and sessions (`credentials/aws.env`, Touch ID).
   `stop`, and `make relay-logs`, are ops' (one Touch ID). `ai-env relay access` is ops' too, and it approves a
   chat for a grant: the user's decision, in the panel or by that command, so never start it yourself.
   `ai-env relay agent` (one Touch ID, then it
-  holds this Mac's relay keys) and `ai-env relay keygen` are the user's to run.
-  `ai-env relay status --local`, `ai-env relay pubkey` (without `--verify`) and `ai-env relay ca` ask
+  holds this Mac's relay keys) and `ai-env relay keygen` are the user's to run, `keygen --sole` too (one Touch
+  ID: the key that alone signs for `[relay].restricted` grants, as `<worker_id>-sole`). A restricted grant goes only
+  to a chat of a `[[workspace]]` with `sole_vm = true`, which from then on runs alone on a VM of its own wherever it
+  reopens and is refused a reopen anywhere else (a fork Cursor makes of it too; `session forget` of either only with
+  `--purge`, the user's call): `restricted` and `sole_vm` in `bridge.toml`, such an approval, and a
+  signer's `--grants` (`relay allow` refuses one other than `<worker_id>-sole` that reaches a restricted grant) are
+  the user's decisions.
+  `ai-env relay status --local`, `ai-env relay pubkey` (without `--verify`, `--sole` too) and `ai-env relay ca` ask
   nothing of AWS and no Touch ID: you may run them, and `make check-advisories` too (RustSec advisories
   over the lock). ai-env is public: never write a private source, host, address,
   worker id or grant into it; grants live in SSM only, and workers in private repositories.

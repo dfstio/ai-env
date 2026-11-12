@@ -444,6 +444,13 @@ pub enum Failure {
     /// name or the VM and the fix, never a value). P3's live gate, after the
     /// Touch ID, is [`Failure::GateRefused`].
     Refused { what: String },
+    /// P0, exit 9 (the fork gap): refused before any Touch ID: a `--resume`
+    /// of `session`, a chat this Mac has no record of (no registry row, no S3
+    /// manifest) and no copy of (no transcript or view in any project
+    /// directory), which the VM's claude could only miss. Its line says to
+    /// start a new chat; [`Failure::cli_line`] is the CLI's own miss for it,
+    /// printed before that line, so Cursor offers one (its banner's link).
+    NothingToResume { session: String },
     /// P0, exit 2: `AI_ENV_BRIDGE_VM` is not a MicroVM id.
     PinInvalid,
     /// P0, exit 8: the pinned VM has no row, or it was terminated.
@@ -536,13 +543,14 @@ pub enum Failure {
 
 impl Failure {
     /// Every kind's [`Failure::word`].
-    pub const WORDS: [&'static str; 27] = [
+    pub const WORDS: [&'static str; 28] = [
         "config",
         "no_token",
         "no_account",
         "no_runtime_key",
         "not_git_repo",
         "refused",
+        "nothing_to_resume",
         "pin_invalid",
         "pin_gone",
         "touchid_cancelled",
@@ -576,6 +584,7 @@ impl Failure {
             Failure::NoRuntimeKey { .. } => "no_runtime_key",
             Failure::NotGitRepo => "not_git_repo",
             Failure::Refused { .. } => "refused",
+            Failure::NothingToResume { .. } => "nothing_to_resume",
             Failure::PinInvalid => "pin_invalid",
             Failure::PinGone { .. } => "pin_gone",
             Failure::TouchIdCancelled => "touchid_cancelled",
@@ -611,7 +620,7 @@ impl Failure {
             Failure::OldImage { .. } => 7,
             Failure::PinGone { .. } | Failure::HelloRefused { .. } | Failure::LinkLost { .. } | Failure::MovesExhausted { .. } => 8,
             Failure::Move { inner, .. } => inner.exit_code(),
-            Failure::NotGitRepo | Failure::Refused { .. } | Failure::MaxConcurrent { .. } | Failure::Finding { .. } | Failure::TranscriptTooLarge { .. } | Failure::TranscriptPullTooLarge { .. } | Failure::GateRefused { .. } | Failure::SpawnLimit { .. } => 9,
+            Failure::NotGitRepo | Failure::Refused { .. } | Failure::NothingToResume { .. } | Failure::MaxConcurrent { .. } | Failure::Finding { .. } | Failure::TranscriptTooLarge { .. } | Failure::TranscriptPullTooLarge { .. } | Failure::GateRefused { .. } | Failure::SpawnLimit { .. } => 9,
             Failure::Select { code, .. } if matches!(code, 7..=9) => *code,
             Failure::Deadline { code, .. } if matches!(code, 5 | 7 | 8) => *code,
             Failure::Select { .. } | Failure::Deadline { .. } => 7,
@@ -684,6 +693,7 @@ impl Failure {
             Failure::NoRuntimeKey { why } => format!("{}: run make runtime-key", part(why, PART_MAX)),
             Failure::NotGitRepo => "not a git repository: ai-env seeds git workspaces only; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally".to_string(),
             Failure::Refused { what } => format!("refused before any Touch ID: {}", part(what, PART_MAX)),
+            Failure::NothingToResume { session } => format!("refused before any Touch ID: no chat {} on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat", part(session, SHORT_MAX)),
             Failure::PinInvalid => format!("{PIN_KNOB} is not a MicroVM id: unset it, or name a VM ai-env vm list shows"),
             Failure::PinGone { vm } => format!("the pinned VM {} ({PIN_KNOB}) is gone or has no row: unset {PIN_KNOB}, or pin a VM ai-env vm list shows", part(vm, SHORT_MAX)),
             Failure::TouchIdCancelled => "Touch ID was cancelled: nothing was started; reopen the chat to try again".to_string(),
@@ -765,6 +775,22 @@ impl Failure {
             Failure::Other { step, first_line, .. } => format!("{} (at {step}); ai-env doctor checks the setup; AI_ENV_BRIDGE_LOCAL=1 runs Cursor locally", part(first_line, PART_MAX)),
         };
         cut(&text, LINE_MAX - PREFIX.len())
+    }
+
+    /// The fork gap (option B): the CLI's own line for a failure that is its
+    /// resume miss, [`Failure::NothingToResume`]'s alone:
+    /// `No conversation found with session ID: <id>`
+    /// (`wire::claude::RESUME_MISS_MARKER`, the id scrubbed and cut). The
+    /// wrapper prints it raw (`voice::echo`), before its own line, which
+    /// stays the last: Cursor's webview matches it in the exit's stderr
+    /// tail and shows its banner, whose link starts a new chat. `None` for
+    /// every other kind.
+    #[must_use]
+    pub fn cli_line(&self) -> Option<String> {
+        match self {
+            Failure::NothingToResume { session } => Some(format!("{} {}", crate::wire::claude::RESUME_MISS_MARKER, part(session, SHORT_MAX))),
+            _ => None,
+        }
     }
 }
 
@@ -1008,6 +1034,9 @@ mod tests {
         assert!(MODE_NOTES.iter().all(|n| n.starts_with("mode:remote")));
     }
 
+    /// The fork gap: the id of a chat this Mac has no record or copy of.
+    const UNKNOWN_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+
     /// The fix a kind's line names (exhaustive: a new kind fails to compile here until its row is added).
     fn fix_of(f: &Failure) -> &'static str {
         match f {
@@ -1017,6 +1046,7 @@ mod tests {
             Failure::NoAccount { .. } => "`ai-env creds account use NAME` installs one",
             Failure::NoRuntimeKey { .. } => "run make runtime-key",
             Failure::Refused { .. } => "refused before any Touch ID: ",
+            Failure::NothingToResume { .. } => "nothing to resume; start a new chat",
             Failure::PinInvalid | Failure::PinGone { .. } => "ai-env vm list",
             Failure::TouchIdCancelled => "reopen the chat",
             Failure::TouchIdTimeout { .. } | Failure::Deadline { .. } => "ai-env vm warm prepares the VM ahead",
@@ -1061,6 +1091,8 @@ mod tests {
             (Failure::NoRuntimeKey { why: "/Users/mike/.config/ai-env/bridge/credentials/aws.env does not exist".into() }, 5),
             (Failure::NotGitRepo, 9),
             (Failure::Refused { what: long.clone() }, 9),
+            (Failure::NothingToResume { session: UNKNOWN_CHAT.into() }, 9),
+            (Failure::NothingToResume { session: format!("{token}{}", "s".repeat(300)) }, 9),
             (Failure::PinInvalid, 2),
             (Failure::PinGone { vm: vm.clone() }, 8),
             (Failure::TouchIdCancelled, 3),
@@ -1121,7 +1153,23 @@ mod tests {
             assert!(!printed.contains('\n') && !printed.contains("second line"), "one line: {printed}");
             assert!(!printed.contains(&token) && !printed.contains(&key_id), "no secret: {printed}");
             assert!(printed.contains(fix_of(f)), "{} names its fix ({}): {printed}", f.word(), fix_of(f));
+            // The fork gap (option B): only a refusal that is the CLI's own miss prints the CLI's line too.
+            match (f, f.cli_line()) {
+                (Failure::NothingToResume { .. }, Some(raw)) => assert!(raw.starts_with("No conversation found with session ID: ") && !raw.contains('\n') && !raw.contains(&token), "{raw}"),
+                (Failure::NothingToResume { .. }, None) => panic!("no CLI line for {f:?}"),
+                (_, raw) => assert_eq!(raw, None, "{f:?}"),
+            }
         }
+        // The fork gap: the refusal's own line, 194 characters with the prefix for a uuid, and the CLI's miss for it,
+        // as `wire::claude::RESUME_MISS_MARKER` reads it (a token-shaped id is cut and scrubbed in both).
+        let unknown = Failure::NothingToResume { session: UNKNOWN_CHAT.into() };
+        assert_eq!(
+            unknown.line(),
+            format!("refused before any Touch ID: no chat {UNKNOWN_CHAT} on this Mac (no registry row, no S3 manifest, no transcript or view): nothing to resume; start a new chat")
+        );
+        assert_eq!(format!("{PREFIX}{}", unknown.line()).chars().count(), 194);
+        assert_eq!(unknown.cli_line(), Some(format!("No conversation found with session ID: {UNKNOWN_CHAT}")));
+        assert_eq!(unknown.cli_line(), Some(format!("{} {UNKNOWN_CHAT}", crate::wire::claude::RESUME_MISS_MARKER)));
         // A quoted part keeps its start, cut with an ellipsis, and the fix after it survives.
         let config = Failure::Config { first_line: long }.line();
         assert!(config.starts_with("aws run_microvm: xxx") && config.contains("\u{2026}; AI_ENV_BRIDGE_LOCAL=1"), "{config}");
@@ -1206,6 +1254,7 @@ mod tests {
             (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true, pinned: None }, " --warm in a terminal, then reopen the chat"),
             // S10 (F3b): the pinned VM's line, its VM and session at their cuts (294 characters with the prefix).
             (Failure::TranscriptPullTooLarge { session: long.clone(), bytes: u64::MAX, reuse_off: true, pinned: Some(long.clone()) }, " --warm, then reopen the chat"),
+            (Failure::NothingToResume { session: long.clone() }, ": nothing to resume; start a new chat"),
             (Failure::SpawnLimit { vm: long.clone(), limit: 8 }, " --detail"),
             (Failure::HelloRefused { code: long.clone() }, "ai-env vm terminate it, then reopen the chat"),
             (Failure::LinkLost { vm: long.clone() }, ": reopen the chat from the picker"),

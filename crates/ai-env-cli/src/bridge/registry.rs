@@ -1,10 +1,13 @@
 //! The session registry: `<bridge root>/state/sessions/<uuid>.toml`, one row
 //! per session the wrapper piped (S2), later extended by S8/S10 (VM ids,
 //! spawn ids, acked sequence numbers, seeded heads). The wrapper that owns a
-//! session is the only writer of its row (no lock in S2 — the per-workspace
-//! flock of §2.4 guards VM placement from S4 on, not this file); every write
-//! is atomic (temp file named after the writer's pid, fsync, rename, dir
-//! fsync), so a wrapper killed mid-write never blocks a later one.
+//! session is the only writer of its row but one field (no lock in S2 — the
+//! per-workspace flock of §2.4 guards VM placement from S4 on, not this file);
+//! every write is atomic (temp file named after the writer's pid, fsync,
+//! rename, dir fsync), so a wrapper killed mid-write never blocks a later one.
+//! R-154: that field is a chat's sole mark ([`mark_sole`], a restricted
+//! approval's), written into a live wrapper's row: every [`write`] keeps the
+//! mark on disk, both under `state/sessions.lock`.
 //!
 //! A row never holds a request body: `host_state` carries digests and an
 //! allowlisted summary (`mcp_set_servers` and `apply_flag_settings` bodies
@@ -138,6 +141,12 @@ pub struct SessionRow {
     /// R-148: the word of the latest spawn's session token (`mint::MintOutcome::word`: `minted`, `off`, `no_agent`, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// R-154, sticky per chat: when the chat was first approved a `[relay].restricted` grant (RFC 3339 UTC, [`mark_sole`]).
+    /// From then on it runs alone wherever it reopens (`workspace::chat_sole`), and P0 refuses its reopen from a cwd
+    /// outside a `sole_vm` workspace; its wrapper marks the rows it writes after it (a `/clear`'s, a fork's). Never
+    /// taken off: every [`write`] keeps the one on disk. Left out of a document while unset, as `access_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sole_since: Option<String>,
 }
 
 impl SessionRow {
@@ -146,6 +155,12 @@ impl SessionRow {
     #[must_use]
     pub fn access(&self) -> Option<&str> {
         self.access_id.as_deref().filter(|id| ai_env_worker::globs::valid_uuid(id))
+    }
+
+    /// R-154: the row is marked sole ([`SessionRow::sole_since`]): any value counts, a hand-edited one too.
+    #[must_use]
+    pub fn is_sole(&self) -> bool {
+        self.sole_since.is_some()
     }
 }
 
@@ -272,8 +287,25 @@ pub(crate) fn remove_if_present(path: &Path) -> Result<bool, BridgeError> {
 /// is never touched and never blocks — created `create_new`, 0600,
 /// `O_NOFOLLOW|O_CLOEXEC`, written, fsync'ed, then renamed over the target
 /// (refused when the target is a symlink) and the directory fsync'ed
-/// (best effort). The temp file is removed on any error.
+/// (best effort). The temp file is removed on any error. R-154: under
+/// `state/sessions.lock` (held for microseconds, as [`mark_sole`] holds it), a
+/// `sole_since` the row on disk holds is kept, whatever `row` says: no writer
+/// takes a chat's mark off (a live wrapper's row is the one another process
+/// marks).
 pub fn write(paths: &Paths, row: &SessionRow) -> Result<(), BridgeError> {
+    path_for(paths, &row.session_id)?;
+    let _rows = crate::bridge::vm::lock::lock_blocking(&paths.sessions_lock())?;
+    let mut row = std::borrow::Cow::Borrowed(row);
+    if !row.is_sole() {
+        if let Some(since) = read(paths, &row.session_id).ok().flatten().and_then(|r| r.sole_since) {
+            row.to_mut().sole_since = Some(since);
+        }
+    }
+    write_locked(paths, &row)
+}
+
+/// [`write`]'s body, `state/sessions.lock` held by the caller.
+fn write_locked(paths: &Paths, row: &SessionRow) -> Result<(), BridgeError> {
     let target = path_for(paths, &row.session_id)?;
     let dir = paths.sessions();
     ensure_private_dir(&dir)?;
@@ -307,6 +339,40 @@ fn write_and_rename(tmp: &Path, target: &Path, data: &[u8]) -> Result<(), Bridge
         return Err(BridgeError::Config(format!("{} is a symlink; refusing to replace it", target.display())));
     }
     std::fs::rename(tmp, target).map_err(io_at("cannot rename onto", target))
+}
+
+/// R-154, sticky per chat: marks `session_id`'s chat sole from now on ([`SessionRow::sole_since`]), as its first
+/// restricted approval does before it is written (`relay access --allow`): that session's row, then every other row
+/// holding its access id (an earlier `/clear`'s), each read and written under `state/sessions.lock`, which every
+/// [`write`] takes: a live wrapper's next write keeps the mark, and the rows it writes after it carry it. A row
+/// marked already keeps its first time. `Ok`: every row of the chat is marked; the ids marked by this call, in that
+/// order. `Err`: no row of `session_id` (or gone meanwhile), one with no access id (no approval names it), or a row
+/// that cannot be read or written.
+pub fn mark_sole(paths: &Paths, session_id: &str) -> Result<Vec<String>, BridgeError> {
+    let no_row = || BridgeError::Config(format!("no session {session_id} in {}", paths.sessions().display()));
+    let first = read(paths, session_id)?.ok_or_else(no_row)?;
+    let Some(chat) = first.access().map(str::to_string) else {
+        return Err(BridgeError::Config(format!("session {session_id} holds no access id: it last ran before this ai-env, so no approval names it")));
+    };
+    let others = list(paths)?.into_iter().filter(|r| r.session_id != session_id && r.access() == Some(chat.as_str())).map(|r| r.session_id);
+    let since = now_rfc3339();
+    let mut marked = Vec::new();
+    for sid in std::iter::once(session_id.to_string()).chain(others) {
+        let _rows = crate::bridge::vm::lock::lock_blocking(&paths.sessions_lock())?;
+        let Some(mut row) = read(paths, &sid)? else {
+            if sid == session_id {
+                return Err(no_row());
+            }
+            continue;
+        };
+        if row.is_sole() || row.access() != Some(chat.as_str()) {
+            continue;
+        }
+        row.sole_since = Some(since.clone());
+        write_locked(paths, &row)?;
+        marked.push(sid);
+    }
+    Ok(marked)
 }
 
 /// The row of `session_id`: `Ok(None)` when its file does not exist; `Err`
@@ -937,8 +1003,11 @@ pub fn cmd_show(uuid: &str, json: bool) -> crate::errors::Result<()> {
 /// `state/transcripts/<sid>/` and views (S10: `s3::forget_purge_many`, one
 /// unseal for all), only once [`forget_check`] passed for every id. Every id
 /// is checked first: a non-uuid is a usage error (exit 2) before anything,
-/// a refusal exit 1 naming its id with nothing removed. An id with nothing
+/// a refusal exit 1 naming its id with nothing removed; R-154: without
+/// `--purge`, a row marked sole too ([`forget_mark_check`]). An id with nothing
 /// to remove says `no session <uuid>`, and the command exits 1 after the others.
+/// R-154: a VM placed for a chat alone that no row names now gets a `note:`
+/// naming `vm terminate` ([`sole_vms_left`]).
 pub fn cmd_forget(store: &crate::store::Keystore, uuids: &[String], purge: bool) -> crate::errors::Result<()> {
     if let Some(bad) = uuids.iter().find(|u| !is_uuid(u)) {
         return Err(CliError::Usage(format!("not a session id: {bad}")));
@@ -952,9 +1021,13 @@ pub fn cmd_forget(store: &crate::store::Keystore, uuids: &[String], purge: bool)
 fn forget_sessions(store: &crate::store::Keystore, paths: &Paths, uuids: &[String], purge: bool) -> crate::errors::Result<()> {
     for uuid in uuids {
         forget_check(paths, uuid)?;
+        if !purge {
+            forget_mark_check(paths, uuid)?;
+        }
     }
     let purged = if purge { crate::bridge::s3::forget_purge_many(store, paths, uuids)? } else { vec![false; uuids.len()] };
-    let chats: Vec<String> = uuids.iter().filter_map(|uuid| read(paths, uuid).ok().flatten()?.access().map(str::to_string)).collect();
+    let owners: Vec<(String, String)> = uuids.iter().filter_map(|uuid| Some((uuid.clone(), read(paths, uuid).ok().flatten()?.access()?.to_string()))).collect();
+    let chats: Vec<String> = owners.iter().map(|(_, chat)| chat.clone()).collect();
     let mut missing: Vec<&str> = Vec::new();
     for (uuid, purged) in uuids.iter().zip(purged.into_iter().chain(std::iter::repeat(false))) {
         let what = forget_suffix(forget(paths, uuid)?);
@@ -966,11 +1039,28 @@ fn forget_sessions(store: &crate::store::Keystore, paths: &Paths, uuids: &[Strin
         }
     }
     note_access_left(paths, chats);
+    for line in sole_vms_left(paths, &owners) {
+        eprintln!("note: {line}");
+    }
     let Some((last, earlier)) = missing.split_last() else { return Ok(()) };
     for uuid in earlier {
         eprintln!("ai-env: no session {uuid}");
     }
     bail!("no session {last}")
+}
+
+/// R-154, sticky per chat: `session forget` without `--purge` refuses a row marked sole ([`SessionRow::sole_since`]):
+/// the mark lives in the row alone, while the chat's transcript stays in S3 and its view on this Mac, so a reopen
+/// after it would find no mark and restore that transcript, which may hold a restricted grant's data, onto a VM
+/// other chats share. `Config` naming `--purge`, which deletes the transcript with the row (exit 1); a row that does
+/// not read is [`forget_check`]'s to judge.
+fn forget_mark_check(paths: &Paths, session_id: &str) -> Result<(), BridgeError> {
+    match read(paths, session_id) {
+        Ok(Some(row)) if row.is_sole() => Err(BridgeError::Config(format!(
+            "session {session_id} was approved a restricted grant, and only its row keeps the chat on a VM of its own: forgotten alone, a reopen would restore its transcript onto a VM other chats share: ai-env session forget {session_id} --purge deletes the transcript with the row"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// What `session forget` says of the chats its rows named (§RS.13's residual), as `state/relay-access.json` last read the
@@ -993,6 +1083,28 @@ fn note_access_left(paths: &Paths, mut chats: Vec<String>) {
             );
         }
     }
+}
+
+/// R-154: what `session forget` says of the VMs placed for a chat alone (`VmRow.sole`) once no row names that chat:
+/// `owners`, each forgotten session and its chat's access id. Such a VM still holds the chat's transcript on its disk
+/// (a `--purge` deletes S3's copy and this Mac's, never a VM's), no start takes it again (`vm::run::reuse_candidate`
+/// asks for that chat's own id, which no row holds now), and it counts toward `[vm].max_concurrent` until its idle or
+/// its wall ends it. One line per VM not terminated, naming `vm terminate`; nothing for a chat a row still names, or
+/// without a VM registry to read.
+fn sole_vms_left(paths: &Paths, owners: &[(String, String)]) -> Vec<String> {
+    let rows = list(paths).unwrap_or_default();
+    let Ok(vms) = crate::bridge::vm::registry::list_rows(paths) else { return Vec::new() };
+    let mut chats: BTreeMap<&str, &str> = BTreeMap::new();
+    for (sid, chat) in owners {
+        chats.entry(chat.as_str()).or_insert(sid.as_str());
+    }
+    let mut lines = Vec::new();
+    for (chat, sid) in chats.into_iter().filter(|(chat, _)| !rows.iter().any(|r| r.access() == Some(*chat))) {
+        for vm in vms.iter().filter(|v| v.sole.as_deref() == Some(chat) && v.status != crate::bridge::vm::registry::RowStatus::Terminated) {
+            lines.push(format!("VM {0} was placed for chat {chat} (session {sid}) alone and still holds its transcript, though no start takes that VM again: ai-env vm terminate {0}", vm.id));
+        }
+    }
+    lines
 }
 
 /// The signal `session drop-transport` sends the wrapper that owns a remote
@@ -1249,6 +1361,7 @@ mod tests {
             title_source: Some("custom".into()),
             access_id: Some("0199a1b2-0000-7000-8000-0000000012a7".into()),
             relay: Some("minted".into()),
+            sole_since: Some("2026-09-25T10:02:00Z".into()),
         }
     }
 
@@ -1299,6 +1412,45 @@ mod tests {
         assert_eq!(read(&p, &r.session_id).unwrap(), Some(r));
         let names: Vec<String> = std::fs::read_dir(p.sessions()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         assert_eq!(names, vec![format!("{}.toml", id(7))]);
+    }
+
+    /// R-154, sticky per chat: `mark_sole` marks the chat's rows (the session's, then every other holding its access id,
+    /// never another chat's) once, at their first time, and refuses a session with no row or no access id; a `write`
+    /// of a row without the mark (a live wrapper's, an older build's shape) keeps the one on disk; a row from before it
+    /// reads unmarked, and an unmarked row's text names no mark.
+    #[test]
+    fn a_chats_sole_mark_is_set_once_and_no_write_takes_it_off() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012b1";
+        const OTHER: &str = "0199a1b2-0000-7000-8000-0000000012b2";
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        let of = |n: u32, chat: Option<&str>| SessionRow { access_id: chat.map(str::to_string), ..row(n, "2026-09-25T10:00:00Z") };
+        for r in [of(1, Some(CHAT)), of(2, Some(CHAT)), of(3, Some(OTHER)), of(4, None)] {
+            write(&p, &r).unwrap();
+        }
+        assert!(!std::fs::read_to_string(path_for(&p, &id(1)).unwrap()).unwrap().contains("sole_since"), "unmarked: no key");
+        let old: SessionRow = toml::from_str("v = 2\nsession_id = \"0199a1b2-0000-7000-8000-0000000012b3\"\n").unwrap();
+        assert!(!old.is_sole(), "a row from before it");
+        assert_eq!(mark_sole(&p, &id(2)).unwrap(), [id(2), id(1)], "the session's row first, then the chat's others");
+        let mark = |n: u32| read(&p, &id(n)).unwrap().unwrap().sole_since;
+        let since = mark(1).expect("marked");
+        assert!(crate::wire::time::parse_rfc3339_utc(&since).is_some(), "{since}");
+        assert_eq!((mark(2), mark(3), mark(4)), (Some(since.clone()), None, None), "another chat's rows stay unmarked");
+        assert!(mark_sole(&p, &id(1)).unwrap().is_empty(), "marked already: nothing new");
+        assert_eq!(mark(1), Some(since.clone()), "the first time stays");
+        // A wrapper's write of the row as it holds it (no mark): the mark stays.
+        write(&p, &of(1, Some(CHAT))).unwrap();
+        assert_eq!(mark(1), Some(since.clone()));
+        assert_eq!(read(&p, &id(1)).unwrap().unwrap().last_seen, "2026-09-25T10:00:00Z", "the rest is the write's");
+        // A row with no access id, and no row at all: refused, nothing written.
+        let e = mark_sole(&p, &id(4)).unwrap_err();
+        assert!(matches!(&e, BridgeError::Config(m) if m.contains("holds no access id")), "{e}");
+        let e = mark_sole(&p, &id(9)).unwrap_err();
+        assert!(matches!(&e, BridgeError::Config(m) if m.starts_with(&format!("no session {}", id(9)))), "{e}");
+        assert_eq!((mark(4), read(&p, &id(9)).unwrap()), (None, None));
+        let names: Vec<String> = std::fs::read_dir(p.sessions()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| !n.ends_with(".toml")).collect();
+        assert!(names.is_empty(), "only rows in state/sessions: {names:?}");
+        assert!(p.sessions_lock().is_file(), "the lock beside them");
     }
 
     #[test]
@@ -1635,6 +1787,66 @@ mod tests {
         forget_sessions(&store, &p, &[id(2)], false).unwrap();
         assert_eq!(read(&p, &id(2)).unwrap(), None, "without --purge: S8's forget");
         assert!(forget_sessions(&store, &p, &[id(2)], false).unwrap_err().to_string().contains("no session"));
+    }
+
+    /// R-154, sticky per chat: without `--purge`, `session forget` refuses a row marked sole (exit 1, naming `--purge`),
+    /// every id checked before any goes; an unmarked row goes as before, and the marked one with `--purge` (its
+    /// transcript deleted with it: here this Mac holds no trace of one, so nothing asks S3), the chat's other row
+    /// keeping its mark.
+    #[test]
+    fn a_marked_chat_is_forgotten_only_with_its_transcript() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012b5";
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        let store = crate::store::Keystore::resolve(Some(d.path().join("keys"))).unwrap();
+        for n in [21, 22] {
+            write(&p, &SessionRow { mode: "remote".into(), access_id: Some(CHAT.into()), ..row(n, "") }).unwrap();
+        }
+        write(&p, &row(23, "")).unwrap();
+        assert_eq!(mark_sole(&p, &id(21)).unwrap(), [id(21), id(22)]);
+        let e = forget_sessions(&store, &p, &[id(23), id(22)], false).unwrap_err();
+        // As `forget_check`'s refusals, a `Config` error: its text after `config: `.
+        let want = format!(
+            "config: session {0} was approved a restricted grant, and only its row keeps the chat on a VM of its own: forgotten alone, a reopen would restore its transcript onto a VM other chats share: ai-env session forget {0} --purge deletes the transcript with the row",
+            id(22)
+        );
+        assert_eq!((e.exit_code(), e.to_string()), (1, want));
+        assert!(path_for(&p, &id(23)).unwrap().exists() && path_for(&p, &id(22)).unwrap().exists(), "every id is checked before any goes");
+        forget_sessions(&store, &p, &[id(23)], false).unwrap();
+        assert_eq!(read(&p, &id(23)).unwrap(), None, "an unmarked row goes as before");
+        forget_sessions(&store, &p, &[id(22)], true).unwrap();
+        assert_eq!(read(&p, &id(22)).unwrap(), None, "with --purge");
+        assert!(read(&p, &id(21)).unwrap().is_some_and(|r| r.is_sole()), "the chat's other row keeps its mark");
+    }
+
+    /// R-154: once no row names a chat, `session forget` names each VM placed for that chat alone (`VmRow.sole`) and not
+    /// terminated, once, by the first of its sessions given: it holds the chat's transcript, and no start takes it again.
+    /// Nothing while a row of the chat remains, and nothing for a VM chats share, another chat's own or a terminated one.
+    #[test]
+    fn forget_names_the_vms_left_placed_for_a_chat_alone() {
+        use crate::bridge::vm::registry::{write_row, RowStatus, VmRow};
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012b6";
+        const OTHER: &str = "0199a1b2-0000-7000-8000-0000000012b7";
+        const ALONE: &str = "microvm-0199a1b2-0000-7000-8000-0000000012c7";
+        let d = tempfile::tempdir().unwrap();
+        let p = paths_in(&d);
+        let store = crate::store::Keystore::resolve(Some(d.path().join("keys"))).unwrap();
+        for n in [24, 25] {
+            write(&p, &SessionRow { mode: "remote".into(), access_id: Some(CHAT.into()), ..row(n, "") }).unwrap();
+        }
+        mark_sole(&p, &id(24)).unwrap();
+        let vm = |id: &str, sole: Option<&str>, status: RowStatus| write_row(&p, &VmRow { id: id.into(), status, egress: "vpc".into(), sole: sole.map(str::to_string), ..VmRow::default() }).unwrap();
+        vm(ALONE, Some(CHAT), RowStatus::Suspended);
+        vm("microvm-0199a1b2-0000-7000-8000-0000000012c8", Some(CHAT), RowStatus::Terminated);
+        vm("microvm-0199a1b2-0000-7000-8000-0000000012c9", None, RowStatus::Running);
+        vm("microvm-0199a1b2-0000-7000-8000-0000000012ca", Some(OTHER), RowStatus::Running);
+        let owners = |ns: &[u32]| -> Vec<(String, String)> { ns.iter().map(|n| (id(*n), CHAT.to_string())).collect() };
+        forget_sessions(&store, &p, &[id(24)], true).unwrap();
+        assert!(sole_vms_left(&p, &owners(&[24])).is_empty(), "a row of the chat remains");
+        forget_sessions(&store, &p, &[id(25)], true).unwrap();
+        let want = format!("VM {ALONE} was placed for chat {CHAT} (session {}) alone and still holds its transcript, though no start takes that VM again: ai-env vm terminate {ALONE}", id(25));
+        assert_eq!(sole_vms_left(&p, &owners(&[25, 24])), [want], "once, by the first session given");
+        assert!(sole_vms_left(&p, &[(id(26), OTHER.to_string())]).len() == 1 && sole_vms_left(&p, &[]).is_empty(), "another chat's own VM is its own");
     }
 
     /// S10 (§6.1, F1): `forget` refuses a row a live wrapper still serves,

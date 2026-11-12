@@ -35,15 +35,24 @@
 //!   a grant `[relay].offer` names and `/ai-env/relay/grants` holds; every write prunes the lapsed entries. `state/relay-access.json`
 //!   keeps what was last read for the panel to show (R-152): the relay alone is the gate, and a write that reports failure,
 //!   which may have landed, leaves no cache.
+//! - A restricted grant (R-156): a `[relay].restricted` one is approved only to a chat whose recorded folder is in a
+//!   `[[workspace]]` with `sole_vm` (exit 9 otherwise), whose rows are then marked to run alone wherever it reopens
+//!   (`registry::mark_sole`, before the write: a mark that fails refuses the approval); for 7 days by default and 30 at most
+//!   (exit 2). Its approval sets its entry's one end, earlier or later (`shortened`), and no ordinary approval moves the end of
+//!   an entry that holds one; it reaches the chat only through `<worker_id>-sole`, on a VM placed for that chat alone.
+//! - The signer guard (R-157): with `[relay].restricted` naming a grant, `allow --token-signer` refuses (exit 9), on the entry
+//!   it would write, a signer other than `<worker_id>-sole` that reaches a restricted grant (no `grants`, or a glob matching
+//!   one); and `<worker_id>-sole` with no `grants` or a glob of `*` alone, whatever `restricted` names.
 use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
 use crate::bridge::audit::event::{RELAY_ACCESS, RELAY_ALLOW, RELAY_ALLOW_IP, RELAY_GRANT, RELAY_REVOKE, RELAY_REVOKE_IP};
 use crate::bridge::awscli::{aws_cmd_as, CALL_TIMEOUT};
-use crate::bridge::config::{BridgeConfig, Paths};
+use crate::bridge::config::{BridgeConfig, Paths, RelayCfg};
 use crate::bridge::doctor::run_capture_cmd;
 use crate::bridge::egress::ops;
 use crate::bridge::identity::{self, Operator, Role};
-use crate::bridge::registry::{self, ensure_private_dir};
+use crate::bridge::registry::{self, ensure_private_dir, SessionRow};
 use crate::bridge::vm::lock::lock_exclusive;
+use crate::bridge::vm::registry as vm_registry;
 use crate::errors::{CliError, Result};
 use crate::store::Keystore;
 use crate::wire::time::{parse_rfc3339_utc, rfc3339_utc, unix_now};
@@ -78,6 +87,10 @@ const CHECKIP_BODY_MAX: usize = 64;
 /// `relay access --days`: how many days past today an entry's last day lies, by default and at most (R-150).
 pub(crate) const ACCESS_DAYS_DEFAULT: u32 = 30;
 const ACCESS_DAYS_MAX: u32 = 90;
+/// The same for a `[relay].restricted` grant (R-156): its approval sets its entry's end, so the chat holds it at most this long
+/// after its latest approval.
+pub(crate) const RESTRICTED_DAYS_DEFAULT: u32 = 7;
+pub(crate) const RESTRICTED_DAYS_MAX: u32 = 30;
 
 /// The type `put-parameter` creates a parameter with: the lists are Strings (a second SecureString would fail the
 /// relay's whole fetch on `NoOtherDecrypt`, I §5.2); `tls` alone is a SecureString under `alias/aws/ssm`.
@@ -391,7 +404,9 @@ pub(crate) enum AccessEdit {
     Added,
     /// The chat held the grant, and its entry's end moved later.
     Extended,
-    /// The chat held the grant until that end or later.
+    /// R-156: the chat held the restricted grant, and its approval moved its entry's end earlier.
+    Shortened,
+    /// The chat held the grant until that end or later (a restricted one: until that end).
     Unchanged,
     Removed,
     /// The chat did not hold the grant.
@@ -403,6 +418,7 @@ impl AccessEdit {
         match self {
             AccessEdit::Added => "added",
             AccessEdit::Extended => "extended",
+            AccessEdit::Shortened => "shortened",
             AccessEdit::Unchanged => "unchanged",
             AccessEdit::Removed => "removed",
             AccessEdit::Absent => "absent",
@@ -425,21 +441,73 @@ pub(crate) fn access_day(now: u64, days: u32) -> String {
 
 /// `grant` in `chat`'s entry until `not_after`, or later if the entry ends later (R-150); an entry made when it has none.
 /// An entry has one end, so this also moves the end of what it holds already: [`cmd_access`] and the confirm page say so.
-pub(crate) fn allow_access(list: &mut Vec<AccessEntry>, chat: &str, grant: &str, not_after: &str) -> AccessEdit {
+/// R-156, with `restricted` the `[relay].restricted` ids: an approval of one sets the end to `not_after`, earlier
+/// ([`AccessEdit::Shortened`] when it held the grant) or later, so it never outlives its latest approval; any other
+/// approval leaves the end of an entry that holds one where it is.
+pub(crate) fn allow_access(list: &mut Vec<AccessEntry>, chat: &str, grant: &str, not_after: &str, restricted: &[String]) -> AccessEdit {
     let Some(entry) = list.iter_mut().find(|a| a.chat == chat) else {
         list.push(AccessEntry { chat: chat.to_string(), grants: vec![grant.to_string()], not_after: not_after.to_string() });
         return AccessEdit::Added;
     };
-    let later = policy::unix_of(not_after).is_ok_and(|t| t > entry.not_after_unix());
-    if later {
+    let old = entry.not_after_unix();
+    let sets = restricted.iter().any(|r| r == grant);
+    let held_back = !sets && entry.grants.iter().any(|g| restricted.contains(g));
+    // Whether the end moves: later (`true`), earlier (`false`); a `not_after` that does not parse moves nothing.
+    let moved = match policy::unix_of(not_after) {
+        Ok(t) if sets && t != old => Some(t > old),
+        Ok(t) if !sets && !held_back && t > old => Some(true),
+        _ => None,
+    };
+    if moved.is_some() {
         entry.not_after = not_after.to_string();
     }
     if entry.grants.iter().any(|g| g == grant) {
-        return if later { AccessEdit::Extended } else { AccessEdit::Unchanged };
+        return match moved {
+            Some(true) => AccessEdit::Extended,
+            Some(false) => AccessEdit::Shortened,
+            None => AccessEdit::Unchanged,
+        };
     }
     entry.grants.push(grant.to_string());
     entry.grants.sort();
     AccessEdit::Added
+}
+
+/// The grants of `grants` that `restricted` names (R-156): what `relay status`, `relay access --list` and the panel mark.
+pub(crate) fn restricted_in<'a>(grants: &'a [String], restricted: &[String]) -> Vec<&'a str> {
+    grants.iter().filter(|g| restricted.contains(g)).map(String::as_str).collect()
+}
+
+/// ` (restricted: <ids>)` for an entry holding `[relay].restricted` grants, else nothing: the mark of R-156's rows.
+pub(crate) fn restricted_mark(grants: &[String], restricted: &[String]) -> String {
+    let held = restricted_in(grants, restricted);
+    if held.is_empty() {
+        String::new()
+    } else {
+        format!(" (restricted: {})", held.join(","))
+    }
+}
+
+/// `--days` (R-150, R-156): `given`, else the default, within its range: 1 to 90, 30 by default; for a
+/// `[relay].restricted` grant 1 to 30, 7 by default. `Err` is the usage error's text.
+pub(crate) fn access_days(given: Option<u32>, restricted: bool) -> std::result::Result<u32, String> {
+    let days = given.unwrap_or(if restricted { RESTRICTED_DAYS_DEFAULT } else { ACCESS_DAYS_DEFAULT });
+    if !(1..=ACCESS_DAYS_MAX).contains(&days) {
+        return Err(format!("--days {days}: 1 to {ACCESS_DAYS_MAX}"));
+    }
+    if restricted && days > RESTRICTED_DAYS_MAX {
+        return Err(format!("--days {days}: 1 to {RESTRICTED_DAYS_MAX} for a [relay].restricted grant"));
+    }
+    Ok(days)
+}
+
+/// R-156: whether the VM session `row` names now was placed for its chat alone (`VmRow.sole` its access id), the only VM whose
+/// tokens the relay agent signs as `<worker_id>-sole`: `None` with no VM; `Some(false)` for one placed otherwise, or whose row
+/// cannot be read.
+pub(crate) fn on_own_vm(paths: &Paths, row: &SessionRow) -> Option<bool> {
+    let vm = row.microvm_id.as_deref()?;
+    let placed = vm_registry::read_row(paths, vm).ok().flatten().and_then(|r| r.sole);
+    Some(placed.is_some() && placed.as_deref() == row.access())
 }
 
 /// `grant` out of `chat`'s entry; an entry left empty is removed (R-150).
@@ -657,9 +725,49 @@ fn side_note(line: &str) {
     let _ = writeln!(std::io::stderr().lock(), "note: {line}");
 }
 
+/// Whether a glob of nothing but `*` is among `globs`: it matches every grant.
+fn holds_star(globs: &[String]) -> bool {
+    globs.iter().any(|glob| glob.bytes().all(|b| b == b'*'))
+}
+
+/// The `[relay].restricted` ids a token signer whose grants are `set` reaches (`None`: every grant).
+pub(crate) fn restricted_reached<'a>(set: Option<&[String]>, restricted: &'a [String]) -> Vec<&'a str> {
+    restricted.iter().filter(|r| set.is_none_or(|globs| globs.iter().any(|glob| glob_match(glob, r)))).map(String::as_str).collect()
+}
+
+/// R-157, on the entry `allow --token-signer` would write, its grants `set` (`None`: every grant), against `cfg`'s `[relay]`.
+/// This Mac's sole signer (`<worker_id>-sole`) must hold `grants` and no glob of `*` alone, whatever `restricted` names. With
+/// `restricted` naming a grant, any other signer must reach none of them: a token it mints on a VM chats share would reach
+/// one through an approval (R-145), which the sole signer alone may carry. `Err` is the refusal (exit 9) with the command to
+/// run instead, as given but `--grants`: [`BridgeConfig::sole_signer_grants`] or, for this Mac's own signer,
+/// [`BridgeConfig::session_signer_grants`]; another's is the user's to name.
+fn signer_guard(cfg: &BridgeConfig, args: &AllowArgs<'_>, set: Option<&[String]>) -> Result<()> {
+    let id = args.id;
+    let sole_id = cfg.relay.sole_id();
+    let refuse = |why: String, wanted: Vec<String>| {
+        let globs = if wanted.is_empty() { "<grant globs>".to_string() } else { wanted.join(",") };
+        let given = AllowArgs { grants: std::slice::from_ref(&globs), ..*args }.given();
+        CliError::Policy(format!("relay allow: {why}: ai-env as deployer -- ai-env relay {}", as_given("allow", &given)))
+    };
+    let held = set.map_or_else(|| "no grants".to_string(), |globs| format!("grants {}", globs.join(",")));
+    if id == sole_id {
+        if set.is_none_or(holds_star) {
+            return Err(refuse(format!("token signer {id}, this Mac's sole signer, would reach every grant ({held})"), cfg.sole_signer_grants()));
+        }
+        return Ok(());
+    }
+    let reached = restricted_reached(set, &cfg.relay.restricted);
+    if reached.is_empty() {
+        return Ok(());
+    }
+    let wanted = if id == cfg.relay.worker_id { cfg.session_signer_grants() } else { Vec::new() };
+    Err(refuse(format!("token signer {id} would reach the [relay].restricted grant {} ({held}), which only {sole_id} may reach", reached.join(",")), wanted))
+}
+
 /// `ai-env relay allow <id> --key <text> (--sources <globs> [--tls-key <p256:…>] | --token-signer [--grants <globs>])
 /// [--not-after <YYYY-MM-DD>]` (WM-R43, §RS.4.2): the arguments checked first (exit 2), then the gate (exit 9), then
-/// the lists; `--tls-key`'s one Touch ID comes after the read and WM-R43's checks and before the write.
+/// the lists; `--tls-key`'s one Touch ID comes after the read and WM-R43's checks and before the write. A token signer's
+/// entry as it would be written meets R-157's guard ([`signer_guard`], exit 9) after the read.
 pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
     let AllowArgs { id, key, sources, token_signer, not_after, tls_key, grants } = *args;
     let usage = |why: String| CliError::Usage(format!("relay allow: {why}"));
@@ -747,6 +855,7 @@ pub fn cmd_allow(store: &Keystore, args: &AllowArgs<'_>) -> Result<()> {
                 let mut list = policy::parse_signers(&mine.value).map_err(|e| unparsed("allow", mine.name, &e))?;
                 // `--grants` is the whole set; without it the entry keeps its own (a key rotation).
                 let set = if grant_set.is_empty() { list.iter().find(|s| s.signer_id == id).and_then(|s| s.grants.clone()) } else { Some(grant_set.clone()) };
+                signer_guard(&ctx.cfg, args, set.as_deref())?;
                 let entry = SignerEntry { signer_id: id.to_string(), alg: "ed25519".into(), public_key: public.b64(), not_after: until.clone(), grants: set.clone() };
                 let outcome = upsert(&mut list, entry).map_err(one_id)?;
                 (outcome, rendered("allow", mine.name, &list, policy::render_signers)?, list.len(), WorkerCert::None, set)
@@ -1260,10 +1369,10 @@ pub(crate) fn access_outcome_unknown(paths: &Paths, pairs: &[(&str, String)]) {
     }
 }
 
-/// The access id of session `sid`'s row (R-150): no row is exit 1, a chat on this Mac with nothing to take back or asked for
-/// more exit 9, a row with no id (its last start came before this build) exit 1. A row now on this Mac that holds an id can
-/// still `--remove`: a later remote `--resume` takes that id. Its `relay` word too.
-fn access_target(paths: &Paths, sid: &str, allowing: bool) -> Result<(String, Option<String>)> {
+/// The access id of session `sid`'s row (R-150), and the row: no row is exit 1, a chat on this Mac with nothing to take back or
+/// asked for more exit 9, a row with no id (its last start came before this build) exit 1. A row now on this Mac that holds an id
+/// can still `--remove`: a later remote `--resume` takes that id.
+fn access_target(paths: &Paths, sid: &str, allowing: bool) -> Result<(String, SessionRow)> {
     let Some(row) = registry::read(paths, sid)? else {
         return Err(CliError::Msg(format!("no session {sid}")));
     };
@@ -1272,17 +1381,20 @@ fn access_target(paths: &Paths, sid: &str, allowing: bool) -> Result<(String, Op
         return Err(CliError::Policy(format!("relay access: session {sid} runs on this Mac: only a chat on a VM holds a relay session")));
     }
     match id {
-        Some(id) => Ok((id, row.relay)),
+        Some(id) => Ok((id, row)),
         None => Err(CliError::Msg(format!("relay access: session {sid} has no access id: it last ran before this ai-env, so reopen the chat first"))),
     }
 }
 
 /// `ai-env relay access <SESSION> (--allow G [--days N] | --remove G)`, `ai-env relay access --list [--json]` (R-150). No
-/// gate: IAM decides. In this order: the arguments (exit 2); `G` in `[relay].offer`, for `--allow` only (exit 9); the
-/// row; the context and the operator, then the lock; one read of `access` and `grants`, with `token-signers` for `--allow`,
-/// `G` in `grants` for `--allow` (exit 9); the lapsed entries pruned; the edit, `render_access`, the write with its version
-/// check; audit; cache. An edit that changes nothing writes nothing; a write that fails is [`access_outcome_unknown`]. An
-/// allow whose grant this Mac's token signer leaves out says so (R-135, R-145): the relay gives the chat nothing through it.
+/// gate: IAM decides. In this order: the arguments (exit 2); `G` in `[relay].offer`, for `--allow` only (exit 9); a restricted
+/// `G`'s `--days` (exit 2); the row; a restricted `G` only to a chat whose recorded folder is in a `sole_vm` workspace (exit 9,
+/// R-156); the context and the operator, then the lock; one read of `access` and `grants`, with `token-signers` for `--allow`,
+/// `G` in `grants` for `--allow` (exit 9); the lapsed entries pruned; the edit, `render_access`; a restricted `G`'s chat marked
+/// to run alone (`registry::mark_sole`: a failure is exit 1, nothing written); the write with its version check; audit;
+/// cache. An edit that changes nothing writes nothing; a write that fails is [`access_outcome_unknown`]. An allow whose grant
+/// the token signer that carries it leaves out says so (R-135, R-145): this Mac's, or `<worker_id>-sole` for a restricted
+/// grant, which a chat on a VM not placed for it alone never reaches until it reopens.
 pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
     if args.from_panel {
         crate::bridge::audit::set_actor(crate::bridge::audit::Actor::Panel);
@@ -1305,32 +1417,47 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
     if !valid_id(grant) {
         return Err(usage(format!("{grant:?} is not an id ({})", ai_env_worker::ai_env_source::names::NAME_RULE)));
     }
-    let days = args.days.unwrap_or(ACCESS_DAYS_DEFAULT);
-    if !(1..=ACCESS_DAYS_MAX).contains(&days) {
-        return Err(usage(format!("--days {days}: 1 to {ACCESS_DAYS_MAX}")));
-    }
+    let mut days = access_days(args.days, false).map_err(usage)?;
     let paths = Paths::resolve()?;
-    // This Mac's token signer, for an allow: its id.
-    let mut signer_id = String::new();
+    // For an allow, `[relay]` checked: the token signer that carries the grant (this Mac's, or its sole signer for a
+    // restricted grant, R-156), and the restricted ids, whose entries' ends no other approval moves.
+    let mut relay = RelayCfg::default();
+    let mut cfg = None;
     if allowing {
-        let relay = BridgeConfig::load(&paths)?.unwrap_or_default().relay;
-        relay.validate()?;
-        if !relay.offer.iter().any(|g| g == grant) {
+        let loaded = BridgeConfig::load(&paths)?.unwrap_or_default();
+        loaded.validate_relay()?;
+        if !loaded.relay.offer.iter().any(|g| g == grant) {
             return Err(CliError::Policy(format!("relay access: grant {grant} is not in [relay].offer of {}: the chats' approvals name only what it offers", paths.config.display())));
         }
-        signer_id = relay.worker_id;
+        if loaded.relay.is_restricted(grant) {
+            days = access_days(args.days, true).map_err(usage)?;
+        }
+        relay = loaded.relay.clone();
+        cfg = Some(loaded);
     }
-    let (access, relay_word) = access_target(&paths, sid, allowing)?;
+    let sole = relay.is_restricted(grant);
+    let signer_id = if sole { relay.sole_id() } else { relay.worker_id.clone() };
+    let (access, row) = access_target(&paths, sid, allowing)?;
+    if let Some(cfg) = cfg.as_ref().filter(|_| sole) {
+        let alone = row.cwd.as_deref().is_some_and(|cwd| crate::bridge::workspace::sole_vm_at(cfg, Path::new(cwd)));
+        if !alone {
+            return Err(CliError::Policy(format!(
+                "relay access: grant {grant} is in [relay].restricted, so it goes only to a chat that runs alone, and session {sid}'s folder {} is in no [[workspace]] with sole_vm = true in {}",
+                row.cwd.as_deref().unwrap_or("(none recorded)"),
+                paths.config.display()
+            )));
+        }
+    }
+    // A chat on a VM not placed for it alone: its tokens there are this Mac's signer's, so it reaches the grant from its next start.
+    let elsewhere = sole && on_own_vm(&paths, &row) == Some(false);
+    // Which command allows the sole signer, should the list name none: `keygen --sole` makes the key and prints it; once
+    // sealed, `relay status` names it (`keygen --sole` then refuses, naming `--force`, which replaces all three keys).
+    let sole_key_sealed = sole && super::keys::read_notes(&paths).is_ok_and(|n| n.sole_key.is_some());
     let ctx = RelayCtx::load()?;
     let op = ctx.operator("relay access")?;
     locked(&ctx, || {
         let mut lists = read("access", if allowing { &[ACCESS, GRANTS, TOKEN_SIGNERS] } else { &[ACCESS, GRANTS] })?;
-        let left_out = allowing && signer_leaves_out(&lists[2].value, &signer_id, grant);
-        let left_out_note = || {
-            if left_out {
-                side_note(&format!("token signer {signer_id}'s grants leave out {grant}: this chat reaches nothing through it"));
-            }
-        };
+        let signer_says = if allowing { signer_note(&lists[2].value, &signer_id, grant, sole.then_some(sole_key_sealed)) } else { None };
         let grants = lists.remove(1);
         let held = lists.remove(0);
         let mut list = policy::parse_access(&held.value).map_err(|e| unparsed("access", held.name, &e))?;
@@ -1342,9 +1469,13 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         }
         let now = unix_now();
         let pruned = prune_access(&mut list, now);
+        // The entry before the edit: its end, and the restricted grants it holds.
+        let before = list.iter().find(|a| a.chat == access).map(|a| (a.not_after_unix(), restricted_in(&a.grants, &relay.restricted).join(",")));
+        let mut asked = 0;
         let edit = if allowing {
             let until = policy::not_after_of_day(&access_day(now, days)).map_err(|e| usage(format!("--days {days}: {e}")))?;
-            allow_access(&mut list, &access, grant, &until)
+            asked = policy::unix_of(&until).unwrap_or(0);
+            allow_access(&mut list, &access, grant, &until, &relay.restricted)
         } else {
             remove_access(&mut list, &access, grant)
         };
@@ -1355,18 +1486,45 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         if let Some(until) = until.as_ref().filter(|_| allowing) {
             pairs.push(("not_after", until.clone()));
         }
+        // R-156: a restricted grant's chat is marked before anything is written, and a mark that fails refuses it.
+        let mark = || -> Result<Vec<String>> {
+            if !sole {
+                return Ok(Vec::new());
+            }
+            registry::mark_sole(&ctx.paths, sid).map_err(|e| CliError::Msg(format!("relay access: session {sid}'s chat could not be marked to run alone ({e}); nothing was written")))
+        };
+        // What an allow says on stderr, whatever it wrote: the signer that carries the grant, the mark, the chat's VM, and an
+        // ordinary approval held back by a restricted grant's end.
+        let notes = |marked: &[String], until: &str| {
+            if let Some(says) = &signer_says {
+                side_note(says);
+            }
+            if !marked.is_empty() {
+                side_note(&format!("chat {access} runs alone from now on: each start places it on a VM of its own, and a reopen outside a [[workspace]] with sole_vm = true is refused (marked: session {})", marked.join(",")));
+            }
+            if elsewhere {
+                side_note(&format!("session {sid} runs on {}, a VM not placed for this chat alone, whose tokens never reach {grant}: the chat reaches it from its next start, on a VM of its own: reopen the chat", row.microvm_id.as_deref().unwrap_or("-")));
+            }
+            if let Some((_, kept)) = before.as_ref().filter(|(end, kept)| allowing && !sole && !kept.is_empty() && asked > *end) {
+                side_note(&format!("chat {access}'s entry holds the [relay].restricted grant {kept}, so its end stays {until}: only an approval of that grant moves it"));
+            }
+        };
         if matches!(edit, AccessEdit::Unchanged | AccessEdit::Absent) {
+            let marked = mark()?;
             pairs.push(("version", held.version.to_string()));
             audit(&ctx.paths, RELAY_ACCESS, &pairs);
             write_access_cache(&ctx.paths, held.version, &list);
             match until.filter(|_| edit == AccessEdit::Unchanged) {
-                Some(until) => say(&format!("{chat} holds grant {grant} until {until} ({} v{}); nothing written", held.name, held.version)),
+                Some(until) => {
+                    say(&format!("{chat} holds grant {grant} until {until} ({} v{}); nothing written", held.name, held.version));
+                    notes(&marked, &until);
+                }
                 None => say(&format!("{chat} does not hold grant {grant} ({} v{}); nothing written", held.name, held.version)),
             }
-            left_out_note();
             return Ok(());
         }
         let value = rendered("access", held.name, &list, policy::render_access)?;
+        let marked = mark()?;
         let version = match write(&ctx, &op, "access", &held, &value) {
             Ok(version) => version,
             Err(e) => {
@@ -1381,13 +1539,19 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
         let swept = if pruned == 0 { String::new() } else { format!("; {pruned} lapsed chat(s) pruned") };
         match until.filter(|_| allowing) {
             Some(until) => {
-                say(&format!("allowed {chat} grant {grant} until {until} ({} v{version}, {} chat(s)){swept}; the relay applies it within about 70 s, with no restart", held.name, list.len()));
-                left_out_note();
+                // A chat whose VM was not placed for it alone reaches a restricted grant only from its next start (its note says to reopen it).
+                let when = if elsewhere { "and the chat reaches it from its next start" } else { "with no restart" };
+                say(&format!("allowed {chat} grant {grant} until {until} ({} v{version}, {} chat(s)){swept}; the relay applies it within about 70 s, {when}", held.name, list.len()));
+                notes(&marked, &until);
                 let others: Vec<&str> = list.iter().find(|a| a.chat == access).map_or_else(Vec::new, |a| a.grants.iter().map(String::as_str).filter(|g| *g != grant).collect());
+                if let Some((end, _)) = before.as_ref().filter(|(end, _)| sole && policy::unix_of(&until).is_ok_and(|t| t < *end)) {
+                    side_note(&format!("chat {access}'s entry ended {} before: an approval of a [relay].restricted grant sets its one end, {until}", rfc3339_utc(*end)));
+                }
                 if !others.is_empty() {
                     side_note(&format!("chat {access}'s entry holds {} too: one end, {until}, covers them all", others.join(",")));
                 }
-                match relay_word.as_deref() {
+                match row.relay.as_deref() {
+                    _ if elsewhere => {}
                     None | Some("minted") => {}
                     Some("off") => side_note(&format!("session {sid}'s latest spawn holds no session token (relay=off): [relay].grant or its workspace's relay_grant names none, so the chat reaches this grant from the first spawn after one does")),
                     Some(word) => side_note(&format!("session {sid}'s latest spawn holds no session token (relay={word}): the chat reaches this grant from its next spawn (ai-env session migrate {sid})")),
@@ -1399,17 +1563,27 @@ pub fn cmd_access(args: &AccessArgs<'_>) -> Result<()> {
     })
 }
 
-/// Whether `signer_id`'s entry in the token signers' `value` holds `grants` none of which matches `grant`: the relay's
-/// filter then takes that grant from every chat this Mac's tokens name (R-135, R-145). A list that does not parse or an
-/// entry with no `grants` says nothing: this only explains, and the relay remains the gate.
-fn signer_leaves_out(value: &str, signer_id: &str, grant: &str) -> bool {
-    let entries = policy::parse_signers(value).unwrap_or_default();
-    let globs = entries.iter().find(|s| s.signer_id == signer_id).and_then(|s| s.grants.as_ref());
-    globs.is_some_and(|globs| !globs.iter().any(|glob| glob_match(glob, grant)))
+/// What `relay access --allow` says of the token signer whose tokens carry `grant` to the chat (R-135, R-145, R-156): this
+/// Mac's, `signer_id`, or for a restricted grant (`sole`: whether this Mac's container holds the sole key) its sole signer. An
+/// entry holding `grants` none of which matches `grant` takes it from every chat that signer's tokens name; the sole signer
+/// listed nowhere carries nothing, and the note names the command that gives its allow: `relay keygen --sole`, which makes
+/// the key, or once one is sealed `relay status` (a second `keygen --sole` refuses, and `--force` replaces all three keys). A
+/// list that does not parse, an entry with no `grants`, or this Mac's signer listed nowhere says nothing: this only explains,
+/// and the relay remains the gate.
+fn signer_note(value: &str, signer_id: &str, grant: &str, sole: Option<bool>) -> Option<String> {
+    let entries = policy::parse_signers(value).ok()?;
+    match (entries.iter().find(|s| s.signer_id == signer_id), sole) {
+        (Some(s), _) => s.grants.as_ref().filter(|globs| !globs.iter().any(|glob| glob_match(glob, grant))).map(|_| format!("token signer {signer_id}'s grants leave out {grant}: this chat reaches nothing through it")),
+        (None, Some(sealed)) => {
+            let how = if sealed { "ai-env relay status names the command that allows this Mac's sole key" } else { "ai-env relay keygen --sole makes its key and prints the command that allows it" };
+            Some(format!("token signer {signer_id} is not in {TOKEN_SIGNERS}, and only it carries {grant}: this chat reaches nothing through it until it is ({how})"))
+        }
+        (None, None) => None,
+    }
 }
 
 /// `relay access --list [--json]`: the list as one read finds it, each chat with the sessions on this Mac whose row
-/// holds it (a `/clear`'s rows share an id); the cache written.
+/// holds it (a `/clear`'s rows share an id), and the grants `[relay].restricted` names marked (R-156); the cache written.
 fn access_list(json: bool) -> Result<()> {
     let ctx = RelayCtx::load()?;
     ctx.operator("relay access")?;
@@ -1418,9 +1592,20 @@ fn access_list(json: bool) -> Result<()> {
     write_access_cache(&ctx.paths, held.version, &list);
     let rows = registry::list(&ctx.paths).unwrap_or_default();
     let sessions = |chat: &str| -> Vec<String> { rows.iter().filter(|r| r.access_id.as_deref() == Some(chat)).map(|r| r.session_id.clone()).collect() };
+    let restricted = &ctx.cfg.relay.restricted;
     let now = unix_now();
     if json {
-        let entries: Vec<Value> = list.iter().map(|a| serde_json::json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix(), "sessions": sessions(&a.chat)})).collect();
+        let entries: Vec<Value> = list
+            .iter()
+            .map(|a| {
+                let mut entry = serde_json::json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix(), "sessions": sessions(&a.chat)});
+                let marked = restricted_in(&a.grants, restricted);
+                if !marked.is_empty() {
+                    entry["restricted"] = serde_json::json!(marked);
+                }
+                entry
+            })
+            .collect();
         let doc = serde_json::json!({"version": held.version, "entries": entries});
         say(&serde_json::to_string_pretty(&doc).unwrap_or_default());
         return Ok(());
@@ -1435,7 +1620,7 @@ fn access_list(json: bool) -> Result<()> {
         let lapsed = if now > a.not_after_unix() { " EXPIRED" } else { "" };
         let shown = sessions(&a.chat);
         let on = if shown.is_empty() { "no session on this Mac".to_string() } else { format!("session {}", shown.join(",")) };
-        say(&format!("  chat {} grants {} until {}{lapsed}: {on}", a.chat, a.grants.join(","), a.not_after));
+        say(&format!("  chat {} grants {} until {}{lapsed}{}: {on}", a.chat, a.grants.join(","), a.not_after, restricted_mark(&a.grants, restricted)));
     }
     Ok(())
 }
@@ -1570,15 +1755,15 @@ mod tests {
         const T2: &str = "2027-11-29T23:59:59Z";
         let entry = |chat: &str, grants: &[&str], not_after: &str| AccessEntry { chat: chat.into(), grants: s(grants), not_after: not_after.into() };
         let mut list = Vec::new();
-        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Added);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1, &[]), AccessEdit::Added);
         assert_eq!(list, [entry(CHAT, &["g-b"], T1)]);
-        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Unchanged);
-        assert_eq!(allow_access(&mut list, CHAT, "g-b", T2), AccessEdit::Extended);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1, &[]), AccessEdit::Unchanged);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T2, &[]), AccessEdit::Extended);
         assert_eq!(list, [entry(CHAT, &["g-b"], T2)], "the later end");
-        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1), AccessEdit::Unchanged, "never earlier");
-        assert_eq!(allow_access(&mut list, CHAT, "g-a", T1), AccessEdit::Added);
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T1, &[]), AccessEdit::Unchanged, "never earlier");
+        assert_eq!(allow_access(&mut list, CHAT, "g-a", T1, &[]), AccessEdit::Added);
         assert_eq!(list, [entry(CHAT, &["g-a", "g-b"], T2)], "joined, sorted, and an entry's end stays the later");
-        assert_eq!(allow_access(&mut list, OTHER, "g-a", T1), AccessEdit::Added);
+        assert_eq!(allow_access(&mut list, OTHER, "g-a", T1, &[]), AccessEdit::Added);
         assert_eq!(remove_access(&mut list, OTHER, "g-b"), AccessEdit::Absent, "another chat's grant");
         assert_eq!(remove_access(&mut list, CHAT, "g-c"), AccessEdit::Absent);
         assert_eq!(remove_access(&mut list, CHAT, "g-b"), AccessEdit::Removed);
@@ -1589,6 +1774,116 @@ mod tests {
         assert_eq!(prune_access(&mut list, t1), 0, "its last second");
         assert_eq!(prune_access(&mut list, t1 + 1), 1);
         assert!(list.is_empty());
+    }
+
+    /// R-156's end rules. An approval of a restricted grant sets its entry's one end, later (`extended`), earlier (`shortened`)
+    /// or the same (`unchanged`), and when it joins an entry it moves the end of what that holds too, either way. An ordinary
+    /// approval never moves the end of an entry that holds a restricted grant, later or earlier, whether it joins it or held it;
+    /// with the restricted grant removed, the later of the two again. Another chat's entry, and an entry with no restricted
+    /// grant, keep R-150's rule.
+    #[test]
+    fn a_restricted_grants_approval_sets_its_entrys_end_and_no_other_moves_it() {
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a1";
+        const OTHER: &str = "0199a1b2-0000-7000-8000-0000000012a2";
+        const T1: &str = "2027-10-29T23:59:59Z";
+        const T2: &str = "2027-11-05T23:59:59Z";
+        const T3: &str = "2027-11-28T23:59:59Z";
+        let restricted = s(&["g-r"]);
+        let entry = |chat: &str, grants: &[&str], not_after: &str| AccessEntry { chat: chat.into(), grants: s(grants), not_after: not_after.into() };
+        let mut list = vec![entry(CHAT, &["g-a"], T3), entry(OTHER, &["g-a"], T1)];
+        // It joins an entry that ends later: the entry ends at its day, the ordinary grant's too.
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", T2, &restricted), AccessEdit::Added);
+        assert_eq!(list[0], entry(CHAT, &["g-a", "g-r"], T2), "shortened by the restricted grant's approval");
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", T2, &restricted), AccessEdit::Unchanged);
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", T1, &restricted), AccessEdit::Shortened);
+        assert_eq!(list[0].not_after, T1);
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", T2, &restricted), AccessEdit::Extended);
+        assert_eq!(list[0].not_after, T2);
+        // An ordinary approval moves it neither way, held or joining.
+        assert_eq!(allow_access(&mut list, CHAT, "g-a", T3, &restricted), AccessEdit::Unchanged, "never later");
+        assert_eq!(allow_access(&mut list, CHAT, "g-a", T1, &restricted), AccessEdit::Unchanged, "never earlier");
+        assert_eq!(allow_access(&mut list, CHAT, "g-b", T3, &restricted), AccessEdit::Added);
+        assert_eq!(list[0], entry(CHAT, &["g-a", "g-b", "g-r"], T2), "joined, its end the restricted grant's");
+        // Another chat's entry and the list's order are untouched; an entry made by a restricted approval ends at its day.
+        assert_eq!(list[1], entry(OTHER, &["g-a"], T1));
+        assert_eq!(allow_access(&mut list, OTHER, "g-a", T3, &restricted), AccessEdit::Extended, "no restricted grant: R-150's rule");
+        let mut fresh = Vec::new();
+        assert_eq!(allow_access(&mut fresh, CHAT, "g-r", T1, &restricted), AccessEdit::Added);
+        assert_eq!(fresh, [entry(CHAT, &["g-r"], T1)]);
+        // With the restricted grant taken out, ordinary approvals stretch the end again.
+        assert_eq!(remove_access(&mut list, CHAT, "g-r"), AccessEdit::Removed);
+        assert_eq!(allow_access(&mut list, CHAT, "g-a", T3, &restricted), AccessEdit::Extended);
+        assert_eq!(list[0], entry(CHAT, &["g-a", "g-b"], T3));
+        // No restricted id at all: the restricted grant's name is an ordinary one.
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", T1, &[]), AccessEdit::Added);
+        assert_eq!(list[0].not_after, T3, "the later of the two");
+        // A not_after that does not parse moves nothing.
+        assert_eq!(allow_access(&mut list, CHAT, "g-r", "not a time", &restricted), AccessEdit::Unchanged);
+        assert_eq!(list[0].not_after, T3);
+        // What the rows mark.
+        assert_eq!(restricted_mark(&s(&["g-a", "g-r"]), &restricted), " (restricted: g-r)");
+        assert_eq!(restricted_mark(&s(&["g-a"]), &restricted), "");
+        assert_eq!(restricted_in(&s(&["g-r", "g-s"]), &s(&["g-s", "g-r"])), ["g-r", "g-s"], "in the entry's order");
+    }
+
+    /// R-150, R-156: `--days`: 1 to 90, 30 by default; for a restricted grant 1 to 30, 7 by default.
+    #[test]
+    fn a_restricted_grant_is_approved_for_a_week_by_default_and_a_month_at_most() {
+        assert_eq!((access_days(None, false), access_days(None, true)), (Ok(30), Ok(7)));
+        assert_eq!((access_days(Some(1), true), access_days(Some(30), true), access_days(Some(90), false)), (Ok(1), Ok(30), Ok(90)));
+        assert_eq!(access_days(Some(31), true), Err("--days 31: 1 to 30 for a [relay].restricted grant".to_string()));
+        assert_eq!(access_days(Some(31), false), Ok(31));
+        for restricted in [false, true] {
+            assert_eq!(access_days(Some(0), restricted), Err("--days 0: 1 to 90".to_string()));
+            assert_eq!(access_days(Some(91), restricted), Err("--days 91: 1 to 90".to_string()));
+        }
+        assert_eq!((ACCESS_DAYS_DEFAULT, RESTRICTED_DAYS_DEFAULT, RESTRICTED_DAYS_MAX), (30, 7, 30));
+    }
+
+    /// R-157's guard on the entry `allow --token-signer` would write. With a restricted grant, a signer other than this Mac's
+    /// sole signer is refused (exit 9) when it has no grants or a glob matches the restricted id, `*` and `g-*` among them;
+    /// one that matches none passes, and so does any signer while nothing is restricted. The sole signer is refused with no
+    /// grants or a glob of `*` alone, restricted or not, and passes with a set. Each refusal names the command as given, its
+    /// `--grants` the set `bridge.toml` names for that signer, or the placeholder for another Mac's.
+    #[test]
+    fn the_signer_guard_keeps_restricted_grants_to_the_sole_signer() {
+        let cfg = BridgeConfig::parse("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\nrestricted = [\"g-r\"]\n\n[[workspace]]\npath = \"/w\"\nsole_vm = true\nrelay_grant = \"g-w\"\n").unwrap();
+        cfg.validate_relay().unwrap();
+        let open = BridgeConfig::parse("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\n").unwrap();
+        let args = |id: &'static str| AllowArgs { id, key: "KEY", sources: &[], token_signer: true, not_after: Some("2027-10-29"), tls_key: None, grants: &[] };
+        let guard = |cfg: &BridgeConfig, id: &'static str, set: Option<&[&str]>| {
+            let set = set.map(s);
+            signer_guard(cfg, &args(id), set.as_deref()).map_err(|e| (e.exit_code(), e.to_string()))
+        };
+        for set in [None, Some(&["*"][..]), Some(&["**", "g-o"][..]), Some(&["g-*"][..]), Some(&["no-grant", "g-r"][..])] {
+            let refused = guard(&cfg, "mac", set).unwrap_err();
+            assert_eq!(refused.0, 9, "{set:?}");
+            assert!(refused.1.starts_with("relay allow: token signer mac would reach the [relay].restricted grant g-r ("), "{set:?}: {}", refused.1);
+            assert!(refused.1.ends_with(", which only mac-sole may reach: ai-env as deployer -- ai-env relay allow mac --key KEY --token-signer --not-after 2027-10-29 --grants g-o,g-w,no-grant"), "{set:?}: {}", refused.1);
+            assert!(guard(&open, "mac", set).is_ok(), "nothing restricted: {set:?}");
+        }
+        assert_eq!(guard(&cfg, "mac", None).unwrap_err().1, "relay allow: token signer mac would reach the [relay].restricted grant g-r (no grants), which only mac-sole may reach: ai-env as deployer -- ai-env relay allow mac --key KEY --token-signer --not-after 2027-10-29 --grants g-o,g-w,no-grant");
+        assert!(guard(&cfg, "mac", Some(&["no-grant", "g-o", "g-w"])).is_ok());
+        let theirs = guard(&cfg, "mac-b", Some(&["g-r"])).unwrap_err();
+        assert!(theirs.0 == 9 && theirs.1.ends_with("--grants '<grant globs>'"), "another Mac's signer: {}", theirs.1);
+        assert!(guard(&cfg, "mac-b", Some(&["g-o"])).is_ok());
+        // The sole signer, restricted or not.
+        for c in [&cfg, &open] {
+            for set in [None, Some(&["*"][..]), Some(&["g-o", "***"][..])] {
+                let refused = guard(c, "mac-sole", set).unwrap_err();
+                assert_eq!(refused.0, 9, "{set:?}");
+                assert!(refused.1.starts_with("relay allow: token signer mac-sole, this Mac's sole signer, would reach every grant ("), "{}", refused.1);
+            }
+            assert!(guard(c, "mac-sole", Some(&["g-r", "no-grant"])).is_ok());
+            assert!(guard(c, "mac-sole", Some(&["g-*"])).is_ok(), "a glob that is not every grant");
+        }
+        assert_eq!(guard(&cfg, "mac-sole", None).unwrap_err().1, "relay allow: token signer mac-sole, this Mac's sole signer, would reach every grant (no grants): ai-env as deployer -- ai-env relay allow mac-sole --key KEY --token-signer --not-after 2027-10-29 --grants g-o,g-r,g-w,no-grant");
+        assert!(guard(&open, "mac-sole", Some(&["*"])).unwrap_err().1.contains("(grants *)"));
+        // What the guard reads: a glob of `*` alone, and the restricted ids a set reaches.
+        assert!(holds_star(&s(&["g-a", "**"])) && !holds_star(&s(&["g-*", "*-a"])) && !holds_star(&[]));
+        assert_eq!(restricted_reached(None, &s(&["g-r", "h-r"])), ["g-r", "h-r"]);
+        assert_eq!(restricted_reached(Some(&s(&["g-*"])), &s(&["g-r", "h-r"])), ["g-r"]);
+        assert!(restricted_reached(Some(&s(&["no-grant"])), &s(&["g-r"])).is_empty());
     }
 
     /// §RS.4.2: checkip's body is one IPv4 address and an optional newline, at most 64 bytes.

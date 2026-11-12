@@ -65,7 +65,8 @@ impl std::fmt::Debug for MintOutcome {
 
 /// The token of the spawn `spawn_id` on the VM of `row` (WM-R50 to WM-R52), asked of this Mac's agent in this
 /// order, the first that applies its word: the grant (`[[workspace]].relay_grant`, else `[relay].grant`) empty
-/// `off`; the grant or `[relay].worker_id` not an id `bad_config`; the VM's shim without `relay_v1` `no_cap`;
+/// `off`; the grant or `[relay].worker_id` not an id, or the grant one of `[relay].restricted` (R-155: never a token's
+/// own, which `validate_relay` refuses and the agent would too), `bad_config`; the VM's shim without `relay_v1` `no_cap`;
 /// less than a minute before `min(now + 8 h, the VM's wall)` `wall`; no `state/relay-ca.der` `no_ca`; no agent
 /// socket `no_agent`; then one `mint_session` within 2 s: a token is `minted`, no answer `no_agent`, a refusal
 /// `agent_error`. With a grant set, `no_agent` and `agent_error` say one note (WM-R53): its refusal's code is
@@ -95,7 +96,7 @@ async fn ask(cfg: &BridgeConfig, paths: &Paths, ws: &WorkspaceRef, row: &VmRow, 
     if grant.is_empty() {
         return skip("off");
     }
-    if !valid_id(&grant) || !valid_id(&cfg.relay.worker_id) {
+    if !valid_id(&grant) || !valid_id(&cfg.relay.worker_id) || cfg.relay.is_restricted(&grant) {
         return skip("bad_config");
     }
     if !row.caps.as_ref().is_some_and(|caps| caps.iter().any(|c| c == CAP_RELAY_V1)) {
@@ -287,5 +288,36 @@ mod tests {
         assert_eq!(m.grant_id, "ws-grant");
         let (_t7, p7, ws7) = world("[relay]\ngrant = \"default\"\n\n[[workspace]]\npath = \"@W@\"\nrelay_grant = \"\"\n", true);
         assert_eq!(word(&for_spawn(&cfg_of(&p7), &p7, &ws7, &row(Some(RELAY), None), &spawn, None, now).await), "off");
+    }
+
+    /// R-155: a token's own grant that `[relay].restricted` names (`[relay].grant` or the workspace's `relay_grant`, a file
+    /// `validate_relay` refuses) is `bad_config`, with no note and nothing asked of the agent, on a VM placed for the chat
+    /// alone too; the workspace's other grant, or the same grant no longer restricted, is minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restricted_grant_is_never_a_tokens_own() {
+        let now = crate::wire::time::unix_now();
+        let spawn = SpawnId::new_v7();
+        let sole = VmRow { sole: Some(CHAT.into()), ..row(Some(RELAY), None) };
+        for config in [
+            "[relay]\ngrant = \"g-r\"\noffer = [\"g-r\"]\nrestricted = [\"g-r\"]\n",
+            "[relay]\ngrant = \"default\"\noffer = [\"g-r\"]\nrestricted = [\"g-r\"]\n\n[[workspace]]\npath = \"@W@\"\nsole_vm = true\nrelay_grant = \"g-r\"\n",
+        ] {
+            let (_t, paths, ws) = world(config, true);
+            let agent = fake_agent(&paths, Script::Mint);
+            let (out, code) = ask(&cfg_of(&paths), &paths, &ws, &sole, &spawn, Some(CHAT), now).await;
+            assert_eq!((out.word(), code), ("bad_config", None), "{config}");
+            assert_eq!(note_of(&out, None), None, "{config}");
+            assert!(agent.lock().unwrap().is_empty(), "{config}: nothing asked of the agent");
+        }
+        for (config, grant) in [
+            ("[relay]\ngrant = \"default\"\noffer = [\"g-r\"]\nrestricted = [\"g-r\"]\n\n[[workspace]]\npath = \"@W@\"\nsole_vm = true\n", "default"),
+            ("[relay]\ngrant = \"default\"\noffer = [\"g-r\"]\n\n[[workspace]]\npath = \"@W@\"\nsole_vm = true\nrelay_grant = \"g-r\"\n", "g-r"),
+        ] {
+            let (_t, paths, ws) = world(config, true);
+            let agent = fake_agent(&paths, Script::Mint);
+            assert_eq!(for_spawn(&cfg_of(&paths), &paths, &ws, &sole, &spawn, Some(CHAT), now).await.word(), "minted", "{config}");
+            let Request::MintSession(m) = agent.lock().unwrap().pop().unwrap() else { panic!("not a mint") };
+            assert_eq!((m.grant_id.as_str(), m.chat_id.as_deref()), (grant, Some(CHAT)), "{config}");
+        }
     }
 }

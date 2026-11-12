@@ -11,17 +11,19 @@
 //! Findings are `[NO ]` and exit 1: this Mac's session key is not an in-force token signer under
 //! `[relay].worker_id`, a list does not parse, the instance is not running, the peers list is absent or holds no
 //! entry in force, a worker in force has no client certificate under a relay that requires one, this Mac's token signer
-//! holds grants that leave out `[relay].grant`; an absent access list is
+//! holds grants that leave out `[relay].grant`; with `[relay].restricted` naming a grant (R-157), a token signer other than
+//! `<worker_id>-sole` that reaches one, this Mac's sole key not an in-force token signer as `<worker_id>-sole`, or that
+//! signer's grants leaving out `[relay].grant`, a `sole_vm` workspace's own grant or a restricted id; an absent access list is
 //! no finding, since no chat is then more than its token's grant (R-146). A read that failed
 //! is `[?? ]` and exit 7 when nothing was found first. `start` and `stop` wait as `proxy start|stop` do, their polls
 //! scaled by the lab knob; a relay that stops answers VM relay tools `unavailable`, and workers keep dialing until it
 //! starts again.
 use super::cli::{audit, note, runtime, say, shell_word, RelayCtx};
 use super::keys::{read_notes, MacKeyNotes};
-use super::params::{fp16, write_access_cache, MAC_LABEL, WIDE_BELOW};
+use super::params::{access_day, fp16, restricted_in, restricted_mark, restricted_reached, write_access_cache, MAC_LABEL, RESTRICTED_DAYS_MAX, WIDE_BELOW};
 use crate::bridge::audit::event::{RELAY_START, RELAY_STOP};
 use crate::bridge::awscli::aws_json;
-use crate::bridge::config::{BridgeConfig, Paths};
+use crate::bridge::config::{BridgeConfig, Paths, RelayCfg};
 use crate::bridge::egress::ops::{self, arr, text, Wait};
 use crate::bridge::egress::RELAY_LOG_GROUP;
 use crate::errors::{CliError, Result};
@@ -163,7 +165,8 @@ fn mac_rows(paths: &Paths, report: &mut Report) -> Option<MacKeyNotes> {
     let notes = match read_notes(paths) {
         Ok(n) => {
             let day = n.sealed_day().unwrap_or_else(|| "on an unrecorded day".into());
-            report.row(Mark::Ok, format!("keys: sealed in credentials/relay-worker.env for worker {}, worker key fp {}, session key fp {}, sealed {day}", n.worker_id, n.worker_key.fingerprint(), n.session_key.fingerprint()));
+            let sole = n.sole_key.as_ref().map_or_else(String::new, |k| format!(", sole key fp {}", k.fingerprint()));
+            report.row(Mark::Ok, format!("keys: sealed in credentials/relay-worker.env for worker {}, worker key fp {}, session key fp {}{sole}, sealed {day}", n.worker_id, n.worker_key.fingerprint(), n.session_key.fingerprint()));
             Some(n)
         }
         Err(e) if !paths.relay_worker_env().exists() => {
@@ -186,6 +189,7 @@ fn mac_rows(paths: &Paths, report: &mut Report) -> Option<MacKeyNotes> {
             "worker_id": notes.as_ref().map(|n| n.worker_id.clone()),
             "worker_fp": notes.as_ref().map(|n| n.worker_key.fingerprint()),
             "session_fp": notes.as_ref().map(|n| n.session_key.fingerprint()),
+            "sole_fp": notes.as_ref().and_then(|n| n.sole_key.as_ref()).map(PublicKey::fingerprint),
             "sealed": notes.as_ref().and_then(MacKeyNotes::sealed_day),
             "agent": agent.as_ref().map(|s| json!({"pid": s.pid, "until": s.until, "signed": s.signed, "minted": s.minted})),
         }),
@@ -234,7 +238,7 @@ pub fn cmd_status(json: bool, local: bool) -> Result<()> {
     let stance = instance_rows(&ctx, &instance, &mut report);
     list_rows(&cfg, notes.as_ref(), stance, &mut report);
     peer_rows(&mut report);
-    access_rows(&paths, &mut report);
+    access_rows(&paths, &cfg.relay, &mut report);
     report.finish(json)
 }
 
@@ -586,8 +590,11 @@ fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance
             report.doc.insert("workers".into(), Value::Array(docs));
         }
     }
-    // token signers, and this Mac's session key among them
+    // token signers, and this Mac's session key and sole key among them
     let mut in_force = false;
+    let mut sole_in_force = false;
+    let mut signers: Vec<policy::SignerEntry> = Vec::new();
+    let sole_id = RelayCfg::sole_id_of(worker_id);
     // RO-6, RO-8: part D's deploy carries part H, so a status line with `client_certs` (R-132) is a relay that parses a
     // signer's `grants`. A line without it is one that refuses them; with none read, it is not known.
     let status_line = report.doc.get("instance").and_then(|i| i.get("status_line")).filter(|line| line.is_object());
@@ -611,6 +618,14 @@ fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance
                 if let Some(text) = every_grant_row(s, parses_grants, mine.then_some(cfg.relay.grant.as_str())) {
                     report.row(Mark::Warn, text);
                 }
+                // R-157: the restricted grants are the sole signer's alone, and it must carry what its chats' tokens name.
+                if s.signer_id == sole_id {
+                    if !refuses_grants {
+                        sole_grant_rows(s, cfg, report);
+                    }
+                } else if let Some(text) = restricted_row(s, cfg, mine, refuses_grants) {
+                    report.row(Mark::No, text);
+                }
                 if mine && !refuses_grants {
                     own_grant_rows(s, cfg, report);
                 }
@@ -621,8 +636,10 @@ fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance
                 report.row(Mark::No, format!("{TOKEN_SIGNERS} holds grants (token signer {}), but this relay refuses such a list, so every token fails (RO-6): deploy part D's relay, or ai-env as deployer -- ai-env relay revoke <id> --token-signer for each and allow it again without --grants", bound.join(",")));
             }
             in_force = notes.is_some_and(|n| list.iter().any(|s| s.signer_id == worker_id && s.public_key == n.session_key.b64() && now <= s.not_after_unix()));
+            sole_in_force = notes.and_then(|n| n.sole_key.as_ref()).is_some_and(|k| list.iter().any(|s| s.signer_id == sole_id && s.public_key == k.b64() && now <= s.not_after_unix()));
             let docs: Vec<Value> = list.iter().map(|s| json!({"id": s.signer_id, "fp": fp(&s.public_key), "grants": s.grants, "not_after": s.not_after, "expired": now > s.not_after_unix()})).collect();
             report.doc.insert("token_signers".into(), Value::Array(docs));
+            signers = list;
         }
     }
     match notes {
@@ -633,6 +650,7 @@ fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance
         ),
         None => report.row(Mark::No, format!("this Mac has no relay keys, so no token signer as {worker_id}: ai-env relay keygen")),
     }
+    sole_key_row(cfg, notes, sole_in_force, report);
     // grants
     match value(GRANTS).map(|(v, n)| (policy::parse_grants(&v), n)) {
         None => {
@@ -645,6 +663,7 @@ fn list_rows(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, stance: CertStance
             for g in &list {
                 report.row(Mark::Note, format!("  grant {}: {}", g.grant_id, g.allow.join(" ")));
             }
+            overlap_rows(&list, &signers, cfg, now, report);
             let docs: Vec<Value> = list.iter().map(|g| json!({"id": g.grant_id, "rules": g.allow})).collect();
             report.doc.insert("grants".into(), Value::Array(docs));
         }
@@ -704,7 +723,8 @@ fn every_grant_row(s: &policy::SignerEntry, parses_grants: bool, mac_grant: Opti
 
 /// This Mac's own token signer, in force, against what `bridge.toml` names (§RS.3.2 row 6): its `grants` bind every token
 /// it mints (R-135) and every grant an approval adds (R-145). No glob matching `[relay].grant` refuses every token, a
-/// finding; none matching a `[[workspace]].relay_grant` or a `[relay].offer` id leaves a chat with nothing through it.
+/// finding; none matching a `[[workspace]].relay_grant` or a `[relay].offer` id leaves a chat with nothing through it, but a
+/// `[relay].restricted` id, which it must never reach ([`restricted_row`]).
 fn own_grant_rows(s: &policy::SignerEntry, cfg: &BridgeConfig, report: &mut Report) {
     let Some(globs) = &s.grants else {
         return;
@@ -717,9 +737,159 @@ fn own_grant_rows(s: &policy::SignerEntry, cfg: &BridgeConfig, report: &mut Repo
         let (key, day, set) = (signer_key_text(s), entry_day(&s.not_after), shell_word(&format!("{grant},{held}")));
         report.row(Mark::No, format!("token signer {id} holds grants {held}, none of which matches [relay].grant {grant}: every token this Mac mints is refused 7 not granted (R-135) (ai-env as deployer -- ai-env relay allow {id} --token-signer --key {key} --grants {set} --not-after {day})"));
     }
-    let named: BTreeSet<&str> = cfg.workspace_overrides.iter().filter_map(|w| w.relay_grant.as_deref()).chain(cfg.relay.offer.iter().map(String::as_str)).filter_map(named_grant).filter(|name| Some(*name) != grant).collect();
+    let named: BTreeSet<&str> = cfg.workspace_overrides.iter().filter_map(|w| w.relay_grant.as_deref()).chain(cfg.relay.offer.iter().map(String::as_str)).filter_map(named_grant).filter(|name| Some(*name) != grant && !cfg.relay.is_restricted(name)).collect();
     for name in named.into_iter().filter(|name| !matched(name)) {
         report.row(Mark::Warn, format!("token signer {id} holds grants {held}, none of which matches {name}: a chat reaches nothing through it"));
+    }
+}
+
+/// R-157: the `[NO ]` of an in-force token signer other than this Mac's sole signer that reaches a `[relay].restricted` grant
+/// (no `grants`, or a glob matching one): a token it mints on a VM chats share reaches that grant through any approval
+/// (R-145), which `<worker_id>-sole` alone may carry. `None` when it reaches none. The command binds this Mac's own signer to
+/// [`BridgeConfig::session_signer_grants`], another to globs of the user's choosing; a relay that refuses a list with grants
+/// gets none (RO-6).
+fn restricted_row(s: &policy::SignerEntry, cfg: &BridgeConfig, mine: bool, refuses_grants: bool) -> Option<String> {
+    let reached = restricted_reached(s.grants.as_deref(), &cfg.relay.restricted);
+    if reached.is_empty() {
+        return None;
+    }
+    let id = &s.signer_id;
+    let held = s.grants.as_ref().map_or_else(|| "no grants".to_string(), |globs| format!("grants {}", globs.join(",")));
+    let cure = if refuses_grants {
+        "not yet: a relay before part H refuses a list with grants, and every token then fails (RO-6)".to_string()
+    } else {
+        let set = if mine { cfg.session_signer_grants() } else { Vec::new() };
+        let set = if set.is_empty() { "<grant globs>".to_string() } else { shell_word(&set.join(",")) };
+        format!("ai-env as deployer -- ai-env relay allow {id} --token-signer --key {} --grants {set} --not-after {}", signer_key_text(s), entry_day(&s.not_after))
+    };
+    Some(format!("token signer {id} reaches the [relay].restricted grant {} ({held}), which only {} may: a token it mints on a VM chats share reaches it through an approval ({cure})", reached.join(","), cfg.relay.sole_id()))
+}
+
+/// R-157, by the grants' rules: a grant other than a `[relay].restricted` one that an in-force token signer other than this
+/// Mac's sole signer reaches (its `grants` match the id, or it has none), one of whose rules meets one of a restricted grant's
+/// ([`rules_meet`]): such a signer's token, minted on a VM chats share, reaches the restricted grant's sources through it,
+/// whatever the ids say, since the relay serves a grant by its rules. `[NO ]` for each such pair, naming the first rules that
+/// meet and the command that sets the grant's rules anew; the guard and the other rows compare ids alone.
+fn overlap_rows(grants: &[policy::Grant], signers: &[policy::SignerEntry], cfg: &BridgeConfig, now: u64, report: &mut Report) {
+    let sole_id = cfg.relay.sole_id();
+    let restricted: Vec<&policy::Grant> = grants.iter().filter(|g| cfg.relay.is_restricted(&g.grant_id)).collect();
+    if restricted.is_empty() {
+        return;
+    }
+    let reaching = |grant: &str| -> Vec<&str> {
+        signers
+            .iter()
+            .filter(|s| s.signer_id != sole_id && now <= s.not_after_unix())
+            .filter(|s| s.grants.as_ref().is_none_or(|globs| globs.iter().any(|glob| glob_match(glob, grant))))
+            .map(|s| s.signer_id.as_str())
+            .collect()
+    };
+    for g in grants.iter().filter(|g| !cfg.relay.is_restricted(&g.grant_id)) {
+        let by = reaching(&g.grant_id);
+        if by.is_empty() {
+            continue;
+        }
+        for r in &restricted {
+            let Some((ours, theirs)) = g.allow.iter().find_map(|a| r.allow.iter().find(|b| rules_meet(a, b)).map(|b| (a, b))) else { continue };
+            report.row(
+                Mark::No,
+                format!(
+                    "grant {0} (rule {ours}) reaches the sources of the [relay].restricted grant {1} (rule {theirs}), and token signer {2} reaches {0}: a token it mints on a VM chats share reaches those sources through it (ai-env as deployer -- ai-env relay grant {0} '<rules that leave them out>')",
+                    g.grant_id,
+                    r.grant_id,
+                    by.join(",")
+                ),
+            );
+        }
+    }
+}
+
+/// Whether two rules (`<source-glob>/<op-glob>`) match a source and an op in common: each half's globs meet
+/// ([`globs_meet`]). A rule that is no rule meets nothing.
+fn rules_meet(a: &str, b: &str) -> bool {
+    match (a.split_once('/').filter(|_| ai_env_worker::globs::valid_rule(a)), b.split_once('/').filter(|_| ai_env_worker::globs::valid_rule(b))) {
+        (Some((a_source, a_op)), Some((b_source, b_op))) => globs_meet(a_source, b_source) && globs_meet(a_op, b_op),
+        _ => false,
+    }
+}
+
+/// Whether two globs (`*` any run of name characters, the empty one too) match a name in common: `meet[i][j]` says
+/// whether `a[i..]` and `b[j..]` do, from the ends back. A `*` stands for nothing, or takes the other's next character
+/// (two `*` that both take one may each take one fewer, so one of them standing for nothing is enough). The name's own
+/// grammar (its first character, its length) is not asked: a finding errs toward saying so.
+fn globs_meet(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut meet = vec![vec![false; b.len() + 1]; a.len() + 1];
+    for i in (0..=a.len()).rev() {
+        for j in (0..=b.len()).rev() {
+            meet[i][j] = match (a.get(i), b.get(j)) {
+                (None, None) => true,
+                (Some(b'*'), _) => meet[i + 1][j] || (j < b.len() && meet[i][j + 1]),
+                (_, Some(b'*')) => meet[i][j + 1] || (i < a.len() && meet[i + 1][j]),
+                (Some(x), Some(y)) => x == y && meet[i + 1][j + 1],
+                _ => false,
+            };
+        }
+    }
+    meet[0][0]
+}
+
+/// R-157: this Mac's sole signer (`<worker_id>-sole`), in force, against what `bridge.toml` names, when `[relay].restricted`
+/// names a grant (the agent signs with it then alone). Its tokens name `[relay].grant` or a `sole_vm` workspace's own grant,
+/// which its `grants` must match or the relay refuses them 7 not granted (R-135), and it alone carries the restricted ids:
+/// each it leaves out is `[NO ]`, naming the command that adds every one it leaves out. An offered id it leaves out is
+/// `[warn]`: a chat on a VM of its own reaches nothing through it. With no `grants`, [`every_grant_row`] says it.
+fn sole_grant_rows(s: &policy::SignerEntry, cfg: &BridgeConfig, report: &mut Report) {
+    let Some(globs) = s.grants.as_ref().filter(|_| !cfg.relay.restricted.is_empty()) else {
+        return;
+    };
+    let id = &s.signer_id;
+    let held = globs.join(",");
+    let missing: Vec<String> = cfg.sole_signer_grants().into_iter().filter(|name| !globs.iter().any(|glob| glob_match(glob, name))).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let set: BTreeSet<&str> = globs.iter().chain(&missing).map(String::as_str).collect();
+    let set = shell_word(&set.into_iter().collect::<Vec<_>>().join(","));
+    let command = format!("ai-env as deployer -- ai-env relay allow {id} --token-signer --key {} --grants {set} --not-after {}", signer_key_text(s), entry_day(&s.not_after));
+    for name in &missing {
+        let own = cfg.workspace_overrides.iter().find(|w| w.sole_vm && w.relay_grant.as_deref() == Some(name.as_str()));
+        let finding = if *name == cfg.relay.grant {
+            Some(format!("[relay].grant {name}: every token it mints is refused 7 not granted (R-135)"))
+        } else if let Some(w) = own {
+            Some(format!("{name}, the own grant of [[workspace]] {}: every token of its chats is refused 7 not granted (R-135)", w.path.display()))
+        } else if cfg.relay.is_restricted(name) {
+            Some(format!("the [relay].restricted grant {name}: no chat reaches it"))
+        } else {
+            None
+        };
+        match finding {
+            Some(what) => report.row(Mark::No, format!("token signer {id} holds grants {held}, none of which matches {what} ({command})")),
+            None => report.row(Mark::Warn, format!("token signer {id} holds grants {held}, none of which matches {name}: a chat on a VM of its own reaches nothing through it")),
+        }
+    }
+}
+
+/// R-157: this Mac's sole key against the token signers: `[ok ]` an in-force signer as `<worker_id>-sole`; with
+/// `[relay].restricted` naming a grant, `[NO ]` otherwise, since no chat then reaches one, naming the command (the sole
+/// signer's, with its grants, or `relay keygen --sole`); without, a sole key not allowed is a note, and none says nothing.
+fn sole_key_row(cfg: &BridgeConfig, notes: Option<&MacKeyNotes>, in_force: bool, report: &mut Report) {
+    let id = cfg.relay.sole_id();
+    let restricted = cfg.relay.restricted.join(",");
+    match notes.and_then(|n| n.sole_key.as_ref()) {
+        Some(k) if in_force => report.row(Mark::Ok, format!("this Mac's sole key (fp {}) is an in-force token signer as {id}", k.fingerprint())),
+        Some(k) => {
+            let set = cfg.sole_signer_grants();
+            let set = if set.is_empty() { "<grant globs>".to_string() } else { set.join(",") };
+            let command = format!("ai-env as deployer -- ai-env relay allow {id} --token-signer --key {} --grants {set}", k.text());
+            if restricted.is_empty() {
+                report.row(Mark::Note, format!("this Mac's sole key (fp {}) is not a token signer as {id}, which the relay agent signs with once [relay].restricted names a grant ({command})", k.fingerprint()));
+            } else {
+                report.row(Mark::No, format!("this Mac's sole key (fp {}) is not an in-force token signer as {id}, so no chat reaches [relay].restricted {restricted}: {command}", k.fingerprint()));
+            }
+        }
+        None if !restricted.is_empty() => report.row(Mark::No, format!("this Mac has no sole key, so no token signer as {id}, and no chat reaches [relay].restricted {restricted}: ai-env relay keygen --sole")),
+        None => {}
     }
 }
 
@@ -769,8 +939,10 @@ fn peer_rows(report: &mut Report) {
 }
 
 /// The access list (R-146), in a `get-parameters` of its own as row 8's: until the deploy that names it the ops policy
-/// cannot read it, and IAM refuses a whole call for one such name. What it reads goes in the panel's cache (R-152).
-fn access_rows(paths: &Paths, report: &mut Report) {
+/// cannot read it, and IAM refuses a whole call for one such name. What it reads goes in the panel's cache (R-152). R-157:
+/// each entry's `[relay].restricted` grants are marked (`restricted` in its JSON), and one in force holding any past the
+/// latest end their approval writes today, 30 days out, is `[warn]`.
+fn access_rows(paths: &Paths, relay: &RelayCfg, report: &mut Report) {
     let (got, _) = match ops::get_parameters(&[ACCESS.to_string()]) {
         Ok(g) => g,
         Err(e) => {
@@ -795,10 +967,29 @@ fn access_rows(paths: &Paths, report: &mut Report) {
     let now = unix_now();
     let in_force = list.iter().filter(|a| now <= a.not_after_unix()).count();
     report.row(Mark::Ok, format!("{ACCESS} v{n}: {} chat(s), {in_force} in force", list.len()));
+    // The latest end an approval of a restricted grant writes today (R-156).
+    let latest = policy::not_after_of_day(&access_day(now, RESTRICTED_DAYS_MAX)).ok().and_then(|t| policy::unix_of(&t).ok()).unwrap_or(u64::MAX);
     for a in &list {
-        report.row(Mark::Note, format!("  chat {} grants {} until {}{}", a.chat, a.grants.join(","), a.not_after, if now > a.not_after_unix() { " EXPIRED" } else { "" }));
+        report.row(Mark::Note, format!("  chat {} grants {} until {}{}{}", a.chat, a.grants.join(","), a.not_after, if now > a.not_after_unix() { " EXPIRED" } else { "" }, restricted_mark(&a.grants, &relay.restricted)));
+        let held = restricted_in(&a.grants, &relay.restricted);
+        if let Some(first) = held.first().filter(|_| now <= a.not_after_unix() && a.not_after_unix() > latest) {
+            report.row(
+                Mark::Warn,
+                format!("chat {} holds the [relay].restricted grant {} until {}, past the {RESTRICTED_DAYS_MAX} days an approval of one writes (ai-env relay access <session> --allow {first} sets its end again)", a.chat, held.join(","), a.not_after),
+            );
+        }
     }
-    let docs: Vec<Value> = list.iter().map(|a| json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix()})).collect();
+    let docs: Vec<Value> = list
+        .iter()
+        .map(|a| {
+            let mut doc = json!({"chat": a.chat, "grants": a.grants, "not_after": a.not_after, "expired": now > a.not_after_unix()});
+            let held = restricted_in(&a.grants, &relay.restricted);
+            if !held.is_empty() {
+                doc["restricted"] = json!(held);
+            }
+            doc
+        })
+        .collect();
     report.doc.insert("access".into(), Value::Array(docs));
     write_access_cache(paths, n, &list);
 }
@@ -890,6 +1081,21 @@ mod tests {
 
     fn rows(report: &Report) -> Vec<(Mark, &str)> {
         report.rows.iter().map(|(m, l)| (*m, l.as_str())).collect()
+    }
+
+    /// R-157, by the grants' rules: two globs meet when a name matches both (a `*` takes any run, the empty one too), in
+    /// either order; two rules when both halves meet. A rule that is no rule meets nothing.
+    #[test]
+    fn globs_and_rules_meet_where_a_name_matches_both() {
+        for (a, b) in [("*", "vault-a"), ("*", "*"), ("vault-*", "vault-a"), ("vault-*", "*-a"), ("v*t-*", "vault-*"), ("*a*", "*b*"), ("a*", "*a"), ("ab", "a*b"), ("a*b", "ab"), ("x*y*z", "x*z")] {
+            assert!(globs_meet(a, b) && globs_meet(b, a), "{a} {b}");
+        }
+        for (a, b) in [("vault-*", "public-*"), ("mac-*", "silo-*"), ("a", "b"), ("a*", "b*"), ("*a", "*b"), ("ab", "a"), ("a*b", "a*c"), ("x*y", "x*z")] {
+            assert!(!globs_meet(a, b) && !globs_meet(b, a), "{a} {b}");
+        }
+        assert!(rules_meet("*/*", "vault-*/list") && rules_meet("vault-*/l*", "*-a/list"));
+        assert!(!rules_meet("vault-*/get", "vault-*/list") && !rules_meet("public-*/*", "vault-*/list"));
+        assert!(!rules_meet("*", "*/*") && !rules_meet("*/*", "a/b/c") && !rules_meet("*****/*", "*/*"), "no rule meets nothing");
     }
 
     /// WM-T60's probe (§RS.3.2 row 2): the real command only dials port 443, which a test cannot bind without root, so

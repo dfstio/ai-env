@@ -398,6 +398,23 @@ fn migrate_offline(store: &Keystore, paths: &Paths, row: &SessionRow, old: &str,
     Ok(Moved { outcome: "done".to_string(), how: "offline", from_vm: old.to_string(), to_vm: Some(to), ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX), code: 0, why: None })
 }
 
+/// The offline move's SELECT_VM plan for `row`'s chat in `ws`: the workspace's VM, never the old one (`avoid`), the
+/// workspace routes and the transcript store required; S11 (L5): a gzip-staged chat goes only to a VM that decodes
+/// it; R-154: a chat that runs alone (`workspace::chat_sole`: its workspace `sole_vm`, or its row marked sole,
+/// wherever it is) to a VM of its own, as its reopen's P0 places it.
+fn move_plan(paths: &Paths, cfg: &crate::bridge::config::BridgeConfig, ws: &crate::bridge::workspace::WorkspaceRef, row: &SessionRow, old: &str) -> Result<crate::bridge::vm::run::RunPlan, BridgeError> {
+    use crate::bridge::vm::run::{Choice, Egress, RunFlags, RunPlan};
+    let flags = RunFlags { workspace: Some(ws.cwd.clone()), egress: Some(Egress::Vpc), purpose: "session", wait: true, ..RunFlags::default() };
+    let mut plan = RunPlan::from_cfg(cfg, &flags)?;
+    plan.choice = Choice::Workspace;
+    plan.workspace_cap = true;
+    plan.transcript_cap = true;
+    plan.avoid = vec![old.to_string()];
+    plan.caps_required = crate::bridge::s3::manifest::caps_required(paths, &row.session_id);
+    plan.sole = crate::bridge::workspace::chat_sole(cfg, ws, row.access(), Some(row));
+    Ok(plan)
+}
+
 /// [`migrate_offline`]'s steps on `api` and `ep`; the new VM's id.
 async fn offline_on<A, E>(ctx: &crate::bridge::vm::cmd::Ctx, api: &std::sync::Arc<A>, ep: &E, row: &SessionRow, old: &str, ws: &crate::bridge::workspace::WorkspaceRef, sync: &crate::bridge::s3::TranscriptSync) -> crate::errors::Result<String>
 where
@@ -406,7 +423,7 @@ where
 {
     use crate::bridge::remote::pipeline::{carry_seed, data_plane, leave_vm, retire_old_vm, running_resumed, target_of, workspace_caps};
     use crate::bridge::vm::registry as vm_registry;
-    use crate::bridge::vm::run::{self, Choice, Egress, Poll, RunFlags, RunPlan};
+    use crate::bridge::vm::run::{self, Poll};
     use crate::bridge::workspace::{EnsureCtx, SeedLimits};
     let sid = row.session_id.as_str();
     // The old VM's work and the chat, fetched and synced there; a VM gone leaves its last fetch record.
@@ -419,15 +436,7 @@ where
         Ok(_) | Err(BridgeError::VmNotFound(_)) => crate::bridge::voice::note(&format!("{old} is gone: the chat moves with its last fetch's work")),
         Err(e) => return Err(e.into()),
     }
-    // SELECT_VM: the workspace's VM, never the old one.
-    let flags = RunFlags { workspace: Some(ws.cwd.clone()), egress: Some(Egress::Vpc), purpose: "session", wait: true, ..RunFlags::default() };
-    let mut plan = RunPlan::from_cfg(&ctx.cfg, &flags)?;
-    plan.choice = Choice::Workspace;
-    plan.workspace_cap = true;
-    plan.transcript_cap = true;
-    plan.avoid = vec![old.to_string()];
-    // S11 (L5): a gzip-staged chat is restored only on a VM that decodes it.
-    plan.caps_required = crate::bridge::s3::manifest::caps_required(&ctx.paths, sid);
+    let plan = move_plan(&ctx.paths, &ctx.cfg, ws, row, old)?;
     let selected = run::select_vm_detailed(&**api, &ctx.paths, &plan, ctx.poll(Poll::RUNNING)).await.map_err(|f| f.error)?;
     let (vm_row, vm) = (selected.row().clone(), selected.vm().clone());
     let (vm_row, caps) = workspace_caps(ctx, &**api, ep, vm_row).await?;
@@ -553,6 +562,43 @@ mod tests {
         assert_eq!(moving_pid(&SessionRow { migrating_pid: None, ..row.clone() }), None);
         // This test's own process is no `ai-env`: its pid in the row holds nothing.
         assert_eq!(moving_pid(&SessionRow { migrating_pid: Some(std::process::id()), last_seen: registry::now_rfc3339(), ..row }), None);
+    }
+
+    /// R-154: the offline move's plan places a chat that runs alone on a VM of its own (`RunPlan.sole`): a chat of a
+    /// `sole_vm` workspace by its access id, a chat marked sole by its row's wherever its cwd is; any other on a shared
+    /// VM; never on the old VM, with the workspace routes and the transcript store required, and vpc egress.
+    #[test]
+    fn the_offline_move_places_a_chat_that_runs_alone_on_its_own_vm() {
+        use crate::bridge::vm::run::{Choice, Egress};
+        use crate::bridge::workspace::{Head, WorkspaceRef, WsKind};
+        const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a8";
+        const OLD: &str = "microvm-old0000001";
+        let d = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(d.path()).unwrap();
+        let (sole, plain) = (top.join("work").join("sole"), top.join("work").join("plain"));
+        for dir in [&sole, &plain] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let connector = "arn:aws:lambda:eu-central-1:123456789012:network-connector:ai-env-egress";
+        let text = format!("[aws]\nimage_arn = {:?}\negress_connector_arn = {connector:?}\n[workspaces]\nroots = [{:?}]\n\n[[workspace]]\npath = {sole:?}\nsole_vm = true\n", crate::bridge::api::FAKE_IMAGE_ARN, top.join("work"));
+        let cfg = crate::bridge::config::BridgeConfig::parse(&text).unwrap();
+        let paths = Paths::from_root_and_env(top.join("bridge"), None);
+        let ws = |p: &Path| WorkspaceRef {
+            cwd: p.to_path_buf(),
+            root: p.to_path_buf(),
+            vm_cwd: p.display().to_string(),
+            vm_root: p.display().to_string(),
+            slug: "-w".into(),
+            kind: WsKind::Git { git_dir: p.join(".git"), common_dir: p.join(".git"), object_format: crate::wire::workspace::ObjectFormat::Sha1 },
+            head: Head::Detached { sha: "a".repeat(40) },
+            seed_branch: None,
+        };
+        let row = |marked: bool| SessionRow { session_id: SID.into(), mode: "remote".into(), access_id: Some(CHAT.into()), sole_since: marked.then(registry::now_rfc3339), ..SessionRow::default() };
+        let plan = move_plan(&paths, &cfg, &ws(&sole), &row(false), OLD).unwrap();
+        assert_eq!((plan.sole.as_deref(), plan.avoid.as_slice(), &plan.choice), (Some(CHAT), [OLD.to_string()].as_slice(), &Choice::Workspace), "its own VM, never the old one");
+        assert_eq!((plan.egress, plan.workspace_cap, plan.transcript_cap, plan.workspace.map(|(p, _)| p)), (Egress::Vpc, true, true, Some(sole.clone())));
+        assert_eq!(move_plan(&paths, &cfg, &ws(&plain), &row(false), OLD).unwrap().sole, None, "elsewhere: a shared VM");
+        assert_eq!(move_plan(&paths, &cfg, &ws(&plain), &row(true), OLD).unwrap().sole.as_deref(), Some(CHAT), "marked: alone wherever it is");
     }
 
     /// The offline move's hold: the row `migrating` with this process's pid

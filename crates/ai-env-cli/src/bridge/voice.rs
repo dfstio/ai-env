@@ -8,7 +8,9 @@
 //! [`note`], [`warn`] and [`line`]; each process picks its voice once, early
 //! ([`set`]), and a process that never picks one is the CLI. (S8 wave 1, W2,
 //! moves the shared call sites here and adds the `make lint` guard against
-//! raw `ai-env:` writes in them.)
+//! raw `ai-env:` writes in them.) The fork gap: [`echo`] repeats another
+//! program's own line as it is, before that last line (the CLI's resume
+//! miss, which Cursor's webview reads in the exit's stderr).
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -41,6 +43,9 @@ pub enum Kind {
     Warning,
     /// The one line a command ends with: always on stderr.
     Line,
+    /// The fork gap: another program's own line, repeated as it is (no
+    /// prefix): always on stderr, and never last ([`Kind::Line`] follows it).
+    Echo,
 }
 
 /// The stderr line `voice` prints for `msg` of `kind`, or `None` when it goes
@@ -51,6 +56,7 @@ pub fn rendered(voice: Voice, kind: Kind, msg: &str) -> Option<String> {
         (Voice::Wrapper, Kind::Note | Kind::Warning) => None,
         (_, Kind::Warning) => Some(format!("{}: warning: {msg}", voice.prefix())),
         (_, Kind::Note | Kind::Line) => Some(format!("{}: {msg}", voice.prefix())),
+        (_, Kind::Echo) => Some(msg.to_string()),
     }
 }
 
@@ -126,6 +132,13 @@ pub fn line(msg: &str) {
     SPEAKER.speak(Kind::Line, msg, &mut std::io::stderr().lock());
 }
 
+/// The fork gap (option B): `msg`, one line of another program's (the CLI's
+/// resume miss: `remote::Failure::cli_line`), on stderr as it is, whoever
+/// speaks; never the last line: the caller's [`line`] follows it.
+pub fn echo(msg: &str) {
+    SPEAKER.speak(Kind::Echo, msg, &mut std::io::stderr().lock());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +182,26 @@ mod tests {
         cli.speak(Kind::Warning, "audit row not written", &mut err);
         cli.speak(Kind::Note, "reusing microvm-x", &mut err);
         assert_eq!(String::from_utf8_lossy(&err), "ai-env: warning: audit row not written\nai-env: reusing microvm-x\n");
+    }
+
+    /// The fork gap (option B): an echo is another program's line as it is,
+    /// on stderr for either voice (the wrapper's notes stay in its log), and
+    /// the wrapper's own line after it is the last.
+    #[test]
+    fn an_echo_is_the_line_as_it_is_before_the_wrappers_last() {
+        let miss = "No conversation found with session ID: 0199a1b2-0000-7000-8000-0000000012a3";
+        for voice in [Voice::Cli, Voice::Wrapper] {
+            assert_eq!(rendered(voice, Kind::Echo, miss), Some(miss.to_string()), "{voice:?}");
+        }
+        let wrapper = Speaker::new();
+        wrapper.set(Voice::Wrapper);
+        let mut err = Vec::new();
+        wrapper.speak(Kind::Note, "refused before the pump", &mut err);
+        wrapper.speak(Kind::Echo, miss, &mut err);
+        wrapper.speak(Kind::Line, "refused before any Touch ID: nothing to resume; start a new chat", &mut err);
+        let text = String::from_utf8_lossy(&err);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, [miss, "ai-env-claude: refused before any Touch ID: nothing to resume; start a new chat"], "{text}");
+        assert!(text.ends_with("start a new chat\n"), "the wrapper's line last: {text}");
     }
 }

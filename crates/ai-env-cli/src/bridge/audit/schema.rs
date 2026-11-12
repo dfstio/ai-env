@@ -352,7 +352,8 @@ pub static EVENTS: &[EventSpec] = &[
     ev("vm_observed", &["id", "state", "was", "via"], NO, &["id"], NoSession, &[always(Effect::Observed)]),
     ev("panel_serve", &["port", "outcome"], NO, NO, NoSession, NONE),
     // S13 (§WM-worker-mac.6.7): ids, words, numbers and 16-hex fingerprints only (WM-R57); no VM key, no cost effect.
-    ev("relay_keygen", &["worker_id", "worker_fp", "session_fp"], &["replaced"], NO, NoSession, NONE),
+    // R-158: `sole_fp`, the sole key's, when the container holds one (`relay keygen --sole`, R-155).
+    ev("relay_keygen", &["worker_id", "worker_fp", "session_fp"], &["replaced", "sole_fp"], NO, NoSession, NONE),
     ev("relay_allow", &["kind", "id", "fp", "outcome"], &["version", "sources", "not_after", "tls_fp", "grants"], NO, NoSession, NONE),
     ev("relay_revoke", &["kind", "id", "outcome"], &["version"], NO, NoSession, NONE),
     ev("relay_grant", &["id", "outcome"], &["rules", "version"], NO, NoSession, NONE),

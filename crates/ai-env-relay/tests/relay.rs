@@ -1,4 +1,4 @@
-//! The relay in-process (§R-relay.7, relay 1 to 54): tonic over `tokio::io::duplex` with the rig of
+//! The relay in-process (§R-relay.7, relay 1 to 55): tonic over `tokio::io::duplex` with the rig of
 //! `tests/common`. Tests marked "paused" run on tokio's paused clock and assert virtual time.
 
 mod common;
@@ -3651,4 +3651,60 @@ async fn a_relay_refuses_a_token_minted_for_another() {
     let (chunks, _) = drain(call(&mut client, &rig.token("g-all"), "example.alpha", "get", b"{}").await.expect("minted for this relay")).await;
     assert_eq!(chunks.len(), 1);
     assert_eq!(a.invokes().len(), 1);
+}
+
+/// Relay 55 (R-155, with R-135 and R-145; M-R186): a restricted grant reaches a chat only through the sole signer, and the
+/// relay needs no change. The two signers as `relay allow` binds them: `mac` (seed 7) to `no-grant` and the open grant
+/// (`g-alpha-get` here), `mac-sole` (seed 8) to those and the restricted one (`g-example`). One chat's entry holds both
+/// grants. Two tokens of that chat with the same own grant, one of each signer: `mac`'s lists and calls the open grant's
+/// op alone, and is refused 7 `not granted` on the rest, nothing reaching the restricted grant's worker; `mac-sole`'s lists
+/// both grants' ops and its call reaches that worker, whose `Caller` names `mac-sole` and the restricted grant. A `mac` token
+/// whose own grant is the restricted one is refused whole, no session made; another chat's `mac-sole` token gets nothing
+/// from this chat's entry.
+#[tokio::test]
+async fn a_restricted_grant_reaches_a_chat_only_through_the_sole_signer() {
+    let rig = Rig::start().await;
+    let a = TestWorker::connect(&rig, "worker-a", 1, catalog_a()).await.serve(Script::echo("worker-a"));
+    let b = TestWorker::connect(&rig, "worker-b", 2, catalog_b()).await.serve(Script::echo("worker-b"));
+    let mut client = rig.client().await;
+    rig.write_signers(&[signer_of("mac", 7, Some(&["no-grant", "g-alpha-get"])), signer_of("mac-sole", 8, Some(&["g-alpha-get", "g-example", "no-grant"]))]);
+    rig.write_access(&[access_entry(CHAT, &["g-alpha-get", "g-example"])]);
+    rig.poll();
+    let chat_of = |seed: u8, id: &str, chat: &str, grant: &str| mint(seed, &SessionClaims { chat_id: Some(chat.into()), ..claims_of(&rig, id, grant) });
+    let (shared, sole) = (chat_of(7, "mac", CHAT, "no-grant"), chat_of(8, "mac-sole", CHAT, "no-grant"));
+    let denied = (Code::PermissionDenied, "not granted".to_string());
+
+    // `mac`: the open grant alone, whatever the entry holds.
+    assert_eq!(listed_ops(&list(&mut client, &shared).await.expect("its own grant")), [ops_row("example.alpha", &["get"])], "the open grant's one op");
+    answered(call(&mut client, &shared, "example.alpha", "get", b"{}").await).await;
+    let caller = a.invoke(0).await.caller.unwrap();
+    assert_eq!((caller.caller_id.as_str(), caller.grant_id.as_str()), ("mac", "g-alpha-get"));
+    for (source, op) in [("example.alpha", "list"), ("example.alpha.logs", "get"), ("example.beta", "get")] {
+        assert_eq!(refusal(call(&mut client, &shared, source, op, b"{}").await), denied, "{source}/{op}: the restricted grant alone allows it");
+    }
+    assert!(b.invokes().is_empty(), "nothing reached the restricted grant's worker");
+
+    // `mac-sole`: both grants, each call through the first that allows it.
+    let every = [ops_row("example.alpha", &["get", "list"]), ops_row("example.alpha.logs", &["get", "list"]), ops_row("example.beta", &["get", "list"])];
+    assert_eq!(listed_ops(&list(&mut client, &sole).await.expect("its own grant")), every);
+    answered(call(&mut client, &sole, "example.beta", "get", b"{}").await).await;
+    let caller = b.invoke(0).await.caller.unwrap();
+    assert_eq!((caller.caller_id.as_str(), caller.grant_id.as_str()), ("mac-sole", "g-example"), "the restricted grant, through the sole signer");
+    answered(call(&mut client, &sole, "example.alpha", "list", b"{}").await).await;
+    assert_eq!(a.invoke(1).await.caller.unwrap().grant_id, "g-example");
+    answered(call(&mut client, &sole, "example.alpha", "get", b"{}").await).await;
+    assert_eq!(a.invoke(2).await.caller.unwrap().grant_id, "g-alpha-get", "the open grant first");
+
+    // `mac` naming the restricted grant as its own: refused whole (R-135), no session made.
+    let sessions = rig.app.snapshot().sessions;
+    let own = chat_of(7, "mac", CHAT, "g-example");
+    let s = list(&mut client, &own).await.expect_err("the restricted grant as its own");
+    assert_eq!((s.code(), s.message()), (Code::PermissionDenied, "not granted"));
+    assert_eq!(refusal(call(&mut client, &own, "example.beta", "get", b"{}").await), denied);
+    assert_eq!(rig.app.snapshot().sessions, sessions, "no session made");
+    // Another chat's sole token: nothing from this chat's entry.
+    let theirs = chat_of(8, "mac-sole", OTHER_CHAT, "no-grant");
+    assert!(list(&mut client, &theirs).await.expect("its own grant").sources.is_empty(), "another chat's entry");
+    assert_eq!(refusal(call(&mut client, &theirs, "example.beta", "get", b"{}").await), denied);
+    assert_eq!((a.invokes().len(), b.invokes().len()), (3, 1), "the three calls above and the one");
 }

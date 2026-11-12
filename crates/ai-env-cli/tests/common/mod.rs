@@ -278,6 +278,49 @@ pub fn pid_alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// The fork gap: Cursor's fork of a remote chat, as extension 2.1.319's
+/// `forkSession` builds it on the Mac from the lines the Mac holds of the
+/// chat, its view (`view`, the file's text): the title lines left out
+/// (ai-env's `ai-title`, Cursor's `custom-title`), each message line kept
+/// as it is but for its ids (a uuid of its own, of the
+/// `0199a1b2-0000-7000-8000-f0…` form, its `parentUuid` the line before's,
+/// its `sessionId` `fork`), so the view's mark stays first on each, then the
+/// fork's own `custom-title` line, `TITLE (fork)`: the name the picker shows
+/// for the view (its newest `custom-title`, else its `ai-title`, else its
+/// first prompt).
+#[must_use]
+pub fn fork_of_view(view: &str, fork: &str) -> String {
+    let (mut out, mut renamed) = (String::new(), Vec::<(String, String)>::new());
+    let (mut custom, mut ai, mut prompt) = (None::<String>, None::<String>, None::<String>);
+    for line in view.lines().filter(|l| !l.is_empty()) {
+        let v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("a view line is JSON ({e}): {line}"));
+        let text = |key: &str| v[key].as_str().map(str::to_string);
+        match v["type"].as_str() {
+            Some("custom-title") => custom = text("customTitle").or(custom),
+            Some("ai-title") => ai = text("aiTitle").or(ai),
+            Some(kind @ ("user" | "assistant")) => {
+                if kind == "user" && prompt.is_none() {
+                    prompt = v["message"]["content"][0]["text"].as_str().map(str::to_string);
+                }
+                let own = v["uuid"].as_str().unwrap_or_else(|| panic!("a message line's uuid: {line}"));
+                renamed.push((own.to_string(), format!("0199a1b2-0000-7000-8000-f0{:010x}", renamed.len())));
+                let parent = v["sessionId"].as_str().unwrap_or_else(|| panic!("a message line's sessionId: {line}"));
+                let mut copy = line.replace(&format!("\"sessionId\":\"{parent}\""), &format!("\"sessionId\":\"{fork}\""));
+                for (from, to) in &renamed {
+                    copy = copy.replace(from.as_str(), to);
+                }
+                out.push_str(&copy);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    let title = custom.or(ai).or(prompt).unwrap_or_default();
+    let name = serde_json::to_string(&format!("{title} (fork)")).expect("a JSON string");
+    out.push_str(&format!("{{\"type\":\"custom-title\",\"sessionId\":\"{fork}\",\"customTitle\":{name}}}\n"));
+    out
+}
+
 /// The fake's resume-miss `result` line, byte for byte.
 #[must_use]
 pub fn resume_miss_frame(resume: &str) -> String {

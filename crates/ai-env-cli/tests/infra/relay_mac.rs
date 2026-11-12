@@ -1,6 +1,6 @@
 //! S13 slice M: the Mac side of the relay, through the real `ai-env` with the fake aws and age
 //! (plans/s13-contracts.md §WM-worker-mac.8.4, WM-T43 to WM-T48, WM-T48a and WM-T42a; the relay security plan's WM-T58
-//! to WM-T60, and §RS.13's WM-T66 and WM-T67). Each test gets a
+//! to WM-T60, §RS.13's WM-T66 and WM-T67, and the restricted grants' WM-T68 to WM-T71). Each test gets a
 //! [`World`]: one temp tree under `/tmp` (the agent's socket path stays well under 104 bytes) holding `bin/`
 //! (tests/fakes/age.sh as `age`, `age-keygen` and `age-plugin-se`, tests/fakes/aws.sh as `aws`), `keys/` (a
 //! keystore key with its public test recipients, as tests/infra/creds.rs makes one), `bridge/` (`bridge.toml`
@@ -92,7 +92,7 @@ impl World {
     }
 
     /// `bridge.toml`: the egress connector, then `extra`.
-    fn config(&self, extra: &str) {
+    pub(crate) fn config(&self, extra: &str) {
         fs::write(self.bridge().join("bridge.toml"), format!("[aws]\negress_connector_arn = \"{CONNECTOR}\"\n\n{extra}")).unwrap();
     }
 
@@ -1047,7 +1047,7 @@ fn relay_help_says_what_each_command_does() {
         ("grant", vec!["The grant's id, as [relay].grant or a workspace's relay_grant names it", rules.as_str(), "Delete the grant"]),
         ("status", vec!["One JSON object: the instance, the lists and this Mac's keys (each key as its fingerprint) and agent, and the verdict with its rows as printed"]),
         ("pubkey", vec!["Print this Mac's relay public keys from the sealed container's notes (no Touch ID; --verify checks them: one Touch ID)"]),
-        ("allow", vec!["Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)", "The last valid day, UTC (default: a year from today; at most two years ahead)", "The grant ids this token signer may mint tokens for: globs (default: every grant)"]),
+        ("allow", vec!["Allow a worker, or with --token-signer a Mac's session key, in the relay's lists (as ai-env-deployer)", "The last valid day, UTC (default: a year from today; at most two years ahead)", "The grant ids this token signer may mint tokens for: globs (default: the entry's own set, or every grant for a new one; <worker_id>-sole needs a set with no glob of * alone, and while [relay].restricted names a grant no other signer may reach one: exit 9)"]),
         ("access", vec!["Approve a remote chat for a grant, or take it back, in /ai-env/relay/access (as ai-env-ops): the relay applies it within about 70 s, with no restart", "The grant to allow this chat, one of [relay].offer", "1 to 90 (default 30)"]),
     ];
     let mut missing = Vec::new();
@@ -2766,4 +2766,630 @@ fn relay_allow_grants_binds_a_signer() {
     w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), 40);
     let (rc, out) = m.status();
     assert!(rc == 1 && !out.contains("token signer mac holds grants") && out.contains("is not an in-force token signer as mac"), "{out}");
+}
+
+// ---- R-155: the sole signer ---------------------------------------------------------------------------------------
+
+/// A chat's access id, a placeholder of no meaning.
+const SOLE_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+
+/// The keys a `keygen --sole` sealed, from the fake age's plaintext: exactly the three variables, in order, each a
+/// PKCS#8 DER: (worker, session, sole) public keys.
+fn sealed_three(w: &World) -> (PublicKey, PublicKey, PublicKey) {
+    use base64::Engine as _;
+    let plain = w.open(&w.container("relay-worker.env"));
+    let lines: Vec<&str> = plain.lines().collect();
+    assert!(plain.ends_with('\n') && lines.len() == 3, "exactly the three variables");
+    let key = |line: &str, var: &str| {
+        let b64 = line.strip_prefix(var).and_then(|l| l.strip_prefix('=')).unwrap_or_else(|| panic!("not {var}"));
+        SigningKey::from_pkcs8_der(&base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap().public_key()
+    };
+    (key(lines[0], "AI_ENV_RELAY_WORKER_KEY"), key(lines[1], "AI_ENV_RELAY_SESSION_KEY"), key(lines[2], "AI_ENV_RELAY_SOLE_KEY"))
+}
+
+/// `keygen`'s three key lines.
+fn three_lines(worker: &PublicKey, session: &PublicKey, sole: &PublicKey) -> String {
+    format!(
+        "worker  mac  {}  fp {}\nsession mac  {}  fp {}\nsole    mac-sole  {}  fp {}\n",
+        worker.text(),
+        worker.fingerprint(),
+        session.text(),
+        session.fingerprint(),
+        sole.text(),
+        sole.fingerprint()
+    )
+}
+
+/// WM-T68 (R-155, R-158): `relay keygen --sole` adds the sole key to the two sealed there with one unseal (one Touch ID)
+/// and keeps both. The plaintext is the three variables in order and the notes name the three keys; stdout is the three key
+/// lines and the sole signer's command alone, bound to `[relay].grant`, the sole workspaces' own grants and the offered
+/// ids; the old container is a `.bak`; the audit row names `sole_fp` and no `replaced`. A second `--sole`, or a plain
+/// `keygen`, is exit 1 naming `--force`, with no Touch ID. `pubkey` prints the three lines and `--sole` the key, with no
+/// Touch ID; `--verify` checks the sole key too (exit 9 when the notes name another, or none). The agent unseals the three
+/// with one Touch ID, signs the token of the chat a VM was placed for alone as `mac-sole` and every other as `mac`, and
+/// its lines say so. `keygen --force` makes all three anew and prints both signers' commands, `replaced` in its row.
+/// With no container, `--sole` makes all three with no Touch ID; keys sealed for another worker id, or a seal that
+/// would be refused, are refused before any Touch ID.
+#[test]
+fn relay_keygen_sole_adds_a_key_and_keeps_both() {
+    use ai_env_cli::bridge::vm::registry::{write_row, RowStatus, VmRow, GATE_PASSED};
+    use ai_env_worker::agent::{request, MintRequest, Request, Response};
+    let w = World::new();
+    w.config("[relay]\ngrant = \"no-grant\"\noffer = [\"g-open\", \"g-closed\"]\nrestricted = [\"g-closed\"]\n\n[[workspace]]\npath = \"/w/shared\"\nrelay_grant = \"g-shared\"\n\n[[workspace]]\npath = \"/w/sole\"\nsole_vm = true\nrelay_grant = \"g-sole\"\n");
+    assert_eq!(code(&w.run(&["keygen"], Who::Nobody)), 0);
+    let (worker, session) = sealed_keys(&w);
+    // An agent with no sole key while [relay].restricted names a grant says so once at its start.
+    w.reset();
+    let agent = w.cmd(&["agent", "--hours", "1"], Who::Nobody).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let socket = w.paths().relay_agent_socket();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    wait_for("the agent's answer", Duration::from_secs(20), || rt.block_on(request(&socket, &Request::Status, Duration::from_secs(1))).is_ok());
+    // SAFETY: kill(2) of our own child, which has not been waited for.
+    assert_eq!(unsafe { libc::kill(i32::try_from(agent.id()).unwrap(), libc::SIGTERM) }, 0);
+    let out = finish(agent, RUN_LIMIT, "ai-env relay agent");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let warning = "relay agent: warning: [relay].restricted names g-closed, but credentials/relay-worker.env holds no sole key, so a chat on a VM of its own gets tokens signed as mac, which reach no restricted grant: ai-env relay keygen --sole adds the key, then start the agent again\n";
+    assert_eq!(stderr(&out).matches(warning).count(), 1, "{}", stderr(&out));
+    let o = w.run(&["pubkey", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 5, "{}", stderr(&o));
+    assert!(stderr(&o).contains("credentials/relay-worker.env holds no sole key: ai-env relay keygen --sole adds it"), "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 0, "no Touch ID");
+
+    // --sole: one unseal, then the two keys sealed again beside the third.
+    let o = w.run(&["keygen", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!((w.age_calls("-d"), w.age_calls("-e")), (1, 1), "one unseal (one Touch ID), one seal");
+    let (worker2, session2, sole) = sealed_three(&w);
+    assert_eq!((worker2, session2), (worker, session), "both kept");
+    assert!(sole != worker && sole != session, "a key of its own");
+    let notes = w.notes("relay-worker.env");
+    assert_eq!((notes["worker_id"].as_str(), notes["worker_key"].as_str(), notes["session_key"].as_str(), notes["sole_key"].as_str()), ("mac", worker.text().as_str(), session.text().as_str(), sole.text().as_str()));
+    let lines = three_lines(&worker, &session, &sole);
+    let sole_command = format!("  ai-env as deployer -- ai-env relay allow mac-sole --token-signer --key {} --grants g-closed,g-open,g-sole,no-grant\n", sole.text());
+    let sole_says = "allow the sole key as the token signer mac-sole, the only one bound to [relay].restricted (the relay agent signs with it only for a chat on a VM of its own):\n";
+    assert_eq!(stdout(&o), format!("{lines}{sole_says}{sole_command}"), "the sole signer's command alone: the two keys are allowed already");
+    assert!(longest_b64(&stdout(&o)) <= 44 && longest_b64(&stderr(&o)) <= 44, "no base64 of more than 44 characters");
+    assert!(stderr(&o).contains("ai-env: the old container is kept as ") && stderr(&o).contains(".bak: it holds the same worker and session keys\n"), "{}", stderr(&o));
+    assert!(!stderr(&o).contains("[relay].restricted names no grant"), "it names one: {}", stderr(&o));
+    let row = w.audit("relay_keygen").pop().unwrap();
+    assert_eq!(detail_keys(&row), ["session_fp", "sole_fp", "worker_fp", "worker_id"], "no replaced: {row}");
+    assert_eq!((row["detail"]["sole_fp"].as_str(), row["detail"]["session_fp"].as_str()), (Some(sole.fingerprint().as_str()), Some(session.fingerprint().as_str())));
+    assert!(!row.to_string().contains(&sole.b64()), "fingerprints only: {row}");
+
+    // Once it holds one: a second --sole and a plain keygen are exit 1 naming --force, with no Touch ID.
+    let o = w.run(&["keygen", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let held = format!("credentials/relay-worker.env already holds this Mac's sole key (worker mac, sole key fp {}): ai-env relay status names the command that allows it while it is not allowed, and ai-env relay pubkey --sole prints it; ai-env relay keygen --force replaces all three keys; then allow the new keys and revoke the old", sole.fingerprint());
+    assert!(stderr(&o).contains(&held), "{}", stderr(&o));
+    assert_eq!((w.age_calls("-d"), w.age_calls("-e")), (0, 0), "no Touch ID, nothing sealed");
+    let o = w.run(&["keygen"], Who::Nobody);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    let held = format!("already holds this Mac's relay keys (worker mac, worker key fp {}, session key fp {}, sole key fp {}): ai-env relay keygen --force replaces them", worker.fingerprint(), session.fingerprint(), sole.fingerprint());
+    assert!(stderr(&o).contains(&held), "{}", stderr(&o));
+    assert_eq!(sealed_three(&w), (worker, session, sole), "left as it was");
+
+    // pubkey: the three lines, and --sole the key, with no Touch ID; --verify checks the three with one.
+    let o = w.run(&["pubkey"], Who::Nobody);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), lines);
+    let o = w.run(&["pubkey", "--sole"], Who::Nobody);
+    assert_eq!((code(&o), stdout(&o)), (0, format!("{}\n", sole.text())), "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 0, "no Touch ID");
+    let o = w.run(&["pubkey", "--sole", "--verify"], Who::Nobody);
+    assert_eq!((code(&o), stdout(&o)), (0, format!("{}\n", sole.text())), "{}", stderr(&o));
+    assert_eq!(w.age_calls("-d"), 1, "one unseal");
+    assert!(stderr(&o).contains("the sealed keys match their notes (worker mac)"), "{}", stderr(&o));
+    let path = w.bridge().join("credentials").join("relay-worker.env");
+    let text = fs::read_to_string(&path).unwrap();
+    let mismatch = "the notes of credentials/relay-worker.env do not match its sealed keys: re-seal it with ai-env relay keygen --force";
+    for (tampered, what) in [(text.replace(&sole.text(), &key_text(9)), "another sole key"), (text.replace(&format!(" sole_key={}", sole.text()), ""), "no sole key")] {
+        assert_ne!(tampered, text, "{what}");
+        fs::write(&path, &tampered).unwrap();
+        let o = w.run(&["pubkey", "--verify"], Who::Nobody);
+        assert_eq!(code(&o), 9, "{what}: {}", stderr(&o));
+        assert!(stderr(&o).contains(mismatch), "{what}: {}", stderr(&o));
+    }
+    fs::write(&path, &text).unwrap();
+
+    // The agent: one Touch ID for the three keys. The token of the chat its VM was placed for is the sole key's, as
+    // mac-sole; another of that VM, the session key's, as mac.
+    let now = ai_env_cli::wire::time::unix_now();
+    let row = VmRow {
+        id: VM.into(),
+        status: RowStatus::Running,
+        egress: "vpc".into(),
+        egress_gate: Some(GATE_PASSED.into()),
+        wall_deadline: Some(now + 36_000),
+        client_token: "0199a1b2-0000-7000-8000-0000000000a1".into(),
+        sole: Some(SOLE_CHAT.into()),
+        ..VmRow::default()
+    };
+    write_row(&w.paths(), &row).unwrap();
+    w.reset();
+    let agent = w.cmd(&["agent", "--hours", "1"], Who::Nobody).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let pid = agent.id();
+    let socket = w.paths().relay_agent_socket();
+    wait_for("the agent's socket at 0600", Duration::from_secs(20), || fs::metadata(&socket).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o600));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let mint = |chat: Option<&str>| {
+        let req = Request::MintSession(MintRequest { vm_id: VM.into(), session_id: SPAWN.into(), chat_id: chat.map(str::to_string), grant_id: "no-grant".into(), exp: now + 3600 });
+        let Response::Minted { token, .. } = rt.block_on(request(&socket, &req, Duration::from_secs(2))).unwrap() else { panic!("no token for {chat:?}") };
+        token
+    };
+    let lookup = |kid: &str| {
+        let key = match kid {
+            "mac" => session,
+            "mac-sole" => sole,
+            _ => return None,
+        };
+        Some(ai_env_worker::session::SignerKey { public_key: key, not_after: now + 86_400, grants: None })
+    };
+    for (chat, signer) in [(Some(SOLE_CHAT), "mac-sole"), (None, "mac")] {
+        let claims = ai_env_worker::session::verify(&mint(chat), now, &lookup).unwrap_or_else(|e| panic!("{chat:?}: {e:?}")).claims;
+        assert_eq!((claims.kid.as_str(), claims.caller_id.as_str(), claims.chat_id.as_deref()), (signer, signer, chat), "{chat:?}");
+    }
+    // SAFETY: kill(2) of our own child, which has not been waited for.
+    assert_eq!(unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGTERM) }, 0);
+    let out = finish(agent, RUN_LIMIT, "ai-env relay agent");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains(&format!("relay agent: worker mac (fp {}), session key fp {}, sole key fp {} (mac-sole); socket ", worker.fingerprint(), session.fingerprint(), sole.fingerprint())), "{err}");
+    assert!(!err.contains("holds no sole key"), "it holds one: {err}");
+    assert!(err.contains(&format!("relay agent: minted a session token for {VM} (spawn {SPAWN}, grant no-grant, signer mac-sole, until ")), "{err}");
+    assert!(err.contains(&format!("relay agent: minted a session token for {VM} (spawn {SPAWN}, grant no-grant, signer mac, until ")), "{err}");
+    assert!(err.contains("relay agent: stopped (0 signed, 2 minted)"), "{err}");
+    assert_eq!(w.age_calls("-d"), 1, "one Touch ID for the three keys");
+
+    // --force: all three anew with no Touch ID, both signers' commands and the worker's; `replaced` in its row. A second
+    // backup in the second of the first is refused (`creds::backup_existing`): the clock moves past it first.
+    let newest_bak = fs::read_dir(w.bridge().join("credentials"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_prefix("relay-worker.env.")?.strip_suffix(".bak")?.parse::<u64>().ok()))
+        .max()
+        .expect("--sole's backup");
+    wait_for("the next second", Duration::from_secs(3), || ai_env_cli::wire::time::unix_now() > newest_bak);
+    let o = w.run(&["keygen", "--force"], Who::Nobody);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!((w.age_calls("-d"), w.age_calls("-e")), (0, 1), "no Touch ID");
+    let (worker3, session3, sole3) = sealed_three(&w);
+    assert!(worker3 != worker && session3 != session && sole3 != sole, "all three anew");
+    let out = stdout(&o);
+    let commands = [
+        format!("  ai-env as deployer -- ai-env relay allow mac --token-signer --key {}\n", session3.text()),
+        format!("  ai-env as deployer -- ai-env relay allow mac-sole --token-signer --key {} --grants g-closed,g-open,g-sole,no-grant\n", sole3.text()),
+        format!("  ai-env as deployer -- ai-env relay allow mac --key {} --sources '<glob>'\n", worker3.text()),
+    ];
+    assert!(out.starts_with(&three_lines(&worker3, &session3, &sole3)), "{out}");
+    let at: Vec<usize> = commands.iter().map(|c| out.find(c.as_str()).unwrap_or_else(|| panic!("{c:?} in {out}"))).collect();
+    assert!(at.windows(2).all(|p| p[0] < p[1]), "the session key's, the sole key's, then the worker key's: {out}");
+    assert!(stderr(&o).contains(".bak: revoke the old keys once the new ones are allowed"), "{}", stderr(&o));
+    let row = w.audit("relay_keygen").pop().unwrap();
+    assert_eq!(detail_keys(&row), ["replaced", "session_fp", "sole_fp", "worker_fp", "worker_id"], "{row}");
+    assert_eq!(row["detail"]["sole_fp"].as_str(), Some(sole3.fingerprint().as_str()));
+
+    // With no container, --sole makes the three with no Touch ID; an empty [relay] binds the sole signer to globs of
+    // one's choosing, and restricted naming none says when the agent signs with it.
+    let fresh = World::new();
+    let o = fresh.run(&["keygen", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!((fresh.age_calls("-d"), fresh.age_calls("-e")), (0, 1), "no Touch ID");
+    let (w4, s4, o4) = sealed_three(&fresh);
+    let out = stdout(&o);
+    assert!(out.starts_with(&three_lines(&w4, &s4, &o4)) && out.contains(&format!("relay allow mac --token-signer --key {}\n", s4.text())) && out.contains(&format!("relay allow mac --key {} --sources '<glob>'\n", w4.text())), "{out}");
+    assert!(out.contains(&format!("relay allow mac-sole --token-signer --key {} --grants '<grant globs>'\n", o4.text())), "{out}");
+    assert!(stderr(&o).contains("ai-env: [relay].restricted names no grant: the relay agent signs with the sole key once it names one\n"), "{}", stderr(&o));
+    let row = fresh.audit("relay_keygen").pop().unwrap();
+    assert_eq!(detail_keys(&row), ["session_fp", "sole_fp", "worker_fp", "worker_id"], "nothing replaced: {row}");
+
+    // Refused before any Touch ID: keys sealed for another worker id; a seal creds would refuse (a key with no recovery
+    // recipient, which --force alone accepts).
+    let other = World::new();
+    assert_eq!(code(&other.run(&["keygen"], Who::Nobody)), 0);
+    other.config("[relay]\nworker_id = \"mac-b\"\n");
+    let o = other.run(&["keygen", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains("credentials/relay-worker.env was sealed for worker mac, but [relay].worker_id is mac-b: ai-env relay keygen --force --sole makes all three keys for mac-b"), "{}", stderr(&o));
+    assert_eq!(other.age_calls("-d"), 0, "no Touch ID");
+    other.config("");
+    fs::write(other.root().join("keys").join("keys").join(KEY).join("recipients.txt"), format!("{SE_REC}\n")).unwrap();
+    let o = other.run(&["keygen", "--sole"], Who::Nobody);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    assert!(stderr(&o).contains("has no recovery recipient"), "{}", stderr(&o));
+    assert_eq!((other.age_calls("-d"), other.age_calls("-e")), (0, 0), "no Touch ID, nothing sealed");
+    assert_eq!(sealed_keys(&other).0, key_of_notes(&other), "the two keys as they were");
+}
+
+/// The worker key the notes of `credentials/relay-worker.env` name.
+fn key_of_notes(w: &World) -> PublicKey {
+    PublicKey::parse_text(&w.notes("relay-worker.env")["worker_key"]).unwrap()
+}
+
+// ---- R-156, R-157: restricted grants ------------------------------------------------------------------------------
+
+/// VM ids of the restricted grants' tests, placeholders of no meaning: one placed for `CHAT_A` alone, one chats share.
+const VM_ALONE: &str = "microvm-0199a1b2-0000-7000-8000-0000000012c1";
+const VM_SHARED: &str = "microvm-0199a1b2-0000-7000-8000-0000000012c2";
+/// Another session of `CHAT_A` (a `/clear`'s row), a session of `CHAT_B`, and a third chat with its session.
+const SID_A2: &str = "0199a1b2-0000-7000-8000-0000000012b2";
+const SID_B: &str = "0199a1b2-0000-7000-8000-0000000012b3";
+const CHAT_C: &str = "0199a1b2-0000-7000-8000-0000000012a4";
+const SID_C: &str = "0199a1b2-0000-7000-8000-0000000012b4";
+
+impl World {
+    /// Two folders of the tree, `ws/sole` and `ws/shared`, and `bridge.toml`: `relay`, then a `[[workspace]]` for each, the
+    /// first with `sole_vm` and its own grant `g-w`. Their canonical paths, as a chat's row records its folder.
+    fn sole_workspaces(&self, relay: &str) -> (PathBuf, PathBuf) {
+        let (sole, shared) = (self.root().join("ws").join("sole"), self.root().join("ws").join("shared"));
+        for dir in [&sole, &shared] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let (sole, shared) = (fs::canonicalize(sole).unwrap(), fs::canonicalize(shared).unwrap());
+        self.config(&format!("{relay}\n[[workspace]]\npath = {:?}\nsole_vm = true\nrelay_grant = \"g-w\"\n\n[[workspace]]\npath = {:?}\n", sole.display().to_string(), shared.display().to_string()));
+        (sole, shared)
+    }
+
+    /// Session `sid`'s row: a remote chat `access` whose latest spawn's word is `relay`, its folder `cwd` (or none recorded),
+    /// on `vm`.
+    fn chat_in(&self, sid: &str, access: &str, cwd: Option<&Path>, vm: Option<&str>, relay: &str) {
+        use ai_env_cli::bridge::registry::{write, SessionRow, REGISTRY_SCHEMA_V};
+        let row = SessionRow {
+            v: REGISTRY_SCHEMA_V,
+            session_id: sid.into(),
+            status: "closed".into(),
+            mode: "remote".into(),
+            pid: 1,
+            access_id: Some(access.into()),
+            relay: Some(relay.into()),
+            cwd: cwd.map(|c| c.display().to_string()),
+            microvm_id: vm.map(str::to_string),
+            ..SessionRow::default()
+        };
+        write(&self.paths(), &row).unwrap();
+    }
+
+    /// The VM row `id`, placed for the chat `sole` alone, or one chats share.
+    fn vm_placed(&self, id: &str, sole: Option<&str>) {
+        use ai_env_cli::bridge::vm::registry::{write_row, RowStatus, VmRow};
+        write_row(&self.paths(), &VmRow { id: id.into(), status: RowStatus::Running, egress: "vpc".into(), sole: sole.map(str::to_string), ..VmRow::default() }).unwrap();
+    }
+
+    /// When session `sid`'s row was marked to run alone, if it was.
+    fn sole_since(&self, sid: &str) -> Option<String> {
+        ai_env_cli::bridge::registry::read(&self.paths(), sid).unwrap().expect("the row").sole_since
+    }
+}
+
+/// The `note:` lines of a run's stderr.
+fn notes_of(o: &Output) -> Vec<String> {
+    stderr(o).lines().filter(|l| l.starts_with("note: ")).map(str::to_string).collect()
+}
+
+/// The command a refusal or a row names after `ai-env as deployer -- ai-env relay `, as words, its `)` cut.
+fn named_command(text: &str) -> Vec<String> {
+    let line = text.lines().find(|l| l.contains("ai-env as deployer -- ai-env relay ")).unwrap_or_else(|| panic!("no command in {text}"));
+    let command = line.split("ai-env as deployer -- ai-env relay ").nth(1).unwrap().trim_end_matches(')');
+    command.split(' ').map(str::to_string).collect()
+}
+
+/// WM-T69 (R-156): `relay access` of a `[relay].restricted` grant. A chat whose recorded folder is in no `sole_vm` workspace,
+/// or that records none, is refused (exit 9) before any AWS call or Touch ID, and its ordinary grants stay its to have;
+/// `--days` past 30 is exit 2. A chat of the sole workspace gets it for 7 days by default, and every row of the chat is marked
+/// to run alone before the write, at its first time; a mark that fails refuses the approval with nothing written. The notes
+/// name the sole signer when it is not listed or leaves the grant out, and the reopen when the chat's VM was not placed for it
+/// alone, in place of the migrate. Its approval sets the entry's one end, earlier (`shortened`, with a note) or later; an
+/// ordinary approval never moves the end of an entry that holds it, and says so; `--remove` keeps the mark; `--list` and its
+/// JSON mark it.
+#[test]
+fn relay_access_restricted_rules() {
+    let w = World::new();
+    let (sole, shared) = w.sole_workspaces("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\nrestricted = [\"g-r\"]\n");
+    let grants: Vec<policy::Grant> = ["g-o", "g-r"].iter().map(|g| policy::Grant { grant_id: (*g).into(), allow: vec!["example-*/*".into()] }).collect();
+    w.set_param(GRANTS, &policy::render_grants(&grants).unwrap(), 4);
+    w.vm_placed(VM_ALONE, Some(CHAT_A));
+    w.vm_placed(VM_SHARED, None);
+    // Outside the sole workspace: exit 9 naming the folder, nothing asked of anyone, no mark; its ordinary grant passes.
+    w.chat_in(SID_B, CHAT_B, Some(&shared), Some(VM_SHARED), "minted");
+    let o = w.run(&["access", SID_B, "--allow", "g-r"], Who::Ops);
+    assert_eq!(code(&o), 9, "{}", stderr(&o));
+    let outside = |folder: &str| format!("relay access: grant g-r is in [relay].restricted, so it goes only to a chat that runs alone, and session {SID_B}'s folder {folder} is in no [[workspace]] with sole_vm = true in ");
+    assert!(stderr(&o).contains(&outside(&shared.display().to_string())), "{}", stderr(&o));
+    assert!(w.aws_calls().is_empty() && w.age_calls("-d") == 0, "{:?}", w.aws_calls());
+    w.chat_in(SID_B, CHAT_B, None, Some(VM_SHARED), "minted");
+    let o = w.run(&["access", SID_B, "--allow", "g-r"], Who::Ops);
+    assert!(code(&o) == 9 && stderr(&o).contains(&outside("(none recorded)")), "{}", stderr(&o));
+    assert_eq!(w.sole_since(SID_B), None, "a refusal marks nothing");
+    let o = w.run(&["access", SID_B, "--allow", "g-o"], Who::Ops);
+    assert_eq!(code(&o), 0, "an ordinary grant: {}", stderr(&o));
+    let end_30 = access_end(30);
+    // --days: at most 30 for it, exit 2 before any AWS call; the general range first.
+    w.chat_in(SID_A, CHAT_A, Some(&sole), Some(VM_ALONE), "minted");
+    w.chat_in(SID_A2, CHAT_A, Some(&sole), None, "minted");
+    for (days, why) in [("31", "relay access: --days 31: 1 to 30 for a [relay].restricted grant"), ("91", "relay access: --days 91: 1 to 90")] {
+        let o = w.run(&["access", SID_A, "--allow", "g-r", "--days", days], Who::Ops);
+        assert_eq!(code(&o), 2, "{days}: {}", stderr(&o));
+        assert!(stderr(&o).contains(why) && w.aws_calls().is_empty(), "{days}: {}", stderr(&o));
+    }
+    assert_eq!(w.sole_since(SID_A), None);
+    // In the sole workspace, on its own VM: 7 days; both rows of the chat marked; the sole signer, listed nowhere, carries
+    // nothing yet.
+    let o = w.run(&["access", SID_A, "--allow", "g-r"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let end_7 = access_end(7);
+    assert_eq!(w.access_of(), (vec![access_entry(CHAT_A, &["g-r"], &end_7), access_entry(CHAT_B, &["g-o"], &end_30)], 2));
+    assert_eq!(stdout(&o), format!("allowed chat {CHAT_A} (session {SID_A}) grant g-r until {end_7} ({ACCESS} v2, 2 chat(s)); the relay applies it within about 70 s, with no restart\n"));
+    assert_eq!(
+        notes_of(&o),
+        [
+            format!("note: token signer mac-sole is not in {SIGNERS}, and only it carries g-r: this chat reaches nothing through it until it is (ai-env relay keygen --sole makes its key and prints the command that allows it)"),
+            format!("note: chat {CHAT_A} runs alone from now on: each start places it on a VM of its own, and a reopen outside a [[workspace]] with sole_vm = true is refused (marked: session {SID_A},{SID_A2})"),
+        ]
+    );
+    let since = w.sole_since(SID_A).expect("marked");
+    assert!(ai_env_cli::wire::time::parse_rfc3339_utc(&since).is_some(), "{since}");
+    assert_eq!((w.sole_since(SID_A2), w.sole_since(SID_B)), (Some(since.clone()), None), "every row of the chat, and no other chat's");
+    let row = w.audit("relay_access").pop().unwrap();
+    assert_eq!(row["detail"], serde_json::json!({"actor": "cli", "op": "allow", "outcome": "added", "grant": "g-r", "access": CHAT_A, "not_after": end_7, "version": "2", "pruned": "0"}), "{row}");
+    // Once this Mac's container holds the sole key, a second `keygen --sole` refuses, so the note names `relay status`.
+    assert_eq!(code(&w.run(&["keygen", "--sole"], Who::Nobody)), 0);
+    let o = w.run(&["access", SID_A, "--allow", "g-r"], Who::Ops);
+    assert!(code(&o) == 0 && stdout(&o).ends_with("; nothing written\n"), "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(notes_of(&o), [format!("note: token signer mac-sole is not in {SIGNERS}, and only it carries g-r: this chat reaches nothing through it until it is (ai-env relay status names the command that allows this Mac's sole key)")]);
+    // Again, the sole signer bound without it: nothing written, the mark at its first time, its note.
+    let signers = |sole_grants: &[&str]| {
+        let entry = |id: &str, seed: u8, grants: &[&str]| policy::SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_of(seed).b64(), not_after: IN_FORCE.into(), grants: Some(grants.iter().map(|g| (*g).to_string()).collect()) };
+        policy::render_signers(&[entry("mac", 5, &["g-o", "g-w", "no-grant"]), entry("mac-sole", 6, sole_grants)]).unwrap()
+    };
+    w.set_param(SIGNERS, &signers(&["no-grant"]), 3);
+    let o = w.run(&["access", SID_A, "--allow", "g-r"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("chat {CHAT_A} (session {SID_A}) holds grant g-r until {end_7} ({ACCESS} v2); nothing written\n"));
+    assert_eq!(notes_of(&o), ["note: token signer mac-sole's grants leave out g-r: this chat reaches nothing through it"]);
+    assert!(puts(&w).is_empty() && w.sole_since(SID_A) == Some(since.clone()), "{:?}", puts(&w));
+    w.set_param(SIGNERS, &signers(&["g-o", "g-r", "g-w", "no-grant"]), 4);
+    // Fewer days: its approval sets the end earlier, and says what it ended before.
+    let o = w.run(&["access", SID_A, "--allow", "g-r", "--days", "3"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let end_3 = access_end(3);
+    assert_eq!(w.access_of().0[0], access_entry(CHAT_A, &["g-r"], &end_3));
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["outcome"].as_str(), Some("shortened"));
+    assert_eq!(notes_of(&o), [format!("note: chat {CHAT_A}'s entry ended {end_7} before: an approval of a [relay].restricted grant sets its one end, {end_3}")]);
+    // An ordinary approval joins, and the end stays the restricted grant's, later or earlier.
+    let o = w.run(&["access", SID_A, "--allow", "g-o", "--days", "90"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of().0[0], access_entry(CHAT_A, &["g-o", "g-r"], &end_3));
+    assert!(stdout(&o).contains(&format!("grant g-o until {end_3} (")), "{}", stdout(&o));
+    assert_eq!(
+        notes_of(&o),
+        [
+            format!("note: chat {CHAT_A}'s entry holds the [relay].restricted grant g-r, so its end stays {end_3}: only an approval of that grant moves it"),
+            format!("note: chat {CHAT_A}'s entry holds g-r too: one end, {end_3}, covers them all"),
+        ]
+    );
+    let o = w.run(&["access", SID_A, "--allow", "g-o", "--days", "1"], Who::Ops);
+    assert!(code(&o) == 0 && stdout(&o).ends_with("; nothing written\n") && notes_of(&o).is_empty(), "{}{}", stdout(&o), stderr(&o));
+    // Its approval moves the end later, the ordinary grant's with it.
+    let o = w.run(&["access", SID_A, "--allow", "g-r", "--days", "30"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of().0[0], access_entry(CHAT_A, &["g-o", "g-r"], &end_30));
+    assert_eq!(w.audit("relay_access").pop().unwrap()["detail"]["outcome"].as_str(), Some("extended"));
+    assert_eq!(notes_of(&o), [format!("note: chat {CHAT_A}'s entry holds g-o too: one end, {end_30}, covers them all")]);
+    // Its chat now on a VM chats share (a start before the mark): reopen, never migrate; the row's rewrite keeps the mark.
+    w.chat_in(SID_A, CHAT_A, Some(&sole), Some(VM_SHARED), "no_agent");
+    assert_eq!(w.sole_since(SID_A), Some(since.clone()), "no write takes it off");
+    let reopen = format!("note: session {SID_A} runs on {VM_SHARED}, a VM not placed for this chat alone, whose tokens never reach g-r: the chat reaches it from its next start, on a VM of its own: reopen the chat");
+    let o = w.run(&["access", SID_A, "--allow", "g-r", "--days", "29"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let end_29 = access_end(29);
+    assert!(notes_of(&o).contains(&reopen) && !stderr(&o).contains("session migrate"), "{}", stderr(&o));
+    assert!(stdout(&o).starts_with(&format!("allowed chat {CHAT_A} (session {SID_A}) grant g-r until {end_29} (")), "{}", stdout(&o));
+    assert!(stdout(&o).ends_with("; the relay applies it within about 70 s, and the chat reaches it from its next start\n") && !stdout(&o).contains("no restart"), "never \"no restart\" beside the reopen: {}", stdout(&o));
+    let o = w.run(&["access", SID_A, "--allow", "g-r", "--days", "29"], Who::Ops);
+    assert!(code(&o) == 0 && stdout(&o).ends_with("; nothing written\n") && notes_of(&o) == [reopen.clone()], "{}", stderr(&o));
+    // --list marks it, its JSON too.
+    let o = w.run(&["access", "--list"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(stdout(&o), format!("{ACCESS} v6: 2 chat(s), 2 in force\n  chat {CHAT_A} grants g-o,g-r until {end_29} (restricted: g-r): session {SID_A},{SID_A2}\n  chat {CHAT_B} grants g-o until {end_30}: session {SID_B}\n"));
+    let o = w.run(&["access", "--list", "--json"], Who::Ops);
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(doc["entries"][0]["restricted"], serde_json::json!(["g-r"]), "{doc}");
+    assert!(doc["entries"][1].get("restricted").is_none(), "none held, no key: {doc}");
+    // A mark that cannot be written refuses the approval: exit 1, nothing written, no row.
+    w.chat_in(SID_C, CHAT_C, Some(&sole), None, "minted");
+    let sessions = w.bridge().join("state").join("sessions");
+    let (rows, held) = (w.audit("relay_access").len(), w.param(ACCESS));
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = w.run(&["access", SID_C, "--allow", "g-r"], Who::Ops);
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&o), 1, "{}", stderr(&o));
+    assert!(stderr(&o).contains(&format!("relay access: session {SID_C}'s chat could not be marked to run alone (")) && stderr(&o).contains("); nothing was written"), "{}", stderr(&o));
+    assert!(puts(&w).is_empty() && w.param(ACCESS) == held && w.audit("relay_access").len() == rows, "{:?}", puts(&w));
+    assert_eq!(w.sole_since(SID_C), None);
+    let o = w.run(&["access", SID_C, "--allow", "g-r"], Who::Ops);
+    assert!(code(&o) == 0 && w.sole_since(SID_C).is_some(), "it writes once it can: {}", stderr(&o));
+    // --remove takes the grant, keeps the end and the mark.
+    let o = w.run(&["access", SID_A, "--remove", "g-r"], Who::Ops);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert_eq!(w.access_of().0[0], access_entry(CHAT_A, &["g-o"], &end_29));
+    assert_eq!(w.sole_since(SID_A), Some(since), "never taken off");
+}
+
+/// WM-T70 (R-157): `relay allow --token-signer` with `[relay].restricted` naming a grant, on the entry it would write. A signer
+/// other than `mac-sole` that reaches it (no grants, `*`, a glob, the id) is exit 9 with nothing written and no row, naming the
+/// command with this Mac's own signer's set (`[relay].grant`, every workspace's own grant, the offered ids but the restricted
+/// one), or a placeholder for another Mac's; a key rotation that keeps such a set too. `mac-sole` with no grants or `*` is
+/// exit 9, restricted grants or none, naming its own set. Following a refusal's command passes; nothing restricted, any other
+/// signer passes as before.
+#[test]
+fn relay_allow_refuses_a_signer_reaching_a_restricted_grant() {
+    let w = World::new();
+    let restricted = "[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\nrestricted = [\"g-r\"]\n";
+    w.sole_workspaces(restricted);
+    let (k5, k6, k7, k8) = (key_text(5), key_text(6), key_text(7), key_text(8));
+    let held = |w: &World| policy::parse_signers(&w.param(SIGNERS).map(|(v, _)| v).unwrap_or_else(|| "[]".into())).unwrap();
+    let bound = |w: &World, id: &str| held(w).into_iter().find(|s| s.signer_id == id).unwrap_or_else(|| panic!("{id}")).grants;
+    let refused = |args: &[&str], want: &str| {
+        let rows = w.audit("relay_allow").len();
+        let o = w.run(args, Who::Deployer);
+        assert_eq!(code(&o), 9, "{args:?}: {}", stderr(&o));
+        assert!(stderr(&o).contains(want), "{args:?}: {}", stderr(&o));
+        assert!(puts(&w).is_empty() && w.audit("relay_allow").len() == rows, "{args:?}: nothing written, no row");
+        o
+    };
+    let follow = |o: &Output| {
+        let command = named_command(&stderr(o));
+        let o = w.run(&command.iter().map(String::as_str).collect::<Vec<_>>(), Who::Deployer);
+        assert_eq!(code(&o), 0, "{command:?}: {}", stderr(&o));
+    };
+    let mac_fix = format!("which only mac-sole may reach: ai-env as deployer -- ai-env relay allow mac --key {k5} --token-signer --grants g-o,g-w,no-grant");
+    for (grants, shown) in [(None, "no grants"), (Some("*"), "grants *"), (Some("g-*"), "grants g-*"), (Some("no-grant,g-r"), "grants g-r,no-grant")] {
+        let mut args = vec!["allow", "mac", "--token-signer", "--key", k5.as_str()];
+        args.extend(grants.map(|g| ["--grants", g]).into_iter().flatten());
+        refused(&args, &format!("relay allow: token signer mac would reach the [relay].restricted grant g-r ({shown}), {mac_fix}"));
+    }
+    assert!(w.param(SIGNERS).is_none(), "no list made");
+    let o = refused(&["allow", "mac", "--token-signer", "--key", &k5], &mac_fix);
+    follow(&o);
+    assert_eq!(bound(&w, "mac"), Some(vec!["g-o".to_string(), "g-w".to_string(), "no-grant".to_string()]));
+    // A rotation keeps that set; one that keeps a set reaching it (a list written by hand) is refused.
+    let o = w.run(&["allow", "mac", "--token-signer", "--key", &k8], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let mut list = held(&w);
+    list[0].grants = Some(vec!["g-*".into(), "no-grant".into()]);
+    let version = w.param(SIGNERS).unwrap().1;
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), version + 1);
+    refused(&["allow", "mac", "--token-signer", "--key", &k5], &format!("relay allow: token signer mac would reach the [relay].restricted grant g-r (grants g-*,no-grant), which only mac-sole may reach: ai-env as deployer -- ai-env relay allow mac --key {k5} --token-signer --grants g-o,g-w,no-grant"));
+    // Another Mac's signer: its set is the user's to name.
+    let o = refused(&["allow", "mac-b", "--token-signer", "--key", &k7, "--grants", "g-r"], &format!("relay allow: token signer mac-b would reach the [relay].restricted grant g-r (grants g-r), which only mac-sole may reach: ai-env as deployer -- ai-env relay allow mac-b --key {k7} --token-signer --grants '<grant globs>'"));
+    assert!(stderr(&o).ends_with("'<grant globs>'\n"), "{}", stderr(&o));
+    let o = w.run(&["allow", "mac-b", "--token-signer", "--key", &k7, "--grants", "g-o"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    // The sole signer: never every grant; its set names the restricted id.
+    let sole_fix = format!("ai-env as deployer -- ai-env relay allow mac-sole --key {k6} --token-signer --grants g-o,g-r,g-w,no-grant");
+    let o = refused(&["allow", "mac-sole", "--token-signer", "--key", &k6], &format!("relay allow: token signer mac-sole, this Mac's sole signer, would reach every grant (no grants): {sole_fix}"));
+    refused(&["allow", "mac-sole", "--token-signer", "--key", &k6, "--grants", "no-grant,**"], "would reach every grant (grants **,no-grant): ");
+    follow(&o);
+    assert_eq!(bound(&w, "mac-sole"), Some(vec!["g-o".to_string(), "g-r".to_string(), "g-w".to_string(), "no-grant".to_string()]));
+    // Nothing restricted: another signer with no grants passes; the sole signer is still refused every grant.
+    w.sole_workspaces("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\n");
+    let o = w.run(&["allow", "mac-c", "--token-signer", "--key", &key_text(9)], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    refused(&["allow", "mac-sole", "--token-signer", "--key", &k6, "--grants", "*"], "relay allow: token signer mac-sole, this Mac's sole signer, would reach every grant (grants *): ");
+}
+
+/// WM-T71 (R-157, with the critic's coverage rows): `relay status` with `[relay].restricted` naming a grant. A signer other than
+/// `mac-sole` that reaches it is `[NO ]` naming the command (this Mac's own set, or a placeholder for another's; a lapsed one
+/// says nothing). No sole key is `[NO ]` naming `keygen --sole`; one that is no in-force signer as `mac-sole` `[NO ]` naming its
+/// command; in force `[ok ]`; the keys row and `--json` name its fp. `mac-sole`'s grants must match `[relay].grant`, the sole
+/// workspace's own grant and the restricted id (`[NO ]` each, naming the command that adds them all), and an offered id
+/// (`[warn]`). The access rows mark the restricted grant, and one in force past 30 days out is `[warn]`, never the exit. An
+/// ordinary grant a signer other than `mac-sole` reaches whose rules meet the restricted grant's is `[NO ]`, naming it.
+/// Nothing restricted, none of these rows.
+#[test]
+fn relay_status_restricted_rows() {
+    let s = StatusWorld::new();
+    let w = &s.w;
+    s.logs(status_of(Some(true), true), &[], &[]);
+    let restricted = "[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\nrestricted = [\"g-r\"]\n";
+    let (sole_dir, _) = w.sole_workspaces(restricted);
+    let (worker, session) = sealed_keys(w);
+    let day = default_day();
+    let row_of = |out: &str, start: &str| out.lines().find(|l| l.starts_with(start)).unwrap_or_else(|| panic!("{start}\n{out}")).to_string();
+    let run_named = |row: &str| {
+        let command = named_command(row);
+        let o = w.run(&command.iter().map(String::as_str).collect::<Vec<_>>(), Who::Deployer);
+        assert_eq!(code(&o), 0, "{command:?}: {}", stderr(&o));
+    };
+    // `mac` with no grants reaches it, and no sole key: two [NO ].
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    let reach = format!("[NO ] token signer mac reaches the [relay].restricted grant g-r (no grants), which only mac-sole may: a token it mints on a VM chats share reaches it through an approval (ai-env as deployer -- ai-env relay allow mac --token-signer --key {} --grants g-o,g-w,no-grant --not-after {day})", session.text());
+    assert!(out.contains(&format!("{reach}\n")), "{out}");
+    assert!(out.contains("[NO ] this Mac has no sole key, so no token signer as mac-sole, and no chat reaches [relay].restricted g-r: ai-env relay keygen --sole\n"), "{out}");
+    run_named(&reach);
+    let (_, out) = s.status();
+    assert!(!out.contains("token signer mac reaches"), "{out}");
+    // keygen --sole: the keys row and --json name it; not a signer yet: [NO ] naming its command, which clears it.
+    assert_eq!(code(&w.run(&["keygen", "--sole"], Who::Nobody)), 0);
+    let (_, _, sole) = sealed_three(w);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[ok ] keys: sealed in credentials/relay-worker.env for worker mac, worker key fp {}, session key fp {}, sole key fp {}, sealed ", worker.fingerprint(), session.fingerprint(), sole.fingerprint())), "{out}");
+    let not_signer = format!("[NO ] this Mac's sole key (fp {}) is not an in-force token signer as mac-sole, so no chat reaches [relay].restricted g-r: ai-env as deployer -- ai-env relay allow mac-sole --token-signer --key {} --grants g-o,g-r,g-w,no-grant", sole.fingerprint(), sole.text());
+    assert!(out.contains(&format!("{not_signer}\n")), "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["mac"]["sole_fp"].as_str(), Some(sole.fingerprint().as_str()), "{doc}");
+    run_named(&not_signer);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    let in_force = format!("[ok ] this Mac's sole key (fp {}) is an in-force token signer as mac-sole\n", sole.fingerprint());
+    assert!(out.contains(&in_force) && !out.contains("none of which matches"), "{out}");
+    // Its grants against bridge.toml: [relay].grant and the sole workspace's own grant are [NO ], an offered id [warn].
+    let o = w.run(&["allow", "mac-sole", "--token-signer", "--key", &sole.text(), "--grants", "g-r"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    let command = format!("(ai-env as deployer -- ai-env relay allow mac-sole --token-signer --key {} --grants g-o,g-r,g-w,no-grant --not-after {day})", sole.text());
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains("none of which matches")).collect();
+    assert_eq!(
+        rows,
+        [
+            "[warn] token signer mac-sole holds grants g-r, none of which matches g-o: a chat on a VM of its own reaches nothing through it".to_string(),
+            format!("[NO ] token signer mac-sole holds grants g-r, none of which matches g-w, the own grant of [[workspace]] {}: every token of its chats is refused 7 not granted (R-135) {command}", sole_dir.display()),
+            format!("[NO ] token signer mac-sole holds grants g-r, none of which matches [relay].grant no-grant: every token it mints is refused 7 not granted (R-135) {command}"),
+        ],
+        "{out}"
+    );
+    run_named(&row_of(&out, "[NO ] token signer mac-sole holds grants g-r"));
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains("none of which matches"), "{out}");
+    // Leaving out the restricted id: [NO ], no chat reaches it.
+    let o = w.run(&["allow", "mac-sole", "--token-signer", "--key", &sole.text(), "--grants", "g-o,g-w,no-grant"], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] token signer mac-sole holds grants g-o,g-w,no-grant, none of which matches the [relay].restricted grant g-r: no chat reaches it {command}\n")), "{out}");
+    run_named(&row_of(&out, "[NO ] token signer mac-sole holds grants g-o,g-w,no-grant"));
+    // Another Mac's signer reaching it by a glob (a list written by hand): [NO ] with a placeholder; lapsed, nothing.
+    let mut list = policy::parse_signers(&w.param(SIGNERS).unwrap().0).unwrap();
+    let theirs = |id: &str, not_after: &str| policy::SignerEntry { signer_id: id.into(), alg: "ed25519".into(), public_key: key_of(12).b64(), not_after: not_after.into(), grants: Some(vec!["g-*".into()]) };
+    list.push(theirs("mac-b", IN_FORCE));
+    let version = w.param(SIGNERS).unwrap().1;
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), version + 1);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains(&format!("[NO ] token signer mac-b reaches the [relay].restricted grant g-r (grants g-*), which only mac-sole may: a token it mints on a VM chats share reaches it through an approval (ai-env as deployer -- ai-env relay allow mac-b --token-signer --key {} --grants <grant globs> --not-after 2036-01-01)\n", key_of(12).text())), "{out}");
+    list.last_mut().unwrap().not_after = LAPSED.into();
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), version + 2);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains("token signer mac-b reaches"), "{out}");
+    // The access rows: the restricted grant marked; in force past 30 days out [warn], never the exit; lapsed, no [warn].
+    let end_30 = access_end(30);
+    w.set_param(ACCESS, &access_value(&[access_entry(CHAT_A, &["g-o", "g-r"], &end_30), access_entry(CHAT_B, &["g-r"], IN_FORCE), access_entry("0199a1b2-0000-7000-8000-0000000012a3", &["g-r"], LAPSED)]), 5);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&format!("[-  ]   chat {CHAT_A} grants g-o,g-r until {end_30} (restricted: g-r)\n[-  ]   chat {CHAT_B} grants g-r until {IN_FORCE} (restricted: g-r)\n[warn] chat {CHAT_B} holds the [relay].restricted grant g-r until {IN_FORCE}, past the 30 days an approval of one writes (ai-env relay access <session> --allow g-r sets its end again)\n[-  ]   chat 0199a1b2-0000-7000-8000-0000000012a3 grants g-r until {LAPSED} EXPIRED (restricted: g-r)\n")), "{out}");
+    assert_eq!(out.matches("past the 30 days").count(), 1, "{out}");
+    let (_, doc) = s.json();
+    assert_eq!(doc["access"][0]["restricted"], serde_json::json!(["g-r"]), "{doc}");
+    // The grants' rules: an ordinary grant `mac` reaches whose rule meets a restricted grant's (`*/*` and `vault-*/list`) is
+    // [NO ], naming the grant to narrow; once narrowed it says nothing, nor does a grant only the sole signer reaches.
+    let rules = |sets: &[(&str, &[&str])]| policy::render_grants(&sets.iter().map(|(id, allow)| policy::Grant { grant_id: (*id).into(), allow: allow.iter().map(|r| (*r).to_string()).collect() }).collect::<Vec<_>>()).unwrap();
+    w.set_param(GRANTS, &rules(&[("g-o", &["*/*"]), ("g-r", &["vault-*/list"]), ("g-x", &["vault-*/*"])]), 2);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 1, "{out}");
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains("reaches the sources of")).collect();
+    assert_eq!(rows, ["[NO ] grant g-o (rule */*) reaches the sources of the [relay].restricted grant g-r (rule vault-*/list), and token signer mac reaches g-o: a token it mints on a VM chats share reaches those sources through it (ai-env as deployer -- ai-env relay grant g-o '<rules that leave them out>')"], "{out}");
+    w.set_param(GRANTS, &rules(&[("g-o", &["vault-*/get", "public-*/*"]), ("g-r", &["vault-*/list"]), ("g-x", &["vault-*/*"])]), 3);
+    let (rc, out) = s.status();
+    assert!(rc == 0 && !out.contains("reaches the sources of"), "{out}");
+    // Nothing restricted: none of these rows; the sole key in force is [ok ] still.
+    w.sole_workspaces("[relay]\ngrant = \"no-grant\"\noffer = [\"g-o\", \"g-r\"]\n");
+    list.last_mut().unwrap().not_after = IN_FORCE.into();
+    w.set_param(SIGNERS, &policy::render_signers(&list).unwrap(), version + 3);
+    let (rc, out) = s.status();
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains(&in_force) && !out.contains("[relay].restricted") && !out.contains("(restricted:"), "{out}");
+    let (_, doc) = s.json();
+    assert!(doc["access"][0].get("restricted").is_none(), "{doc}");
 }

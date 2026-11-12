@@ -20,6 +20,9 @@ ai-env-worker = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0"
 ai-env-source = { git = "https://github.com/dfstio/ai-env", tag = "relay-v0.2.0" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# main unblocks SIGINT and SIGTERM, in safe code. Never the `aio` feature: it pulls in pin-utils, which is
+# unmaintained (RUSTSEC-2026-0441).
+nix = { version = "0.30", default-features = false, features = ["signal"] }
 # HttpJsonSource's client: rustls with no provider of its own; main installs aws-lc-rs, so no ring is built.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }

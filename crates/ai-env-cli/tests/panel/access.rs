@@ -363,3 +363,64 @@ fn relay_access_runs_its_cli_twin_as_a_child() {
     assert!(p.get(&format!("session/{SID}")).text().contains(&running));
     assert_eq!(p.stop().0, Some(0));
 }
+
+/// R-156: a restricted grant in the panel. A chat whose folder is in a `sole_vm` workspace is offered it, marked
+/// `(restricted)`; one outside is shown it with no link, and its confirm page is 400. The confirm page says until today + 7,
+/// names the sole signer and that the chat runs alone from then on and, its VM shared, says to reopen it in place of the
+/// token's note. The action's child marks the chat's row, and its line carries the CLI's notes; the pages then show it held,
+/// marked, and an ordinary grant's confirm page says that only the restricted grant's approval moves the entry's end.
+#[test]
+fn a_restricted_grant_goes_only_to_a_chat_that_runs_alone() {
+    let w = world();
+    let sole = w.root().join("ws").join("sole");
+    std::fs::create_dir_all(&sole).unwrap();
+    let sole = std::fs::canonicalize(sole).unwrap().display().to_string();
+    let toml = w.bridge().join("bridge.toml");
+    let text = std::fs::read_to_string(&toml).unwrap().replacen("offer = [\"g-a\", \"g-b\", \"g-c\"]\n", "offer = [\"g-a\", \"g-b\", \"g-c\"]\nrestricted = [\"g-c\"]\n", 1);
+    assert!(text.contains("restricted = [\"g-c\"]"), "{text}");
+    std::fs::write(&toml, format!("{text}\n[[workspace]]\npath = {sole:?}\nsole_vm = true\n")).unwrap();
+    set_param(&w, GRANTS, &grants(&["g-a", "g-b", "g-c"]), 5);
+    let vm = w.vm(&[]);
+    w.session(SID, "remote", Some(&vm), "remote", &sole);
+    w.set_access(SID, CHAT, "minted");
+    w.session(SID_OTHER, "remote", Some(&vm), "remote", "/w/remote");
+    w.set_access(SID_OTHER, "0199a1b2-0000-7000-8000-0000000012a2", "minted");
+    let p = serve(&w);
+    // Offered, marked, to the chat that runs alone; shown with no link to the other.
+    let page = p.get("").text();
+    assert!(page.contains(&format!("[ ] g-c (restricted) <a href=\"./confirm?action=relay-allow&amp;target={SID}_g-c\">Allow</a>")), "{page}");
+    assert!(page.contains("[ ] g-c (restricted: its workspace is not sole_vm)") && !page.contains(&format!("target={SID_OTHER}_g-c")), "{page}");
+    assert!(page.contains(&format!("[ ] g-a <a href=\"./confirm?action=relay-allow&amp;target={SID_OTHER}_g-a\">Allow</a>")), "its ordinary grants stay offered: {page}");
+    assert_eq!(p.get(&format!("confirm?action=relay-allow&target={SID_OTHER}_g-c")).status, 400);
+    // Its confirm page: a week, the sole signer, the reopen.
+    let what = p.get(&format!("confirm?action=relay-allow&target={SID}_g-c&json=1")).json()["what"].as_str().expect("what").to_string();
+    assert!(what.contains(&format!("grant g-c until {}:", day(7))), "{what}");
+    assert!(what.contains(" g-c is restricted: the relay agent signs the chat's tokens that reach it as mac-sole, only on a VM placed for this chat alone, and from then on the chat runs alone wherever it reopens."), "{what}");
+    assert!(what.contains(&format!(" Its VM {vm} was not placed for it alone, so it reaches g-c from its next start: reopen the chat.")) && !what.contains("session token"), "{what}");
+    assert!(what.contains("within about 70 s, with no change in the chat or its VM. ") && !what.contains("no restart"), "never \"no restart\" beside the reopen: {what}");
+    let what = p.get(&format!("confirm?action=relay-allow&target={SID}_g-a&json=1")).json()["what"].as_str().expect("what").to_string();
+    assert!(what.contains(&format!("grant g-a until {}:", day(30))) && !what.contains("restricted"), "an ordinary grant as before: {what}");
+    // The action: its child marks the chat, writes a week, and says so.
+    let (_, done) = p.act("relay-allow", &format!("{SID}_g-c"));
+    assert_eq!((done["state"].as_str(), done["code"].as_i64()), (Some("done"), Some(0)), "{done}\n{}", p.stderr());
+    let line = done["line"].as_str().expect("its line");
+    let end = format!("{}T23:59:59Z", day(7));
+    for want in [
+        "note: token signer mac-sole is not in /ai-env/relay/token-signers, and only it carries g-c".to_string(),
+        format!("note: chat {CHAT} runs alone from now on: each start places it on a VM of its own, and a reopen outside a [[workspace]] with sole_vm = true is refused (marked: session {SID})"),
+        format!("note: session {SID} runs on {vm}, a VM not placed for this chat alone, whose tokens never reach g-c: the chat reaches it from its next start, on a VM of its own: reopen the chat"),
+        format!("allowed chat {CHAT} (session {SID}) grant g-c until {end} ({ACCESS} v1, 1 chat(s)); the relay applies it within about 70 s, and the chat reaches it from its next start"),
+    ] {
+        assert!(line.contains(&want), "{want}\n{line}");
+    }
+    assert!(!line.contains("no restart"), "{line}");
+    assert!(ai_env_cli::bridge::registry::read(&w.paths(), SID).unwrap().unwrap().sole_since.is_some(), "marked");
+    assert!(ai_env_cli::bridge::registry::read(&w.paths(), SID_OTHER).unwrap().unwrap().sole_since.is_none(), "another chat's row is not");
+    assert_eq!(access(&w), (vec![policy::AccessEntry { chat: CHAT.into(), grants: vec!["g-c".into()], not_after: end }], 1));
+    // Held, marked; an ordinary grant's page names the end the restricted grant holds.
+    let page = p.get("").text();
+    assert!(page.contains(&format!("[x] g-c (restricted) until {} <a href=\"./confirm?action=relay-remove&amp;target={SID}_g-c\">Remove</a>", day(7))), "{page}");
+    let what = p.get(&format!("confirm?action=relay-allow&target={SID}_g-a&json=1")).json()["what"].as_str().expect("what").to_string();
+    assert!(what.contains(&format!(" Its entry ends {} and holds g-c: one end covers all its grants, and only an approval of its restricted grant g-c moves it.", day(7))), "{what}");
+    assert_eq!(p.stop().0, Some(0));
+}

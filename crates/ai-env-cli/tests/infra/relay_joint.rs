@@ -5,8 +5,9 @@
 //! production profile) are served by the relay's `run` on both faces; the VM's client (V) verifies `10.42.0.20` under
 //! `state/relay-ca.der`, a worker (W) verifies `ai-env-relay` under `state/relay-ca.pem` and presents the client
 //! certificate `relay allow … --tls-key …` issued under that CA (R-124 to R-127), and another CA or another name
-//! fails. No key, token or certificate is committed: each comes from a low-entropy seed at run time or from the
-//! run itself; every name is generic.
+//! fails. WM-J6 (R-155): the two token signers `relay allow` writes for this Mac, `mac` and `mac-sole`, loaded by that
+//! relay, split one chat's catalog. No key, token or certificate is committed: each comes from a low-entropy seed at
+//! run time or from the run itself; every name is generic.
 use super::common::{stderr, stdout};
 use super::relay_mac::{Who, World};
 use ai_env_cli::bridge::relay::tls::ca_der_b64;
@@ -387,6 +388,144 @@ async fn serve_both_faces(w: &World, live: &Path, client: &ClientCert, point: &c
             .count()
     };
     until("the relay's tls_failed lines on each face", || (failed("public") == 4 && failed("private") == 2).then_some(())).await;
+
+    let _ = stop.send(());
+    serving.await.unwrap().expect("the worker stops");
+    app.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), running).await.expect("run stops").unwrap().expect("run ends cleanly");
+}
+
+/// A generic source of this name with one op, `get`, answering `{"ok":true}`.
+struct Named(&'static str);
+
+impl DataSource for Named {
+    fn descriptor(&self) -> SourceDescriptor {
+        SourceDescriptor::new(self.0, "1.0.0", "A generic example source.").env("test").op(OpDescriptor::new("get", "Answers a fixed object.").read_only(true))
+    }
+
+    fn call<'s, 'f>(&'s self, _req: CallRequest, _ctx: CallContext) -> BoxFuture<'f, Result<Output, SourceError>>
+    where
+        's: 'f,
+        Self: 'f,
+    {
+        Box::pin(async { Ok(Output::json(serde_json::json!({"ok": true}))) })
+    }
+}
+
+/// The chat's access id in WM-J6, a placeholder of no meaning.
+const SOLE_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012a3";
+
+/// WM-J6 (R-155, with R, V and W): the two token signers `relay allow` writes for this Mac, `mac` bound to
+/// `no-grant` and the open grant and `mac-sole` to those and the restricted one, split one chat's catalog on WM-J4's relay
+/// (R's `run`, M's `tls` value, lists and certificate, W's worker, V's client). The chat's access entry, as M renders it,
+/// holds both grants; worker-a serves one source under each. The chat's two tokens, with the same own grant: `mac`'s lists
+/// and calls the open grant's source alone and is refused 7 on the restricted one's, while `mac-sole`'s lists and calls
+/// both.
+#[test]
+fn the_two_signers_m_allows_split_a_chats_catalog() {
+    let w = World::new();
+    // The bridge.toml such a Mac holds: the restricted grant offered, never a token's own.
+    w.config("[relay]\ngrant = \"no-grant\"\noffer = [\"g-open\", \"g-closed\"]\nrestricted = [\"g-closed\"]\n");
+    deployer(&w, &["tls", "init"]);
+    let client_key = certs::client_key().expect("a P-256 key");
+    let point = certs::client_point(&client_key).expect("its point");
+    let o = w.run(&["allow", "worker-a", "--key", &key_of(1).text(), "--sources", "example-*", "--tls-key", &point.text()], Who::Deployer);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let client = ClientCert { cert_pem: stdout(&o).into_bytes(), key_pem: certs::pem("PRIVATE KEY", &client_key).into_bytes() };
+    deployer(&w, &["allow", "mac", "--token-signer", "--key", &key_of(7).text(), "--grants", "no-grant,g-open"]);
+    deployer(&w, &["allow", "mac-sole", "--token-signer", "--key", &key_of(8).text(), "--grants", "no-grant,g-open,g-closed"]);
+    deployer(&w, &["grant", "g-open", "example-open/*"]);
+    deployer(&w, &["grant", "g-closed", "example-closed/*"]);
+    let bound = |id: &str| signers(&w).into_iter().find(|s| s.signer_id == id).unwrap_or_else(|| panic!("{id}")).grants;
+    assert_eq!(bound("mac"), Some(vec!["g-open".to_string(), "no-grant".to_string()]), "R's loader reads mac's set");
+    assert_eq!(bound("mac-sole"), Some(vec!["g-closed".to_string(), "g-open".to_string(), "no-grant".to_string()]), "and mac-sole's");
+    let live = tempfile::tempdir().unwrap();
+    let tls_name = tls_param();
+    for (file, name) in [(TLS_FILE, tls_name.as_str()), (WORKERS_FILE, policy::WORKERS), (SIGNERS_FILE, policy::TOKEN_SIGNERS), (GRANTS_FILE, policy::GRANTS)] {
+        fs::write(live.path().join(file), value(&w, name)).unwrap();
+    }
+    let entry = policy::AccessEntry { chat: SOLE_CHAT.into(), grants: vec!["g-open".into(), "g-closed".into()], not_after: format!("{}T23:59:59Z", day_in(30)) };
+    fs::write(live.path().join(lists::ACCESS_FILE), policy::render_access(&[entry]).expect("W/M's render")).unwrap();
+    fs::write(live.path().join(lists::PEERS_FILE), peers_json()).unwrap();
+    fs::write(live.path().join(FETCHED_FILE), format!("{}\n", unix_now())).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(split_catalog(&w, live.path(), &client));
+}
+
+/// The names of the catalog `link` lists, sorted.
+async fn catalog_names(link: &RelayLink) -> Vec<String> {
+    let (sources, truncated) = link.catalog(None).await.expect("a catalog");
+    assert!(!truncated);
+    let mut names: Vec<String> = sources.into_iter().map(|s| s.name).collect();
+    names.sort();
+    names
+}
+
+/// A `get` of `source` through `link`.
+async fn get(link: &RelayLink, source: &str) -> Result<ai_env_relay_client::dial::CallOut, ai_env_relay_client::dial::Failure> {
+    link.call(source, "get", &serde_json::json!({}), 65_536, 0, std::future::pending()).await
+}
+
+async fn split_catalog(w: &World, live: &Path, client: &ClientCert) {
+    let ca_pem = fs::read(w.bridge().join("state").join("relay-ca.pem")).unwrap();
+    let ca_b64 = ca_der_b64(&w.paths()).expect("state/relay-ca.der");
+    let cfg = Config {
+        relay_id: "ai-env-relay".into(),
+        public_addr: "127.0.0.1:0".parse().unwrap(),
+        private_addr: "127.0.0.1:0".parse().unwrap(),
+        private_peers: vec!["127.0.0.0/8".parse().unwrap()],
+        live_dir: live.to_path_buf(),
+        request_log: live.join("requests.log"),
+        limits: Limits { h2_keepalive_s: 0, ping_interval_ms: 1000, ..Limits::default() },
+    };
+    let deps = Deps { clock: Arc::new(SystemClock), sink: Arc::new(MemorySink::default()), params_key: [9; 32], notifier: Notifier::disabled() };
+    let app = RelayApp::new(cfg, deps).expect("a valid config");
+    let running = tokio::spawn({
+        let app = app.clone();
+        async move { app.run().await }
+    });
+    let (public, private) = until("both faces bound", || app.bound()).await;
+    // worker-a (seed 1) serving one source under each grant, with the certificate M issued.
+    let endpoint = RelayEndpoint::new(&public.to_string()).expect("the public face").ca_pem(&ca_pem).expect("a CA").server_name("ai-env-relay").expect("a name").client_identity(&client.cert_pem, &client.key_pem).expect("the key is the certificate's");
+    let signer = Arc::new(FileSigner::from_key(SigningKey::from_seed(&[1; 32]).unwrap()));
+    let worker = Worker::builder().worker_id("worker-a").relay(endpoint).signer(signer).source(Arc::new(Named("example-open"))).source(Arc::new(Named("example-closed"))).build().expect("a worker");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(worker.run_until(async move {
+        let _ = stopped.await;
+    }));
+    until("worker-a's tunnel and its two sources", || {
+        let s = app.snapshot();
+        (s.tunnels == 1 && s.sources_live == 2).then_some(())
+    })
+    .await;
+    // The chat's two tokens: the same chat, the same own grant, one of each signer, each its own spawn (a session is its
+    // signer's, R-136).
+    let link = |seed: u8, signer: &str, spawn: &str| {
+        let now = unix_now();
+        let claims = SessionClaims {
+            kid: signer.into(),
+            aud: SESSION_AUD.into(),
+            caller_id: signer.into(),
+            session_id: spawn.into(),
+            chat_id: Some(SOLE_CHAT.into()),
+            grant_id: "no-grant".into(),
+            vm_id: "microvm-0199a1b2-0000-7000-8000-0000000012c1".into(),
+            iat: now,
+            exp: now + 3600,
+        };
+        let token = session::mint(&SigningKey::from_seed(&[seed; 32]).unwrap(), &claims, now).expect("W/M's mint");
+        vm_link(&RelaySpawn { token: Secret::new(token), addr: format!("127.0.0.1:{}", private.port()), server_name: VM_SERVER_NAME.into(), ca_der_b64: ca_b64.clone() })
+    };
+    let shared = link(7, "mac", "0199a1b2-0000-7000-8000-0000000012b1");
+    assert_eq!(catalog_names(&shared).await, ["example-open"], "mac: the open grant alone");
+    get(&shared, "example-open").await.expect("mac: the open grant");
+    let failure = get(&shared, "example-closed").await.expect_err("mac: never the restricted grant");
+    assert_eq!(failure.code, Code::PermissionDenied, "{failure:?}");
+    let sole = link(8, "mac-sole", "0199a1b2-0000-7000-8000-0000000012b2");
+    assert_eq!(catalog_names(&sole).await, ["example-closed", "example-open"], "mac-sole: both");
+    let out = get(&sole, "example-closed").await.expect("mac-sole: the restricted grant");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.data).unwrap(), serde_json::json!({"ok": true}));
+    get(&sole, "example-open").await.expect("mac-sole: the open grant");
 
     let _ = stop.send(());
     serving.await.unwrap().expect("the worker stops");

@@ -110,6 +110,13 @@ revoked` when its address left the list or its entry lapsed, `the peers list is 
 is stale` when the relay lost the list, `inbound rate` or `catalog rate` past its tunnel's budget (600 frames
 and 32 MiB a minute of what it sends unasked, six catalogs a minute). The worker dials again by itself.
 
+## Stopping it
+
+`run` stops on Ctrl-C (SIGINT) or SIGTERM, which `systemctl stop` sends: it logs `stopping`, ends its tunnel
+within 2 s and exits 0. A process starts with its parent's blocked signals, so `main` unblocks both before
+anything else: a shell that blocked SIGINT cannot keep the worker running through Ctrl-C. When you change
+`main`, keep the unblock its first statement: each thread starts with the mask of the one that made it.
+
 ## Logs
 
 The worker logs to stderr (`RUST_LOG`, default `info`): one line per call with its ids, outcome, bytes

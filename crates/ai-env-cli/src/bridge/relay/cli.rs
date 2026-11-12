@@ -21,8 +21,8 @@ pub(crate) const HINT: &str = "make infra-status WRITE=1";
 /// `ai-env relay …`.
 pub fn main(store: &Keystore, cmd: RelayCmd) -> Result<()> {
     match cmd {
-        RelayCmd::Keygen { force } => super::keys::cmd_keygen(store, force),
-        RelayCmd::Pubkey { worker, session, verify } => super::keys::cmd_pubkey(store, worker, session, verify),
+        RelayCmd::Keygen { force, sole } => super::keys::cmd_keygen(store, force, sole),
+        RelayCmd::Pubkey { worker, session, sole, verify } => super::keys::cmd_pubkey(store, worker, session, sole, verify),
         RelayCmd::Allow { id, key, sources, token_signer, not_after, tls_key, grants } => {
             super::params::cmd_allow(store, &super::params::AllowArgs { id: &id, key: &key, sources: &sources, token_signer, not_after: not_after.as_deref(), tls_key: tls_key.as_deref(), grants: &grants })
         }
@@ -46,6 +46,9 @@ pub fn main(store: &Keystore, cmd: RelayCmd) -> Result<()> {
 /// What an operator command of the relay works from (WM-R41).
 pub(crate) struct RelayCtx {
     pub(crate) paths: Paths,
+    /// `bridge.toml` as [`RelayCtx::load`] read it, its `[relay]` not validated (R-157's guard and the access rows read
+    /// `[relay].restricted` from it).
+    pub(crate) cfg: BridgeConfig,
     pub(crate) state: InfraState,
     /// `[aws].egress_connector_arn`: the operator's account is its account.
     connector: String,
@@ -67,7 +70,7 @@ impl RelayCtx {
         if backoff_ms.is_some() {
             note("LAB KNOB ACTIVE (AI_ENV_BRIDGE_LAB_BACKOFF_MS): polls scaled to milliseconds (debug build)");
         }
-        Ok(RelayCtx { paths, state, connector, backoff_ms })
+        Ok(RelayCtx { paths, cfg, state, connector, backoff_ms })
     }
 
     /// The operator identity (the runner's key, else `credentials/ops.env` and its one Touch ID, else exit 5),

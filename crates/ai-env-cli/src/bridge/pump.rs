@@ -1243,6 +1243,13 @@ struct Pump {
     /// S10 (§6.1): the `vms` entries of the session's row as an earlier
     /// wrapper left it, kept as the prefix of this process's.
     vms_prefix: Vec<toml::Value>,
+    /// R-154, sticky per chat: the sole mark of this process's chat (`SessionRow::sole_since`), once seen on the
+    /// `--resume` row or on a row this process writes ([`Pump::fill_remote`]): every row it writes from then on
+    /// carries it (a `/clear`'s, a fork's).
+    sole_since: Option<String>,
+    /// R-154: whether [`Pump::fill_remote`] read the `--resume` row's mark, which it does once, at this process's first
+    /// row: a mark that row gets later is its own chat's, another than a fork's.
+    sole_resume_read: bool,
     /// S10: the current generation's start: its `vms` why (the kind that ran
     /// replaces a move's own at `Started`), the move it is, whether it
     /// forwarded a `system/init` (a moved CLI's miss comes before one).
@@ -1556,6 +1563,8 @@ impl Pump {
             leaf: None,
             results: 0,
             vms_prefix: Vec::new(),
+            sole_since: None,
+            sole_resume_read: false,
             gen_why: String::new(),
             gen_move: None,
             gen_init: false,
@@ -2802,12 +2811,25 @@ impl Pump {
     /// Never while this process's tripwires do not load (C5: no title here,
     /// the view's neither; loaded at the first title, this one if it is).
     /// R-148: the plan's access id unless the row holds one (a row's id never changes) or is the session this process is
-    /// not (`SessionPlan.access_foreign`, which an init can name), and the latest mint word.
+    /// not (`SessionPlan.access_foreign`, which an init can name), and the latest mint word. R-154, sticky per chat: the
+    /// chat's sole mark, once this process saw it (the `--resume` row's, read here at its first row only; the one P0 found
+    /// a Cursor fork inherits, `RemoteSnapshot.sole_inherited`; or this row's on disk: a restricted approval marks a live
+    /// chat's row), on every row it writes, a `/clear`'s and a fork's too; a parent marked once its fork runs is another
+    /// chat, whose mark the fork never takes.
     fn fill_remote(&mut self) {
         let Some(row) = self.row.as_mut() else { return };
         let Some(s) = self.links.snapshot() else { return };
         if row.access_id.is_none() && s.access_foreign.as_deref() != Some(row.session_id.as_str()) {
             row.access_id = s.access_id;
+        }
+        if self.sole_since.is_none() {
+            let paths = &self.sess.paths;
+            let marked = |sid: &str| registry::read(paths, sid).ok().flatten().and_then(|r| r.sole_since);
+            let resumed = if std::mem::replace(&mut self.sole_resume_read, true) { None } else { self.plan.resume.as_deref().and_then(marked) };
+            self.sole_since = resumed.or(s.sole_inherited).or_else(|| marked(&row.session_id));
+        }
+        if row.sole_since.is_none() {
+            row.sole_since.clone_from(&self.sole_since);
         }
         row.relay = s.relay.map(str::to_string);
         row.microvm_id = s.vm;
@@ -4881,8 +4903,14 @@ fn exec_unpiped(sess: &Session) -> ! {
 /// code) and the audit row `session_remote_failed` are written, then the
 /// failure's one line is printed last (through the voice), and the wrapper
 /// exits with the failure's code. Nothing ran: no AWS call, no Touch ID.
+/// The fork gap (option B): a failure that is the CLI's own resume miss
+/// (`Failure::cli_line`) prints the CLI's line raw before its own, so
+/// Cursor shows its banner and its link to a new chat.
 fn fail_before_pump(sess: &Session, failure: &Failure) -> ! {
     let code = record_failure_before_pump(sess, failure);
+    if let Some(raw) = failure.cli_line() {
+        voice::echo(&raw);
+    }
     voice::line(&failure.line());
     std::process::exit(code)
 }
@@ -7599,6 +7627,7 @@ mod tests {
         fn a_failure_before_the_pump_is_recorded_with_its_code_and_step() {
             for (failure, code) in [
                 (Failure::NotGitRepo, 9),
+                (Failure::NothingToResume { session: SID.into() }, 9),
                 (Failure::NoToken { why: "no setup-token is sealed".into(), accounts: false }, 5),
                 (Failure::Other { code: 1, step: "precheck", first_line: "the session's pump cannot start: HOME is not set".into() }, 1),
             ] {
@@ -9393,6 +9422,166 @@ mod tests {
                 assert_eq!(ends.iter().map(|r| r["detail"]["outcome"].clone()).collect::<Vec<_>>(), [Value::from("abandoned")], "{ends:?}");
                 assert_eq!(hand.borrow().whys.len(), 1, "no generation after the called-off switch");
             });
+        }
+
+        /// R-154, sticky per chat: the sole mark (`SessionRow::sole_since`) on the rows a remote session's wrapper writes.
+        mod sole_tests {
+            use super::*;
+
+            /// The chat's access id (the plan's, as the snapshot hands it on) and a `/clear`'s new session.
+            const CHAT: &str = "0199a1b2-0000-7000-8000-0000000012e1";
+            const NEW: &str = "0199a1b2-0000-7000-8000-0000000012e2";
+
+            /// The marks the rows of `SID` and `NEW` hold now.
+            fn marks(paths: &Paths) -> [Option<String>; 2] {
+                [SID, NEW].map(|sid| registry::read(paths, sid).unwrap().and_then(|r| r.sole_since))
+            }
+
+            /// The host's EOF, the CLI's exit, the pump's end (exit 0), concluded.
+            async fn close(host: &Host, far: &mut Far, task: tokio::task::JoinHandle<(i32, Pump)>) {
+                host.eof().await;
+                while far.next_input().await.is_some() {}
+                far.exit(0).await;
+                let (code, mut pump) = ended(task).await;
+                assert_eq!(code, 0, "the session's end");
+                pump.conclude(code);
+            }
+
+            /// A restricted approval marks a live chat's row (`registry::mark_sole`) between two of its wrapper's
+            /// writes: the next turn's write keeps the mark, and a `/clear`'s new row (the same chat: the plan's
+            /// access id) carries it from its first write, through the close; each keeps the first time.
+            #[test]
+            fn a_live_chats_mark_survives_its_writes_and_reaches_a_clears_row() {
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[]);
+                    hand.borrow_mut().snap.access_id = Some(CHAT.into());
+                    let paths = pump.sess.paths.clone();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, SID).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(registry::read(&paths, SID).unwrap().and_then(|r| r.access_id).as_deref(), Some(CHAT));
+                    assert_eq!(marks(&paths), [None, None], "no mark before the approval");
+                    assert_eq!(registry::mark_sole(&paths, SID).unwrap(), [SID]);
+                    let since = marks(&paths)[0].clone().expect("marked");
+                    host.send(&user(2)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result_for(2)).await;
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    assert_eq!(marks(&paths), [Some(since.clone()), None], "the wrapper's write kept it");
+                    far.line(&init_frame(NEW)).await;
+                    host.wait_for("the new session's init", |v| v["subtype"] == "init" && v["session_id"] == NEW).await;
+                    assert_eq!(marks(&paths), [Some(since.clone()), Some(since.clone())], "the /clear's row is the same chat's");
+                    close(&host, &mut far, task).await;
+                    assert_eq!(marks(&paths), [Some(since.clone()), Some(since)], "kept through the close");
+                    assert_eq!(registry::read(&paths, NEW).unwrap().and_then(|r| r.access_id).as_deref(), Some(CHAT));
+                });
+            }
+
+            /// A wrapper that resumes a marked chat marks every row it writes from the first: a fork's own row (a new
+            /// session) included, while an unmarked chat's fork writes none.
+            #[test]
+            fn a_resume_of_a_marked_chat_marks_its_rows_from_the_first() {
+                for marked in [true, false] {
+                    let d = tempfile::tempdir().unwrap();
+                    on_local(async {
+                        let resume = format!("--resume={SID}");
+                        let (pump, hand, host, io) = remote_pump(d.path(), &[&resume, "--fork-session"]);
+                        let paths = pump.sess.paths.clone();
+                        let parent = SessionRow { v: registry::REGISTRY_SCHEMA_V, session_id: SID.into(), status: "closed".into(), mode: "remote".into(), pid: 1, access_id: Some(CHAT.into()), ..SessionRow::default() };
+                        registry::write(&paths, &parent).unwrap();
+                        if marked {
+                            registry::mark_sole(&paths, SID).unwrap();
+                        }
+                        let task = supervise(pump, io);
+                        let mut far = far(&hand).await;
+                        far.started().await;
+                        handshake(&host, &mut far, NEW).await;
+                        host.send(&user(1)).await;
+                        assert!(far.next_input().await.is_some());
+                        let row = |sid: &str| registry::read(&paths, sid).unwrap();
+                        let first = row(NEW).expect("the fork's row, written at its first user line");
+                        assert_eq!(first.sole_since.is_some(), marked, "marked: {marked}");
+                        assert_eq!(first.sole_since, row(SID).and_then(|r| r.sole_since), "the parent's mark, its time");
+                        close(&host, &mut far, task).await;
+                        assert_eq!(row(NEW).and_then(|r| r.sole_since).is_some(), marked);
+                    });
+                }
+            }
+
+            /// A fork's wrapper reads its parent's mark once, at its first row: a parent marked while the fork runs (an
+            /// approval of that other chat, which `mark_sole` gives the parent's rows alone) leaves the fork's rows unmarked,
+            /// through its next turn's write and the close.
+            #[test]
+            fn a_parent_marked_once_its_fork_runs_leaves_the_fork_unmarked() {
+                const FORK_CHAT: &str = "0199a1b2-0000-7000-8000-0000000012e3";
+                let d = tempfile::tempdir().unwrap();
+                on_local(async {
+                    let resume = format!("--resume={SID}");
+                    let (pump, hand, host, io) = remote_pump(d.path(), &[&resume, "--fork-session"]);
+                    hand.borrow_mut().snap.access_id = Some(FORK_CHAT.into());
+                    let paths = pump.sess.paths.clone();
+                    let parent = SessionRow { v: registry::REGISTRY_SCHEMA_V, session_id: SID.into(), status: "closed".into(), mode: "remote".into(), pid: 1, access_id: Some(CHAT.into()), ..SessionRow::default() };
+                    registry::write(&paths, &parent).unwrap();
+                    let task = supervise(pump, io);
+                    let mut far = far(&hand).await;
+                    far.started().await;
+                    handshake(&host, &mut far, NEW).await;
+                    host.send(&user(1)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result_for(1)).await;
+                    host.wait_for("the result", |v| v["type"] == "result").await;
+                    assert_eq!(registry::read(&paths, NEW).unwrap().and_then(|r| r.access_id).as_deref(), Some(FORK_CHAT), "the fork's own chat");
+                    assert_eq!(marks(&paths), [None, None], "nothing marked yet");
+                    assert_eq!(registry::mark_sole(&paths, SID).unwrap(), [SID], "the parent's chat alone");
+                    host.send(&user(2)).await;
+                    assert!(far.next_input().await.is_some());
+                    far.line(&result_for(2)).await;
+                    host.wait_for("turn 2's result", |v| v["type"] == "result" && v["user_message_uuid"] == uuid_of(2).as_str()).await;
+                    close(&host, &mut far, task).await;
+                    let [parent, fork] = marks(&paths);
+                    assert!(parent.is_some() && fork.is_none(), "the parent marked, the fork not: {parent:?} {fork:?}");
+                });
+            }
+
+            /// The fork gap: a Cursor fork (a `--resume` of an id no row names) made in the folder of a chat marked sole
+            /// carries the mark P0 found it inherits (`RemoteSnapshot.sole_inherited`) on its rows from the first, a
+            /// `/clear`'s too, through the close; with none it writes no mark.
+            #[test]
+            fn a_cursor_fork_carries_the_mark_it_inherits_from_its_first_row() {
+                const SINCE: &str = "2026-11-02T08:00:00Z";
+                for inherited in [true, false] {
+                    let d = tempfile::tempdir().unwrap();
+                    on_local(async {
+                        let resume = format!("--resume={SID}");
+                        let (pump, hand, host, io) = remote_pump(d.path(), &[&resume]);
+                        hand.borrow_mut().snap.access_id = Some(CHAT.into());
+                        hand.borrow_mut().snap.sole_inherited = inherited.then(|| SINCE.to_string());
+                        let paths = pump.sess.paths.clone();
+                        assert_eq!(registry::read(&paths, SID).unwrap(), None, "no row names the fork");
+                        let task = supervise(pump, io);
+                        let mut far = far(&hand).await;
+                        far.started().await;
+                        handshake(&host, &mut far, SID).await;
+                        host.send(&user(1)).await;
+                        assert!(far.next_input().await.is_some());
+                        let first = registry::read(&paths, SID).unwrap().expect("the fork's row, written at its first user line");
+                        assert_eq!((first.sole_since.as_deref(), first.access_id.as_deref()), (inherited.then_some(SINCE), Some(CHAT)), "inherited: {inherited}");
+                        far.line(&result_for(1)).await;
+                        host.wait_for("the result", |v| v["type"] == "result").await;
+                        far.line(&init_frame(NEW)).await;
+                        host.wait_for("the new session's init", |v| v["subtype"] == "init" && v["session_id"] == NEW).await;
+                        close(&host, &mut far, task).await;
+                        let want = inherited.then(|| SINCE.to_string());
+                        assert_eq!(marks(&paths), [want.clone(), want], "inherited: {inherited}: the fork's rows, its /clear's too");
+                    });
+                }
+            }
         }
 
         /// S12 (T): the chat's name in the pump (plans/s12-contracts.md §T3 P1 to P10, §T8.1), over the hand factory:

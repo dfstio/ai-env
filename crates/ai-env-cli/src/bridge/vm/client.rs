@@ -28,8 +28,9 @@ use crate::select::resolve_for_decrypt;
 use crate::store::{validate_key_name, Keystore};
 use crate::wire::redact::{register_secret, scrub, Secret};
 use crate::wire::time::unix_now;
-use aws_sdk_lambdamicrovms::config::interceptors::BeforeSerializationInterceptorContextRef;
+use aws_sdk_lambdamicrovms::config::interceptors::{BeforeSerializationInterceptorContextRef, InterceptorContext};
 use aws_sdk_lambdamicrovms::config::http::HttpResponse;
+use aws_sdk_lambdamicrovms::config::retry::{ClassifyRetry, RetryAction};
 use aws_sdk_lambdamicrovms::config::{ConfigBag, Credentials, Intercept, Region};
 use aws_sdk_lambdamicrovms::error::{BoxError, DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_lambdamicrovms::operation::run_microvm::builders::RunMicrovmFluentBuilder;
@@ -282,7 +283,7 @@ fn secret_fault(secret: &str) -> Option<String> {
 /// Profile files that hold nothing and live in memory: with them the loader
 /// never opens `~/.aws/config`, `~/.aws/credentials`, `AWS_CONFIG_FILE` or
 /// `AWS_SHARED_CREDENTIALS_FILE` (container mode has no use for any of them).
-#[allow(deprecated)] // aws-config 1.12 re-exports these under deprecated aliases (plan D21)
+#[allow(deprecated)] // aws-config 1.13 re-exports these under deprecated aliases (plan D21)
 fn empty_profile_files() -> aws_config::profile::profile_file::ProfileFiles {
     use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
     ProfileFiles::builder().with_contents(ProfileFileKind::Config, "").with_contents(ProfileFileKind::Credentials, "").build()
@@ -341,7 +342,7 @@ pub async fn sdk_config_for(creds: &RuntimeCreds) -> aws_config::SdkConfig {
 /// Environment variables that move the STS call of an assume-role (or
 /// web-identity) profile. aws-config builds that STS client from its
 /// `ProviderConfig` with `ignore_configured_endpoint_urls: false` hard-coded
-/// and the real process environment (aws-config 1.12 `client_config()`; no
+/// and the real process environment (aws-config 1.13 `client_config()`; no
 /// public setter overrides either), so `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS`
 /// does not help, and `tls::sdk_http_client()` dials `http://` as readily as
 /// `https://`: the SigV4-signed source key would travel in clear text and the
@@ -467,6 +468,47 @@ impl Intercept for RefuseProfile {
     }
 }
 
+/// Answers a modelled `ConflictException` after one request, as
+/// aws-sdk-lambdamicrovms 1.8 did. 1.19's model marks it retryable
+/// (`ErrorKind::ClientError`) for RunMicrovm, ResumeMicrovm, SuspendMicrovm,
+/// TerminateMicrovm and both token operations (the image operations too,
+/// which the bridge never calls), so the standard strategy would send a
+/// conflicting call [`SDK_MAX_ATTEMPTS`] times, with up to 1 + 2 s of
+/// jittered backoff between them. The bridge reads a conflict as the VM's
+/// state (`BridgeError::Conflict`): a resume already under way, or a VM no
+/// longer RUNNING when the closing suspend asks inside its 1500 ms budget
+/// (`remote::CLOSE_BUDGET_MS`). `RetryForbidden` ends the classification, so
+/// no other classifier retries it either.
+#[derive(Debug)]
+struct ConflictIsAnAnswer;
+
+impl ClassifyRetry for ConflictIsAnAnswer {
+    fn classify_retry(&self, ctx: &InterceptorContext) -> RetryAction {
+        use aws_sdk_lambdamicrovms::operation::create_microvm_auth_token::CreateMicrovmAuthTokenError;
+        use aws_sdk_lambdamicrovms::operation::create_microvm_shell_auth_token::CreateMicrovmShellAuthTokenError;
+        use aws_sdk_lambdamicrovms::operation::resume_microvm::ResumeMicrovmError;
+        use aws_sdk_lambdamicrovms::operation::suspend_microvm::SuspendMicrovmError;
+        use aws_sdk_lambdamicrovms::operation::terminate_microvm::TerminateMicrovmError;
+        let Some(Err(e)) = ctx.output_or_error() else { return RetryAction::NoActionIndicated };
+        let Some(e) = e.as_operation_error() else { return RetryAction::NoActionIndicated };
+        let conflict = e.downcast_ref::<RunMicrovmError>().is_some_and(RunMicrovmError::is_conflict_exception)
+            || e.downcast_ref::<ResumeMicrovmError>().is_some_and(ResumeMicrovmError::is_conflict_exception)
+            || e.downcast_ref::<SuspendMicrovmError>().is_some_and(SuspendMicrovmError::is_conflict_exception)
+            || e.downcast_ref::<TerminateMicrovmError>().is_some_and(TerminateMicrovmError::is_conflict_exception)
+            || e.downcast_ref::<CreateMicrovmAuthTokenError>().is_some_and(CreateMicrovmAuthTokenError::is_conflict_exception)
+            || e.downcast_ref::<CreateMicrovmShellAuthTokenError>().is_some_and(CreateMicrovmShellAuthTokenError::is_conflict_exception);
+        if conflict {
+            RetryAction::RetryForbidden
+        } else {
+            RetryAction::NoActionIndicated
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ai-env-conflict-is-an-answer"
+    }
+}
+
 // ---- the client -----------------------------------------------------------------------
 
 /// `MicrovmApi` over `aws-sdk-lambdamicrovms`, configured by [`sdk_config_for`].
@@ -491,7 +533,8 @@ pub struct SdkMicrovmApi {
 
 /// The client for `creds` (see [`SdkMicrovmApi`] for the runtime rule). The
 /// service configuration re-applies the region, endpoint, FIPS and
-/// dual-stack pins on top of [`sdk_config_for`]. For a profile (and the
+/// dual-stack pins on top of [`sdk_config_for`], and never retries a
+/// conflict (`ConflictIsAnAnswer`). For a profile (and the
 /// default chain of the read-only tests, whose profile is `AWS_PROFILE` or
 /// `default`) it first reads the environment and the shared config files:
 /// when they would move the assume-role STS call ([`PROFILE_REFUSED_ENV`],
@@ -508,7 +551,12 @@ pub async fn connect(creds: &RuntimeCreds) -> SdkMicrovmApi {
             (None, profile_mode_refusal(&name))
         }
     };
-    let mut conf = aws_sdk_lambdamicrovms::config::Builder::from(&sdk).region(Region::new(REGION)).endpoint_url(CONTROL_PLANE_URL).use_fips(false).use_dual_stack(false);
+    let mut conf = aws_sdk_lambdamicrovms::config::Builder::from(&sdk)
+        .region(Region::new(REGION))
+        .endpoint_url(CONTROL_PLANE_URL)
+        .use_fips(false)
+        .use_dual_stack(false)
+        .retry_classifier(ConflictIsAnAnswer);
     if let Some(why) = &refusal {
         conf = conf.interceptor(RefuseProfile(why.clone()));
     }
@@ -1389,5 +1437,126 @@ mod tests {
         for marker in [None, Some(Ok(Marker::Root)), Some(Ok(Marker::Ambient)), Some(Marker::parse("nobody"))] {
             assert_eq!(profile_under_runner("ops-profile", marker), None);
         }
+    }
+
+    /// A loopback control plane for the retry test: every request, read whole,
+    /// is answered with `status` and the error `code` in `x-amzn-errortype`
+    /// (how the service names a modelled error), one request per connection.
+    /// The counter holds the requests that arrived.
+    async fn control_plane_answering(status: u16, code: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+                    let head = loop {
+                        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let lower = String::from_utf8_lossy(&buf[..head]).to_ascii_lowercase();
+                    let length: usize = lower.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                    while buf.len() < head + length {
+                        match s.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let body = "{\"message\":\"the loopback control plane says no\"}";
+                    let reply = format!("HTTP/1.1 {status} Answer\r\ncontent-type: application/json\r\nx-amzn-errortype: {code}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = s.write_all(reply.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// aws-sdk-lambdamicrovms 1.19 models `ConflictException` as retryable for
+    /// RunMicrovm, ResumeMicrovm, SuspendMicrovm, TerminateMicrovm and both
+    /// token operations (1.8 did not). The client [`connect`] builds still
+    /// answers a conflict after one request, as `BridgeError::Conflict`, on
+    /// every operation of the trait; throttling and server errors keep their
+    /// [`SDK_MAX_ATTEMPTS`], and every other error stays one request. Offline:
+    /// a loopback control plane, static keys, the backoff cut to 1 ms.
+    #[tokio::test]
+    async fn a_conflict_is_answered_at_once_and_only_throttling_and_server_errors_are_retried() {
+        use crate::bridge::api::{APP_PORT, FAKE_IMAGE_ARN};
+        use aws_sdk_lambdamicrovms::config::retry::{RetryConfig, RetryPartition};
+        use std::sync::atomic::Ordering;
+        const OPS: [&str; 11] = [
+            "run_microvm",
+            "get_microvm",
+            "suspend_microvm",
+            "resume_microvm",
+            "terminate_microvm",
+            "list_microvms",
+            "create_microvm_auth_token",
+            "create_microvm_shell_auth_token",
+            "get_microvm_image",
+            "list_microvm_image_versions",
+            "list_managed_microvm_images",
+        ];
+        let retried = SDK_MAX_ATTEMPTS as usize;
+        let answers = [
+            (409, "ConflictException", 1),
+            (429, "ThrottlingException", retried),
+            (500, "InternalServerException", retried),
+            (400, "ValidationException", 1),
+            (402, "ServiceQuotaExceededException", 1),
+            (403, "AccessDeniedException", 1),
+            (404, "ResourceNotFoundException", 1),
+        ];
+        let id = "microvm-0199a1b2-0000-7000-8000-0000000012a3";
+        let api = connect(&static_creds("Z1A2")).await;
+        let mut wrong = Vec::new();
+        for (status, code, attempts) in answers {
+            let (url, requests) = control_plane_answering(status, code).await;
+            let conf = api
+                .client()
+                .config()
+                .to_builder()
+                .endpoint_url(url)
+                .retry_config(RetryConfig::standard().with_max_attempts(SDK_MAX_ATTEMPTS).with_initial_backoff(Duration::from_millis(1)))
+                .retry_partition(RetryPartition::new("ai-env-retry-test"))
+                .build();
+            let sdk = SdkMicrovmApi { client: Client::from_conf(conf), credentials: api.credentials.clone(), profile: None, refusal: None };
+            for op in OPS {
+                let answer = match op {
+                    "run_microvm" => sdk.run(&run_spec("0199a1b2-0000-7000-8000-0000000012a3")).await.map(drop),
+                    "get_microvm" => sdk.get(id).await.map(drop),
+                    "suspend_microvm" => sdk.suspend(id).await,
+                    "resume_microvm" => sdk.resume(id).await,
+                    "terminate_microvm" => sdk.terminate(id).await,
+                    "list_microvms" => sdk.list(None).await.map(drop),
+                    "create_microvm_auth_token" => sdk.create_auth_token(id, 5, APP_PORT).await.map(drop),
+                    "create_microvm_shell_auth_token" => sdk.create_shell_token(id, 5).await.map(drop),
+                    "get_microvm_image" => sdk.get_image(FAKE_IMAGE_ARN).await.map(drop),
+                    "list_microvm_image_versions" => sdk.list_image_versions(FAKE_IMAGE_ARN).await.map(drop),
+                    "list_managed_microvm_images" => sdk.list_managed_images().await.map(drop),
+                    other => unreachable!("{other}"),
+                };
+                let e = answer.expect_err(op);
+                let sent = requests.swap(0, Ordering::SeqCst);
+                if sent != attempts {
+                    wrong.push(format!("{op} sent {sent} request(s) for {status} {code}, expected {attempts}"));
+                }
+                if code == "ConflictException" {
+                    assert!(matches!(e, BridgeError::Conflict(_)), "{op}: {e}");
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }
